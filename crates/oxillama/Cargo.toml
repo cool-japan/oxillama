@@ -1,0 +1,40 @@
+[package]
+name = "oxillama"
+description = "Pure Rust LLM inference engine — the sovereign alternative to llama.cpp (meta crate)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+keywords = ["llm", "inference", "gguf", "llama", "pure-rust"]
+categories = ["science", "algorithms"]
+readme = "README.md"
+
+[features]
+default = ["server", "bench"]
+server = ["dep:oxillama-server"]
+bench = ["dep:oxillama-bench"]
+gpu = ["dep:oxillama-gpu", "oxillama-gpu/gpu"]
+simd-avx2 = ["oxillama-quant/simd-avx2"]
+simd-avx512 = ["oxillama-quant/simd-avx512"]
+simd-neon = ["oxillama-quant/simd-neon"]
+# Architecture feature flags
+llama = ["oxillama-arch/llama", "oxillama-runtime/llama"]
+qwen3 = ["oxillama-arch/qwen3", "oxillama-runtime/qwen3"]
+mistral = ["oxillama-arch/mistral", "oxillama-runtime/mistral"]
+gemma = ["oxillama-arch/gemma", "oxillama-runtime/gemma"]
+phi = ["oxillama-arch/phi", "oxillama-runtime/phi"]
+command-r = ["oxillama-arch/command-r", "oxillama-runtime/command-r"]
+starcoder = ["oxillama-arch/starcoder", "oxillama-runtime/starcoder"]
+llava = ["oxillama-arch/llava"]
+
+[dependencies]
+oxillama-gguf = { workspace = true, features = ["mmap"] }
+oxillama-quant = { workspace = true, features = ["parallel"] }
+oxillama-arch.workspace = true
+oxillama-runtime = { workspace = true, features = ["tokenizer-wasm"] }
+oxillama-server = { workspace = true, optional = true }
+oxillama-bench = { workspace = true, optional = true }
+oxillama-gpu = { workspace = true, optional = true }

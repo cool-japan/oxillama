@@ -1,0 +1,27 @@
+[package]
+name = "oxillama-server"
+description = "OpenAI-compatible HTTP API server for OxiLLaMa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["llm", "openai", "api-server", "inference", "llama"]
+categories = ["web-programming::http-server", "science"]
+readme = "README.md"
+
+[dependencies]
+oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi"] }
+axum.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }

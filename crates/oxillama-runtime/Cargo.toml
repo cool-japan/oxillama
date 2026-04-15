@@ -1,0 +1,44 @@
+[package]
+name = "oxillama-runtime"
+description = "Inference engine — KV cache, sampling, tokenizer bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["llm", "inference", "llama", "transformer", "sampling"]
+categories = ["science", "algorithms"]
+readme = "README.md"
+
+[features]
+default = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "tokenizer-wasm"]
+llama = ["oxillama-arch/llama"]
+qwen3 = ["oxillama-arch/qwen3"]
+mistral = ["oxillama-arch/mistral"]
+gemma = ["oxillama-arch/gemma"]
+phi = ["oxillama-arch/phi"]
+command-r = ["oxillama-arch/command-r"]
+starcoder = ["oxillama-arch/starcoder"]
+tokenizer-onig = ["dep:tokenizers", "tokenizers/onig"]
+tokenizer-wasm = ["dep:tokenizers", "tokenizers/unstable_wasm"]
+
+[dependencies]
+oxillama-gguf = { workspace = true, features = ["mmap"] }
+oxillama-quant = { workspace = true, features = ["parallel"] }
+oxillama-arch.workspace = true
+half.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rayon.workspace = true
+tokenizers = { workspace = true, optional = true, default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+oxillama-gguf = { workspace = true, features = ["test-utils"] }
+
+[[bench]]
+name = "sampling"
+harness = false

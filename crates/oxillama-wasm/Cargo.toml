@@ -1,0 +1,39 @@
+[package]
+name = "oxillama-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "WebAssembly bindings for OxiLLaMa GGUF parsing and quantization"
+keywords = ["llm", "wasm", "gguf", "llama", "webassembly"]
+categories = ["wasm", "science"]
+readme = "README.md"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["console_error_panic_hook", "inference"]
+# Enables full text generation via oxillama-runtime with the pure-Rust
+# `unstable_wasm` tokenizer backend (fancy-regex, no C/Oniguruma).
+inference = ["dep:oxillama-runtime"]
+
+[dependencies]
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+console_error_panic_hook = { workspace = true, optional = true }
+# serde + serde-wasm-bindgen retained for future metadata serialisation exports
+serde = { workspace = true, optional = true }
+serde-wasm-bindgen = { workspace = true, optional = true }
+# Pure-compute crates used regardless of feature set.
+# `parallel` is intentionally omitted so rayon is NOT compiled into WASM.
+oxillama-gguf = { workspace = true, default-features = false }
+oxillama-quant = { workspace = true, default-features = false }
+# Inference engine with pure-Rust tokenizer — compiled only when `inference`
+# feature is active.  Uses `tokenizer-wasm` (fancy-regex) instead of the
+# C-backed `tokenizer-onig` backend to remain wasm32-unknown-unknown clean.
+oxillama-runtime = { workspace = true, default-features = false, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi"], optional = true }
+
+

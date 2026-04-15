@@ -1,0 +1,33 @@
+[package]
+name = "oxillama-arch"
+description = "Model architecture implementations — LLaMA, Qwen3, Mistral, Gemma, Phi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["llama", "transformer", "neural-network", "llm", "inference"]
+categories = ["science", "algorithms"]
+readme = "README.md"
+
+[features]
+default = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "llava"]
+llama = []
+qwen3 = []
+mistral = []
+gemma = []
+phi = []
+command-r = []
+starcoder = []
+llava = ["llama"]
+
+[dependencies]
+oxillama-gguf.workspace = true
+oxillama-quant.workspace = true
+half.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+oxillama-gguf = { workspace = true, features = ["test-utils"] }

@@ -1,0 +1,34 @@
+//! AVX-512 accelerated quantization kernels (x86_64 only, `simd-avx512` feature).
+//!
+//! All kernels in this module require the `avx512f` CPU feature and are
+//! guarded by `#[target_feature(enable = "avx512f")]` on their inner
+//! functions.  The [`crate::dispatch::KernelDispatcher`] checks for AVX-512
+//! support at runtime before constructing any of these kernels.
+//!
+//! ## Kernels
+//!
+//! | Struct | Format | Block size | Block bytes | Throughput vs AVX2 |
+//! |--------|--------|-----------|-------------|-------------------|
+//! | [`Q4_0Avx512`]      | Q4_0       | 32  | 18  | ~2× |
+//! | [`Q8_0Avx512`]      | Q8_0       | 32  | 34  | ~2× |
+//! | [`Q4_KAvx512`]      | Q4_K       | 256 | 144 | ~2× |
+//! | [`Q5_KAvx512`]      | Q5_K       | 256 | 176 | ~2× |
+//! | [`Q6_KAvx512`]      | Q6_K       | 256 | 210 | ~2× |
+//! | [`Q1_0G128Avx512`]  | Q1_0_G128  | 128 | 18  | ~2× |
+
+#![cfg(all(feature = "simd-avx512", target_arch = "x86_64"))]
+
+pub mod q1_0_g128;
+pub mod q4_0;
+pub mod q4_k;
+pub mod q5_k;
+pub mod q6_k;
+pub mod q8_0;
+mod util;
+
+pub use q1_0_g128::Q1_0G128Avx512;
+pub use q4_0::Q4_0Avx512;
+pub use q4_k::Q4_KAvx512;
+pub use q5_k::Q5_KAvx512;
+pub use q6_k::Q6_KAvx512;
+pub use q8_0::Q8_0Avx512;

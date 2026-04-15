@@ -1,0 +1,34 @@
+[package]
+name = "oxillama-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Python bindings for OxiLLaMa LLM inference engine"
+keywords = ["llm", "inference", "python", "llama", "gguf"]
+categories = ["science", "api-bindings"]
+readme = "README.md"
+
+[lib]
+name = "oxillama_py"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# NOTE: `extension-module` is NOT listed here so that `cargo test` links
+# against the system Python automatically.  Maturin adds it via pyproject.toml
+# (`features = ["pyo3/extension-module"]`) during wheel builds only.
+pyo3 = { workspace = true }
+oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi"] }
+oxillama-arch = { workspace = true }
+oxillama-gguf = { workspace = true, features = ["mmap"] }
+numpy = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Only needed for error.rs tests that reference quant error variants.
+oxillama-quant = { workspace = true, features = ["parallel"] }
+
+[features]
+default = []
+numpy = ["dep:numpy"]

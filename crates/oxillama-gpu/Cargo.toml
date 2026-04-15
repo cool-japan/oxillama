@@ -1,0 +1,29 @@
+[package]
+name = "oxillama-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Optional wgpu GPU compute backend for OxiLLaMa"
+keywords = ["llm", "gpu", "wgpu", "compute", "webgpu"]
+categories = ["science", "hardware-support"]
+readme = "README.md"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[dependencies]
+thiserror.workspace = true
+oxillama-gguf  = { workspace = true, default-features = false }
+half.workspace = true
+wgpu     = { version = "29.0.1", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+
+

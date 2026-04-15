@@ -1,0 +1,48 @@
+[package]
+name = "oxillama-cli"
+description = "Pure Rust LLM inference engine CLI — the sovereign alternative to llama.cpp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+keywords = ["llm", "inference", "gguf", "llama", "cli"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "oxillama"
+path = "src/main.rs"
+
+[features]
+default = ["server"]
+server = ["dep:oxillama-server", "dep:axum"]
+bench = ["dep:oxillama-bench"]
+simd-avx2 = ["oxillama-quant/simd-avx2"]
+simd-avx512 = ["oxillama-quant/simd-avx512"]
+simd-neon = ["oxillama-quant/simd-neon"]
+
+[dependencies]
+oxillama-gguf = { workspace = true, features = ["mmap"] }
+oxillama-quant = { workspace = true, features = ["parallel"] }
+oxillama-arch.workspace = true
+oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi"] }
+oxillama-server = { workspace = true, optional = true }
+oxillama-bench = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "inference"
+harness = false

@@ -1,0 +1,26 @@
+[package]
+name = "oxillama-gguf"
+description = "GGUF v3 parser and tensor loader for OxiLLaMa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["gguf", "llm", "model-format", "quantization", "inference"]
+categories = ["parser-implementations", "encoding", "data-structures"]
+readme = "README.md"
+
+[features]
+default = ["mmap"]
+mmap = ["dep:memmap2"]
+test-utils = []
+integrity = ["dep:blake3"]
+
+[dependencies]
+thiserror.workspace = true
+memmap2 = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true

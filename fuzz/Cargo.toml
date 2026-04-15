@@ -1,0 +1,36 @@
+[workspace]
+# Empty [workspace] table opts this crate out of the parent workspace.
+# This is the standard cargo-fuzz pattern — do NOT add fuzz/ to the
+# workspace root members list.
+
+[package]
+name = "oxillama-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+# NOT a workspace member — cargo-fuzz manages its own build.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxillama-gguf = { path = "../crates/oxillama-gguf" }
+
+[[bin]]
+name = "gguf_parse"
+path = "fuzz_targets/gguf_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gguf_header_parse"
+path = "fuzz_targets/gguf_header_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gguf_from_bytes"
+path = "fuzz_targets/gguf_from_bytes.rs"
+test = false
+doc = false

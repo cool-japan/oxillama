@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "oxillama-py"
+requires-python = ">=3.8"
+description = "Python bindings for OxiLLaMa — Pure Rust LLM inference engine"
+license = {text = "Apache-2.0"}
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "oxillama_py"

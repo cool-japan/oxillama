@@ -1,0 +1,32 @@
+[package]
+name = "oxillama-quant"
+description = "Quantization kernels for all GGUF quantization types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["quantization", "llm", "q4", "simd", "inference"]
+categories = ["algorithms", "mathematics", "science"]
+readme = "README.md"
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+simd-avx2 = []
+simd-avx512 = []
+simd-neon = []
+
+[dependencies]
+oxillama-gguf.workspace = true
+half.workspace = true
+thiserror.workspace = true
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "quant_kernels"
+harness = false

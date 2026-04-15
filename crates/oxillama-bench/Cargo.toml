@@ -1,0 +1,18 @@
+[package]
+name = "oxillama-bench"
+description = "Benchmark suite for OxiLLaMa inference engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["benchmark", "llm", "quantization", "performance", "inference"]
+categories = ["development-tools::profiling"]
+readme = "README.md"
+
+[dependencies]
+oxillama-quant = { workspace = true, features = ["parallel"] }
+oxillama-gguf = { workspace = true, features = ["mmap"] }
+criterion.workspace = true
+half.workspace = true
