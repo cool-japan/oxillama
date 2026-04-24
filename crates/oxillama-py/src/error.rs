@@ -224,7 +224,11 @@ mod tests {
             }),
             RuntimeError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "test")),
             RuntimeError::Grammar(GrammarError::Stuck),
-            RuntimeError::OffloadEof { offset: 0, needed: 4, available: 2 },
+            RuntimeError::OffloadEof {
+                offset: 0,
+                needed: 4,
+                available: 2,
+            },
             RuntimeError::TensorNotFound("blk.0.attn_q.weight".to_string()),
             RuntimeError::LockPoisoned,
         ];

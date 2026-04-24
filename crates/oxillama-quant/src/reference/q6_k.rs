@@ -270,17 +270,16 @@ impl QuantKernel for Q6KRef {
                     for l in 0..32 {
                         let is = l / 16; // sub-block index within group (0 or 1)
 
-                        let q1 = ((ql[ql_off + l] & 0x0F)
-                            | ((qh[qh_off + l] & 3) << 4)) as i32
+                        let q1 =
+                            ((ql[ql_off + l] & 0x0F) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
+                        let q2 = ((ql[ql_off + l + 32] & 0x0F) | (((qh[qh_off + l] >> 2) & 3) << 4))
+                            as i32
                             - 32;
-                        let q2 = ((ql[ql_off + l + 32] & 0x0F)
-                            | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32
+                        let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4))
+                            as i32
                             - 32;
-                        let q3 = ((ql[ql_off + l] >> 4)
-                            | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32
-                            - 32;
-                        let q4 = ((ql[ql_off + l + 32] >> 4)
-                            | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32
+                        let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4))
+                            as i32
                             - 32;
 
                         let s0 = d * scales[sc_off + is] as i8 as f32;
@@ -325,8 +324,8 @@ impl QuantKernel for Q6KRef {
                             // Column `col` is within the super-block; find Q8_0 block index.
                             let q8_blk = blk * 8 + col / 32;
                             let q8_lane = col % 32;
-                            let ab = &acts_q8[q8_blk * Q8_0_BLOCK_BYTES..
-                                            (q8_blk + 1) * Q8_0_BLOCK_BYTES];
+                            let ab = &acts_q8
+                                [q8_blk * Q8_0_BLOCK_BYTES..(q8_blk + 1) * Q8_0_BLOCK_BYTES];
                             let d_a = f16_to_f32(u16::from_le_bytes([ab[0], ab[1]]));
                             let q_a = ab[2 + q8_lane] as i8 as f32;
                             Some(d_a * q_a)

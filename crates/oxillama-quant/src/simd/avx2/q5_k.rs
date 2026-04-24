@@ -244,8 +244,8 @@ unsafe fn fused_q5_k_q8_0_row_avx2(
         let d = f16_to_f32(block);
         let dmin = f16_to_f32(&block[2..]);
         let (sc, mn) = decode_scales_mins(&block[4..16]);
-        let qh = &block[16..48];   // 32 high-bit bytes
-        let qs = &block[48..176];  // 128 nibble bytes
+        let qh = &block[16..48]; // 32 high-bit bytes
+        let qs = &block[48..176]; // 128 nibble bytes
 
         let input_offset = blk * BLOCK_SIZE;
         let cols_in_block = (n_cols - input_offset).min(BLOCK_SIZE);
@@ -310,8 +310,10 @@ unsafe fn fused_q5_k_q8_0_row_avx2(
                     }
 
                     // SAFETY: nib_buf and q8_buf are stack arrays; loads are valid.
-                    let vw = _mm256_cvtepi8_epi32(_mm_loadl_epi64(nib_buf.as_ptr() as *const __m128i));
-                    let va = _mm256_cvtepi8_epi32(_mm_loadl_epi64(q8_buf.as_ptr() as *const __m128i));
+                    let vw =
+                        _mm256_cvtepi8_epi32(_mm_loadl_epi64(nib_buf.as_ptr() as *const __m128i));
+                    let va =
+                        _mm256_cvtepi8_epi32(_mm_loadl_epi64(q8_buf.as_ptr() as *const __m128i));
                     dot_lo_i32 = _mm256_add_epi32(dot_lo_i32, _mm256_mullo_epi32(vw, va));
                     sum_a_lo_i32 = _mm256_add_epi32(sum_a_lo_i32, va);
                 }
@@ -347,8 +349,10 @@ unsafe fn fused_q5_k_q8_0_row_avx2(
                         q8_buf[j] = q8_hi[l + j] as i8;
                     }
 
-                    let vw = _mm256_cvtepi8_epi32(_mm_loadl_epi64(nib_buf.as_ptr() as *const __m128i));
-                    let va = _mm256_cvtepi8_epi32(_mm_loadl_epi64(q8_buf.as_ptr() as *const __m128i));
+                    let vw =
+                        _mm256_cvtepi8_epi32(_mm_loadl_epi64(nib_buf.as_ptr() as *const __m128i));
+                    let va =
+                        _mm256_cvtepi8_epi32(_mm_loadl_epi64(q8_buf.as_ptr() as *const __m128i));
                     dot_hi_i32 = _mm256_add_epi32(dot_hi_i32, _mm256_mullo_epi32(vw, va));
                     sum_a_hi_i32 = _mm256_add_epi32(sum_a_hi_i32, va);
                 }
@@ -992,8 +996,10 @@ mod tests {
 
         let w_block = make_q5k_block(0.5, 0.25, &scales, &qh, &qs);
         // 8 Q8_0 activation blocks for one Q5_K super-block.
-        let act_vals = [2i8, -3, 5, -7, 1, -1, 4, -4, 6, -6, 3, -3, 2, -2, 1, -1,
-                        8, -8, 7, -7, 6, -6, 5, -5, 4, -4, 3, -3, 2, -2, 1, -1];
+        let act_vals = [
+            2i8, -3, 5, -7, 1, -1, 4, -4, 6, -6, 3, -3, 2, -2, 1, -1, 8, -8, 7, -7, 6, -6, 5, -5,
+            4, -4, 3, -3, 2, -2, 1, -1,
+        ];
         let acts = make_q8_acts(8, 0.1, &act_vals);
 
         let mut out_avx2 = vec![0.0f32; 1];
@@ -1053,8 +1059,8 @@ mod tests {
         }
 
         let act_vals: [i8; 32] = [
-            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16,
-            0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8,
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 0, 1, -1, 2, -2, 3, -3,
+            4, -4, 5, -5, 6, -6, 7, -7, 8,
         ];
         let acts = make_q8_acts(q8_blocks_per_row, 0.05, &act_vals);
 

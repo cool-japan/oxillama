@@ -27,10 +27,6 @@ pub mod tool_dispatch;
 pub use batched_attention::batched_flash_attention;
 pub use engine::{EngineConfig, InferenceEngine, FLASH_ATTN_THRESHOLD};
 pub use error::{RuntimeError, RuntimeResult};
-pub use offload::{
-    FilePagerSource, LayerPager, MemoryPressureProbe, OffloadPolicy, PagerSource, ResidentTensor,
-    TensorEntry, TensorId,
-};
 pub use flash_attention::{
     flash_attention, flash_attention_forward, flash_attention_gqa, flash_attention_multi_head,
     FlashAttentionConfig,
@@ -39,6 +35,10 @@ pub use kv_cache::{BatchedKvView, KvCache, KvCacheSnapshot, KvSlot, VecBatchedKv
 pub use kv_pool::KvCachePool;
 pub use lora_loader::apply_lora;
 pub use metrics::{EngineMetrics, MetricsSnapshot};
+pub use offload::{
+    FilePagerSource, LayerPager, MemoryPressureProbe, OffloadPolicy, PagerSource, ResidentTensor,
+    TensorEntry, TensorId,
+};
 pub use oxillama_arch::LoraStack;
 pub use sampling::chain::{SamplerChain, SamplerStage};
 pub use sampling::grammar::{Grammar, GrammarError, GrammarState};

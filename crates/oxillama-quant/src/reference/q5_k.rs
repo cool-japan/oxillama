@@ -278,8 +278,8 @@ impl QuantKernel for Q5KRef {
                 let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
                 let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
                 let (sc, mn) = decode_scales_mins(&block[4..16]);
-                let qh = &block[16..48];   // 32 bytes: high bit per weight
-                let qs = &block[48..176];  // 128 bytes: lo 4-bit quants
+                let qh = &block[16..48]; // 32 bytes: high bit per weight
+                let qs = &block[48..176]; // 128 bytes: lo 4-bit quants
 
                 let input_offset = blk * Q5_K_BLOCK_SIZE;
                 let cols_in_block = (n_cols - input_offset).min(Q5_K_BLOCK_SIZE);

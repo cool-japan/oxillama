@@ -22,11 +22,11 @@ gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 thiserror.workspace = true
 oxillama-gguf  = { workspace = true, default-features = false }
 half.workspace = true
-wgpu     = { version = "29.0.1", optional = true }
-pollster = { version = "0.4", optional = true }
-bytemuck = { version = "1", features = ["derive"], optional = true }
+wgpu     = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
 
 [dev-dependencies]
-naga = { version = "29.0.1", features = ["wgsl-in", "msl-out", "spv-out"] }
+naga = { workspace = true }
 
 

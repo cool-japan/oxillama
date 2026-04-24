@@ -140,8 +140,7 @@ where
     let len = read_u64_le(src)? as usize;
     let mut bytes = Vec::with_capacity(len.min(1_024 * 1_024));
     bytes.resize(len, 0u8);
-    src.read_exact(&mut bytes)
-        .map_err(|_| eof_at(str_offset))?;
+    src.read_exact(&mut bytes).map_err(|_| eof_at(str_offset))?;
     String::from_utf8(bytes).map_err(|e| GgufError::InvalidString {
         offset: str_offset,
         source: e,
@@ -157,8 +156,7 @@ where
     let len = read_u32_le(src)? as usize;
     let mut bytes = Vec::with_capacity(len.min(1_024 * 1_024));
     bytes.resize(len, 0u8);
-    src.read_exact(&mut bytes)
-        .map_err(|_| eof_at(str_offset))?;
+    src.read_exact(&mut bytes).map_err(|_| eof_at(str_offset))?;
     String::from_utf8(bytes).map_err(|e| GgufError::InvalidString {
         offset: str_offset,
         source: e,
@@ -246,12 +244,11 @@ where
         let key = read_string_versioned(src, version)?;
 
         let value_type_id = read_u32_le(src)?;
-        let value_type = GgufValueType::from_u32(value_type_id).ok_or_else(|| {
-            GgufError::InvalidMetadata {
+        let value_type =
+            GgufValueType::from_u32(value_type_id).ok_or_else(|| GgufError::InvalidMetadata {
                 key: key.clone(),
                 reason: format!("unknown value type: {value_type_id}"),
-            }
-        })?;
+            })?;
 
         let value = read_metadata_value(src, value_type, version)?;
         store.insert(key, value);
@@ -464,7 +461,8 @@ mod tests {
         let mut src = SliceSource::new(&original);
 
         let mut first_half = vec![0u8; 128];
-        src.read_exact(&mut first_half).expect("test: read first half");
+        src.read_exact(&mut first_half)
+            .expect("test: read first half");
         assert_eq!(first_half, &original[..128]);
         assert_eq!(src.position(), 128);
 

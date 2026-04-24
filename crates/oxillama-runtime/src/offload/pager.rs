@@ -12,8 +12,8 @@
 //! `.map_err(|_| RuntimeError::LockPoisoned)?` — no `unwrap()` anywhere.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::error::RuntimeError;
 
@@ -179,11 +179,13 @@ impl MmapPagerSource {
 impl PagerSource for MmapPagerSource {
     fn read_bytes_at(&self, offset: u64, out: &mut [u8]) -> Result<(), RuntimeError> {
         let start = offset as usize;
-        let end = start.checked_add(out.len()).ok_or(RuntimeError::OffloadEof {
-            offset,
-            needed: out.len(),
-            available: 0,
-        })?;
+        let end = start
+            .checked_add(out.len())
+            .ok_or(RuntimeError::OffloadEof {
+                offset,
+                needed: out.len(),
+                available: 0,
+            })?;
         if end > self.mmap.len() {
             let available = self.mmap.len().saturating_sub(start);
             return Err(RuntimeError::OffloadEof {
@@ -356,8 +358,7 @@ impl LayerPager {
                     if let Some(evicted) = removed {
                         self.resident_bytes
                             .fetch_sub(evicted.size_bytes as u64, Ordering::Relaxed);
-                        let mut lru =
-                            self.lru.lock().map_err(|_| RuntimeError::LockPoisoned)?;
+                        let mut lru = self.lru.lock().map_err(|_| RuntimeError::LockPoisoned)?;
                         lru.retain(|x| x != &victim_id);
                     }
                 }
@@ -383,10 +384,7 @@ impl LayerPager {
 
     /// Return the number of tensors currently resident in RAM.
     pub fn resident_count(&self) -> usize {
-        self.resident
-            .read()
-            .map(|g| g.len())
-            .unwrap_or(0)
+        self.resident.read().map(|g| g.len()).unwrap_or(0)
     }
 
     /// Return the configured RAM budget in bytes.
@@ -426,11 +424,13 @@ mod tests {
     impl PagerSource for VecPagerSource {
         fn read_bytes_at(&self, offset: u64, out: &mut [u8]) -> Result<(), RuntimeError> {
             let start = offset as usize;
-            let end = start.checked_add(out.len()).ok_or(RuntimeError::OffloadEof {
-                offset,
-                needed: out.len(),
-                available: 0,
-            })?;
+            let end = start
+                .checked_add(out.len())
+                .ok_or(RuntimeError::OffloadEof {
+                    offset,
+                    needed: out.len(),
+                    available: 0,
+                })?;
             if end > self.0.len() {
                 let available = self.0.len().saturating_sub(start);
                 return Err(RuntimeError::OffloadEof {
@@ -455,7 +455,12 @@ mod tests {
         budget: u64,
         pinned: &[&str],
     ) -> (LayerPager, Vec<u8>) {
-        let total: usize = tensors.iter().map(|(_, sz, offset)| *offset as usize + *sz).max().unwrap_or(0) + 1;
+        let total: usize = tensors
+            .iter()
+            .map(|(_, sz, offset)| *offset as usize + *sz)
+            .max()
+            .unwrap_or(0)
+            + 1;
         let mut data = vec![0u8; total];
         let mut tensor_map = HashMap::new();
         for (id, size, offset) in tensors {
@@ -587,21 +592,14 @@ mod tests {
         let source = FilePagerSource::open(tmp.path()).expect("open");
         let mut buf = vec![0u8; 100];
         let res = source.read_bytes_at(0, &mut buf);
-        assert!(
-            res.is_err(),
-            "reading past end of file must return Err"
-        );
+        assert!(res.is_err(), "reading past end of file must return Err");
     }
 
     // ── Test: resident_count and resident_bytes ───────────────────────────────
 
     #[test]
     fn offload_resident_count_tracks_evictions() {
-        let (pager, _) = make_pager(
-            &[("a", 50, 0), ("b", 50, 50), ("c", 50, 100)],
-            100,
-            &[],
-        );
+        let (pager, _) = make_pager(&[("a", 50, 0), ("b", 50, 50), ("c", 50, 100)], 100, &[]);
         assert_eq!(pager.resident_count(), 0);
         let _a = pager.acquire(&TensorId("a".into())).expect("a");
         assert_eq!(pager.resident_count(), 1);

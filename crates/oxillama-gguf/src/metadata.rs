@@ -1,13 +1,13 @@
 //! GGUF metadata key-value store with typed access.
 
-#[cfg(feature = "std")]
-use std::collections::HashMap;
 #[cfg(not(feature = "std"))]
 use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
     vec::Vec,
 };
+#[cfg(feature = "std")]
+use std::collections::HashMap;
 #[cfg(feature = "std")]
 type MetaMap = HashMap<String, MetadataValue>;
 #[cfg(not(feature = "std"))]

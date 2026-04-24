@@ -250,8 +250,14 @@ unsafe fn gemv_row_avx512(
             // Tail path: partial block — scalar to avoid OOB reads.
             let mut partial = [0.0f32; BLOCK_SIZE];
             let pp = partial.as_mut_ptr();
-            _mm512_storeu_ps(pp, _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(first16)), vd, vm));
-            _mm512_storeu_ps(pp.add(16), _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(last16)), vd, vm));
+            _mm512_storeu_ps(
+                pp,
+                _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(first16)), vd, vm),
+            );
+            _mm512_storeu_ps(
+                pp.add(16),
+                _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(last16)), vd, vm),
+            );
 
             let mut scalar_sum = 0.0f32;
             for j in 0..remaining {

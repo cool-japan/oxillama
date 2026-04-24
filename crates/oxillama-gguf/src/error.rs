@@ -1,9 +1,9 @@
 //! Error types for the GGUF parser.
 
-#[cfg(feature = "std")]
-use std::string::FromUtf8Error;
 #[cfg(not(feature = "std"))]
 use alloc::string::{FromUtf8Error, String};
+#[cfg(feature = "std")]
+use std::string::FromUtf8Error;
 
 use thiserror::Error;
 

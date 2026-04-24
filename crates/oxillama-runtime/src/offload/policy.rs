@@ -83,7 +83,9 @@ mod tests {
 
     #[test]
     fn budget_returns_bytes() {
-        let policy = OffloadPolicy::Budget { ram_bytes: 1024 * 1024 * 1024 };
+        let policy = OffloadPolicy::Budget {
+            ram_bytes: 1024 * 1024 * 1024,
+        };
         assert_eq!(policy.ram_budget_bytes(), Some(1024 * 1024 * 1024));
     }
 

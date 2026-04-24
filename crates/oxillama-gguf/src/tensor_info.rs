@@ -1,13 +1,13 @@
 //! GGUF tensor information and storage.
 
-#[cfg(feature = "std")]
-use std::collections::HashMap;
 #[cfg(not(feature = "std"))]
 use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
     vec::Vec,
 };
+#[cfg(feature = "std")]
+use std::collections::HashMap;
 #[cfg(feature = "std")]
 type TensorMap = HashMap<String, TensorInfo>;
 #[cfg(not(feature = "std"))]

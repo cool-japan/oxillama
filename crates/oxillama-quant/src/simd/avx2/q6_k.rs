@@ -231,14 +231,12 @@ unsafe fn fused_q6_k_q8_0_row_avx2(
             for l in 0..32 {
                 let is = l / 16; // sub-block index within group (0 or 1)
 
-                let q1 = ((ql[ql_off + l] & 0x0F)
-                    | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
-                let q2 = ((ql[ql_off + l + 32] & 0x0F)
-                    | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
-                let q3 = ((ql[ql_off + l] >> 4)
-                    | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 = ((ql[ql_off + l + 32] >> 4)
-                    | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+                let q1 = ((ql[ql_off + l] & 0x0F) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
+                let q2 =
+                    ((ql[ql_off + l + 32] & 0x0F) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 =
+                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
 
                 let s0 = d * scales[sc_off + is] as i8 as f32;
                 let s1 = d * scales[sc_off + is + 2] as i8 as f32;
@@ -956,8 +954,8 @@ mod tests {
 
         let w_block = make_q6k_block(0.01, &ql, &qh, &scales);
         let act_vals: [i8; 32] = [
-            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16,
-            0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8,
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 0, 1, -1, 2, -2, 3, -3,
+            4, -4, 5, -5, 6, -6, 7, -7, 8,
         ];
         let acts = make_q8_acts(8, 0.1, &act_vals);
 
@@ -1003,21 +1001,15 @@ mod tests {
                 for (i, h) in qh.iter_mut().enumerate() {
                     *h = ((r * 13 + b * 19 + i * 3) & 0xFF) as u8;
                 }
-                let scales: [u8; 16] = core::array::from_fn(|i| {
-                    ((r * 7 + b * 11 + i * 13 + 5) & 0xFF) as u8
-                });
-                all_weights.extend(make_q6k_block(
-                    0.01 + r as f32 * 0.005,
-                    &ql,
-                    &qh,
-                    &scales,
-                ));
+                let scales: [u8; 16] =
+                    core::array::from_fn(|i| ((r * 7 + b * 11 + i * 13 + 5) & 0xFF) as u8);
+                all_weights.extend(make_q6k_block(0.01 + r as f32 * 0.005, &ql, &qh, &scales));
             }
         }
 
         let act_vals: [i8; 32] = [
-            2, -3, 5, -7, 1, -1, 4, -4, 6, -6, 3, -3, 2, -2, 1, -1,
-            8, -8, 7, -7, 6, -6, 5, -5, 4, -4, 3, -3, 2, -2, 1, -1,
+            2, -3, 5, -7, 1, -1, 4, -4, 6, -6, 3, -3, 2, -2, 1, -1, 8, -8, 7, -7, 6, -6, 5, -5, 4,
+            -4, 3, -3, 2, -2, 1, -1,
         ];
         let acts = make_q8_acts(q8_blocks_per_row, 0.05, &act_vals);
 

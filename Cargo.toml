@@ -122,9 +122,17 @@ rand = "0.8.6"
 # ── Platform directories ──
 directories = "5.0.1"
 
+# ── GPU / WebGPU ──
+wgpu = "29.0.1"
+pollster = "0.4.0"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+naga = { version = "29.0.1", features = ["wgsl-in", "msl-out", "spv-out"] }
+
 # ── Benchmarking (dev) ──
 criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1.11.0"
+sysinfo = "0.38.4"
+tabled = "0.20.0"
 
 
 

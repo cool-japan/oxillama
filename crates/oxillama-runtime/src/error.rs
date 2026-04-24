@@ -98,7 +98,9 @@ pub enum RuntimeError {
     },
 
     /// Offload pager read past end of backing store.
-    #[error("offload: unexpected EOF at offset {offset}, needed {needed} bytes, {available} available")]
+    #[error(
+        "offload: unexpected EOF at offset {offset}, needed {needed} bytes, {available} available"
+    )]
     OffloadEof {
         /// Byte offset at which the read was attempted.
         offset: u64,

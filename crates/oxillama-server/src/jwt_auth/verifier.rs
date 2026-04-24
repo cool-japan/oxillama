@@ -117,9 +117,7 @@ pub struct JwtConfig {
 impl Default for JwtConfig {
     fn default() -> Self {
         Self {
-            algorithm: JwtAlgorithm::Hs256 {
-                secret: Vec::new(),
-            },
+            algorithm: JwtAlgorithm::Hs256 { secret: Vec::new() },
             audience: None,
             issuer: None,
             required_scopes_per_route: HashMap::new(),
@@ -164,10 +162,10 @@ struct JwtHeader {
 
 /// Verifies an HS256 (HMAC-SHA256) signature using constant-time comparison.
 fn verify_hs256(secret: &[u8], signing_input: &[u8], signature: &[u8]) -> JwtResult<()> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret)
-        .map_err(|_| JwtError::BadSignature)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).map_err(|_| JwtError::BadSignature)?;
     mac.update(signing_input);
-    mac.verify_slice(signature).map_err(|_| JwtError::BadSignature)
+    mac.verify_slice(signature)
+        .map_err(|_| JwtError::BadSignature)
 }
 
 // ── RS256 verification ────────────────────────────────────────────────────────
@@ -177,8 +175,8 @@ fn verify_hs256(secret: &[u8], signing_input: &[u8], signature: &[u8]) -> JwtRes
 /// Uses `rsa::sha2::Sha256` (re-exported from rsa's bundled sha2 dependency,
 /// which carries the `AssociatedOid` implementation required by `VerifyingKey`).
 fn verify_rs256(public_key_der: &[u8], signing_input: &[u8], signature: &[u8]) -> JwtResult<()> {
-    use rsa::pkcs8::DecodePublicKey;
     use rsa::pkcs1v15::VerifyingKey;
+    use rsa::pkcs8::DecodePublicKey;
     use rsa::sha2::Sha256 as RsaSha256;
     use rsa::signature::Verifier;
 
@@ -187,8 +185,8 @@ fn verify_rs256(public_key_der: &[u8], signing_input: &[u8], signature: &[u8]) -
 
     let verifying_key = VerifyingKey::<RsaSha256>::new(pub_key);
 
-    let sig = rsa::pkcs1v15::Signature::try_from(signature)
-        .map_err(|_| JwtError::RsaSignatureInvalid)?;
+    let sig =
+        rsa::pkcs1v15::Signature::try_from(signature).map_err(|_| JwtError::RsaSignatureInvalid)?;
 
     verifying_key
         .verify(signing_input, &sig)
@@ -284,9 +282,9 @@ impl JwtVerifier {
                 Some(aud_val) => {
                     let matches = match aud_val {
                         serde_json::Value::String(s) => s == expected_aud,
-                        serde_json::Value::Array(arr) => arr.iter().any(|v| {
-                            v.as_str().is_some_and(|s| s == expected_aud)
-                        }),
+                        serde_json::Value::Array(arr) => arr
+                            .iter()
+                            .any(|v| v.as_str().is_some_and(|s| s == expected_aud)),
                         _ => false,
                     };
                     if !matches {
@@ -387,8 +385,8 @@ mod tests {
         let sig_b64 = if alg.eq_ignore_ascii_case("none") {
             String::new()
         } else {
-            let mut mac = Hmac::<Sha256>::new_from_slice(secret)
-                .expect("test fixture: HMAC construction");
+            let mut mac =
+                Hmac::<Sha256>::new_from_slice(secret).expect("test fixture: HMAC construction");
             mac.update(signing_input.as_bytes());
             URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
         };
@@ -421,8 +419,8 @@ mod tests {
             "sub": "user-1",
             "exp": unix_now() + 3600,
         });
-        let token = make_hs256_token(secret, &claims, None)
-            .expect("test fixture: token construction");
+        let token =
+            make_hs256_token(secret, &claims, None).expect("test fixture: token construction");
 
         let verifier = hs256_verifier(secret);
         let result = verifier.verify(&token);
@@ -432,10 +430,12 @@ mod tests {
     #[test]
     fn jwt_wrong_secret_rejected() {
         let claims = serde_json::json!({ "sub": "user-1", "exp": unix_now() + 3600 });
-        let token = make_hs256_token(b"correct-secret", &claims, None)
-            .expect("test fixture");
+        let token = make_hs256_token(b"correct-secret", &claims, None).expect("test fixture");
         let verifier = hs256_verifier(b"wrong-secret");
-        assert!(matches!(verifier.verify(&token), Err(JwtError::BadSignature)));
+        assert!(matches!(
+            verifier.verify(&token),
+            Err(JwtError::BadSignature)
+        ));
     }
 
     // ── Temporal claims ──────────────────────────────────────────────────────
@@ -448,8 +448,7 @@ mod tests {
             "sub": "user-1",
             "exp": unix_now() - 1000,
         });
-        let token = make_hs256_token(secret, &claims, None)
-            .expect("test fixture");
+        let token = make_hs256_token(secret, &claims, None).expect("test fixture");
         let verifier = hs256_verifier(secret);
         assert!(
             matches!(verifier.verify(&token), Err(JwtError::Expired)),
@@ -465,8 +464,7 @@ mod tests {
             "exp": unix_now() + 3600,
             "nbf": unix_now() + 10_000,
         });
-        let token = make_hs256_token(secret, &claims, None)
-            .expect("test fixture");
+        let token = make_hs256_token(secret, &claims, None).expect("test fixture");
         let verifier = hs256_verifier(secret);
         assert!(
             matches!(verifier.verify(&token), Err(JwtError::NotYetValid)),
@@ -484,8 +482,7 @@ mod tests {
             "exp": unix_now() + 3600,
             "aud": "other-service",
         });
-        let token = make_hs256_token(secret, &claims, None)
-            .expect("test fixture");
+        let token = make_hs256_token(secret, &claims, None).expect("test fixture");
         let verifier = JwtVerifier::new(JwtConfig {
             algorithm: JwtAlgorithm::Hs256 {
                 secret: secret.to_vec(),
@@ -507,8 +504,7 @@ mod tests {
             "exp": unix_now() + 3600,
             "aud": ["other-service", "my-service"],
         });
-        let token = make_hs256_token(secret, &claims, None)
-            .expect("test fixture");
+        let token = make_hs256_token(secret, &claims, None).expect("test fixture");
         let verifier = JwtVerifier::new(JwtConfig {
             algorithm: JwtAlgorithm::Hs256 {
                 secret: secret.to_vec(),
@@ -529,8 +525,7 @@ mod tests {
             "exp": unix_now() + 3600,
             "iss": "bad-issuer",
         });
-        let token = make_hs256_token(secret, &claims, None)
-            .expect("test fixture");
+        let token = make_hs256_token(secret, &claims, None).expect("test fixture");
         let verifier = JwtVerifier::new(JwtConfig {
             algorithm: JwtAlgorithm::Hs256 {
                 secret: secret.to_vec(),
@@ -575,8 +570,7 @@ mod tests {
     fn jwt_alg_none_rejected() {
         let secret = b"my-secret";
         let claims = serde_json::json!({ "sub": "user-1", "exp": unix_now() + 3600 });
-        let token = make_hs256_token(secret, &claims, Some("none"))
-            .expect("test fixture");
+        let token = make_hs256_token(secret, &claims, Some("none")).expect("test fixture");
         let verifier = hs256_verifier(secret);
         assert!(
             matches!(verifier.verify(&token), Err(JwtError::AlgNone)),
@@ -588,8 +582,7 @@ mod tests {
     fn jwt_alg_none_uppercase_rejected() {
         let secret = b"my-secret";
         let claims = serde_json::json!({ "sub": "user-1", "exp": unix_now() + 3600 });
-        let token = make_hs256_token(secret, &claims, Some("NONE"))
-            .expect("test fixture");
+        let token = make_hs256_token(secret, &claims, Some("NONE")).expect("test fixture");
         let verifier = hs256_verifier(secret);
         assert!(matches!(verifier.verify(&token), Err(JwtError::AlgNone)));
     }
@@ -604,8 +597,7 @@ mod tests {
             "exp": unix_now() + 3600,
             "scope": "chat:read embed:read",
         });
-        let token = make_hs256_token(secret, &claims, None)
-            .expect("test fixture");
+        let token = make_hs256_token(secret, &claims, None).expect("test fixture");
         let verifier = hs256_verifier(secret);
         let decoded = verifier.verify(&token).expect("valid token");
         let scopes = verifier.scopes_from_claims(&decoded);
@@ -622,8 +614,7 @@ mod tests {
             "exp": unix_now() + 3600,
             "scopes": ["chat:read", "admin:read"],
         });
-        let token = make_hs256_token(secret, &claims, None)
-            .expect("test fixture");
+        let token = make_hs256_token(secret, &claims, None).expect("test fixture");
         let verifier = hs256_verifier(secret);
         let decoded = verifier.verify(&token).expect("valid token");
         let scopes = verifier.scopes_from_claims(&decoded);
@@ -634,10 +625,7 @@ mod tests {
     #[test]
     fn jwt_required_scopes_for_path() {
         let mut route_scopes = HashMap::new();
-        route_scopes.insert(
-            "/v1/chat/completions".to_string(),
-            vec![Scope::ChatWrite],
-        );
+        route_scopes.insert("/v1/chat/completions".to_string(), vec![Scope::ChatWrite]);
         let verifier = JwtVerifier::new(JwtConfig {
             algorithm: JwtAlgorithm::Hs256 {
                 secret: b"s".to_vec(),
@@ -659,15 +647,15 @@ mod tests {
     #[test]
     #[ignore]
     fn jwt_rs256_with_generated_key() {
-        use rsa::pkcs8::EncodePublicKey;
         use rsa::pkcs1v15::SigningKey;
+        use rsa::pkcs8::EncodePublicKey;
         use rsa::sha2::Sha256 as RsaSha256;
-        use rsa::signature::SignatureEncoding;
         use rsa::signature::RandomizedSigner;
+        use rsa::signature::SignatureEncoding;
 
         let mut rng = rand::thread_rng();
-        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048)
-            .expect("test fixture: RSA key generation");
+        let private_key =
+            rsa::RsaPrivateKey::new(&mut rng, 2048).expect("test fixture: RSA key generation");
         let public_key = rsa::RsaPublicKey::from(&private_key);
 
         // Encode public key as DER (SPKI)
@@ -682,18 +670,14 @@ mod tests {
             "sub": "rs256-user",
             "exp": unix_now() + 3600,
         });
-        let header_b64 = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&header).expect("test fixture")
-        );
-        let payload_b64 = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&claims_json).expect("test fixture")
-        );
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("test fixture"));
+        let payload_b64 =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims_json).expect("test fixture"));
         let signing_input = format!("{header_b64}.{payload_b64}");
 
         // Use rsa::sha2::Sha256 (re-exported from rsa's sha2 dep, has AssociatedOid)
         let signing_key = SigningKey::<RsaSha256>::new(private_key);
-        let signature = signing_key
-            .sign_with_rng(&mut rng, signing_input.as_bytes());
+        let signature = signing_key.sign_with_rng(&mut rng, signing_input.as_bytes());
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
         let token = format!("{signing_input}.{sig_b64}");

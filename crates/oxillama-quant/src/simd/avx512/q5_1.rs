@@ -167,8 +167,8 @@ unsafe fn dequant_block_avx512(block: &[u8], output: &mut [f32]) {
     let qs = _mm_loadu_si128(block.as_ptr().add(8) as *const __m128i);
 
     let mask4 = _mm_set1_epi8(0x0F_u8 as i8);
-    let lo_nib = _mm_and_si128(qs, mask4);  // low nibbles (weights 0..15 lo part)
-    let hi_nib = _mm_and_si128(_mm_srli_epi16(qs, 4), mask4);  // high nibbles (weights 16..31 hi part)
+    let lo_nib = _mm_and_si128(qs, mask4); // low nibbles (weights 0..15 lo part)
+    let hi_nib = _mm_and_si128(_mm_srli_epi16(qs, 4), mask4); // high nibbles (weights 16..31 hi part)
 
     // Expand qh into per-element 5th bit (shifted to bit position 4).
     // lo group: bits 0..16 → weights 0..15
@@ -181,8 +181,8 @@ unsafe fn dequant_block_avx512(block: &[u8], output: &mut [f32]) {
     let vqh_hi = _mm_loadu_si128(qh_hi_bits.as_ptr() as *const __m128i);
 
     // Combine: q5[i] = lo_nib[i] | qh_lo[i]  (bit 4 is the 5th bit)
-    let q5_lo = _mm_or_si128(lo_nib, vqh_lo);   // 5-bit unsigned, weights 0-15
-    let q5_hi = _mm_or_si128(hi_nib, vqh_hi);   // 5-bit unsigned, weights 16-31
+    let q5_lo = _mm_or_si128(lo_nib, vqh_lo); // 5-bit unsigned, weights 0-15
+    let q5_hi = _mm_or_si128(hi_nib, vqh_hi); // 5-bit unsigned, weights 16-31
 
     // Widen to 16 × i32 per group (AVX-512), convert to f32, then FMA: d * q5 + m.
 
@@ -218,7 +218,7 @@ unsafe fn gemv_row_avx512(
     n_cols: usize,
 ) -> f32 {
     let mut acc_wd = _mm512_setzero_ps(); // accumulates (q5 * d) * input
-    let mut acc_m = _mm512_setzero_ps();  // accumulates m * input
+    let mut acc_m = _mm512_setzero_ps(); // accumulates m * input
 
     for blk in 0..blocks_per_row {
         let bo = blk * BLOCK_BYTES;
@@ -273,8 +273,14 @@ unsafe fn gemv_row_avx512(
             // Scalar tail: materialize q5 values then dot.
             let mut partial = [0.0f32; BLOCK_SIZE];
             let pp = partial.as_mut_ptr();
-            _mm512_storeu_ps(pp, _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(q5_lo)), vd, vm));
-            _mm512_storeu_ps(pp.add(16), _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(q5_hi)), vd, vm));
+            _mm512_storeu_ps(
+                pp,
+                _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(q5_lo)), vd, vm),
+            );
+            _mm512_storeu_ps(
+                pp.add(16),
+                _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(q5_hi)), vd, vm),
+            );
 
             let mut scalar_sum = 0.0f32;
             for j in 0..remaining {
@@ -385,7 +391,9 @@ mod tests {
         let mut avx512_out = vec![0.0f32; 1];
 
         Q5_1Ref.gemv(&tensor_ref, &input, &mut ref_out).unwrap();
-        Q5_1Avx512.gemv(&tensor_avx512, &input, &mut avx512_out).unwrap();
+        Q5_1Avx512
+            .gemv(&tensor_avx512, &input, &mut avx512_out)
+            .unwrap();
 
         assert!(
             (ref_out[0] - avx512_out[0]).abs() < 1e-3,
@@ -409,7 +417,9 @@ mod tests {
         let mut avx512_out = vec![0.0f32; 1];
 
         Q5_1Ref.gemv(&tensor_ref, &input, &mut ref_out).unwrap();
-        Q5_1Avx512.gemv(&tensor_avx512, &input, &mut avx512_out).unwrap();
+        Q5_1Avx512
+            .gemv(&tensor_avx512, &input, &mut avx512_out)
+            .unwrap();
 
         assert!(
             (ref_out[0] - avx512_out[0]).abs() < 1e-3,

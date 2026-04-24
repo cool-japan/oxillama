@@ -125,8 +125,7 @@ impl<R: std::io::Read + std::io::Seek> Source for ReadSource<R> {
     }
 
     fn seek(&mut self, pos: u64) -> Result<u64, std::io::Error> {
-        let new_pos =
-            std::io::Seek::seek(&mut self.inner, std::io::SeekFrom::Start(pos))?;
+        let new_pos = std::io::Seek::seek(&mut self.inner, std::io::SeekFrom::Start(pos))?;
         self.pos = new_pos;
         Ok(new_pos)
     }
@@ -163,7 +162,8 @@ mod tests {
         src.seek(3).expect("test: seek");
         assert_eq!(src.position(), 3);
         let mut buf = [0u8; 3];
-        src.read_exact(&mut buf).expect("test: read_exact after seek");
+        src.read_exact(&mut buf)
+            .expect("test: read_exact after seek");
         assert_eq!(&buf, b"def");
         assert_eq!(src.position(), 6);
     }
@@ -183,10 +183,7 @@ mod tests {
     fn slice_source_invalid_seek_error() {
         let data = [0u8; 4];
         let mut src = SliceSource::new(&data);
-        assert!(
-            src.seek(100).is_err(),
-            "seeking past end must error"
-        );
+        assert!(src.seek(100).is_err(), "seeking past end must error");
     }
 
     #[test]
