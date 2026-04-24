@@ -131,6 +131,158 @@ impl QuantKernel for Q6_KAvx2 {
     fn name(&self) -> &'static str {
         "Q6_K"
     }
+
+    /// Fused Q6_K weight × Q8_0 activation GEMV.
+    ///
+    /// Each Q6_K super-block (256 weights, 210 bytes) maps to 8 Q8_0 activation blocks.
+    /// Column `col` within the super-block maps to Q8_0 block `blk*8 + col/32` and
+    /// lane `col % 32` within that block.
+    /// Accumulates into `out` (ACCUMULATE semantics).
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let q8_blocks_per_row = blocks_per_row * 8;
+        let acts_needed = q8_blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for row in 0..n_rows {
+            let row_start = row * row_bytes;
+            // SAFETY: bounds checked above; CPU avx2+fma guaranteed by KernelDispatcher.
+            let row_sum = unsafe {
+                fused_q6_k_q8_0_row_avx2(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            out[row] += row_sum;
+        }
+
+        Ok(())
+    }
+}
+
+/// Q8_0 block bytes for fused GEMV.
+const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Fused Q6_K weight × Q8_0 activation dot product for one row using AVX2+FMA.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES`
+/// - CPU must support `avx2` and `fma`
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fused_q6_k_q8_0_row_avx2(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    let mut row_sum = 0.0f32;
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        // SAFETY: row_data.len() == blocks_per_row * BLOCK_BYTES; blk < blocks_per_row.
+        let block = &row_data[bo..bo + BLOCK_BYTES];
+
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let d = f16_to_f32(&block[208..]);
+
+        let input_offset = blk * BLOCK_SIZE;
+        let cols_in_block = (n_cols - input_offset).min(BLOCK_SIZE);
+
+        // Q6_K: 2 groups of 128 weights; each group has 4 sub-blocks of 32.
+        // Within each sub-block of 32, use Q8_0 block at: blk*8 + (in_off+col)/32
+        for group in 0..2 {
+            let ql_off = group * 64;
+            let qh_off = group * 32;
+            let sc_off = group * 8;
+            let in_off = group * 128;
+
+            for l in 0..32 {
+                let is = l / 16; // sub-block index within group (0 or 1)
+
+                let q1 = ((ql[ql_off + l] & 0x0F)
+                    | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[ql_off + l + 32] & 0x0F)
+                    | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4)
+                    | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[ql_off + l + 32] >> 4)
+                    | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+
+                let s0 = d * scales[sc_off + is] as i8 as f32;
+                let s1 = d * scales[sc_off + is + 2] as i8 as f32;
+                let s2 = d * scales[sc_off + is + 4] as i8 as f32;
+                let s3 = d * scales[sc_off + is + 6] as i8 as f32;
+
+                let c0 = in_off + l;
+                let c1 = in_off + l + 32;
+                let c2 = in_off + l + 64;
+                let c3 = in_off + l + 96;
+
+                // For each column, resolve the corresponding Q8_0 sample.
+                // Column `col` within the super-block → Q8_0 block `blk*8 + col/32`,
+                // lane `col % 32`.
+                let sample_q8 = |col: usize| -> Option<f32> {
+                    if col >= cols_in_block {
+                        return None;
+                    }
+                    let q8_blk = blk * 8 + col / 32;
+                    let q8_lane = col % 32;
+                    // SAFETY: acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES.
+                    let ab = &acts_q8[q8_blk * Q8_0_BLOCK_BYTES..(q8_blk + 1) * Q8_0_BLOCK_BYTES];
+                    let d_a = f16_to_f32(ab);
+                    let q_a = ab[2 + q8_lane] as i8 as f32;
+                    Some(d_a * q_a)
+                };
+
+                if let Some(a0) = sample_q8(c0) {
+                    row_sum += s0 * q1 as f32 * a0;
+                }
+                if let Some(a1) = sample_q8(c1) {
+                    row_sum += s1 * q2 as f32 * a1;
+                }
+                if let Some(a2) = sample_q8(c2) {
+                    row_sum += s2 * q3 as f32 * a2;
+                }
+                if let Some(a3) = sample_q8(c3) {
+                    row_sum += s3 * q4 as f32 * a3;
+                }
+            }
+        }
+    }
+
+    row_sum
 }
 
 // ---------------------------------------------------------------------------

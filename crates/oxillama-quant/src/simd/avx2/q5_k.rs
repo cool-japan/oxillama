@@ -161,6 +161,236 @@ impl QuantKernel for Q5_KAvx2 {
     fn name(&self) -> &'static str {
         "Q5_K"
     }
+
+    /// Fused Q5_K weight × Q8_0 activation GEMV.
+    ///
+    /// Each Q5_K super-block (256 weights, 176 bytes) maps to 8 Q8_0 activation blocks.
+    /// Sub-block `is` (0..8) of weight block `blk` uses Q8_0 at index `blk*8 + is`.
+    /// Accumulates into `out` (ACCUMULATE semantics).
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let q8_blocks_per_row = blocks_per_row * 8;
+        let acts_needed = q8_blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for row in 0..n_rows {
+            let row_start = row * row_bytes;
+            // SAFETY: bounds checked above; CPU avx2+fma guaranteed by KernelDispatcher.
+            let row_sum = unsafe {
+                fused_q5_k_q8_0_row_avx2(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            out[row] += row_sum;
+        }
+
+        Ok(())
+    }
+}
+
+/// Q8_0 block bytes for fused GEMV.
+const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Fused Q5_K weight × Q8_0 activation dot product for one row using AVX2+FMA.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES`
+/// - CPU must support `avx2` and `fma`
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fused_q5_k_q8_0_row_avx2(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    let mut row_sum = 0.0f32;
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        // SAFETY: row_data.len() == blocks_per_row * BLOCK_BYTES; blk < blocks_per_row.
+        let block = &row_data[bo..bo + BLOCK_BYTES];
+
+        let d = f16_to_f32(block);
+        let dmin = f16_to_f32(&block[2..]);
+        let (sc, mn) = decode_scales_mins(&block[4..16]);
+        let qh = &block[16..48];   // 32 high-bit bytes
+        let qs = &block[48..176];  // 128 nibble bytes
+
+        let input_offset = blk * BLOCK_SIZE;
+        let cols_in_block = (n_cols - input_offset).min(BLOCK_SIZE);
+
+        let mut is = 0usize;
+        let mut qs_off = 0usize;
+        let mut w_off = 0usize;
+
+        for group in 0..4 {
+            // Sub-block `is` (lo nibbles) — Q8_0 act block index `blk*8 + is`.
+            let a_idx_lo = blk * 8 + is;
+            let a_start_lo = a_idx_lo * Q8_0_BLOCK_BYTES;
+            // SAFETY: acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES.
+            let a_block_lo = &acts_q8[a_start_lo..a_start_lo + Q8_0_BLOCK_BYTES];
+            let d_a_lo = f16_to_f32(a_block_lo);
+            let q8_lo = &a_block_lo[2..]; // 32 i8 values
+
+            let da_lo = d * sc[is] as f32;
+            let m_lo = dmin * mn[is] as f32;
+
+            // Sub-block `is+1` (hi nibbles) — Q8_0 act block index `blk*8 + is + 1`.
+            let a_idx_hi = blk * 8 + is + 1;
+            let a_start_hi = a_idx_hi * Q8_0_BLOCK_BYTES;
+            // SAFETY: same guarantee as above.
+            let a_block_hi = &acts_q8[a_start_hi..a_start_hi + Q8_0_BLOCK_BYTES];
+            let d_a_hi = f16_to_f32(a_block_hi);
+            let q8_hi = &a_block_hi[2..]; // 32 i8 values
+
+            let da_hi = d * sc[is + 1] as f32;
+            let m_hi = dmin * mn[is + 1] as f32;
+
+            // Vectorised inner loops: compute Σ(q5_lo * q8_lo) and Σ(q8_lo) in 4-wide chunks.
+            // Using i32 accumulators for the integer dot products.
+            let mut dot_lo_i32 = _mm256_setzero_si256();
+            let mut sum_a_lo_i32 = _mm256_setzero_si256();
+            let mut dot_hi_i32 = _mm256_setzero_si256();
+            let mut sum_a_hi_i32 = _mm256_setzero_si256();
+
+            // Process groups of 8 within the sub-block.
+            let valid_lo = cols_in_block.saturating_sub(w_off).min(32);
+            let valid_hi = cols_in_block.saturating_sub(w_off + 32).min(32);
+
+            // Lo sub-block (weights w_off..w_off+32).
+            if valid_lo >= 8 {
+                let full_iters_lo = valid_lo / 8;
+                for chunk in 0..full_iters_lo {
+                    let l = chunk * 8;
+                    let q5_ptr = qs_off + l;
+
+                    // Extract 8 lo nibbles from qs bytes (two bytes each cover 2 weights).
+                    // Byte qs_off + l/2 has lo = weight 2*(l/2), hi = weight 2*(l/2)+1
+                    // But we process in the nibble-interleaved order stored by Q5_K.
+                    // For a clean SIMD approach: expand 4 bytes into 8 nibbles.
+                    // Actually Q5_K lo nibbles: for l in 0..32, qs[qs_off+l] & 0x0F.
+                    // We have 8 consecutive positions here.
+                    let mut nib_buf = [0i8; 8];
+                    let mut q8_buf = [0i8; 8];
+                    for j in 0..8 {
+                        let qh_bit = (qh[l + j] >> group) & 1;
+                        nib_buf[j] = ((qs[q5_ptr + j] & 0x0F) | (qh_bit << 4)) as i8;
+                        q8_buf[j] = q8_lo[l + j] as i8;
+                    }
+
+                    // SAFETY: nib_buf and q8_buf are stack arrays; loads are valid.
+                    let vw = _mm256_cvtepi8_epi32(_mm_loadl_epi64(nib_buf.as_ptr() as *const __m128i));
+                    let va = _mm256_cvtepi8_epi32(_mm_loadl_epi64(q8_buf.as_ptr() as *const __m128i));
+                    dot_lo_i32 = _mm256_add_epi32(dot_lo_i32, _mm256_mullo_epi32(vw, va));
+                    sum_a_lo_i32 = _mm256_add_epi32(sum_a_lo_i32, va);
+                }
+            }
+            // Scalar tail for lo sub-block.
+            let mut dot_lo_scalar = 0.0f32;
+            let mut sum_a_lo_scalar = 0.0f32;
+            let lo_simd_done = (valid_lo / 8) * 8;
+            for l in lo_simd_done..valid_lo {
+                let qh_bit = (qh[l] >> group) & 1;
+                let q_w = ((qs[qs_off + l] & 0x0F) | (qh_bit << 4)) as f32;
+                let q_a = q8_lo[l] as i8 as f32;
+                dot_lo_scalar += q_w * q_a;
+                sum_a_lo_scalar += q_a;
+            }
+            // Combine SIMD and scalar results for lo sub-block.
+            let dot_lo_total = hsum_i32_avx2(dot_lo_i32) as f32 + dot_lo_scalar;
+            let sum_a_lo_total = hsum_i32_avx2(sum_a_lo_i32) as f32 + sum_a_lo_scalar;
+            row_sum += (da_lo * dot_lo_total - m_lo * sum_a_lo_total) * d_a_lo;
+
+            // Hi sub-block (weights w_off+32..w_off+64).
+            if valid_hi >= 8 {
+                let full_iters_hi = valid_hi / 8;
+                for chunk in 0..full_iters_hi {
+                    let l = chunk * 8;
+                    let q5_ptr = qs_off + l;
+
+                    let mut nib_buf = [0i8; 8];
+                    let mut q8_buf = [0i8; 8];
+                    for j in 0..8 {
+                        let qh_bit = (qh[l + j] >> (group + 4)) & 1;
+                        nib_buf[j] = (((qs[q5_ptr + j] >> 4) & 0x0F) | (qh_bit << 4)) as i8;
+                        q8_buf[j] = q8_hi[l + j] as i8;
+                    }
+
+                    let vw = _mm256_cvtepi8_epi32(_mm_loadl_epi64(nib_buf.as_ptr() as *const __m128i));
+                    let va = _mm256_cvtepi8_epi32(_mm_loadl_epi64(q8_buf.as_ptr() as *const __m128i));
+                    dot_hi_i32 = _mm256_add_epi32(dot_hi_i32, _mm256_mullo_epi32(vw, va));
+                    sum_a_hi_i32 = _mm256_add_epi32(sum_a_hi_i32, va);
+                }
+            }
+            let mut dot_hi_scalar = 0.0f32;
+            let mut sum_a_hi_scalar = 0.0f32;
+            let hi_simd_done = (valid_hi / 8) * 8;
+            for l in hi_simd_done..valid_hi {
+                let qh_bit = (qh[l] >> (group + 4)) & 1;
+                let q_w = (((qs[qs_off + l] >> 4) & 0x0F) | (qh_bit << 4)) as f32;
+                let q_a = q8_hi[l] as i8 as f32;
+                dot_hi_scalar += q_w * q_a;
+                sum_a_hi_scalar += q_a;
+            }
+            let dot_hi_total = hsum_i32_avx2(dot_hi_i32) as f32 + dot_hi_scalar;
+            let sum_a_hi_total = hsum_i32_avx2(sum_a_hi_i32) as f32 + sum_a_hi_scalar;
+            row_sum += (da_hi * dot_hi_total - m_hi * sum_a_hi_total) * d_a_hi;
+
+            is += 2;
+            qs_off += 32;
+            w_off += 64;
+        }
+    }
+
+    row_sum
+}
+
+/// Horizontal sum of a 256-bit i32 register.
+///
+/// # Safety
+/// Requires `avx2`.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_i32_avx2(v: __m256i) -> i32 {
+    let hi = _mm256_extracti128_si256(v, 1);
+    let lo = _mm256_castsi256_si128(v);
+    let s = _mm_add_epi32(hi, lo);
+    let shuf = _mm_shuffle_epi32(s, 0b10_11_00_01);
+    let s2 = _mm_add_epi32(s, shuf);
+    let shuf2 = _mm_shuffle_epi32(s2, 0b00_00_10_10);
+    let s3 = _mm_add_epi32(s2, shuf2);
+    _mm_cvtsi128_si32(s3)
 }
 
 // ---------------------------------------------------------------------------

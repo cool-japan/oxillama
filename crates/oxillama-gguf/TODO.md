@@ -118,8 +118,7 @@ workspace assumes this layer is correct and zero-copy where possible.
   signatures are now semver-stable within the 0.1.x series.
 - Tensor-data hash validation shipped via `TensorHashValidator` in `src/validate.rs` (v1.1); use `GgufModel::validate_tensor_hashes()` to verify integrity.
 - Deep metadata schema validation shipped via pluggable `SchemaValidator` in `src/schema.rs` (v1.1); use `GgufModel::validate_schema()` with a custom validator.
-- **No `no_std` story.** `std::fs` and `std::path::Path` are used in
-  `loader.rs`; embedded targets cannot yet reuse the reader core.
+- ~~**No `no_std` story.**~~ ✅ Resolved: `Source` trait + `SliceSource` in `src/source.rs`, `reader_core.rs` parse logic generic over any `Source`, `cfg_attr(not(feature = "std"), no_std)` in `lib.rs`, cfg-gated `HashMap`→`BTreeMap` in `metadata.rs`/`tensor_info.rs`, cfg-gated `Io` variant in `error.rs`. `cargo check --no-default-features --features alloc` green.
 
 ## 6. v1.1 Roadmap
 
@@ -145,8 +144,7 @@ Priority order (highest first):
    trait with built-in validators for LLaMA, Qwen3, Mistral, Gemma, Phi,
    Command-R, StarCoder. `validate_schema()` dispatches on `general.architecture`
    and returns a `Vec<SchemaViolation>` for callers to decide fail/warn.
-7. **`no_std` reader core.** Split reader/types into a `no_std + alloc`
-   sub-module to unlock embedded-target plans in v2.0.
+7. [x] **`no_std` reader core.** — `Source` trait, `SliceSource`, `reader_core.rs` split, cfg-gated std/io in error.rs/types.rs, `cargo check --no-default-features --features alloc` green (2026-04-24)
 8. ~~**Richer fuzzing.**~~ ✅ Done — `fuzz/fuzz_targets/gguf_metadata_arbitrary.rs`
    added using `arbitrary`-derived `ArbScalar`/`ArbMetadata` types that map
    directly to all `MetadataValue` variants including nested `Array` trees.

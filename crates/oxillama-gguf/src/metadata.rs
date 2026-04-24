@@ -1,6 +1,17 @@
 //! GGUF metadata key-value store with typed access.
 
+#[cfg(feature = "std")]
 use std::collections::HashMap;
+#[cfg(not(feature = "std"))]
+use alloc::{
+    collections::BTreeMap,
+    string::{String, ToString},
+    vec::Vec,
+};
+#[cfg(feature = "std")]
+type MetaMap = HashMap<String, MetadataValue>;
+#[cfg(not(feature = "std"))]
+type MetaMap = BTreeMap<String, MetadataValue>;
 
 use crate::error::{GgufError, GgufResult};
 
@@ -35,8 +46,8 @@ pub enum MetadataValue {
     Float64(f64),
 }
 
-impl std::fmt::Display for MetadataValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for MetadataValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Uint8(v) => write!(f, "{v}"),
             Self::Int8(v) => write!(f, "{v}"),
@@ -126,14 +137,14 @@ impl MetadataValue {
 /// tokenizer data, and other metadata embedded in GGUF files.
 #[derive(Debug, Clone, Default)]
 pub struct MetadataStore {
-    entries: HashMap<String, MetadataValue>,
+    entries: MetaMap,
 }
 
 impl MetadataStore {
     /// Create an empty metadata store.
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: MetaMap::new(),
         }
     }
 

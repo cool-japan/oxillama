@@ -541,6 +541,157 @@ impl QuantKernel for Q6_KNeon {
     fn name(&self) -> &'static str {
         "Q6_K_NEON"
     }
+
+    /// Fused Q6_K weight × Q8_0 activation GEMV using NEON.
+    ///
+    /// Each Q6_K super-block (256 weights) maps to 8 Q8_0 activation blocks.
+    /// Column `col` → Q8_0 block `blk*8 + col/32`, lane `col % 32`.
+    /// Accumulates into `out` (ACCUMULATE semantics).
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let q8_blocks_per_row = blocks_per_row * 8;
+        let acts_needed = q8_blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for row in 0..n_rows {
+            let row_start = row * row_bytes;
+            // SAFETY: bounds checked above.
+            let row_sum = unsafe {
+                fused_q6_k_q8_0_row_neon(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            out[row] += row_sum;
+        }
+
+        Ok(())
+    }
+}
+
+/// Q8_0 activation block byte count.
+const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Convert two raw LE bytes to f32 via FP16.
+#[inline(always)]
+fn f16_bytes_to_f32_neon(bytes: [u8; 2]) -> f32 {
+    half::f16::from_le_bytes(bytes).to_f32()
+}
+
+/// Fused Q6_K weight × Q8_0 activation dot product for one row using NEON.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES`
+/// - Must run on AArch64 with NEON.
+unsafe fn fused_q6_k_q8_0_row_neon(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    let mut row_sum = 0.0f32;
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        // SAFETY: blk < blocks_per_row; row_data.len() == blocks_per_row * BLOCK_BYTES.
+        let block = &row_data[bo..bo + BLOCK_BYTES];
+
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let d = f16_bytes_to_f32_neon([block[208], block[209]]);
+
+        let input_offset = blk * BLOCK_SIZE;
+        let cols_in_block = (n_cols - input_offset).min(BLOCK_SIZE);
+
+        for group in 0..2 {
+            let ql_off = group * 64;
+            let qh_off = group * 32;
+            let sc_off = group * 8;
+            let in_off = group * 128;
+
+            for l in 0..32 {
+                let is = l / 16;
+
+                let q1 = ((ql[ql_off + l] & 0x0F)
+                    | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[ql_off + l + 32] & 0x0F)
+                    | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4)
+                    | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[ql_off + l + 32] >> 4)
+                    | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+
+                let s0 = d * scales[sc_off + is] as i8 as f32;
+                let s1 = d * scales[sc_off + is + 2] as i8 as f32;
+                let s2 = d * scales[sc_off + is + 4] as i8 as f32;
+                let s3 = d * scales[sc_off + is + 6] as i8 as f32;
+
+                let c0 = in_off + l;
+                let c1 = in_off + l + 32;
+                let c2 = in_off + l + 64;
+                let c3 = in_off + l + 96;
+
+                let sample_q8 = |col: usize| -> Option<f32> {
+                    if col >= cols_in_block {
+                        return None;
+                    }
+                    let q8_blk = blk * 8 + col / 32;
+                    let q8_lane = col % 32;
+                    // SAFETY: acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES.
+                    let ab = &acts_q8[q8_blk * Q8_0_BLOCK_BYTES..(q8_blk + 1) * Q8_0_BLOCK_BYTES];
+                    let d_a = f16_bytes_to_f32_neon([ab[0], ab[1]]);
+                    let q_a = ab[2 + q8_lane] as i8 as f32;
+                    Some(d_a * q_a)
+                };
+
+                if let Some(a0) = sample_q8(c0) {
+                    row_sum += s0 * q1 as f32 * a0;
+                }
+                if let Some(a1) = sample_q8(c1) {
+                    row_sum += s1 * q2 as f32 * a1;
+                }
+                if let Some(a2) = sample_q8(c2) {
+                    row_sum += s2 * q3 as f32 * a2;
+                }
+                if let Some(a3) = sample_q8(c3) {
+                    row_sum += s3 * q4 as f32 * a3;
+                }
+            }
+        }
+    }
+
+    row_sum
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,17 @@
 //! GGUF tensor information and storage.
 
+#[cfg(feature = "std")]
 use std::collections::HashMap;
+#[cfg(not(feature = "std"))]
+use alloc::{
+    collections::BTreeMap,
+    string::{String, ToString},
+    vec::Vec,
+};
+#[cfg(feature = "std")]
+type TensorMap = HashMap<String, TensorInfo>;
+#[cfg(not(feature = "std"))]
+type TensorMap = BTreeMap<String, TensorInfo>;
 
 use crate::error::{GgufError, GgufResult};
 use crate::types::GgufTensorType;
@@ -52,7 +63,7 @@ impl TensorInfo {
 #[derive(Debug, Default)]
 pub struct TensorStore {
     /// Tensor info entries keyed by tensor name.
-    infos: HashMap<String, TensorInfo>,
+    infos: TensorMap,
     /// Base offset of the tensor data section in the file.
     data_section_offset: u64,
 }
@@ -61,7 +72,7 @@ impl TensorStore {
     /// Create an empty tensor store.
     pub fn new() -> Self {
         Self {
-            infos: HashMap::new(),
+            infos: TensorMap::new(),
             data_section_offset: 0,
         }
     }

@@ -1,5 +1,10 @@
 //! Error types for the GGUF parser.
 
+#[cfg(feature = "std")]
+use std::string::FromUtf8Error;
+#[cfg(not(feature = "std"))]
+use alloc::string::{FromUtf8Error, String};
+
 use thiserror::Error;
 
 /// Result type alias for GGUF operations.
@@ -45,9 +50,15 @@ pub enum GgufError {
         type_id: u32,
     },
 
-    /// Memory mapping failed.
-    #[error("memory mapping failed: {0}")]
+    /// I/O or memory mapping error (std environments only).
+    #[cfg(feature = "std")]
+    #[error("I/O error: {0}")]
     MmapError(#[from] std::io::Error),
+
+    /// I/O error representation for no_std environments.
+    #[cfg(not(feature = "std"))]
+    #[error("I/O error: {0}")]
+    MmapError(alloc::borrow::Cow<'static, str>),
 
     /// Unexpected end of file during parsing.
     #[error("unexpected end of file at offset {offset}")]
@@ -71,7 +82,7 @@ pub enum GgufError {
         /// Byte offset of the invalid string.
         offset: u64,
         /// The underlying UTF-8 error.
-        source: std::string::FromUtf8Error,
+        source: FromUtf8Error,
     },
 
     /// Error during GGUF write operations.

@@ -199,7 +199,164 @@ impl QuantKernel for Q6KRef {
     fn name(&self) -> &'static str {
         "Q6_K"
     }
+
+    /// Override of `matvec_q8_fused` required because the trait default is wrong for Q6_K.
+    ///
+    /// Q6_K (block_size=256) maps 1 weight super-block → 8 Q8_0 activation blocks.
+    /// Sub-block `s` (0..16) with 16 weights each → Q8_0 at index `blk * 8 + s/2`.
+    ///
+    /// # Formula
+    /// Each 256-weight block has 16 sub-blocks of 16 weights.  Pairs of sub-blocks
+    /// share a Q8_0 activation block (32 activations).  Per sub-block:
+    /// `contrib = d_a * d * scale_s * Σ(q6_centered * q_a)`
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(Q6_K_BLOCK_SIZE);
+        let row_bytes = blocks_per_row * Q6_K_BLOCK_BYTES;
+        // Each Q6_K super-block maps to 8 Q8_0 activation blocks.
+        let q8_blocks_per_row = blocks_per_row * 8;
+        let acts_needed = q8_blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            let mut sum = 0.0f32;
+
+            for blk in 0..blocks_per_row {
+                let bo = row_start + blk * Q6_K_BLOCK_BYTES;
+                let block = &weights[bo..bo + Q6_K_BLOCK_BYTES];
+
+                let ql = &block[0..128];
+                let qh = &block[128..192];
+                let scales = &block[192..208];
+                let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+
+                let input_offset = blk * Q6_K_BLOCK_SIZE;
+                let cols_in_block = (n_cols - input_offset).min(Q6_K_BLOCK_SIZE);
+
+                // Q6_K has 16 sub-blocks of 16 weights each.  Pairs share one Q8_0 block (32 acts).
+                // group=0..2 covers group*128 weights;  l=0..32 within a group covers 4 sub-values.
+                for group in 0..2 {
+                    let ql_off = group * 64;
+                    let qh_off = group * 32;
+                    let sc_off = group * 8;
+                    let in_off = group * 128;
+
+                    for l in 0..32 {
+                        let is = l / 16; // sub-block index within group (0 or 1)
+
+                        let q1 = ((ql[ql_off + l] & 0x0F)
+                            | ((qh[qh_off + l] & 3) << 4)) as i32
+                            - 32;
+                        let q2 = ((ql[ql_off + l + 32] & 0x0F)
+                            | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32
+                            - 32;
+                        let q3 = ((ql[ql_off + l] >> 4)
+                            | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32
+                            - 32;
+                        let q4 = ((ql[ql_off + l + 32] >> 4)
+                            | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32
+                            - 32;
+
+                        let s0 = d * scales[sc_off + is] as i8 as f32;
+                        let s1 = d * scales[sc_off + is + 2] as i8 as f32;
+                        let s2 = d * scales[sc_off + is + 4] as i8 as f32;
+                        let s3 = d * scales[sc_off + is + 6] as i8 as f32;
+
+                        // Each pair of sub-blocks (is=0 or 1) maps to Q8_0 activation block
+                        // at index `blk*8 + group*4 + is*2 + (column_half)`.
+                        // The column mapping is:
+                        //   c0 = in_off + l        (sub-block group*2 + 0, first half)
+                        //   c2 = in_off + l + 64   (sub-block group*2 + 0, second half)
+                        //   c1 = in_off + l + 32   (sub-block group*2 + 1, first half)
+                        //   c3 = in_off + l + 96   (sub-block group*2 + 1, second half)
+                        // Sub-blocks for c0/c2 share Q8_0 block = blk*8 + group*4 + is*2
+                        // Sub-blocks for c1/c3 share Q8_0 block = blk*8 + group*4 + is*2 + 1
+                        // BUT c0 and c2 are in different 16-weight sub-blocks mapped to different Q8_0.
+                        // Correct mapping: each 32-weight half-group uses one Q8_0 block.
+                        //   c0, c1 (l in 0..32 → in_off + l, in_off + l + 32): Q8_0 at blk*8 + group*4 + 2*is
+                        //                                                         and blk*8 + group*4 + 2*is + 1
+                        //   c2, c3 (in_off + l + 64, in_off + l + 96):          Q8_0 at blk*8 + group*4 + 2*is + 2
+                        //                                                         and blk*8 + group*4 + 2*is + 3
+
+                        // For simplicity: use the 4-activation-block grouping.
+                        // The 256 weights decompose into 8 groups of 32, one Q8_0 per group:
+                        // group 0: cols 0..32     Q8_0 #0
+                        // group 1: cols 32..64    Q8_0 #1
+                        // ...
+                        // group 7: cols 224..256  Q8_0 #7
+                        // But Q6_K's layout interleaves columns differently.  We accumulate per
+                        // weight-column directly, resolving the Q8_0 block from the column index.
+
+                        let c0 = in_off + l;
+                        let c1 = in_off + l + 32;
+                        let c2 = in_off + l + 64;
+                        let c3 = in_off + l + 96;
+
+                        let get_q8_sample = |col: usize| -> Option<f32> {
+                            if col >= cols_in_block {
+                                return None;
+                            }
+                            // Column `col` is within the super-block; find Q8_0 block index.
+                            let q8_blk = blk * 8 + col / 32;
+                            let q8_lane = col % 32;
+                            let ab = &acts_q8[q8_blk * Q8_0_BLOCK_BYTES..
+                                            (q8_blk + 1) * Q8_0_BLOCK_BYTES];
+                            let d_a = f16_to_f32(u16::from_le_bytes([ab[0], ab[1]]));
+                            let q_a = ab[2 + q8_lane] as i8 as f32;
+                            Some(d_a * q_a)
+                        };
+
+                        if let Some(a0) = get_q8_sample(c0) {
+                            sum += s0 * q1 as f32 * a0;
+                        }
+                        if let Some(a1) = get_q8_sample(c1) {
+                            sum += s1 * q2 as f32 * a1;
+                        }
+                        if let Some(a2) = get_q8_sample(c2) {
+                            sum += s2 * q3 as f32 * a2;
+                        }
+                        if let Some(a3) = get_q8_sample(c3) {
+                            sum += s3 * q4 as f32 * a3;
+                        }
+                    }
+                }
+            }
+
+            *out_val += sum;
+        }
+
+        Ok(())
+    }
 }
+
+/// Q8_0 activation block byte count used in fused GEMV.
+const Q8_0_BLOCK_BYTES: usize = 34;
 
 fn f16_to_f32(bits: u16) -> f32 {
     half::f16::from_bits(bits).to_f32()

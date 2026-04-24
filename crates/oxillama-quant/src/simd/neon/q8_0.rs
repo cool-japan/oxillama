@@ -263,6 +263,135 @@ impl QuantKernel for Q8_0Neon {
     fn name(&self) -> &'static str {
         "Q8_0_Neon"
     }
+
+    /// Fused Q8_0 weight × Q8_0 activation GEMV using NEON.
+    ///
+    /// Both blocks share the 34-byte format.  Accumulates into `out`.
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let acts_needed = blocks_per_row * BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for row in 0..n_rows {
+            let row_start = row * row_bytes;
+            // SAFETY: bounds checked above.
+            let row_sum = unsafe {
+                fused_q8_0_q8_0_row_neon(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            out[row] += row_sum;
+        }
+
+        Ok(())
+    }
+}
+
+/// Fused Q8_0 weight × Q8_0 activation dot product for one row using NEON.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * BLOCK_BYTES`
+/// - Must run on AArch64 with NEON.
+unsafe fn fused_q8_0_q8_0_row_neon(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    let mut row_sum = 0.0f32;
+
+    for blk in 0..blocks_per_row {
+        let w_off = blk * BLOCK_BYTES;
+        // SAFETY: blk < blocks_per_row; row_data.len() == blocks_per_row * BLOCK_BYTES.
+        let w_block = &row_data[w_off..w_off + BLOCK_BYTES];
+        let d_w = f16_to_f32(u16::from_le_bytes([w_block[0], w_block[1]]));
+
+        let a_off = blk * BLOCK_BYTES;
+        // SAFETY: acts_q8.len() >= blocks_per_row * BLOCK_BYTES.
+        let a_block = &acts_q8[a_off..a_off + BLOCK_BYTES];
+        let d_a = f16_to_f32(u16::from_le_bytes([a_block[0], a_block[1]]));
+
+        let scale = d_w * d_a;
+
+        let input_offset = blk * BLOCK_SIZE;
+        let remaining = n_cols.saturating_sub(input_offset);
+
+        if remaining >= BLOCK_SIZE {
+            // Fast path: full 32-weight block using NEON i8 dot products.
+            // SAFETY: w_block[2..34] and a_block[2..34] are 32 valid i8 bytes.
+            let wptr = w_block.as_ptr().add(2) as *const i8;
+            let aptr = a_block.as_ptr().add(2) as *const i8;
+
+            // Load 4×8-lane i8 vectors.
+            let w0 = vld1_s8(wptr);
+            let w1 = vld1_s8(wptr.add(8));
+            let w2 = vld1_s8(wptr.add(16));
+            let w3 = vld1_s8(wptr.add(24));
+            let a0 = vld1_s8(aptr);
+            let a1 = vld1_s8(aptr.add(8));
+            let a2 = vld1_s8(aptr.add(16));
+            let a3 = vld1_s8(aptr.add(24));
+
+            // i8 → i16 multiply-add using vmull_s8 (8 lanes × 2 = 16-lane i16).
+            let prod0 = vmull_s8(w0, a0);
+            let prod1 = vmull_s8(w1, a1);
+            let prod2 = vmull_s8(w2, a2);
+            let prod3 = vmull_s8(w3, a3);
+
+            // Pair-sum to i32 (vpaddlq_s16: add adjacent pairs).
+            let acc0 = vpaddlq_s16(prod0);
+            let acc1 = vpaddlq_s16(prod1);
+            let acc2 = vpaddlq_s16(prod2);
+            let acc3 = vpaddlq_s16(prod3);
+
+            // Sum all four accumulators.
+            let total = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+            let dot_i32 = vaddvq_s32(total);
+            row_sum += scale * dot_i32 as f32;
+        } else if remaining > 0 {
+            // Scalar tail.
+            let q_w = &w_block[2..];
+            let q_a = &a_block[2..];
+            let mut partial = 0.0f32;
+            for i in 0..remaining {
+                partial += (q_w[i] as i8 as f32) * (q_a[i] as i8 as f32);
+            }
+            row_sum += scale * partial;
+        }
+    }
+
+    row_sum
 }
 
 #[cfg(all(test, feature = "simd-neon", target_arch = "aarch64"))]
