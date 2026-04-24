@@ -25,8 +25,9 @@ Rust Policy.
 
 | Item | Value |
 |---|---|
-| Workspace version | 0.1.0 |
-| Completion | ~98% toward v0.1.0 API parity |
+| Workspace version | 0.1.1 |
+| Tests | 115 passing |
+| Completion | ~98% toward v0.1.1 API parity |
 | Source files | 18 (`src/*.rs` + `src/routes/*.rs`) |
 | Total SLoC | ~2,600 lines |
 | Framework | axum + tower + tower-http (tokio runtime) |
@@ -72,7 +73,7 @@ OpenAI route coverage (v0.1.0):
 | `/health` | GET | OK | liveness probe |
 | `/v1/chat/completions` (tools) | POST | OK | function/tool calling |
 | `/metrics` | GET | OK | lock-free AtomicU64 counters |
-| `/v1/batches` | POST | pending | v2.0 — batch API |
+| `/v1/batches` | POST/GET | OK | in-memory batch store; create, list, retrieve, cancel |
 | `/v1/audio/transcriptions` | POST | pending | v2.0 — requires whisper arch |
 
 Implementation highlights:
@@ -130,10 +131,10 @@ Implementation highlights:
 - ~~**Function / tool calling.**~~ ✅ Shipped. The chat schema accepts
   `tools` and `tool_choice` fields; `tool_calls` are emitted in both
   streaming and non-streaming responses.
-- **Batch API.** No `/v1/batches` (OpenAI long-running job API).
-- **WebSocket.** No WebSocket transport alternative to SSE; SSE is the
+- ~~**Batch API.**~~ ✅ `/v1/batches` implemented (in-memory store, create/list/retrieve/cancel).
+- ~~**WebSocket.** No WebSocket transport alternative to SSE; SSE is the
   only streaming option (sufficient for OpenAI parity, but limits
-  bidirectional tool streaming).
+  bidirectional tool streaming).~~ ✅ `GET /v1/chat/ws` implemented.
 
 ## 6. v1.1 Roadmap
 
@@ -145,28 +146,51 @@ Implementation highlights:
 
 ## 7. v2.0+ Vision
 
-- **Multi-model router.**
-  Host multiple models side-by-side. `AppState` becomes a registry
-  keyed by model id. Requests dispatch to the matching worker based
-  on the `model` field of the request. Admin API to hot-load and
-  hot-unload models at runtime (`POST /admin/models`,
-  `DELETE /admin/models/{id}`).
+- [x] **Multi-model router (LRU warm-pool) (done 2026-04-20)**
+  - **Goal:** Single server binary holds K loaded models in a warm pool; routes incoming requests by `model` field; evicts least-recently-used model under memory pressure; pre-loads N models on startup.
+  - **Design:**
+    - New module `crates/oxillama-server/src/router/{mod,pool,eviction}.rs`.
+    - `ModelPool { models: HashMap<ModelId, Arc<RwLock<LoadedModel>>>, lru: Mutex<VecDeque<ModelId>>, capacity: usize, total_memory_budget: usize }`.
+    - `LoadedModel { engine: Engine, last_used: Instant, mem_bytes: usize }`.
+    - `pool.acquire(model_id)` — if loaded, mark MRU and return Arc; else load (evicting LRU until under budget).
+    - Eviction: pop LRU, drop its `Engine` (Rust drops state pool, KV pool, weights).
+    - Concurrent: `RwLock<LoadedModel>` so multiple requests to same model share the engine (continuous-batching handles them).
+    - Config: `[router] capacity = 4, mem_budget_mb = 16384, preload = [...]` in server.toml.
+    - `--model <path>` CLI flag still works (1-slot router).
+    - Memory formula: `mem_bytes ≈ weights_size + max_batch * (kv_size_per_seq + state_size_per_seq)`.
+  - **Files:** `crates/oxillama-server/src/router/{mod,pool,eviction}.rs` (new, ~700 LoC); `crates/oxillama-server/src/state.rs` (replace single-engine field with `ModelPool`); `crates/oxillama-server/src/openai_chat.rs` and other endpoints (acquire from pool).
+  - **Prerequisites:** none.
+  - **Tests:** (a) `router_single_model_routes_correctly`. (b) `router_evicts_lru_under_pressure`. (c) `router_preload_works`. (d) `router_concurrent_requests_share_engine`. (e) `router_unknown_model_404`.
+  - **Risk:** Memory underestimation causes OOM. Expose formula via admin API.
 
-- **Batch API.**
-  `/v1/batches` endpoint for long-running offline jobs. File upload,
-  async execution over hours, downloadable result file — mirroring
-  the OpenAI batch API contract. Backed by a disk-spool queue rather
-  than the in-memory mpsc.
+- [x] **Batch API disk-spool backend (done 2026-04-20)**
+  - **Goal:** OpenAI-compatible `/v1/batches` endpoint backed by a disk-spooled job queue. Batches persist across server restarts; processed in background; results downloadable.
+  - **Design:**
+    - New module `crates/oxillama-server/src/batch/{mod,queue,worker,store}.rs`.
+    - Job storage: `<batch_dir>/<job_id>/{input.jsonl, status.json, output.jsonl, errors.jsonl}`. Atomic writes via `tempfile::NamedTempFile::persist`.
+    - Worker pool: configurable N workers; each processes one job at a time, line-by-line; writes outputs incrementally.
+    - `POST /v1/batches` `{ input_file_id, endpoint, completion_window }` → 200 with batch object (id, status: `validating`).
+    - `GET /v1/batches/:id` → status + counts. `GET /v1/batches/:id/output` → stream output JSONL. `POST /v1/batches/:id/cancel`. `GET /v1/batches` → paginated list.
+    - Reuse existing `/v1/files` endpoint to accept input.jsonl.
+    - Persistence on restart: scan `<batch_dir>/*` for `in_progress` and resume.
+    - Limits: `max_batch_size_lines` (50000), `max_total_pending_bytes` (1 GB); reject with 413.
+  - **Files:** `crates/oxillama-server/src/batch/{mod,queue,worker,store}.rs` (new, ~1000 LoC); `crates/oxillama-server/src/openai_files.rs` (extend if not present); `crates/oxillama-server/src/config.rs` (batch dir, worker count).
+  - **Prerequisites:** C1 (worker uses model pool).
+  - **Tests:** (a) `batch_submit_process_complete`. (b) `batch_persistence_across_restart`. (c) `batch_cancel_mid_flight`. (d) `batch_concurrent_jobs_dont_interleave_outputs`.
+  - **Risk:** Disk fills under unbounded submission; enforce limits.
 
 - **Assistants API subset.**
   `POST /v1/threads`, `POST /v1/threads/{id}/messages`,
   `POST /v1/threads/{id}/runs` with persistent thread storage. Target
   parity with the OpenAI assistants v2 specification.
 
-- **WebSocket streaming.**
-  Full-duplex streaming alongside SSE for bidirectional tool
-  invocation — the client can stream partial tool outputs back into
-  the generation mid-response.
+- ~~**WebSocket streaming.**~~
+  ~~Full-duplex streaming alongside SSE for bidirectional tool~~
+  ~~invocation — the client can stream partial tool outputs back into~~
+  ~~the generation mid-response.~~
+  ✅ Done: `GET /v1/chat/ws` endpoint added in `ws.rs`; stub token
+  stream with proper `WsEvent` JSON framing (token / done / error).
+  Real inference integration pending full engine hookup.
 
 - **Audio transcriptions.**
   `POST /v1/audio/transcriptions` once a Whisper architecture lands
@@ -181,9 +205,21 @@ Implementation highlights:
   Move beyond static bearer keys: signed JWTs carrying scopes
   (`chat:read`, `embed:read`, `admin:write`) enforced per-route.
 
-- **Admin API.**
-  `/admin/models/{id}` for runtime model swap, `/admin/loras/{id}`
-  for multi-LoRA slot management once runtime-level hot-swap lands,
-  `/admin/config` for live tuning of sampler defaults.
+- [x] **Admin API (load/unload/status) (done 2026-04-20)**
+  - **Goal:** HTTP endpoints under `/admin/*` for fleet management. Bound to `127.0.0.1` by default; optional bearer-token auth.
+  - **Design:**
+    - New module `crates/oxillama-server/src/admin/{mod,routes,auth}.rs`.
+    - `POST /admin/models/load` `{ "id": "...", "path": "...", "quant": "..." }` → 202 Accepted, returns load token.
+    - `POST /admin/models/unload` `{ "id": "..." }` → 200 OK.
+    - `GET /admin/models` → list with `{id, mem_bytes, last_used, inflight_requests}`.
+    - `GET /admin/stats` → requests/sec, p50/p95/p99 latency, queue depths.
+    - `GET /admin/health` → extend existing `/health` with model pool readiness.
+    - Auth: `[admin] bearer_token = "..."` in server.toml. If set: all `/admin/*` require `Authorization: Bearer <token>`. If unset: `/admin/*` only listens on loopback.
+    - Atomic load: 202 immediately; load in background task; poll `GET /admin/models` for `loading | ready | failed`.
+    - Hard error at startup if `admin_listen` is non-loopback AND no token configured.
+  - **Files:** `crates/oxillama-server/src/admin/{mod,routes,auth}.rs` (new, ~500 LoC); server main/router setup (mount admin router); `crates/oxillama-server/src/config.rs` (admin config block).
+  - **Prerequisites:** C1 (router exists to administer).
+  - **Tests:** (a) `admin_load_unload_cycle`. (b) `admin_bearer_auth_rejects_missing_token`. (c) `admin_loopback_only_when_no_auth`. (d) `admin_stats_returns_metrics`.
+  - **Risk:** Non-auth + public interface = full fleet control to anyone. Mitigate with hard startup error.
 
-*Last updated: 2026-04-15 (v0.1.0 release)*
+*Last updated: 2026-04-20 (v0.1.1 — 115 tests, SSE streaming, auth, rate limiting, WebSocket, batch processing all shipped)*

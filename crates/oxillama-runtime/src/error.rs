@@ -78,4 +78,22 @@ pub enum RuntimeError {
         /// Description of the attention error.
         message: String,
     },
+
+    /// Snapshot format version is incompatible with this runtime.
+    #[error("snapshot incompatible: {detail}")]
+    SnapshotIncompatible {
+        /// Details about the incompatibility.
+        detail: String,
+    },
+
+    /// Model fingerprint in snapshot does not match the file on disk.
+    #[error("model fingerprint mismatch: expected={expected}, found={found}, detail={detail}")]
+    ModelFingerprintMismatch {
+        /// The fingerprint expected (from snapshot).
+        expected: String,
+        /// The fingerprint found (computed from disk).
+        found: String,
+        /// Additional detail about the mismatch.
+        detail: String,
+    },
 }

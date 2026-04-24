@@ -21,6 +21,7 @@ use crate::reference::{
     all(feature = "simd-neon", target_arch = "aarch64"),
 ))]
 use crate::simd;
+use crate::simd::float_gemm::{Bf16OxiblasKernel, F16OxiblasKernel, F32OxiblasKernel};
 use crate::traits::QuantKernel;
 
 /// Detected CPU SIMD capabilities.
@@ -148,6 +149,10 @@ impl KernelDispatcher {
                 GgufTensorType::Q1_0G128 => return Ok(Box::new(simd::avx512::Q1_0G128Avx512)),
                 GgufTensorType::Q5K => return Ok(Box::new(simd::avx512::Q5_KAvx512)),
                 GgufTensorType::Q6K => return Ok(Box::new(simd::avx512::Q6_KAvx512)),
+                GgufTensorType::Tq1_0 => return Ok(Box::new(simd::avx512::Tq1_0Avx512)),
+                GgufTensorType::Tq2_0 => return Ok(Box::new(simd::avx512::Tq2_0Avx512)),
+                GgufTensorType::Q5_0 => return Ok(Box::new(simd::avx512::Q5_0Avx512)),
+                GgufTensorType::Q8K => return Ok(Box::new(simd::avx512::Q8_KAvx512)),
                 _ => {}
             }
         }
@@ -157,6 +162,7 @@ impl KernelDispatcher {
         if simd::cached_capabilities().avx2 {
             match tensor_type {
                 GgufTensorType::Q4_0 => return Ok(Box::new(simd::avx2::Q4_0Avx2)),
+                GgufTensorType::Q5_0 => return Ok(Box::new(simd::avx2::Q5_0Avx2)),
                 GgufTensorType::Q8_0 => return Ok(Box::new(simd::avx2::Q8_0Avx2)),
                 GgufTensorType::Q4K => return Ok(Box::new(simd::avx2::Q4_KAvx2)),
                 GgufTensorType::Q5K => return Ok(Box::new(simd::avx2::Q5_KAvx2)),
@@ -164,8 +170,21 @@ impl KernelDispatcher {
                 GgufTensorType::Q1_0G128 => return Ok(Box::new(simd::avx2::Q1_0G128Avx2)),
                 GgufTensorType::Q2K => return Ok(Box::new(simd::avx2::Q2_KAvx2)),
                 GgufTensorType::Q3K => return Ok(Box::new(simd::avx2::Q3_KAvx2)),
+                GgufTensorType::Q4_1 => return Ok(Box::new(simd::avx2::Q4_1Avx2)),
+                GgufTensorType::Q5_1 => return Ok(Box::new(simd::avx2::Q5_1Avx2)),
+                GgufTensorType::Q8_1 => return Ok(Box::new(simd::avx2::Q8_1Avx2)),
+                GgufTensorType::Iq1S => return Ok(Box::new(simd::avx2::Iq1SAvx2)),
+                GgufTensorType::Iq1M => return Ok(Box::new(simd::avx2::Iq1MAvx2)),
+                GgufTensorType::Iq2Xs => return Ok(Box::new(simd::avx2::Iq2XsAvx2)),
                 GgufTensorType::Iq2Xxs => return Ok(Box::new(simd::avx2::Iq2XxsAvx2)),
+                GgufTensorType::Iq2S => return Ok(Box::new(simd::avx2::Iq2SAvx2)),
+                GgufTensorType::Iq3Xxs => return Ok(Box::new(simd::avx2::Iq3XxsAvx2)),
+                GgufTensorType::Iq3S => return Ok(Box::new(simd::avx2::Iq3SAvx2)),
+                GgufTensorType::Iq4Nl => return Ok(Box::new(simd::avx2::Iq4NlAvx2)),
+                GgufTensorType::Iq4Xs => return Ok(Box::new(simd::avx2::Iq4XsAvx2)),
                 GgufTensorType::Q8K => return Ok(Box::new(simd::avx2::Q8_KAvx2)),
+                GgufTensorType::Tq1_0 => return Ok(Box::new(simd::avx2::Tq1_0Avx2)),
+                GgufTensorType::Tq2_0 => return Ok(Box::new(simd::avx2::Tq2_0Avx2)),
                 _ => {}
             }
         }
@@ -175,17 +194,42 @@ impl KernelDispatcher {
         if simd::cached_capabilities().neon {
             match tensor_type {
                 GgufTensorType::Q4_0 => return Ok(Box::new(simd::neon::Q4_0Neon)),
+                GgufTensorType::Q4_1 => return Ok(Box::new(simd::neon::Q4_1Neon)),
+                GgufTensorType::Q5_0 => return Ok(Box::new(simd::neon::Q5_0Neon)),
+                GgufTensorType::Q5_1 => return Ok(Box::new(simd::neon::Q5_1Neon)),
                 GgufTensorType::Q8_0 => return Ok(Box::new(simd::neon::Q8_0Neon)),
+                GgufTensorType::Q8_1 => return Ok(Box::new(simd::neon::Q8_1Neon)),
+                GgufTensorType::Q2K => return Ok(Box::new(simd::neon::Q2_KNeon)),
+                GgufTensorType::Q3K => return Ok(Box::new(simd::neon::Q3_KNeon)),
                 GgufTensorType::Q4K => return Ok(Box::new(simd::neon::Q4_KNeon)),
                 GgufTensorType::Q5K => return Ok(Box::new(simd::neon::Q5_KNeon)),
                 GgufTensorType::Q1_0G128 => return Ok(Box::new(simd::neon::Q1_0G128Neon)),
                 GgufTensorType::Q6K => return Ok(Box::new(simd::neon::Q6_KNeon)),
                 GgufTensorType::Q8K => return Ok(Box::new(simd::neon::Q8_KNeon)),
+                GgufTensorType::Iq1S => return Ok(Box::new(simd::neon::Iq1SNeon)),
+                GgufTensorType::Iq1M => return Ok(Box::new(simd::neon::Iq1MNeon)),
+                GgufTensorType::Iq2S => return Ok(Box::new(simd::neon::Iq2SNeon)),
+                GgufTensorType::Iq2Xxs => return Ok(Box::new(simd::neon::Iq2XxsNeon)),
+                GgufTensorType::Iq2Xs => return Ok(Box::new(simd::neon::Iq2XsNeon)),
+                GgufTensorType::Iq3Xxs => return Ok(Box::new(simd::neon::Iq3XxsNeon)),
+                GgufTensorType::Iq3S => return Ok(Box::new(simd::neon::Iq3SNeon)),
+                GgufTensorType::Iq4Xs => return Ok(Box::new(simd::neon::Iq4XsNeon)),
+                GgufTensorType::Iq4Nl => return Ok(Box::new(simd::neon::Iq4NlNeon)),
+                GgufTensorType::Tq1_0 => return Ok(Box::new(simd::neon::Tq1_0Neon)),
+                GgufTensorType::Tq2_0 => return Ok(Box::new(simd::neon::Tq2_0Neon)),
                 _ => {}
             }
         }
 
-        // 4. Scalar reference fallback
+        // 4. oxiblas-backed float kernels (always available, no CPU feature gate needed)
+        match tensor_type {
+            GgufTensorType::F32 => return Ok(Box::new(F32OxiblasKernel)),
+            GgufTensorType::F16 => return Ok(Box::new(F16OxiblasKernel)),
+            GgufTensorType::Bf16 => return Ok(Box::new(Bf16OxiblasKernel)),
+            _ => {}
+        }
+
+        // 5. Scalar reference fallback
         self.get_reference_kernel(tensor_type)
     }
 

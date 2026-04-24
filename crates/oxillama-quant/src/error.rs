@@ -64,4 +64,8 @@ pub enum QuantError {
         /// Description of the internal error.
         message: String,
     },
+
+    /// Float GEMM (F16/BF16/F32) computation failure.
+    #[error("float GEMM failed: {0}")]
+    FloatGemmFailed(String),
 }

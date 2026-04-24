@@ -5,29 +5,57 @@ use std::sync::Arc;
 use axum::routing::{get, post};
 use axum::Router;
 
+use crate::admin;
 use crate::auth::{auth_middleware, ApiKeys};
+use crate::batch;
+use crate::batch_spool;
 use crate::body_limit::body_limit_layer;
 use crate::config::ServerConfig;
 use crate::rate_limit::{rate_limit_middleware, RateLimiter};
 use crate::routes;
 use crate::state::AppState;
 use crate::tracing_layer::tracing_middleware;
+use crate::ws::ws_handler;
 
 /// Build the OxiLLaMa API server router with shared state.
 ///
-/// Mounts all OpenAI-compatible endpoints:
-/// - `POST /v1/chat/completions`
-/// - `POST /v1/completions`
-/// - `POST /v1/embeddings`
-/// - `GET /v1/models`
-/// - `GET /health`
+/// Mounts all OpenAI-compatible endpoints and the admin API.
 pub fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
+        // ── OpenAI inference ──────────────────────────────────────────────
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))
         .route("/v1/embeddings", post(routes::embeddings::embeddings))
         .route("/v1/models", get(routes::models::list_models))
         .route("/health", get(routes::health::health))
+        .route("/v1/chat/ws", get(ws_handler))
+        // ── Legacy in-memory batch API ────────────────────────────────────
+        .route(
+            "/v1/batches",
+            post(batch::create_batch).get(batch::list_batches),
+        )
+        .route("/v1/batches/{id}", get(batch::get_batch))
+        .route("/v1/batches/{id}/cancel", post(batch::cancel_batch))
+        // ── Disk-spooled batch API ────────────────────────────────────────
+        .route(
+            "/v1/batch_jobs",
+            post(batch_spool::routes::create_batch).get(batch_spool::routes::list_batches),
+        )
+        .route("/v1/batch_jobs/{id}", get(batch_spool::routes::get_batch))
+        .route(
+            "/v1/batch_jobs/{id}/output",
+            get(batch_spool::routes::get_batch_output),
+        )
+        .route(
+            "/v1/batch_jobs/{id}/cancel",
+            post(batch_spool::routes::cancel_batch),
+        )
+        // ── Admin API ─────────────────────────────────────────────────────
+        .route("/admin/models/load", post(admin::admin_load_model))
+        .route("/admin/models/unload", post(admin::admin_unload_model))
+        .route("/admin/models", get(admin::admin_list_models))
+        .route("/admin/stats", get(admin::admin_stats))
+        .route("/admin/health", get(admin::admin_health))
         .with_state(state)
 }
 
@@ -36,12 +64,46 @@ pub fn build_app(state: Arc<AppState>) -> Router {
 pub fn build_app_with_config(state: Arc<AppState>, config: &ServerConfig) -> Router {
     let metrics = Arc::clone(&state.metrics);
 
+    // Admin auth config from server config.
+    let admin_auth = crate::admin::AdminAuth {
+        token: config.admin_bearer_token.clone(),
+    };
+
     let mut app = Router::new()
+        // ── OpenAI inference ──────────────────────────────────────────────
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))
         .route("/v1/embeddings", post(routes::embeddings::embeddings))
         .route("/v1/models", get(routes::models::list_models))
-        .route("/health", get(routes::health::health));
+        .route("/health", get(routes::health::health))
+        .route("/v1/chat/ws", get(ws_handler))
+        // ── Legacy in-memory batch API ────────────────────────────────────
+        .route(
+            "/v1/batches",
+            post(batch::create_batch).get(batch::list_batches),
+        )
+        .route("/v1/batches/{id}", get(batch::get_batch))
+        .route("/v1/batches/{id}/cancel", post(batch::cancel_batch))
+        // ── Disk-spooled batch API ────────────────────────────────────────
+        .route(
+            "/v1/batch_jobs",
+            post(batch_spool::routes::create_batch).get(batch_spool::routes::list_batches),
+        )
+        .route("/v1/batch_jobs/{id}", get(batch_spool::routes::get_batch))
+        .route(
+            "/v1/batch_jobs/{id}/output",
+            get(batch_spool::routes::get_batch_output),
+        )
+        .route(
+            "/v1/batch_jobs/{id}/cancel",
+            post(batch_spool::routes::cancel_batch),
+        )
+        // ── Admin API ─────────────────────────────────────────────────────
+        .route("/admin/models/load", post(admin::admin_load_model))
+        .route("/admin/models/unload", post(admin::admin_unload_model))
+        .route("/admin/models", get(admin::admin_list_models))
+        .route("/admin/stats", get(admin::admin_stats))
+        .route("/admin/health", get(admin::admin_health));
 
     // Metrics endpoint
     if config.metrics_enabled {
@@ -49,6 +111,9 @@ pub fn build_app_with_config(state: Arc<AppState>, config: &ServerConfig) -> Rou
     }
 
     let mut app = app.with_state(state);
+
+    // Admin auth extension.
+    app = app.layer(axum::Extension(admin_auth));
 
     // Metrics extension (shared with the metrics route handler)
     if config.metrics_enabled {

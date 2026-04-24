@@ -26,4 +26,7 @@ wgpu     = { version = "29.0.1", optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 
+[dev-dependencies]
+naga = { version = "29.0.1", features = ["wgsl-in", "msl-out", "spv-out"] }
+
 

@@ -11,6 +11,19 @@ import os
 import pytest
 
 
+# Skip tests in this file that use the native extension when it is not built.
+def _native_available() -> bool:
+    try:
+        import oxillama_py.oxillama_py  # type: ignore[import-untyped]  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+_REQUIRES_NATIVE = pytest.mark.skipif(
+    not _native_available(), reason="Native extension not built (run `maturin develop`)"
+)
+
 @pytest.fixture(scope="session")
 def model_path():
     """Return the model path or skip the test if none is set."""
@@ -34,10 +47,11 @@ def engine(model_path):
 
 
 # ---------------------------------------------------------------------------
-# Config / no-model tests (never skip)
+# Config / no-model tests (skipped when native extension is absent)
 # ---------------------------------------------------------------------------
 
 
+@_REQUIRES_NATIVE
 def test_engine_config_defaults():
     """EngineConfig should accept a model path and expose it."""
     import oxillama_py
@@ -48,6 +62,7 @@ def test_engine_config_defaults():
     assert cfg.context_size is None
 
 
+@_REQUIRES_NATIVE
 def test_engine_config_context_size_override():
     """context_size keyword argument should be stored correctly."""
     import oxillama_py
@@ -56,6 +71,7 @@ def test_engine_config_context_size_override():
     assert cfg.context_size == 8192
 
 
+@_REQUIRES_NATIVE
 def test_sampler_config_defaults():
     """SamplerConfig should expose all fields with correct defaults."""
     import oxillama_py
@@ -68,6 +84,7 @@ def test_sampler_config_defaults():
     assert sc.mirostat == 0
 
 
+@_REQUIRES_NATIVE
 def test_sampler_config_greedy():
     """SamplerConfig.greedy() should return temperature=0 and top_k=1."""
     import oxillama_py
@@ -77,6 +94,7 @@ def test_sampler_config_greedy():
     assert sc.top_k == 1
 
 
+@_REQUIRES_NATIVE
 def test_engine_not_loaded_initially():
     """A freshly created Engine must not be loaded."""
     import oxillama_py
@@ -86,6 +104,7 @@ def test_engine_not_loaded_initially():
     assert not eng.is_loaded()
 
 
+@_REQUIRES_NATIVE
 def test_engine_hidden_size_none_before_load():
     """hidden_size() must return None before load_model()."""
     import oxillama_py
@@ -95,6 +114,7 @@ def test_engine_hidden_size_none_before_load():
     assert eng.hidden_size() is None
 
 
+@_REQUIRES_NATIVE
 def test_engine_tokenize_raises_without_model():
     """tokenize() must raise RuntimeError when no model is loaded."""
     import oxillama_py
@@ -105,6 +125,7 @@ def test_engine_tokenize_raises_without_model():
         eng.tokenize("hello")
 
 
+@_REQUIRES_NATIVE
 def test_lora_load_raises_for_missing_file():
     """Lora.load() must raise for a nonexistent file."""
     import oxillama_py
@@ -113,6 +134,7 @@ def test_lora_load_raises_for_missing_file():
         oxillama_py.Lora.load("/tmp/oxillama_py_nonexistent_lora_xyz.gguf")
 
 
+@_REQUIRES_NATIVE
 def test_speculative_config_defaults():
     """SpeculativeConfig default num_speculative is 4."""
     import oxillama_py

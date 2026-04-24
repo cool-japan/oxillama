@@ -15,7 +15,8 @@ standalone binary target; never linked into production builds.
 
 | Field | Value |
 |---|---|
-| Version | 0.1.0 |
+| Version | 0.1.1 |
+| Tests | 79 passing |
 | Completion | ~78% |
 | src files | 7 (`lib.rs`, `latency.rs`, `throughput.rs`, `memory.rs`, `e2e.rs`, `prefill_decode.rs`, `arch_config.rs`) |
 | Bench targets | kernel-level (quant dequant/GEMV/GEMM, sampling) |
@@ -78,46 +79,62 @@ missing portion is comparative and per-architecture measurement.
   configurations for LLaMA-3, Qwen3, Mistral, Gemma, and Phi via `from_name()`,
   `known_architectures()`, and conversion to `PrefillDecodeConfig` /
   `E2eBenchConfig`. Architecture-specific regressions are now visible.
-- **No cross-SIMD dispatch comparison.** The harness never forces a specific
-  backend, so there is no AVX-512 vs AVX2 vs NEON vs scalar comparison table.
-- **No KV-cache scaling curve.** No benchmark sweeps context length
-  (1K / 4K / 8K / 32K) to expose the O(N) decode cost of growing KV state.
-- **No memory-fragmentation profile.** `MemoryResult` is a point-in-time
-  snapshot; there is no time-series of allocator behaviour under load.
-- **No `criterion --save-baseline` discipline** — regressions between commits
-  have to be caught by hand; no baseline is checked into the repo and no CI
-  job enforces a comparison threshold.
-- **No batched-inference benchmark.** Single-request decode is covered;
-  many-concurrent-request throughput (the metric that matters for the
-  server crate) is not measured.
-- **No tokenizer throughput bench.** BPE encode/decode rates are not
+- **No cross-SIMD dispatch comparison.** ~~The harness never forces a specific
+  backend, so there is no AVX-512 vs AVX2 vs NEON vs scalar comparison table.~~
+  ✅ Shipped: `run_dequant_comparison`, `run_gemv_comparison`, and
+  `format_comparison_table` in `simd_comparison.rs`; Criterion bench binary at
+  `benches/cross_simd.rs` with `bench_cross_simd` group.
+- **No KV-cache scaling curve.** ~~No benchmark sweeps context length
+  (1K / 4K / 8K / 32K) to expose the O(N) decode cost of growing KV state.~~
+  ✅ Shipped: `run_kv_cache_scaling`, `KvCacheScalingConfig`, `KvCacheScalingResult`,
+  `KvCacheScalingPoint` in `prefill_decode.rs`; Criterion bench at `benches/kv_cache.rs`.
+  Also added `run_prefill_vs_decode_isolation` for prefill/decode ratio reporting.
+- **No memory-fragmentation profile.** ~~`MemoryResult` is a point-in-time
+  snapshot; there is no time-series of allocator behaviour under load.~~
+  ✅ Shipped: `MemoryProfiler` with rolling-window RSS sampling and `MemoryReport`
+  (baseline, peak, P50, P99, sample count) in `memory.rs`; Criterion bench at
+  `benches/memory_profile.rs`.
+- **No tokenizer throughput bench.** ~~BPE encode/decode rates are not
   profiled even though they set an upper bound on prefill latency for
-  short prompts.
+  short prompts.~~
+  ✅ Shipped: `TokenizerBench` trait, `StubBpeTokenizer`, `bench_tokenizer_encode`,
+  `bench_tokenizer_decode`, `TokenizerThroughputResult`, `TOKENIZER_SAMPLE_TEXT`
+  in `throughput.rs`; Criterion bench at `benches/tokenizer.rs`.
+- ~~**No E2E tokens/sec bench binary.**~~ ✅ Shipped (stub harness): `benches/end_to_end.rs`
+  with Criterion groups for LLaMA-3, Qwen3, and Mistral using a synthetic
+  `StubEngine`; real model support gated on a future GGUF cache in CI.
 
 ## 6. v1.1 Roadmap
 
-1. **End-to-end tokens/sec benches.** Add `benches/end_to_end.rs` that runs
-   `InferenceEngine::generate` for each (architecture × quant × context)
-   combination in the matrix below:
-
-   | Architecture | Sizes | Quant types |
-   |---|---|---|
-   | LLaMA-3 | 8B | Q4_K_M, Q8_0 |
-   | Qwen3 | 7B | Q4_K_M, Q8_0 |
-   | Mistral | 7B | Q4_K_M, Q8_0 |
+1. ~~**End-to-end tokens/sec benches.**~~ ✅ Shipped: `benches/end_to_end.rs` with
+   Criterion groups for LLaMA-3, Qwen3, and Mistral (stub `StubEngine`; real GGUF
+   support pending model cache in CI).
 
 2. **Prefill vs decode isolation.** Report prefill `tok/s` (batch GEMM) and
    decode `tok/s` (per-token GEMV) as separate Criterion groups.
-3. **Cross-SIMD table.** Add a bench that uses a runtime-dispatch override
-   (env var or `OXI_SIMD_FORCE=avx2|avx512|neon|scalar`) to produce a
-   side-by-side comparison table for every SIMD-backed quant type.
+- [x] **E1 — Cross-SIMD dispatch matrix + memory profiling (planned 2026-04-20)**
+  - **Goal:** Benchmarks measure all SIMD paths (scalar / AVX2 / AVX512 / NEON) of every shipped quant kernel in a single matrix-style report. Memory profiling module records peak RSS, KV-cache occupancy, and weight memory at fixed sample intervals during inference.
+  - **Design:**
+    - New module `crates/oxillama-bench/src/dispatch_matrix.rs`:
+      - For each `(quant_type, simd_path)` combo, runs `matvec_q8` and `matvec_q8_fused` on a 4096×4096 GEMV; reports tokens/s and µs/iter.
+      - Result table written to CSV at `target/bench-dispatch.csv`.
+      - Selectable via `cargo bench --bench dispatch_matrix --features simd-avx2` etc.
+    - New module `crates/oxillama-bench/src/memory_profiler.rs`:
+      - `MemoryProfiler::start(interval_ms)` spawns a tokio task that samples process RSS via `sysinfo` (Pure Rust, cross-platform) at the interval.
+      - Inference engine emits events (via existing tracing spans) on `kv_cache_alloc`, `kv_cache_free`, `state_alloc`, `state_free`; profiler captures and aggregates.
+      - Output: JSON at `target/bench-memory-<timestamp>.json`; ASCII table summary via `tabled` crate (Pure Rust).
+    - Bench harness: criterion bench targets in `benches/dispatch_matrix.rs` and `benches/memory.rs`.
+  - **Files:** `crates/oxillama-bench/src/dispatch_matrix.rs` (new, ~400 LoC); `crates/oxillama-bench/src/memory_profiler.rs` (new, ~500 LoC); `benches/dispatch_matrix.rs`, `benches/memory.rs` (new); `crates/oxillama-bench/Cargo.toml` (add `sysinfo`, `tabled` from crates.io latest).
+  - **Prerequisites:** none.
+  - **Tests:** (a) `dispatch_matrix_runs_all_paths` — CSV contains expected number of rows. (b) `memory_profiler_captures_baseline` — RSS bump within 10% of expected after ~100MB allocation. (c) `memory_events_correlate_with_kv_alloc` — KV slot allocation appears in profiler output.
+  - **Risk:** `sysinfo` RSS reporting can be coarse on macOS (~1 MB granularity). Document. Report bench results alongside cpuinfo for context.
+
 4. **Long-context curves.** Sweep `ctx ∈ {4K, 8K, 32K}` and plot decode
    `tok/s` as the KV cache grows.
-5. **Memory-profiling module.** Add `src/profile.rs` with a time-series
-   sampler (`Vec<(Instant, usize)>`) and peak / P95 aggregation, plus a
-   markdown-table report writer.
-6. **CI hook.** Wire `criterion --save-baseline master` into a scheduled CI
-   job so regressions get surfaced on PRs without manual baselining.
+5. ~~**Memory-profiling module.**~~ Promoted to [x] E1 above (combined with Cross-SIMD dispatch matrix).
+6. ~~**CI hook.**~~ ✅ Shipped: `.github/workflows/bench_ci.yml` — weekly Monday
+   schedule + `workflow_dispatch`; runs `--test` for compile/sanity, then
+   `--save-baseline master`, and uploads `target/criterion/` as an artifact.
 
 All code examples in this crate must remain `unwrap`-free — prefer
 `ok_or_else(|| BenchError::...)` and `?`. No deviation from the No-Unwrap
@@ -148,4 +165,4 @@ policy in benchmark harnesses either, even though they are not strictly
 - **Regression history dashboard.** Persist criterion JSON to a small
   on-repo time-series and render a rolling-window plot per metric.
 
-*Last updated: 2026-04-15 (v0.1.0 release)*
+*Last updated: 2026-04-20 (v0.1.1 — 79 tests; KV-cache scaling, cross-SIMD, memory profiler, tokenizer throughput, E2E stub bench all shipped)*

@@ -31,14 +31,14 @@ shader coverage, batching, and attention fusion.
 
 | Item              | Value                                        |
 |-------------------|----------------------------------------------|
-| Version           | 0.1.0 (workspace)                            |
+| Version           | 0.1.1 (workspace)                            |
 | Completion        | ~93 %                                        |
 | Feature flag      | `gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]` (off by default) |
 | wgpu version      | 29.0.1                                       |
 | Source files      | 7 Rust files (`lib.rs`, `context.rs`, `buffer.rs`, `error.rs`, `kernels/mod.rs`, `kernels/q4_0.rs`, `kernels/q8_0.rs`) |
 | WGSL shaders      | 2 shader files (`shaders/gemv_f32.wgsl`, `shaders/batched_gemv_f32.wgsl`) with Q4_0 and Q8_0 entry points |
-| Tests             | 77 unit tests (smoke + error-display + gated end-to-end correctness) |
-| Quant coverage    | 6 / 25 quant types (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q1_0_G128) |
+| Tests             | 151 unit tests (smoke + error-display + gated end-to-end correctness) |
+| Quant coverage    | 14 / 25 quant types (Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q8_K, Q1_0_G128, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS; tiled GEMM + fused attention) |
 | Pure Rust         | Yes — wgpu is Rust-native                    |
 | Default behaviour | Graceful CPU fallback when no adapter found  |
 
@@ -48,13 +48,23 @@ shader coverage, batching, and attention fusion.
 |---------------------------|:---------:|---------------------------------------------------|
 | Q4_0                      | ✓         | f32 accumulator, naive one-workgroup-per-row      |
 | Q8_0                      | ✓         | f32 accumulator, naive                            |
+| Q2_K                      | ✓         | CPU dequant + GPU f32 GEMV                        |
+| Q3_K                      | ✓         | CPU dequant + GPU f32 GEMV                        |
 | Q4_K                      | ✓         | CPU dequant + GPU f32 GEMV                        |
 | Q5_K                      | ✓         | CPU dequant + GPU f32 GEMV                        |
 | Q6_K                      | ✓         | CPU dequant + GPU f32 GEMV                        |
-| K-quants (rest)           | —         | v2.0                                            |
-| I-quants (all 9)          | —         | v2.0                                            |
-| Ternary (TQ1_0, TQ2_0)    | —         | v2.0                                            |
-| Q1_0_G128                 | ✓         | CPU dequant + GPU GEMV                        |
+| Q8_K                      | ✓         | CPU dequant + GPU f32 GEMV                        |
+| Q1_0_G128                 | ✓         | CPU dequant + GPU GEMV                            |
+| IQ2_XXS                   | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.1**    |
+| IQ2_S                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.1**    |
+| IQ3_XXS                   | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.1**    |
+| IQ3_S                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.1**    |
+| IQ4_XS                    | ✓         | CPU dequant + GPU f32 GEMV                        |
+| Tiled GEMM                | ✓         | TILE_M/N=32, TILE_K=16; `gemm_f32.wgsl` — **new in v0.1.1** |
+| Fused attention           | ✓         | Online softmax, QK+AV single dispatch — **new in v0.1.1** |
+| K-quants (Q2_K rest)      | —         | v2.0                                              |
+| I-quants (remaining)      | —         | v2.0                                              |
+| Ternary (TQ1_0, TQ2_0)    | —         | v2.0                                              |
 
 ## 3. Module Map
 
@@ -178,11 +188,12 @@ These items make up the remaining ~18 % of the v0.1.0 completion figure.
   `batched_gemv_f32.wgsl` shader, `BatchedGemvConfig`, `BatchedGpuKernel`
   trait, Q4_0 batched implementation. Amortises dispatch cost for prefill
   and multi-sample decoding.
-- f16 accumulator path for fp16-safe ops, gated at kernel selection time
-  so accuracy-sensitive ops (softmax, norms) keep the f32 path.
-- naga cross-compile validation in CI: emit Metal MSL and Vulkan SPIR-V
-  from every shader and assert they parse. Catches backend-specific
-  issues without needing GPUs of each flavour on every CI runner.
+- ~~f16 accumulator path for fp16-safe ops, gated at kernel selection time
+  so accuracy-sensitive ops (softmax, norms) keep the f32 path.~~ ✅ Shipped: Q4_0 and Q8_0 GPU kernels check `supports_f16(ctx)` at dispatch time and branch to `dequant_q*_to_f16` + `f16_gemv` via the `gemv_f16.wgsl` shader; f32 path remains the fallback.
+- ~~naga cross-compile validation in CI~~ ✅ Shipped: `tests/shader_validation.rs`
+  parses all `src/shaders/*.wgsl` files and cross-compiles each to Metal MSL
+  and Vulkan SPIR-V via naga. CI workflow at
+  `.github/workflows/shader_validate.yml`.
 - ~~Device selection API~~ ✅ Shipped: enumerate adapters,
   `try_init_with_name(&str)` and `try_init_with_index(usize)` constructors
   for `GpuContext`. `GpuDispatcher` exposes `with_device_name` and
@@ -214,4 +225,97 @@ These items make up the remaining ~18 % of the v0.1.0 completion figure.
   tuned for tile-based mobile GPUs, coordinated with the `oxillama-wasm`
   hookup so a browser build gets real acceleration, not just portability.
 
-*Last updated: 2026-04-15 (v0.1.0 release)*
+*Last updated: 2026-04-20 (v0.1.1 shipped — tiled GEMM, fused attention, IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S GPU kernels; 151 tests)*
+
+## 8. Planned GPU Kernels (v2.0 — Scheduled 2026-04-19)
+
+### B1 — Q2_K GPU kernel
+
+- [x] Q2_K GPU kernel — CPU-dequant + GPU f32 GEMV (done 2026-04-19)
+  - **Goal:** `Q2_KGpuKernel` implementing `GpuKernel::gemv`, dispatched for `GgufTensorType::Q2K`, correctness vs CPU reference (tolerance 1e-3).
+  - **Design:** Follow `Q4_KGpuKernel` template. CPU-dequant weights via `Q2KRef::dequantize_block` → `Vec<f32>`, upload to GPU, dispatch `gemv_f32` shader, read back.
+  - **Files:** `src/kernels/q2_k.rs` (new), `src/kernels/mod.rs`, `src/lib.rs`.
+  - **Tests:** `#[cfg(feature = "gpu")]` end-to-end correctness test; `if ctx.is_none() { return; }` guard for CI without GPU.
+  - **Risk:** wgpu buffer alignment; pattern identical to Q4_K so low risk.
+
+### B2 — Q3_K GPU kernel
+
+- [x] Q3_K GPU kernel — CPU-dequant + GPU f32 GEMV (done 2026-04-19)
+  - **Goal:** Symmetric to B1 for Q3_K.
+  - **Design:** Wire `Q3KRef::dequantize_block` into same CPU-dequant-then-GPU-GEMV pattern.
+  - **Files:** `src/kernels/q3_k.rs` (new), `src/kernels/mod.rs`, `src/lib.rs`.
+  - **Tests:** Same template as B1.
+  - **Risk:** Low.
+
+### B3 — Q8_K GPU kernel
+
+- [x] Q8_K GPU kernel — CPU-dequant + GPU f32 GEMV (done 2026-04-19)
+  - **Goal:** Symmetric for Q8_K.
+  - **Design:** Q8_K block = 256 signed 8-bit values × f16 scale. CPU-dequant then GPU GEMV.
+  - **Files:** `src/kernels/q8_k.rs` (new), `src/kernels/mod.rs`, `src/lib.rs`.
+  - **Tests:** Same template.
+  - **Risk:** Low.
+
+### B4 — IQ4_XS GPU kernel (first I-quant on GPU)
+
+- [x] IQ4_XS GPU kernel — first I-quant GPU path; opens IQ2/IQ3 pipeline (done 2026-04-19)
+  - **Goal:** `Iq4XsGpuKernel` — first I-quant GPU path; opens IQ2/IQ3 pipeline.
+  - **Design:** IQ4_XS = 16-entry lookup grid + 4-bit indices. Wire `Iq4XsRef::dequantize_block` into CPU-dequant-then-GPU-GEMV. `gemv_f32` shader unchanged.
+  - **Files:** `src/kernels/iq4_xs.rs` (new), `src/kernels/mod.rs`, `src/lib.rs`.
+  - **Tests:** End-to-end correctness vs CPU reference on 64×256 block.
+  - **Risk:** Low; same contract as K-quant GPU kernels.
+
+## 9. Planned GPU Kernels (v2.0 — Scheduled 2026-04-19, Slice C)
+
+### C1 — Tiled GEMM WGSL shader (planned 2026-04-19)
+
+- [x] Tiled GEMM WGSL shader — production-grade GPU matmul replacing naive per-row path (done 2026-04-20)
+  - **Goal:** Production-grade GPU matmul shader (`gemm_f32.wgsl`) with workgroup shared memory and cooperative tile loading. Replaces one-workgroup-per-output-row naïve path for K >= 64. Target: ~3–5× over naïve path on Apple M3 Max.
+  - **Design:** Tile sizes: `TILE_M=32, TILE_N=32, TILE_K=16`. Workgroup: `@workgroup_size(16,16)` — 256 threads. Shared memory: `var<workgroup> A_tile: array<f32, TILE_M * TILE_K>; var<workgroup> B_tile: array<f32, TILE_K * TILE_N>;`. Loop: workgroupBarrier → cooperative load A+B tiles (each thread loads 1 elem) → workgroupBarrier → accumulate `C[m,n] += A_tile[m,k]*B_tile[k,n]` over k. Rust: `TiledGemmKernel` implementing `GpuKernel::gemm` trait method. Edge tiles: guards + write zeros when out of bounds.
+  - **Files:** `src/shaders/gemm_f32.wgsl` (new); `src/kernels/tiled_gemm.rs` (new, ~300 LoC); `src/lib.rs` (register gemm trait method + dispatch).
+  - **Tests:** (a) `tiled_gemm_matches_cpu_32x32x32` tol 1e-3; (b) `tiled_gemm_matches_cpu_256x256x256` tol 1e-3; (c) `tiled_gemm_non_multiple_of_tile` (33×65×17) tol 1e-3.
+  - **Risk:** Edge-tile handling; workgroupBarrier() placement.
+
+### C2 — Fused attention WGSL kernel (planned 2026-04-19)
+
+- [x] Fused attention WGSL kernel — QK + softmax + AV in single dispatch (done 2026-04-20)
+  - **Goal:** `attention_fused_f32.wgsl` shader: QK + softmax + AV in single dispatch with shared memory. GPU counterpart to CPU FlashAttention. Eliminates two VRAM round-trips per attention layer.
+  - **Design:** One workgroup per Q row × full K,V. Shared: `K_tile[TILE_K × head_dim]`, `V_tile[TILE_K × head_dim]`, `scores[TILE_K]`. Online softmax in registers: m, ℓ, o per thread. For each K tile: cooperative load K,V → shared; compute `S[k] = dot(q_row, K_tile[k,:]) * scale`; causal mask; m_new = max(m, max(S)); P[k] = exp(S[k]-m_new); ℓ_new = exp(m-m_new)*ℓ + sum(P); o = exp(m-m_new)*o + sum_k(P[k]*V_tile[k,:]); update m,ℓ. Final: o /= ℓ.
+  - **Files:** `src/shaders/attention_fused_f32.wgsl` (new, ~150 LoC WGSL); `src/kernels/fused_attention.rs` (new, ~400 LoC Rust); `src/lib.rs` (export).
+  - **Tests:** (a) `fused_attention_matches_cpu_causal` — 1 head, 32 head_dim, 64×64 QK, tol 1e-3; (b) `fused_attention_matches_cpu_long` — 256×1024, tol 1e-3; (c) `fused_attention_decode_single_q` — 1×1024, tol 1e-3.
+  - **Risk:** Online softmax rounding at long seqs — 1e-3 tolerance intentional. workgroupBarrier() before reading shared tile, after writing.
+
+### C3 — IQ2_XXS GPU GEMV kernel (planned 2026-04-19)
+
+- [x] IQ2_XXS GPU GEMV kernel — CPU-dequant + GPU f32 GEMV (done 2026-04-20)
+  - **Goal:** `Iq2XxsGpuKernel` for `GgufTensorType::Iq2Xxs`; CPU-dequant then `gemv_f32.wgsl`.
+  - **Design:** IQ2_XXS block = 66 bytes, 256 weights via 256-entry lookup grid. Follow IQ4_XS template from v0.1.1. Inline the block layout from `oxillama-quant/src/reference/iq2_xxs.rs` (oxillama-quant is not a GPU crate dep).
+  - **Files:** `src/kernels/iq2_xxs.rs` (new, ~400 LoC); `src/kernels/mod.rs`; `src/lib.rs` (dispatcher arm).
+  - **Tests:** `test_gpu_gemv_iq2_xxs_matches_cpu` — 64×256 GEMV, tol 1e-3.
+  - **Risk:** Lookup-grid constants must match upstream exactly — cross-reference `reference/iq2_xxs.rs` byte-for-byte.
+
+### C4 — IQ2_S GPU GEMV kernel (planned 2026-04-19)
+
+- [x] IQ2_S GPU GEMV kernel — sibling of C3 for IQ2_S (done 2026-04-20)
+  - **Goal:** Sibling of C3 for IQ2_S.
+  - **Design:** IQ2_S block = 74 bytes, 256 weights with per-8-weight sign bits. Inline grid + signs decode from `reference/iq2_s.rs`.
+  - **Files:** `src/kernels/iq2_s.rs` (new); `src/kernels/mod.rs`; `src/lib.rs`.
+  - **Tests:** `test_gpu_gemv_iq2_s_matches_cpu` — 64×256 GEMV, tol 1e-3.
+  - **Risk:** Sign-bit decode order — cross-reference reference impl.
+
+### C5 — IQ3_XXS GPU GEMV kernel (planned 2026-04-19)
+
+- [x] IQ3_XXS GPU GEMV kernel — 3-bit index GPU GEMV (done 2026-04-20)
+  - **Goal:** GPU GEMV for IQ3_XXS.
+  - **Design:** IQ3_XXS block = 98 bytes, 256 weights with 3-bit indices into 256-entry grid. Inline decode from `reference/iq3_xxs.rs`.
+  - **Files:** `src/kernels/iq3_xxs.rs` (new); `src/kernels/mod.rs`; `src/lib.rs`.
+  - **Tests:** `test_gpu_gemv_iq3_xxs_matches_cpu` — 64×256 GEMV, tol 1e-3.
+
+### C6 — IQ3_S GPU GEMV kernel (planned 2026-04-19)
+
+- [x] IQ3_S GPU GEMV kernel — most complex I-quant in this slice (done 2026-04-20)
+  - **Goal:** GPU GEMV for IQ3_S. Most-complex I-quant in this slice.
+  - **Design:** IQ3_S block = 110 bytes, 256 weights with 3-bit low + high bits, sign nibbles. Inline decode from `reference/iq3_s.rs` — cross-reference twice.
+  - **Files:** `src/kernels/iq3_s.rs` (new); `src/kernels/mod.rs`; `src/lib.rs`.
+  - **Tests:** `test_gpu_gemv_iq3_s_matches_cpu` — 64×256 GEMV, tol 1e-3.
+  - **Risk:** IQ3_S decode is the most byte-fiddly — cross-reference reference impl twice before coding.

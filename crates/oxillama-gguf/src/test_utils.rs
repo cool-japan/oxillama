@@ -1,16 +1,26 @@
-//! Synthetic GGUF binary builder for tests.
+//! Utilities for building synthetic GGUF models in tests.
 //!
-//! Provides a minimal but valid GGUF v3 binary for a 1-layer LLaMA model
-//! along with a matching BPE tokenizer JSON string.  Use these in tests
-//! that need a fully-loaded [`crate::GgufModel`] without an on-disk model file.
+//! Enabled with `features = ["test-utils"]`. This module is **stable** as of v0.1.1:
+//! builder function signatures will not change in a breaking way within the 0.1.x
+//! series.
+//!
+//! Each builder returns a `Vec<u8>` containing a valid GGUF v3 binary. The
+//! binaries can be parsed with [`crate::GgufModel::from_bytes`] and satisfy all
+//! tensor lookups performed by `oxillama-arch`.
 //!
 //! # Example
-//! ```ignore
+//!
+//! ```rust,ignore
+//! # #[cfg(feature = "test-utils")]
+//! # {
 //! use oxillama_gguf::test_utils::{build_minimal_llama_gguf, minimal_tokenizer_json};
 //!
 //! let bytes = build_minimal_llama_gguf();
 //! let model = oxillama_gguf::GgufModel::from_bytes(bytes).expect("parse synthetic GGUF");
 //! assert_eq!(model.architecture().expect("arch"), "llama");
+//!
+//! let _tok_json = minimal_tokenizer_json();
+//! # }
 //! ```
 
 /// Minimal BPE tokenizer JSON string compatible with `tokenizers 0.22.x`.
@@ -18,6 +28,7 @@
 /// The vocabulary contains 32 entries (IDs 0–31), matching the `vocab_size=32`
 /// baked into the synthetic GGUF produced by [`build_minimal_llama_gguf`].
 /// Special tokens: `<unk>`=0, `<s>`=1, `</s>`=2.
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub fn minimal_tokenizer_json() -> &'static str {
     r#"{
   "version": "1.0",
@@ -216,6 +227,7 @@ const TENSORS: &[TensorDesc] = &[
 /// | `vocab_size`    | 32    |
 /// | `ffn_size`      | 64    |
 /// | `context_len`   | 128   |
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub fn build_minimal_llama_gguf() -> Vec<u8> {
     const GGUF_MAGIC: u32 = 0x4755_4746; // b"GGUF" little-endian
     const TENSOR_COUNT: u64 = 12;
@@ -403,6 +415,7 @@ const QWEN3_TENSORS: &[TensorDesc] = &[
 /// Uses the same tiny dimensions as [`build_minimal_llama_gguf`].
 /// Qwen3 tensor names are identical to LLaMA; only `general.architecture`
 /// differs.
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub fn build_minimal_qwen3_gguf() -> Vec<u8> {
     build_gguf_v3(
         &[
@@ -495,6 +508,7 @@ const MISTRAL_TENSORS: &[TensorDesc] = &[
 ///
 /// Includes `attention.sliding_window = 64` which exercises the sliding-window
 /// attention path in `MistralModel`.
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub fn build_minimal_mistral_gguf() -> Vec<u8> {
     build_gguf_v3(
         &[
@@ -601,6 +615,7 @@ const GEMMA_TENSORS: &[TensorDesc] = &[
 /// Includes `attention.logit_softcap` and `final_logit_softcap` to exercise
 /// Gemma-2 soft-capping.  Also includes per-block `attn_post_norm.weight` and
 /// `ffn_post_norm.weight` to cover the post-norm code path.
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub fn build_minimal_gemma_gguf() -> Vec<u8> {
     build_gguf_v3(
         &[
@@ -689,6 +704,7 @@ const PHI_TENSORS: &[TensorDesc] = &[
 /// Phi is the most architecturally distinct from LLaMA:
 /// - Merged QKV (`attn_qkv.weight`) instead of separate q/k/v weights.
 /// - Partial RoPE (`phi3.rope.partial_rotary_factor = 0.5`).
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub fn build_minimal_phi3_gguf() -> Vec<u8> {
     build_gguf_v3(
         &[
@@ -780,6 +796,7 @@ const COMMAND_R_TENSORS: &[TensorDesc] = &[
 /// Build a valid GGUF v3 binary for a minimal 1-layer Command-R model.
 ///
 /// Includes `logit_scale = 0.0625` to exercise the logit-scaling path.
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub fn build_minimal_command_r_gguf() -> Vec<u8> {
     build_gguf_v3(
         &[
@@ -918,6 +935,7 @@ const STARCODER_TENSORS: &[TensorDesc] = &[
 /// - Fused `attn_qkv.weight/bias` of shape `[(num_heads+2)*head_dim, hidden]`.
 /// - LayerNorm (not RMSNorm) with separate bias tensors everywhere.
 /// - GELU activation (gate-free FFN).
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub fn build_minimal_starcoder_gguf() -> Vec<u8> {
     build_gguf_v3(
         &[
@@ -1000,6 +1018,7 @@ const LORA_TENSORS: &[TensorDesc] = &[
 /// - A matrices `[in_features=32, rank=4]`   → 128 f32 = 512 bytes each
 /// - B matrices for attn_q/v `[rank=4, out_features=32]` → 128 f32 = 512 bytes
 /// - B matrix  for ffn_gate `[rank=4, out_features=64]`  → 256 f32 = 1024 bytes
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub fn build_minimal_lora_gguf() -> Vec<u8> {
     build_gguf_v3(
         &[
@@ -1008,6 +1027,803 @@ pub fn build_minimal_lora_gguf() -> Vec<u8> {
             KvEntry::F32("lora.alpha", 8.0),
         ],
         LORA_TENSORS,
+    )
+}
+
+// ─── DeepSeek-V2 builder ──────────────────────────────────────────────────────
+
+/// Tensor catalogue for a minimal 1-layer DeepSeek-V2 model.
+///
+/// Dimensions (tiny but structurally valid):
+///
+/// | Hyper-parameter         | Value |
+/// |-------------------------|-------|
+/// | `hidden_size`           | 32    |
+/// | `num_heads`             | 2     |
+/// | `q_lora_rank`           | 8     |
+/// | `kv_lora_rank`          | 8     |
+/// | `qk_nope_head_dim`      | 4     |
+/// | `qk_rope_head_dim`      | 4     |
+/// | `v_head_dim`            | 4     |
+/// | `expert_count` (routed) | 2     |
+/// | `shared_experts`        | 1     |
+/// | `layers`                | 1     |
+/// | `vocab_size`            | 32    |
+const DEEPSEEK_TENSORS: &[TensorDesc] = &[
+    // Token embedding: [vocab=32, hidden=32]
+    TensorDesc {
+        name: "token_embd.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    // ── Layer 0: pre-attention norm ──
+    TensorDesc {
+        name: "blk.0.attn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    // ── Layer 0: MLA weights ──
+    // w_q_a: [q_lora_rank=8, hidden=32]
+    TensorDesc {
+        name: "blk.0.attn_q_a_proj.weight",
+        dims: &[32, 8],
+        n_elements: 256,
+    },
+    // q_a_norm: [q_lora_rank=8]
+    TensorDesc {
+        name: "blk.0.attn_q_a_norm.weight",
+        dims: &[8],
+        n_elements: 8,
+    },
+    // w_q_b: [q_full=2*(4+4)=16, q_lora_rank=8]
+    TensorDesc {
+        name: "blk.0.attn_q_b_proj.weight",
+        dims: &[8, 16],
+        n_elements: 128,
+    },
+    // w_kv_a: [kv_comb=8+4=12, hidden=32]
+    TensorDesc {
+        name: "blk.0.attn_kv_a_proj.weight",
+        dims: &[32, 12],
+        n_elements: 384,
+    },
+    // kv_a_norm: [kv_lora_rank=8]
+    TensorDesc {
+        name: "blk.0.attn_kv_a_norm.weight",
+        dims: &[8],
+        n_elements: 8,
+    },
+    // w_kv_b: [kv_b_full=2*(4+4)=16, kv_lora_rank=8]
+    TensorDesc {
+        name: "blk.0.attn_kv_b_proj.weight",
+        dims: &[8, 16],
+        n_elements: 128,
+    },
+    // w_o: [hidden=32, attn_out=2*4=8]
+    TensorDesc {
+        name: "blk.0.attn_output.weight",
+        dims: &[8, 32],
+        n_elements: 256,
+    },
+    // ── Layer 0: pre-FFN norm ──
+    TensorDesc {
+        name: "blk.0.ffn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    // ── Layer 0: Dense FFN (layer 0 is dense in DeepSeek-V2) ──
+    TensorDesc {
+        name: "blk.0.ffn_gate.weight",
+        dims: &[32, 64],
+        n_elements: 2048,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_up.weight",
+        dims: &[32, 64],
+        n_elements: 2048,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_down.weight",
+        dims: &[64, 32],
+        n_elements: 2048,
+    },
+    // ── Layer 0: Router (for completeness; dense layer, router unused) ──
+    // Router: [n_routed_experts=2, hidden=32]
+    TensorDesc {
+        name: "blk.0.ffn_gate_inp.weight",
+        dims: &[32, 2],
+        n_elements: 64,
+    },
+    // ── Layer 0: Routed expert 0 (2D layout) ──
+    TensorDesc {
+        name: "blk.0.ffn_exp.0.ffn_gate.weight",
+        dims: &[32, 64],
+        n_elements: 2048,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_exp.0.ffn_up.weight",
+        dims: &[32, 64],
+        n_elements: 2048,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_exp.0.ffn_down.weight",
+        dims: &[64, 32],
+        n_elements: 2048,
+    },
+    // ── Layer 0: Routed expert 1 ──
+    TensorDesc {
+        name: "blk.0.ffn_exp.1.ffn_gate.weight",
+        dims: &[32, 64],
+        n_elements: 2048,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_exp.1.ffn_up.weight",
+        dims: &[32, 64],
+        n_elements: 2048,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_exp.1.ffn_down.weight",
+        dims: &[64, 32],
+        n_elements: 2048,
+    },
+    // ── Layer 0: Shared expert 0 ──
+    TensorDesc {
+        name: "blk.0.ffn_shared_exp.0.ffn_gate.weight",
+        dims: &[32, 64],
+        n_elements: 2048,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_shared_exp.0.ffn_up.weight",
+        dims: &[32, 64],
+        n_elements: 2048,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_shared_exp.0.ffn_down.weight",
+        dims: &[64, 32],
+        n_elements: 2048,
+    },
+    // ── Output ──
+    TensorDesc {
+        name: "output_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "output.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+];
+
+/// Build a valid GGUF v3 binary for a minimal 1-layer DeepSeek-V2 model.
+///
+/// The binary includes all required MLA and MoE metadata keys prefixed with
+/// `deepseek2.*`. All tensors are F32 and zero-initialised.
+///
+/// The resulting bytes can be parsed with [`crate::GgufModel::from_bytes`]
+/// and verified to contain all expected tensor names.
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
+pub fn build_minimal_deepseek_gguf() -> Vec<u8> {
+    build_gguf_v3(
+        &[
+            // General
+            KvEntry::Str("general.architecture", "deepseek2"),
+            KvEntry::Str("general.name", "test-deepseek"),
+            // Base model hyperparameters
+            KvEntry::U32("deepseek2.embedding_length", 32),
+            KvEntry::U32("deepseek2.feed_forward_length", 64),
+            KvEntry::U32("deepseek2.block_count", 1),
+            KvEntry::U32("deepseek2.attention.head_count", 2),
+            KvEntry::U32("deepseek2.attention.head_count_kv", 2),
+            KvEntry::U32("deepseek2.context_length", 128),
+            KvEntry::U32("deepseek2.vocab_size", 32),
+            KvEntry::F32("deepseek2.rope.freq_base", 10000.0),
+            KvEntry::F32("deepseek2.attention.layer_norm_rms_epsilon", 1e-5),
+            // MLA hyperparameters
+            KvEntry::U32("deepseek2.attention.q_lora_rank", 8),
+            KvEntry::U32("deepseek2.attention.kv_lora_rank", 8),
+            KvEntry::U32("deepseek2.attention.key_length", 4),
+            KvEntry::U32("deepseek2.attention.rope_head_dim", 4),
+            KvEntry::U32("deepseek2.attention.value_length", 4),
+            // MoE hyperparameters
+            KvEntry::U32("deepseek2.expert_count", 2),
+            KvEntry::U32("deepseek2.expert_used_count", 1),
+            KvEntry::U32("deepseek2.expert_shared_count", 1),
+            KvEntry::U32("deepseek2.expert_shared_feed_forward_length", 64),
+            KvEntry::F32("deepseek2.expert_weights_scale", 1.0),
+            // Tokenizer stub
+            KvEntry::Str("tokenizer.ggml.model", "deepseek"),
+        ],
+        DEEPSEEK_TENSORS,
+    )
+}
+
+// ─── DBRX builder ────────────────────────────────────────────────────────────
+
+/// Tensor catalogue for a minimal 2-layer DBRX model.
+///
+/// Dimensions (small but structurally valid):
+/// - hidden=32, heads=2, kv_heads=2, head_dim=16, vocab=32
+/// - 4 MoE experts (small, not 16), top-2 from 4
+const DBRX_TENSORS: &[TensorDesc] = &[
+    TensorDesc {
+        name: "token_embd.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    // Layer 0
+    TensorDesc {
+        name: "blk.0.attn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "blk.0.attn_q.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.attn_k.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.attn_v.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.attn_output.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    // Router: [n_experts=4, hidden=32]
+    TensorDesc {
+        name: "blk.0.ffn_gate_inp.weight",
+        dims: &[32, 4],
+        n_elements: 128,
+    },
+    // Stacked gate exps: [n_experts=4, ffn_hidden=64, hidden=32]
+    TensorDesc {
+        name: "blk.0.ffn_gate_exps.weight",
+        dims: &[4, 64, 32],
+        n_elements: 8192,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_up_exps.weight",
+        dims: &[4, 64, 32],
+        n_elements: 8192,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_down_exps.weight",
+        dims: &[4, 32, 64],
+        n_elements: 8192,
+    },
+    // Layer 1
+    TensorDesc {
+        name: "blk.1.attn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "blk.1.attn_q.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.1.attn_k.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.1.attn_v.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.1.attn_output.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.1.ffn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "blk.1.ffn_gate_inp.weight",
+        dims: &[32, 4],
+        n_elements: 128,
+    },
+    TensorDesc {
+        name: "blk.1.ffn_gate_exps.weight",
+        dims: &[4, 64, 32],
+        n_elements: 8192,
+    },
+    TensorDesc {
+        name: "blk.1.ffn_up_exps.weight",
+        dims: &[4, 64, 32],
+        n_elements: 8192,
+    },
+    TensorDesc {
+        name: "blk.1.ffn_down_exps.weight",
+        dims: &[4, 32, 64],
+        n_elements: 8192,
+    },
+    // Output
+    TensorDesc {
+        name: "output_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "output.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+];
+
+/// Build a valid GGUF v3 binary for a minimal 2-layer DBRX model.
+///
+/// Uses 4 experts (not 16) for speed. The binary can be parsed with
+/// [`crate::GgufModel::from_bytes`] and will satisfy structural tensor checks.
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
+pub fn build_minimal_dbrx_gguf() -> Vec<u8> {
+    build_gguf_v3(
+        &[
+            KvEntry::Str("general.architecture", "dbrx"),
+            KvEntry::Str("general.name", "test-dbrx"),
+            KvEntry::U32("dbrx.embedding_length", 32),
+            KvEntry::U32("dbrx.feed_forward_length", 64),
+            KvEntry::U32("dbrx.block_count", 2),
+            KvEntry::U32("dbrx.attention.head_count", 2),
+            KvEntry::U32("dbrx.attention.head_count_kv", 2),
+            KvEntry::U32("dbrx.context_length", 128),
+            KvEntry::U32("dbrx.vocab_size", 32),
+            KvEntry::F32("dbrx.rope.freq_base", 10000.0),
+            KvEntry::U32("dbrx.expert_count", 4),
+            KvEntry::U32("dbrx.expert_used_count", 2),
+            KvEntry::Str("tokenizer.ggml.model", "dbrx"),
+        ],
+        DBRX_TENSORS,
+    )
+}
+
+// ─── Grok builder ─────────────────────────────────────────────────────────────
+
+/// Tensor catalogue for a minimal 2-layer Grok-1 model.
+///
+/// Uses 2 experts (top-2 from 2) for speed. Real Grok-1 has 8 experts.
+const GROK_TENSORS: &[TensorDesc] = &[
+    TensorDesc {
+        name: "token_embd.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    // Layer 0
+    TensorDesc {
+        name: "blk.0.attn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "blk.0.attn_q.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.attn_k.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.attn_v.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.attn_output.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    // Router: [n_experts=2, hidden=32]
+    TensorDesc {
+        name: "blk.0.ffn_gate_inp.weight",
+        dims: &[32, 2],
+        n_elements: 64,
+    },
+    // Stacked expert tensors: [n_experts=2, ffn_hidden=64, hidden=32]
+    TensorDesc {
+        name: "blk.0.ffn_gate_exps.weight",
+        dims: &[2, 64, 32],
+        n_elements: 4096,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_up_exps.weight",
+        dims: &[2, 64, 32],
+        n_elements: 4096,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_down_exps.weight",
+        dims: &[2, 32, 64],
+        n_elements: 4096,
+    },
+    // Layer 1
+    TensorDesc {
+        name: "blk.1.attn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "blk.1.attn_q.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.1.attn_k.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.1.attn_v.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.1.attn_output.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.1.ffn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "blk.1.ffn_gate_inp.weight",
+        dims: &[32, 2],
+        n_elements: 64,
+    },
+    TensorDesc {
+        name: "blk.1.ffn_gate_exps.weight",
+        dims: &[2, 64, 32],
+        n_elements: 4096,
+    },
+    TensorDesc {
+        name: "blk.1.ffn_up_exps.weight",
+        dims: &[2, 64, 32],
+        n_elements: 4096,
+    },
+    TensorDesc {
+        name: "blk.1.ffn_down_exps.weight",
+        dims: &[2, 32, 64],
+        n_elements: 4096,
+    },
+    // Output
+    TensorDesc {
+        name: "output_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "output.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+];
+
+/// Build a valid GGUF v3 binary for a minimal 2-layer Grok-1 model.
+///
+/// Uses 2 experts for speed. The Grok-1 rope_theta of 1_000_000 is encoded.
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
+pub fn build_minimal_grok_gguf() -> Vec<u8> {
+    build_gguf_v3(
+        &[
+            KvEntry::Str("general.architecture", "grok"),
+            KvEntry::Str("general.name", "test-grok"),
+            KvEntry::U32("grok.embedding_length", 32),
+            KvEntry::U32("grok.feed_forward_length", 64),
+            KvEntry::U32("grok.block_count", 2),
+            KvEntry::U32("grok.attention.head_count", 2),
+            KvEntry::U32("grok.attention.head_count_kv", 2),
+            KvEntry::U32("grok.context_length", 128),
+            KvEntry::U32("grok.vocab_size", 32),
+            KvEntry::F32("grok.rope.freq_base", 1_000_000.0),
+            KvEntry::U32("grok.expert_count", 2),
+            KvEntry::U32("grok.expert_used_count", 2),
+            KvEntry::Str("tokenizer.ggml.model", "grok"),
+        ],
+        GROK_TENSORS,
+    )
+}
+
+// ─── DeepSeek-V3 builder ──────────────────────────────────────────────────────
+
+/// Build a valid GGUF v3 binary for a minimal 1-layer DeepSeek-V3 model
+/// (same as V2 but adds `exp_probs_b.weight` tensor for sigmoid+bias routing).
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
+pub fn build_minimal_deepseek_v3_gguf() -> Vec<u8> {
+    // Re-use the same tensor layout as V2 but append the exp_probs_b tensor.
+    // exp_probs_b: [n_routed_experts=2] — one bias per routed expert.
+    const DEEPSEEK_V3_TENSORS: &[TensorDesc] = &[
+        TensorDesc {
+            name: "token_embd.weight",
+            dims: &[32, 32],
+            n_elements: 1024,
+        },
+        TensorDesc {
+            name: "blk.0.attn_norm.weight",
+            dims: &[32],
+            n_elements: 32,
+        },
+        TensorDesc {
+            name: "blk.0.attn_q_a_proj.weight",
+            dims: &[32, 8],
+            n_elements: 256,
+        },
+        TensorDesc {
+            name: "blk.0.attn_q_a_norm.weight",
+            dims: &[8],
+            n_elements: 8,
+        },
+        TensorDesc {
+            name: "blk.0.attn_q_b_proj.weight",
+            dims: &[8, 16],
+            n_elements: 128,
+        },
+        TensorDesc {
+            name: "blk.0.attn_kv_a_proj.weight",
+            dims: &[32, 12],
+            n_elements: 384,
+        },
+        TensorDesc {
+            name: "blk.0.attn_kv_a_norm.weight",
+            dims: &[8],
+            n_elements: 8,
+        },
+        TensorDesc {
+            name: "blk.0.attn_kv_b_proj.weight",
+            dims: &[8, 16],
+            n_elements: 128,
+        },
+        TensorDesc {
+            name: "blk.0.attn_output.weight",
+            dims: &[8, 32],
+            n_elements: 256,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_norm.weight",
+            dims: &[32],
+            n_elements: 32,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_gate.weight",
+            dims: &[32, 64],
+            n_elements: 2048,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_up.weight",
+            dims: &[32, 64],
+            n_elements: 2048,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_down.weight",
+            dims: &[64, 32],
+            n_elements: 2048,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_gate_inp.weight",
+            dims: &[32, 2],
+            n_elements: 64,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_exp.0.ffn_gate.weight",
+            dims: &[32, 64],
+            n_elements: 2048,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_exp.0.ffn_up.weight",
+            dims: &[32, 64],
+            n_elements: 2048,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_exp.0.ffn_down.weight",
+            dims: &[64, 32],
+            n_elements: 2048,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_exp.1.ffn_gate.weight",
+            dims: &[32, 64],
+            n_elements: 2048,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_exp.1.ffn_up.weight",
+            dims: &[32, 64],
+            n_elements: 2048,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_exp.1.ffn_down.weight",
+            dims: &[64, 32],
+            n_elements: 2048,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_shared_exp.0.ffn_gate.weight",
+            dims: &[32, 64],
+            n_elements: 2048,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_shared_exp.0.ffn_up.weight",
+            dims: &[32, 64],
+            n_elements: 2048,
+        },
+        TensorDesc {
+            name: "blk.0.ffn_shared_exp.0.ffn_down.weight",
+            dims: &[64, 32],
+            n_elements: 2048,
+        },
+        // Per-expert bias for sigmoid+bias routing: [n_routed_experts=2]
+        TensorDesc {
+            name: "blk.0.exp_probs_b.weight",
+            dims: &[2],
+            n_elements: 2,
+        },
+        TensorDesc {
+            name: "output_norm.weight",
+            dims: &[32],
+            n_elements: 32,
+        },
+        TensorDesc {
+            name: "output.weight",
+            dims: &[32, 32],
+            n_elements: 1024,
+        },
+    ];
+
+    build_gguf_v3(
+        &[
+            KvEntry::Str("general.architecture", "deepseek2"),
+            KvEntry::Str("general.name", "test-deepseek-v3"),
+            KvEntry::U32("deepseek2.embedding_length", 32),
+            KvEntry::U32("deepseek2.feed_forward_length", 64),
+            KvEntry::U32("deepseek2.block_count", 1),
+            KvEntry::U32("deepseek2.attention.head_count", 2),
+            KvEntry::U32("deepseek2.attention.head_count_kv", 2),
+            KvEntry::U32("deepseek2.context_length", 128),
+            KvEntry::U32("deepseek2.vocab_size", 32),
+            KvEntry::F32("deepseek2.rope.freq_base", 10000.0),
+            KvEntry::F32("deepseek2.attention.layer_norm_rms_epsilon", 1e-5),
+            KvEntry::U32("deepseek2.attention.q_lora_rank", 8),
+            KvEntry::U32("deepseek2.attention.kv_lora_rank", 8),
+            KvEntry::U32("deepseek2.attention.key_length", 4),
+            KvEntry::U32("deepseek2.attention.rope_head_dim", 4),
+            KvEntry::U32("deepseek2.attention.value_length", 4),
+            KvEntry::U32("deepseek2.expert_count", 2),
+            KvEntry::U32("deepseek2.expert_used_count", 1),
+            KvEntry::U32("deepseek2.expert_shared_count", 1),
+            KvEntry::U32("deepseek2.expert_shared_feed_forward_length", 64),
+            // Non-unit expert_weights_scale triggers SigmoidWithBias auto-detection.
+            KvEntry::F32("deepseek2.expert_weights_scale", 2.5),
+            KvEntry::Str("tokenizer.ggml.model", "deepseek"),
+        ],
+        DEEPSEEK_V3_TENSORS,
+    )
+}
+
+// ─── Mamba-2 builder ──────────────────────────────────────────────────────────
+
+/// Tensor catalogue for a minimal 1-layer Mamba-2 model.
+///
+/// Dimensions:
+/// - d_model=16, d_state=8, d_inner=16 (expand=1), d_conv=4, n_layer=1, vocab=256
+const MAMBA2_TENSORS: &[TensorDesc] = &[
+    // Token embedding: [vocab=256, d_model=16]
+    TensorDesc {
+        name: "token_embd.weight",
+        dims: &[16, 256],
+        n_elements: 4096,
+    },
+    // Layer 0: norm
+    TensorDesc {
+        name: "blk.0.attn_norm.weight",
+        dims: &[16],
+        n_elements: 16,
+    },
+    // Combined gate+input projection: [2*d_inner=32, d_model=16]
+    TensorDesc {
+        name: "blk.0.ssm_in.weight",
+        dims: &[16, 32],
+        n_elements: 512,
+    },
+    // Depthwise conv: [d_inner=16, d_conv=4]
+    TensorDesc {
+        name: "blk.0.ssm_conv1d.weight",
+        dims: &[4, 16],
+        n_elements: 64,
+    },
+    TensorDesc {
+        name: "blk.0.ssm_conv1d.bias",
+        dims: &[16],
+        n_elements: 16,
+    },
+    // B projection: [d_state=8, d_inner=16]
+    TensorDesc {
+        name: "blk.0.ssm_x.weight",
+        dims: &[16, 8],
+        n_elements: 128,
+    },
+    // C projection: [d_state=8, d_inner=16] (separate for clarity)
+    // Δ projection: [d_inner=16, d_inner=16]
+    TensorDesc {
+        name: "blk.0.ssm_dt.weight",
+        dims: &[16, 16],
+        n_elements: 256,
+    },
+    TensorDesc {
+        name: "blk.0.ssm_dt.bias",
+        dims: &[16],
+        n_elements: 16,
+    },
+    // Log-A: [d_state=8, d_inner=16]
+    TensorDesc {
+        name: "blk.0.ssm_A",
+        dims: &[16, 8],
+        n_elements: 128,
+    },
+    // D (skip): [d_inner=16]
+    TensorDesc {
+        name: "blk.0.ssm_D",
+        dims: &[16],
+        n_elements: 16,
+    },
+    // Output projection: [d_model=16, d_inner=16]
+    TensorDesc {
+        name: "blk.0.ssm_out.weight",
+        dims: &[16, 16],
+        n_elements: 256,
+    },
+    // Output head
+    TensorDesc {
+        name: "output_norm.weight",
+        dims: &[16],
+        n_elements: 16,
+    },
+    TensorDesc {
+        name: "output.weight",
+        dims: &[16, 256],
+        n_elements: 4096,
+    },
+];
+
+/// Build a valid GGUF v3 binary for a minimal 1-layer Mamba-2 model.
+///
+/// d_model=16, d_state=8, d_inner=16, d_conv=4, n_layer=1, vocab=256.
+/// All weights are F32, zero-initialised.
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
+pub fn build_minimal_mamba2_gguf() -> Vec<u8> {
+    build_gguf_v3(
+        &[
+            KvEntry::Str("general.architecture", "mamba2"),
+            KvEntry::Str("general.name", "test-mamba2"),
+            KvEntry::U32("mamba2.d_model", 16),
+            KvEntry::U32("mamba2.n_layer", 1),
+            KvEntry::U32("mamba2.d_state", 8),
+            KvEntry::U32("mamba2.d_conv", 4),
+            KvEntry::U32("mamba2.expand", 1),
+            KvEntry::U32("mamba2.vocab_size", 256),
+            KvEntry::U32("mamba2.context_length", 512),
+            KvEntry::Str("tokenizer.ggml.model", "mamba2"),
+        ],
+        MAMBA2_TENSORS,
     )
 }
 

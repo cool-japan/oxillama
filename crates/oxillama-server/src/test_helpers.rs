@@ -118,6 +118,22 @@ pub async fn build_live_test_app() -> axum::Router {
     build_app(state)
 }
 
+/// Build an `Arc<AppState>` with a pool, useful for admin route tests.
+///
+/// Like `build_test_app` but returns the `Arc<AppState>` rather than a
+/// `Router`, so that admin test helpers can inject custom routers with the
+/// state.
+pub async fn build_test_app_with_pool() -> std::sync::Arc<AppState> {
+    let (tx, _rx) = tokio::sync::mpsc::channel::<BatchRequest>(1);
+    std::sync::Arc::new(AppState::new(
+        tx,
+        "test-model".to_string(),
+        SamplerConfig::default(),
+        None,
+        0,
+    ))
+}
+
 /// GET `uri` on the given `app` and return `(StatusCode, Value)`.
 pub async fn get(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     let response = app

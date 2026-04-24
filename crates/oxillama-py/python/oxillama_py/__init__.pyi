@@ -6,6 +6,11 @@ Generated for PyO3 bindings exposed by OxiLLaMa.
 from typing import Callable, Optional, Sequence
 
 try:
+    from typing import Protocol, runtime_checkable
+except ImportError:
+    from typing_extensions import Protocol, runtime_checkable  # type: ignore[assignment]
+
+try:
     import numpy as np
     import numpy.typing as npt
     _HAS_NUMPY = True
@@ -15,6 +20,19 @@ except ImportError:
 __version__: str
 
 __all__: list[str]
+
+# ---------------------------------------------------------------------------
+# StreamingCallback Protocol
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class StreamingCallback(Protocol):
+    """Protocol for streaming token callbacks."""
+
+    def __call__(self, token: str, token_id: int, is_final: bool) -> None: ...
+
+#: Convenience alias for a bare callable matching the streaming callback signature.
+TokenCallback = Callable[[str, int, bool], None]
 
 # ---------------------------------------------------------------------------
 # Exception hierarchy
@@ -42,6 +60,10 @@ class GrammarError(OxiLlamaError):
 
 class QuantError(OxiLlamaError):
     """Quantization kernel errors."""
+    ...
+
+class KvCacheFullError(OxiLlamaError):
+    """KV cache capacity exceeded during generation."""
     ...
 
 # ---------------------------------------------------------------------------
@@ -145,11 +167,22 @@ class Engine:
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         seed: Optional[int] = None,
+        strict_callback: bool = False,
     ) -> str: ...
     def embed(self, text: str) -> list[float]: ...
     def embed_numpy(self, text: str) -> "np.ndarray[tuple[int], np.dtype[np.float32]]": ...
     def embed_batch_numpy(self, texts: Sequence[str]) -> "np.ndarray[tuple[int, int], np.dtype[np.float32]]": ...
     def apply_lora(self, lora_path: str) -> None: ...
+    @classmethod
+    def from_hub(
+        cls,
+        repo_id: str,
+        *,
+        filename: Optional[str] = None,
+        revision: Optional[str] = None,
+        token: Optional[str] = None,
+        config: Optional[EngineConfig] = None,
+    ) -> Engine: ...
 
 # ---------------------------------------------------------------------------
 # SpeculativeConfig
@@ -201,10 +234,17 @@ class Tokenizer:
     @staticmethod
     def from_json(json: str) -> Tokenizer: ...
     def encode(self, text: str) -> list[int]: ...
+    def encode_batch(self, texts: list[str]) -> list[list[int]]: ...
     def decode(self, ids: list[int]) -> str: ...
     @property
     def vocab_size(self) -> int: ...
     def id_to_token(self, id: int) -> Optional[str]: ...
+    def apply_chat_template(
+        self,
+        messages: list[dict],
+        template: Optional[str] = None,
+        add_generation_prompt: bool = True,
+    ) -> str: ...
     def __repr__(self) -> str: ...
 
 # ---------------------------------------------------------------------------

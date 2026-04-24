@@ -17,7 +17,7 @@ OxiLLaMa is a Pure Rust reimplementation of [llama.cpp](https://github.com/ggml-
 
 - **Pure Rust:** Zero C/C++/Fortran. Zero FFI. Zero system library dependencies.
 - **Full GGUF:** All mainstream quantization formats (Q4_0 through Q8_0, K-quants, I-quants, Q1_0_G128).
-- **Multi-Architecture:** LLaMA, Qwen3, Mistral, Gemma, Phi, Command-R, StarCoder, LLaVA — extensible via trait-based plugins.
+- **Multi-Architecture:** 20 architectures: LLaMA, Qwen3, Mistral, Gemma, Phi, Command-R, StarCoder, Falcon, DeepSeek-V2/V3, DBRX, Grok-1, Mamba-2, Jamba, OLMo2, Yi, Granite, LLaVA, MiniCPM, InternLM3, Mixtral — extensible via trait-based plugins.
 - **Production-Grade:** Enterprise observability, graceful error recovery, configuration management.
 - **Cross-Platform:** x86-64, ARM64, WASM, RISC-V — identical behavior everywhere.
 
@@ -40,7 +40,16 @@ OxiLLaMa is a Pure Rust reimplementation of [llama.cpp](https://github.com/ggml-
 │  │   Map    │  │ • Phi       │  └──────────────────┘   │
 │  │          │  │ • Command-R │                          │
 │  │          │  │ • StarCoder │                          │
+│  │          │  │ • Falcon    │                          │
+│  │          │  │ • DeepSeek  │                          │
+│  │          │  │ • DBRX      │                          │
+│  │          │  │ • Grok-1    │                          │
+│  │          │  │ • Mamba-2   │                          │
+│  │          │  │ • OLMo2     │                          │
+│  │          │  │ • Yi/Granite│                          │
 │  │          │  │ • LLaVA     │                          │
+│  │          │  │ • Jamba     │                          │
+│  │          │  │ +4 more     │                          │
 │  └──────────┘  └──────────────┘                          │
 │                                                          │
 │  ┌──────────────────────────────────────────────────┐    │
@@ -65,7 +74,7 @@ OxiLLaMa is a Pure Rust reimplementation of [llama.cpp](https://github.com/ggml-
 | [`oxillama`](crates/oxillama) | Meta crate — unified re-export of all subcrates | ~10 |
 | [`oxillama-gguf`](crates/oxillama-gguf) | GGUF v3 parser and tensor loader | ~3,100 |
 | [`oxillama-quant`](crates/oxillama-quant) | Quantization kernels (25 formats, SIMD) | ~20,500 |
-| [`oxillama-arch`](crates/oxillama-arch) | Model architectures (8 models) | ~7,500 |
+| [`oxillama-arch`](crates/oxillama-arch) | Model architectures (20 architectures) | ~7,500 |
 | [`oxillama-runtime`](crates/oxillama-runtime) | Inference engine, KV cache, sampling | ~5,400 |
 | [`oxillama-server`](crates/oxillama-server) | OpenAI-compatible HTTP API server | ~1,500 |
 | [`oxillama-bench`](crates/oxillama-bench) | Benchmark suite | ~640 |
@@ -74,7 +83,7 @@ OxiLLaMa is a Pure Rust reimplementation of [llama.cpp](https://github.com/ggml-
 | [`oxillama-wasm`](crates/oxillama-wasm) | WebAssembly bindings | ~150 |
 | [`oxillama-cli`](crates/oxillama-cli) | CLI binary (`cargo install oxillama-cli`) | ~430 |
 
-**Total: ~56,200 lines of Pure Rust across 11 crates** (as of v0.1.0)
+**Total: ~87,400 lines of Pure Rust across 11 crates** (as of v0.1.1, 1,898 tests passing)
 
 ---
 
@@ -126,17 +135,46 @@ oxillama info --model path/to/model.gguf
 | `phi` | Phi-3/4 | Alpha |
 | `command-r` | Command-R/R+ | Alpha |
 | `starcoder` | StarCoder (GPT-BigCode) | Alpha |
+| `falcon` | Falcon 7B/40B/180B | Alpha |
+| `deepseek-v2` | DeepSeek-V2/V3 (MLA, sigmoid MoE scoring) | Alpha |
+| `dbrx` | DBRX (16-expert MoE, top-4) | Alpha |
+| `grok-1` | Grok-1 (8-expert MoE, top-2) | Alpha |
+| `mamba-2` | Mamba-2 (selective scan, learned Δ) | Alpha |
+| `olmo2` | OLMo2 | Alpha |
+| `yi` | Yi | Alpha |
+| `granite` | Granite 3.x | Alpha |
 | `llava` | LLaVA-1.5 (multimodal vision) | Alpha |
+| `minicpm` | MiniCPM | Alpha |
+| `internlm3` | InternLM3 | Alpha |
+| `jamba` | Jamba (hybrid attention + SSM) | Alpha |
+| `mixtral` | Mixtral (sparse MoE) | Alpha |
 
 ## Supported Quantization Types
 
 | Category | Types | Status |
 |----------|-------|--------|
 | Legacy | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1 | Alpha |
-| K-Quants | Q2_K, Q3_K, Q4_K, Q5_K, Q6_K | Alpha |
-| I-Quants | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL | Alpha |
+| K-Quants | Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q6_K_S, Q8_K | Alpha |
+| I-Quants | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ2_M, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL | Alpha |
+| Ternary | TQ1_0, TQ2_0 | Alpha |
 | 1-Bit | Q1_0_G128 | Alpha |
 | Float | F16, BF16, F32 | Alpha |
+
+---
+
+## What's New in v0.1.1 (2026-04-24)
+
+- **FlashAttention tiled CPU kernel** — BQ=BK=64 blocking, online softmax, rayon per-head parallelism; removes the full N×N attention matrix allocation.
+- **True continuous batching** — per-request KV slot allocation, `BatchedKvView` trait; enables heterogeneous request lengths with zero padding waste.
+- **Fused dequant+GEMM** — Q4_0 and Q4_K AVX2 + NEON paths skip the scratch buffer entirely; measured ~12% throughput gain on Q4_K_M decode.
+- **oxiblas float GEMM fallback** — F16/BF16/F32 tensor paths now route through OxiBLAS GEMM rather than naive loops.
+- **Tiled GEMM WGSL shader** — TILE_M/N=32, TILE_K=16, shared memory cooperative load; replaces naive GPU matmul for prefill workloads.
+- **Fused attention WGSL kernel** — QK + softmax + AV in a single GPU dispatch, eliminating intermediate buffer round-trips.
+- **4 new GPU GEMV kernels** — IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S quant GEMV on wgpu; GPU now covers 10 quantization types.
+- **5 new architectures** — DBRX (16-expert MoE, top-4), Grok-1 (8-expert MoE, top-2), DeepSeek-V3 sigmoid-with-bias MoE scoring, Mamba-2 (selective scan, learned Δ), plus OLMo2, Yi, Granite, MiniCPM, InternLM3.
+- **SequenceState trait** — arch-internal SSM abstraction that generalises the KV cache slot interface to state-space models.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full diff.
 
 ---
 
@@ -198,4 +236,4 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for detai
 
 ---
 
-*Copyright 2026 COOLJAPAN OU (Team KitaSan). All rights reserved.*
+*Copyright 2026 COOLJAPAN OU (Team KitaSan). All rights reserved. — OxiLLaMa v0.1.1 (2026-04-24)*

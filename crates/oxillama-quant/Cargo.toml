@@ -23,10 +23,15 @@ oxillama-gguf.workspace = true
 half.workspace = true
 thiserror.workspace = true
 rayon = { workspace = true, optional = true }
+oxiblas = { workspace = true, features = ["f16"] }
 
 [dev-dependencies]
 criterion.workspace = true
 
 [[bench]]
 name = "quant_kernels"
+harness = false
+
+[[bench]]
+name = "quant_shapes"
 harness = false

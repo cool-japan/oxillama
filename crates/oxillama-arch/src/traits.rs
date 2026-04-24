@@ -4,9 +4,10 @@
 //! [`ModelArchitecture`] to register itself, and [`ForwardPass`]
 //! for the actual inference computation.
 
+use crate::common::sequence_state::{AttentionSequenceState, SequenceState};
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
-use crate::lora::LoadedLora;
+use crate::lora::{LoadedLora, LoraStack};
 use oxillama_gguf::TensorStore;
 
 /// Pattern for matching expected tensor names in a model file.
@@ -44,6 +45,14 @@ pub trait ModelArchitecture: Send + Sync {
     ///
     /// Used for validation and diagnostics when loading a model file.
     fn tensor_names(&self) -> Vec<TensorNamePattern>;
+
+    /// Returns the sliding-window attention configuration for this model.
+    ///
+    /// Returns `Some((window_size, is_interleaved))` when the architecture
+    /// uses SWA on at least some layers, or `None` for pure global attention.
+    fn swa_config(&self) -> Option<(u32, bool)> {
+        None
+    }
 }
 
 /// Trait for running forward passes through a loaded model.
@@ -100,6 +109,55 @@ pub trait ForwardPass: Send + Sync {
     fn apply_lora(&mut self, lora: &LoadedLora) -> ArchResult<()> {
         let _ = lora;
         Ok(())
+    }
+
+    /// Apply an ordered stack of LoRA adapters.
+    ///
+    /// Default implementation: applies each adapter in the stack in order via
+    /// [`apply_lora`](Self::apply_lora), ignoring per-entry scale multipliers.
+    /// Override for architectures that support scaled stacking.
+    fn apply_lora_stack(&mut self, stack: &LoraStack) -> ArchResult<()> {
+        for (lora, _scale) in stack.entries() {
+            self.apply_lora(lora)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the sliding-window attention configuration for this loaded model.
+    ///
+    /// Returns `Some((window_size, is_interleaved))` when the model uses SWA
+    /// on at least some layers, or `None` for pure global attention.
+    fn swa_config(&self) -> Option<(u32, bool)> {
+        None
+    }
+
+    /// Set a persistent LoRA adapter stack that applies to all subsequent
+    /// `forward()` calls.
+    ///
+    /// Default implementation is a no-op — architectures that do not support
+    /// LoRA stacking silently ignore the call (compatible with the existing
+    /// `apply_lora_stack` interface).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArchError::LoraIncompatible`] if the adapter's rank or
+    /// dimensions are incompatible with this model.
+    fn with_lora_stack(&mut self, _stack: LoraStack) -> ArchResult<()> {
+        Ok(())
+    }
+
+    /// Allocate a fresh per-sequence state object for this model.
+    ///
+    /// The runtime calls this once per pool slot at model load time.
+    /// Default implementation returns an [`AttentionSequenceState`] suitable
+    /// for all KV-cache-based architectures.
+    ///
+    /// SSM and hybrid architectures **must** override this to return the
+    /// correct state type (e.g. [`Mamba2SequenceState`] or `JambaSequenceState`).
+    ///
+    /// [`Mamba2SequenceState`]: crate::common::sequence_state::Mamba2SequenceState
+    fn allocate_sequence_state(&self, max_context_length: usize) -> Box<dyn SequenceState> {
+        Box::new(AttentionSequenceState::new(max_context_length))
     }
 }
 

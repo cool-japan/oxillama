@@ -297,6 +297,62 @@ impl QuantKernel for Q4_0Neon {
         Ok(())
     }
 
+    /// Fused Q4_0 weight × Q8_0 activation GEMV using NEON intrinsics.
+    ///
+    /// Computes `out[row] += Σ_block (q4_0_weight · q8_0_act)` with ACCUMULATE semantics.
+    ///
+    /// Activation blocks (Q8_0) are 34 bytes each: 2-byte FP16 scale + 32 i8 values.
+    /// Weight blocks (Q4_0) are 18 bytes each: 2-byte FP16 scale + 16 nibble bytes.
+    /// One weight block maps 1-to-1 to one Q8_0 activation block.
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let acts_needed = blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            // SAFETY: all bounds checked above; AArch64 always has NEON.
+            let row_sum = unsafe {
+                fused_q4_0_q8_0_row_neon(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            *out_val += row_sum; // ACCUMULATE
+        }
+
+        Ok(())
+    }
+
     fn block_size(&self) -> usize {
         BLOCK_SIZE
     }
@@ -310,10 +366,126 @@ impl QuantKernel for Q4_0Neon {
     }
 }
 
+/// Q8_0 block constants for the fused GEMV.
+const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Compute fused Q4_0 weight × Q8_0 activation dot product for one row using NEON.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * Q8_0_BLOCK_BYTES`
+/// - Must be called on AArch64 with NEON
+unsafe fn fused_q4_0_q8_0_row_neon(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    let mut row_sum = 0.0f32;
+
+    for blk in 0..blocks_per_row {
+        // Weight block.
+        let w_off = blk * BLOCK_BYTES;
+        // SAFETY: row_data.len() == blocks_per_row * BLOCK_BYTES; blk < blocks_per_row.
+        let w_block = &row_data[w_off..w_off + BLOCK_BYTES];
+        let d_w = f16_to_f32(u16::from_le_bytes([w_block[0], w_block[1]]));
+
+        // Q8_0 activation block (1:1 with weight block).
+        let a_off = blk * Q8_0_BLOCK_BYTES;
+        // SAFETY: acts_q8.len() >= blocks_per_row * Q8_0_BLOCK_BYTES.
+        let a_block = &acts_q8[a_off..a_off + Q8_0_BLOCK_BYTES];
+        let d_a = f16_to_f32(u16::from_le_bytes([a_block[0], a_block[1]]));
+        let scale = d_w * d_a;
+
+        let input_offset = blk * BLOCK_SIZE;
+        let remaining = n_cols.saturating_sub(input_offset);
+
+        if remaining >= BLOCK_SIZE {
+            // Fast path: full block. Use NEON to compute Σ (q4_w × q8_a).
+            // SAFETY: w_block has 18 bytes; nibbles at [2..18] = 16 bytes. a_block has 34 bytes; q8 at [2..34] = 32 i8s.
+            let nibble_ptr = w_block.as_ptr().add(2);
+            let q8_ptr = a_block.as_ptr().add(2) as *const i8;
+
+            // Load 16 nibble bytes.
+            // SAFETY: nibble_ptr points to 16 valid bytes.
+            let raw = unsafe { vld1q_u8(nibble_ptr) };
+            let mask = unsafe { vdupq_n_u8(0x0F) };
+            // SAFETY: bitwise ops on NEON registers.
+            let lo = unsafe { vandq_u8(raw, mask) };
+            let hi = unsafe { vshrq_n_u8::<4>(raw) };
+
+            // Subtract 8 from nibbles → signed weights in [-8, 7].
+            let offset_u8 = unsafe { vdupq_n_u8(8) };
+            // Reinterpret as i8 and subtract 8 (unsigned subtract keeps values).
+            // Use vreinterpretq_s8_u8 then vsubq_s8 with constant.
+            let offset_s8 = unsafe { vdupq_n_s8(8) };
+            let lo_s8 = unsafe { vsubq_s8(vreinterpretq_s8_u8(lo), offset_s8) };
+            let hi_s8 = unsafe { vsubq_s8(vreinterpretq_s8_u8(hi), offset_s8) };
+
+            // Load Q8_0 activation bytes (32 i8s = two int8x16_t).
+            // SAFETY: q8_ptr points to 32 valid i8 values.
+            let qa_lo = unsafe { vld1q_s8(q8_ptr) };
+            let qa_hi = unsafe { vld1q_s8(q8_ptr.add(16)) };
+
+            // Q4 nibbles interleave: byte i → lo nibble = weight 2i, hi nibble = weight 2i+1.
+            // Q8 activations are sequential: index 0,1,2,3,...,31.
+            // So lo_s8[0..16] pairs with qa[0,2,4,...,30] and hi_s8[0..16] pairs with qa[1,3,5,...,31].
+            // We need to deinterleave qa into even and odd lanes.
+
+            // Deinterleave: even (qa[0,2,4,...]) and odd (qa[1,3,5,...]).
+            // SAFETY: vuzp1q_s8 / vuzp2q_s8 are always valid on AArch64.
+            let qa_even = unsafe { vuzp1q_s8(qa_lo, qa_hi) }; // qa[0,2,4,...,30]
+            let qa_odd = unsafe { vuzp2q_s8(qa_lo, qa_hi) }; // qa[1,3,5,...,31]
+
+            // Multiply lo nibble weights × even activations.
+            // SAFETY: vmull_s8 / vmlal_s8 are always valid on AArch64.
+            let mut acc_lo = unsafe { vmull_s8(vget_low_s8(lo_s8), vget_low_s8(qa_even)) };
+            acc_lo = unsafe { vmlal_s8(acc_lo, vget_high_s8(lo_s8), vget_high_s8(qa_even)) };
+
+            // Multiply hi nibble weights × odd activations.
+            // SAFETY: vmull_s8 / vmlal_s8 are always valid on AArch64.
+            let mut acc_hi = unsafe { vmull_s8(vget_low_s8(hi_s8), vget_low_s8(qa_odd)) };
+            acc_hi = unsafe { vmlal_s8(acc_hi, vget_high_s8(hi_s8), vget_high_s8(qa_odd)) };
+
+            // acc_lo + acc_hi is now a int16x8_t. Widen to i32 and sum.
+            let combined = unsafe { vaddq_s16(acc_lo, acc_hi) };
+            // SAFETY: vpaddlq_s16 / vaddvq_s32 are always valid on AArch64.
+            let i32_sum = unsafe { vpaddlq_s16(combined) };
+            let dot: i32 = unsafe { vaddvq_s32(i32_sum) };
+
+            row_sum += scale * dot as f32;
+
+            let _ = offset_u8; // suppress unused warning
+        } else if remaining > 0 {
+            // Scalar tail path.
+            let q8_bytes = &a_block[2..];
+            let valid = remaining;
+
+            for i in 0..(valid / 2) {
+                let byte = w_block[2 + i];
+                let q_lo = (byte & 0x0F) as i32 - 8;
+                let q_hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                let a_lo = q8_bytes[i * 2] as i8 as i32;
+                let a_hi = q8_bytes[i * 2 + 1] as i8 as i32;
+                row_sum += scale * (q_lo * a_lo + q_hi * a_hi) as f32;
+            }
+            if valid % 2 == 1 {
+                let i = valid / 2;
+                let byte = w_block[2 + i];
+                let q_lo = (byte & 0x0F) as i32 - 8;
+                let a_lo = q8_bytes[i * 2] as i8 as i32;
+                row_sum += scale * (q_lo * a_lo) as f32;
+            }
+        }
+    }
+
+    row_sum
+}
+
 #[cfg(all(test, feature = "simd-neon", target_arch = "aarch64"))]
 mod tests {
     use super::*;
-    use crate::reference::q4_0::Q4_0Ref;
+    use crate::reference::q4_0::{matvec_q8_fused_reference, Q4_0Ref};
     use crate::traits::QuantKernel;
     use crate::types::QuantTensor;
 
@@ -543,6 +715,111 @@ mod tests {
             out_neon[0],
             out_ref[0],
             err
+        );
+    }
+
+    // ── matvec_q8_fused ───────────────────────────────────────────────────
+
+    fn make_q8_0_block(scale: f32, qs: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(34);
+        let d_bits = half::f16::from_f32(scale).to_bits();
+        block.extend_from_slice(&d_bits.to_le_bytes());
+        for &q in qs {
+            block.push(q as u8);
+        }
+        block
+    }
+
+    #[test]
+    fn neon_fused_matches_reference_single_block() {
+        // Single row, single block: NEON fused must match scalar oracle.
+        let nibbles = fixed_nibbles();
+        let w_block = make_block(0.25, &nibbles);
+        let q8_vals: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, -1, 2, -3, 4, -5, 6, -7,
+            8, -9, 10, -11, 12, -13, 14, -15, 16,
+        ];
+        let a_block = make_q8_0_block(0.5, &q8_vals);
+
+        let mut out_neon = vec![0.0f32; 1];
+        let mut out_ref = vec![0.0f32; 1];
+
+        Q4_0Neon
+            .matvec_q8_fused(&w_block, &a_block, &mut out_neon, 1, 32)
+            .expect("neon fused");
+        matvec_q8_fused_reference(&w_block, &a_block, &mut out_ref, 1, 32).expect("ref fused");
+
+        let err = (out_neon[0] - out_ref[0]).abs();
+        assert!(
+            err < 1e-3,
+            "neon_fused_matches_reference: neon={} ref={} err={}",
+            out_neon[0],
+            out_ref[0],
+            err
+        );
+    }
+
+    #[test]
+    fn neon_fused_matches_reference_multi_row() {
+        // 4 rows × 64 cols (2 blocks each): NEON fused vs scalar oracle.
+        let n_rows = 4usize;
+        let n_cols = 64usize;
+        let blocks_per_row = 2usize;
+        let nibbles = fixed_nibbles();
+        let scales = [0.1f32, 0.25f32, 0.5f32, 1.0f32];
+        let d_a = 0.5f32;
+        let q8_vals: [i8; 32] = [
+            2, 4, -6, 8, -10, 12, -14, 16, 1, -3, 5, -7, 9, -11, 13, -15, 0, 1, -2, 3, -4, 5, -6,
+            7, -8, 9, -10, 11, -12, 13, -14, 15,
+        ];
+
+        let mut weights: Vec<u8> = Vec::new();
+        for &s in &scales {
+            for _ in 0..blocks_per_row {
+                weights.extend_from_slice(&make_block(s, &nibbles));
+            }
+        }
+
+        let mut acts: Vec<u8> = Vec::new();
+        for _ in 0..blocks_per_row {
+            acts.extend_from_slice(&make_q8_0_block(d_a, &q8_vals));
+        }
+
+        let mut out_neon = vec![0.0f32; n_rows];
+        let mut out_ref = vec![0.0f32; n_rows];
+
+        Q4_0Neon
+            .matvec_q8_fused(&weights, &acts, &mut out_neon, n_rows, n_cols)
+            .expect("neon fused multi-row");
+        matvec_q8_fused_reference(&weights, &acts, &mut out_ref, n_rows, n_cols)
+            .expect("ref fused multi-row");
+
+        for i in 0..n_rows {
+            let err = (out_neon[i] - out_ref[i]).abs();
+            assert!(
+                err < 1e-3,
+                "row {i}: neon={} ref={} err={}",
+                out_neon[i],
+                out_ref[i],
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn neon_fused_accumulate_semantics() {
+        // Out must be ADDED to (not overwritten).
+        let w_block = make_block(1.0, &[0x88u8; 16]); // zero weights
+        let a_block = make_q8_0_block(1.0, &[0i8; 32]);
+
+        let mut out = vec![42.0f32; 1];
+        Q4_0Neon
+            .matvec_q8_fused(&w_block, &a_block, &mut out, 1, 32)
+            .expect("neon fused accumulate");
+        assert!(
+            (out[0] - 42.0).abs() < 1e-5,
+            "accumulation broken: got {}",
+            out[0]
         );
     }
 }

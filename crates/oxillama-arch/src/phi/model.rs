@@ -91,7 +91,13 @@ impl PhiModel {
 
         // Partial RoPE: only rotate this many dims per head
         let rope_dims = ((head_dim as f32 * partial_rotary_factor) as usize).max(2);
-        let rope = RopeTable::new(rope_dims, max_ctx, config.rope_freq_base);
+        let rope = RopeTable::new(
+            rope_dims,
+            max_ctx,
+            config.rope_freq_base,
+            config.rope_scaling_type,
+            config.rope_scaling_factor,
+        );
         let dispatcher = KernelDispatcher::new();
 
         let q_dim = num_heads * head_dim;

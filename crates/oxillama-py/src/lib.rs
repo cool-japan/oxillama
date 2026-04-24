@@ -39,12 +39,15 @@
 //! | `Lora`               | `lora.rs`         |
 
 pub mod async_support;
+pub mod callback;
+pub mod cancel;
+pub mod chat_template;
 pub mod engine;
 pub mod error;
+pub mod hub;
 pub mod lora;
 pub mod sampler;
 pub mod speculative;
-pub mod streaming;
 pub mod tokenizer;
 
 use pyo3::prelude::*;
@@ -62,6 +65,7 @@ fn oxillama_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<speculative::PySpeculativeEngine>()?;
     m.add_class::<lora::PyLora>()?;
     m.add_class::<tokenizer::PyTokenizer>()?;
+    m.add_class::<cancel::PyCancellationToken>()?;
     error::register_exceptions(m)?;
     Ok(())
 }

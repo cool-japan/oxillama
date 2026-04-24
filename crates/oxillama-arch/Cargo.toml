@@ -12,7 +12,7 @@ categories = ["science", "algorithms"]
 readme = "README.md"
 
 [features]
-default = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "llava"]
+default = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "llava", "falcon", "minicpm", "olmo2", "granite", "deepseek", "dbrx", "grok", "mamba2", "jamba"]
 llama = []
 qwen3 = []
 mistral = []
@@ -21,6 +21,16 @@ phi = []
 command-r = []
 starcoder = []
 llava = ["llama"]
+falcon = []
+minicpm = []
+olmo2 = []
+granite = []
+deepseek = []
+dbrx = []
+grok = []
+mamba2 = []
+jamba = ["mamba2"]
+reference-f32 = []
 
 [dependencies]
 oxillama-gguf.workspace = true
@@ -31,3 +41,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 oxillama-gguf = { workspace = true, features = ["test-utils"] }
+proptest.workspace = true

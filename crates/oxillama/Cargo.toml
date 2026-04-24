@@ -12,6 +12,11 @@ keywords = ["llm", "inference", "gguf", "llama", "pure-rust"]
 categories = ["science", "algorithms"]
 readme = "README.md"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]
+
 [features]
 default = ["server", "bench"]
 server = ["dep:oxillama-server"]
@@ -29,8 +34,34 @@ phi = ["oxillama-arch/phi", "oxillama-runtime/phi"]
 command-r = ["oxillama-arch/command-r", "oxillama-runtime/command-r"]
 starcoder = ["oxillama-arch/starcoder", "oxillama-runtime/starcoder"]
 llava = ["oxillama-arch/llava"]
+deepseek = ["oxillama-arch/deepseek"]
+dbrx = ["oxillama-arch/dbrx"]
+grok = ["oxillama-arch/grok"]
+mamba2 = ["oxillama-arch/mamba2"]
+jamba = ["oxillama-arch/jamba"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+
+[[example]]
+name = "load_and_generate"
+path = "examples/load_and_generate.rs"
+required-features = []
+
+[[example]]
+name = "lora_apply"
+path = "examples/lora_apply.rs"
+required-features = []
+
+[[example]]
+name = "speculative"
+path = "examples/speculative.rs"
+required-features = []
 
 [dependencies]
+anyhow = { workspace = true }
 oxillama-gguf = { workspace = true, features = ["mmap"] }
 oxillama-quant = { workspace = true, features = ["parallel"] }
 oxillama-arch.workspace = true

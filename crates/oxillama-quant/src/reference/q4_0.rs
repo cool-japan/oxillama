@@ -142,6 +142,95 @@ fn f16_to_f32(bits: u16) -> f32 {
     half::f16::from_bits(bits).to_f32()
 }
 
+/// Q8_0 activation block constants.
+const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Scalar oracle for the fused Q4_0 weight × Q8_0 activation GEMV.
+///
+/// Computes `out[row] += Σ_block (dequant_q4_0_weight · dequant_q8_0_act)`.
+/// Values are **added** to `out` — callers must zero it for a fresh result.
+///
+/// This standalone function (not a trait override) is intended as a reference
+/// to validate SIMD implementations with tolerance 1e-3.
+///
+/// # Block mapping
+/// One Q4_0 weight block (32 weights, 18 bytes) is paired 1-to-1 with one
+/// Q8_0 activation block (32 values, 34 bytes).
+pub fn matvec_q8_fused_reference(
+    weights: &[u8],
+    acts_q8: &[u8],
+    out: &mut [f32],
+    n_rows: usize,
+    n_cols: usize,
+) -> QuantResult<()> {
+    if out.len() < n_rows {
+        return Err(QuantError::DimensionMismatch {
+            expected: n_rows,
+            got: out.len(),
+        });
+    }
+
+    let blocks_per_row = n_cols.div_ceil(Q4_0_BLOCK_SIZE);
+    let row_bytes = blocks_per_row * Q4_0_BLOCK_BYTES;
+    let acts_needed = blocks_per_row * Q8_0_BLOCK_BYTES;
+
+    if weights.len() < n_rows * row_bytes {
+        return Err(QuantError::BufferTooSmall {
+            needed: n_rows * row_bytes,
+            available: weights.len(),
+        });
+    }
+    if acts_q8.len() < acts_needed {
+        return Err(QuantError::BufferTooSmall {
+            needed: acts_needed,
+            available: acts_q8.len(),
+        });
+    }
+
+    for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+        let row_start = row * row_bytes;
+        let mut sum = 0.0f32;
+
+        for blk in 0..blocks_per_row {
+            // Weight block.
+            let w_start = row_start + blk * Q4_0_BLOCK_BYTES;
+            let w_block = &weights[w_start..w_start + Q4_0_BLOCK_BYTES];
+            let d_w = f16_to_f32(u16::from_le_bytes([w_block[0], w_block[1]]));
+
+            // Q8_0 activation block (1:1 with weight block).
+            let a_start = blk * Q8_0_BLOCK_BYTES;
+            let a_block = &acts_q8[a_start..a_start + Q8_0_BLOCK_BYTES];
+            let d_a = f16_to_f32(u16::from_le_bytes([a_block[0], a_block[1]]));
+            let q8_bytes = &a_block[2..]; // 32 i8 values
+
+            let w_offset = blk * Q4_0_BLOCK_SIZE;
+            let valid = (n_cols - w_offset).min(Q4_0_BLOCK_SIZE);
+
+            for i in 0..(valid / 2) {
+                let byte = w_block[2 + i];
+                let q_lo = (byte & 0x0F) as i32 - 8;
+                let q_hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                let a_lo = q8_bytes[i * 2] as i8 as f32;
+                let a_hi = q8_bytes[i * 2 + 1] as i8 as f32;
+                sum += q_lo as f32 * d_w * a_lo * d_a;
+                sum += q_hi as f32 * d_w * a_hi * d_a;
+            }
+            // Handle odd valid count.
+            if valid % 2 == 1 {
+                let i = valid / 2;
+                let byte = w_block[2 + i];
+                let q_lo = (byte & 0x0F) as i32 - 8;
+                let a_lo = q8_bytes[i * 2] as i8 as f32;
+                sum += q_lo as f32 * d_w * a_lo * d_a;
+            }
+        }
+
+        *out_val += sum; // ACCUMULATE
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +363,176 @@ mod tests {
             kernel.dequant_block(&block, &mut output).is_err(),
             "output too small should error"
         );
+    }
+
+    // ── matvec_q8_fused_reference ─────────────────────────────────────────
+
+    /// Build a Q8_0 activation block from a scale and 32 i8 values.
+    fn make_q8_0_block(scale: f32, qs: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(34);
+        let d_bits = half::f16::from_f32(scale).to_bits();
+        block.extend_from_slice(&d_bits.to_le_bytes());
+        for &q in qs {
+            block.push(q as u8);
+        }
+        block
+    }
+
+    #[test]
+    fn test_fused_ref_zero_activations() {
+        // Zero activations → output must stay zero regardless of weights.
+        let nibbles = [0x5Au8; 16];
+        let w_block = make_q4_0_block(1.0, &nibbles);
+        let a_block = make_q8_0_block(1.0, &[0i8; 32]);
+
+        let mut out = vec![0.0f32; 1];
+        matvec_q8_fused_reference(&w_block, &a_block, &mut out, 1, 32)
+            .expect("fused ref zero acts");
+        assert!(out[0].abs() < 1e-5, "expected 0, got {}", out[0]);
+    }
+
+    #[test]
+    fn test_fused_ref_zero_weights() {
+        // Zero weights (nibble=8 → weight=0) → output must stay zero.
+        let w_block = make_q4_0_block(1.0, &[0x88u8; 16]);
+        let a_block = make_q8_0_block(1.0, &[127i8; 32]);
+
+        let mut out = vec![0.0f32; 1];
+        matvec_q8_fused_reference(&w_block, &a_block, &mut out, 1, 32)
+            .expect("fused ref zero weights");
+        assert!(out[0].abs() < 1e-5, "expected 0, got {}", out[0]);
+    }
+
+    #[test]
+    fn test_fused_ref_accumulates() {
+        // Verify ACCUMULATE semantics: result is added to existing out value.
+        let w_block = make_q4_0_block(1.0, &[0x88u8; 16]); // zero weights
+        let a_block = make_q8_0_block(1.0, &[0i8; 32]);
+
+        let mut out = vec![42.0f32; 1];
+        matvec_q8_fused_reference(&w_block, &a_block, &mut out, 1, 32).expect("fused accumulate");
+        // Zero weights + zero acts → sum=0, out stays 42.
+        assert!(
+            (out[0] - 42.0).abs() < 1e-5,
+            "accumulation broken: got {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn test_fused_matches_unfused_q4_0() {
+        // Fused oracle must match the two-pass unfused gemv path.
+        let nibbles: [u8; 16] = [
+            0x5A, 0xF0, 0x13, 0x7E, 0xC2, 0x48, 0x9D, 0x6B, 0xA3, 0x2F, 0x71, 0xE4, 0x0C, 0x58,
+            0xB6, 0xD9,
+        ];
+        let d_w = 0.25f32;
+        let d_a = 0.5f32;
+        let w_block = make_q4_0_block(d_w, &nibbles);
+
+        let q8_vals: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, -1, 2, -3, 4, -5, 6, -7,
+            8, -9, 10, -11, 12, -13, 14, -15, 16,
+        ];
+        let a_block = make_q8_0_block(d_a, &q8_vals);
+
+        // Build f32 input for unfused gemv.
+        let input: Vec<f32> = q8_vals.iter().map(|&q| q as f32 * d_a).collect();
+
+        let tensor = QuantTensor::new(
+            w_block.clone(),
+            vec![1, 32],
+            oxillama_gguf::GgufTensorType::Q4_0,
+        );
+        let kernel = Q4_0Ref;
+        let mut out_unfused = vec![0.0f32; 1];
+        kernel
+            .gemv(&tensor, &input, &mut out_unfused)
+            .expect("unfused gemv");
+
+        let mut out_fused = vec![0.0f32; 1];
+        matvec_q8_fused_reference(&w_block, &a_block, &mut out_fused, 1, 32).expect("fused ref");
+
+        let err = (out_fused[0] - out_unfused[0]).abs();
+        assert!(
+            err < 1e-3,
+            "fused vs unfused: fused={} unfused={} err={}",
+            out_fused[0],
+            out_unfused[0],
+            err
+        );
+    }
+
+    #[test]
+    fn test_fused_ref_multi_row() {
+        // Multi-row matrix: verify all rows match unfused path.
+        let n_rows = 4usize;
+        let n_cols = 64usize;
+        let blocks_per_row = 2usize;
+        let nibbles: [u8; 16] = [
+            0x13, 0x57, 0x9B, 0xDF, 0x24, 0x68, 0xAC, 0xE0, 0x5F, 0x3A, 0x72, 0x8D, 0xC6, 0x4E,
+            0x91, 0xB7,
+        ];
+        let scales_w = [0.1f32, 0.25f32, 0.5f32, 1.0f32];
+        let d_a = 0.125f32;
+        let q8_vals: [i8; 32] = [
+            2, 4, -6, 8, -10, 12, -14, 16, 1, -3, 5, -7, 9, -11, 13, -15, 0, 1, -2, 3, -4, 5, -6,
+            7, -8, 9, -10, 11, -12, 13, -14, 15,
+        ];
+
+        // Build weight data (n_rows × blocks_per_row blocks).
+        let mut weights: Vec<u8> = Vec::new();
+        for &sw in &scales_w {
+            for _ in 0..blocks_per_row {
+                weights.extend_from_slice(&make_q4_0_block(sw, &nibbles));
+            }
+        }
+
+        // Build activation data (blocks_per_row Q8_0 blocks).
+        let mut acts: Vec<u8> = Vec::new();
+        for _ in 0..blocks_per_row {
+            acts.extend_from_slice(&make_q8_0_block(d_a, &q8_vals));
+        }
+
+        // Build f32 inputs for unfused (repeated q8_vals twice for 64 cols).
+        let input: Vec<f32> = q8_vals
+            .iter()
+            .chain(q8_vals.iter())
+            .map(|&q| q as f32 * d_a)
+            .collect();
+
+        let kernel = Q4_0Ref;
+
+        // Unfused path per row.
+        let mut out_unfused = vec![0.0f32; n_rows];
+        for row in 0..n_rows {
+            let row_start = row * blocks_per_row * Q4_0_BLOCK_BYTES;
+            let row_data =
+                weights[row_start..row_start + blocks_per_row * Q4_0_BLOCK_BYTES].to_vec();
+            let tensor = QuantTensor::new(
+                row_data,
+                vec![1, n_cols],
+                oxillama_gguf::GgufTensorType::Q4_0,
+            );
+            kernel
+                .gemv(&tensor, &input, &mut out_unfused[row..row + 1])
+                .expect("unfused gemv row");
+        }
+
+        // Fused oracle path.
+        let mut out_fused = vec![0.0f32; n_rows];
+        matvec_q8_fused_reference(&weights, &acts, &mut out_fused, n_rows, n_cols)
+            .expect("fused ref multi row");
+
+        for i in 0..n_rows {
+            let err = (out_fused[i] - out_unfused[i]).abs();
+            assert!(
+                err < 1e-3,
+                "row {i}: fused={} unfused={} err={}",
+                out_fused[i],
+                out_unfused[i],
+                err
+            );
+        }
     }
 }

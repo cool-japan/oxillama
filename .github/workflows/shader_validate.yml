@@ -1,0 +1,45 @@
+name: Shader Cross-Compile Validation
+
+on:
+  push:
+    paths:
+      - 'crates/oxillama-gpu/src/shaders/**'
+      - 'crates/oxillama-gpu/tests/**'
+      - 'crates/oxillama-gpu/Cargo.toml'
+      - '.github/workflows/shader_validate.yml'
+  pull_request:
+    paths:
+      - 'crates/oxillama-gpu/src/shaders/**'
+      - 'crates/oxillama-gpu/tests/**'
+      - 'crates/oxillama-gpu/Cargo.toml'
+  workflow_dispatch:
+
+jobs:
+  validate-shaders:
+    name: Validate WGSL shaders (WGSL + MSL + SPIR-V)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-shader-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-shader-
+
+      - name: Run shader validation tests
+        run: cargo nextest run -p oxillama-gpu --test shader_validation
+        env:
+          RUST_LOG: info

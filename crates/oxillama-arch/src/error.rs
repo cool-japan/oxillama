@@ -94,4 +94,14 @@ pub enum ArchError {
         /// Description of the unsupported operation.
         message: String,
     },
+
+    /// A LoRA adapter is incompatible with the loaded model.
+    ///
+    /// Returned by `with_lora_stack()` when rank, dimension, or architecture
+    /// constraints are violated.
+    #[error("LoRA adapter incompatible: {detail}")]
+    LoraIncompatible {
+        /// Human-readable explanation.
+        detail: String,
+    },
 }

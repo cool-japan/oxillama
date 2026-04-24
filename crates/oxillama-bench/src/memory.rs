@@ -292,6 +292,113 @@ impl RssTracker {
     }
 }
 
+/// Rolling-window memory sampler that records RSS allocations over a benchmark run.
+///
+/// Call [`MemoryProfiler::record`] inside your benchmark loop; collect the report
+/// with [`MemoryProfiler::report`] after the loop finishes.  The profiler uses
+/// the same platform-specific RSS reader as [`current_rss_bytes`].
+pub struct MemoryProfiler {
+    /// Time-stamped RSS snapshots (monotonic instant, bytes).
+    samples: Vec<(std::time::Instant, usize)>,
+    /// RSS at construction time (used as zero-reference).
+    baseline_bytes: usize,
+}
+
+impl MemoryProfiler {
+    /// Create a new profiler and record the current RSS as the baseline.
+    pub fn new() -> Self {
+        let baseline_bytes = current_rss_bytes().unwrap_or(0) as usize;
+        Self {
+            samples: Vec::new(),
+            baseline_bytes,
+        }
+    }
+
+    /// Snapshot the current RSS and append it to the sample window.
+    pub fn record(&mut self) {
+        let bytes = current_rss_bytes().unwrap_or(0) as usize;
+        self.samples.push((std::time::Instant::now(), bytes));
+    }
+
+    /// Return the maximum RSS observed across all recorded samples.
+    ///
+    /// Falls back to the baseline when no samples have been recorded.
+    pub fn peak_bytes(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|(_, b)| *b)
+            .max()
+            .unwrap_or(self.baseline_bytes)
+    }
+
+    /// Return the `p`-th percentile (0.0–100.0) of observed RSS values.
+    ///
+    /// Uses nearest-rank interpolation.  Returns the baseline when no samples
+    /// have been recorded.
+    pub fn percentile_bytes(&self, p: f64) -> usize {
+        if self.samples.is_empty() {
+            return self.baseline_bytes;
+        }
+        let mut sorted: Vec<usize> = self.samples.iter().map(|(_, b)| *b).collect();
+        sorted.sort_unstable();
+        let idx = ((sorted.len() as f64 * p / 100.0).ceil() as usize)
+            .saturating_sub(1)
+            .min(sorted.len().saturating_sub(1));
+        sorted[idx]
+    }
+
+    /// Consume all samples and produce a [`MemoryReport`].
+    pub fn report(&self) -> MemoryReport {
+        MemoryReport {
+            baseline_bytes: self.baseline_bytes,
+            peak_bytes: self.peak_bytes(),
+            p50_bytes: self.percentile_bytes(50.0),
+            p99_bytes: self.percentile_bytes(99.0),
+            sample_count: self.samples.len(),
+        }
+    }
+}
+
+impl Default for MemoryProfiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Summary statistics produced by [`MemoryProfiler::report`].
+#[derive(Debug, Clone)]
+pub struct MemoryReport {
+    /// RSS at profiler construction time.
+    pub baseline_bytes: usize,
+    /// Highest RSS observed during the profiling window.
+    pub peak_bytes: usize,
+    /// P50 (median) RSS during the profiling window.
+    pub p50_bytes: usize,
+    /// P99 RSS during the profiling window.
+    pub p99_bytes: usize,
+    /// Number of samples recorded.
+    pub sample_count: usize,
+}
+
+impl MemoryReport {
+    /// Net peak growth above baseline in bytes.
+    pub fn growth_bytes(&self) -> usize {
+        self.peak_bytes.saturating_sub(self.baseline_bytes)
+    }
+
+    /// Human-readable single-line summary.
+    pub fn display(&self) -> String {
+        format!(
+            "memory: baseline={} peak={} p50={} p99={} samples={}",
+            format_bytes(self.baseline_bytes as u64),
+            format_bytes(self.peak_bytes as u64),
+            format_bytes(self.p50_bytes as u64),
+            format_bytes(self.p99_bytes as u64),
+            self.sample_count,
+        )
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes >= 1024 * 1024 * 1024 {
         format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
@@ -363,5 +470,69 @@ mod estimate_tests {
         let _data: Vec<u8> = vec![1u8; 1024 * 1024];
         // The growth might be zero on some systems depending on page allocation
         let _growth = tracker.growth_bytes();
+    }
+
+    #[test]
+    fn test_memory_profiler_new_does_not_panic() {
+        let profiler = MemoryProfiler::new();
+        let _ = profiler.baseline_bytes; // just confirm it's readable
+    }
+
+    #[test]
+    fn test_memory_profiler_empty_report() {
+        let profiler = MemoryProfiler::new();
+        let report = profiler.report();
+        assert_eq!(report.sample_count, 0);
+        assert_eq!(report.peak_bytes, report.baseline_bytes);
+    }
+
+    #[test]
+    fn test_memory_profiler_record_and_report() {
+        let mut profiler = MemoryProfiler::new();
+        for _ in 0..5 {
+            profiler.record();
+        }
+        let report = profiler.report();
+        assert_eq!(report.sample_count, 5);
+        let _ = report.p50_bytes; // just confirm it's readable
+    }
+
+    #[test]
+    fn test_memory_profiler_percentile_monotone() {
+        let mut profiler = MemoryProfiler::new();
+        // Inject synthetic samples by recording repeatedly
+        for _ in 0..100 {
+            profiler.record();
+        }
+        let p50 = profiler.percentile_bytes(50.0);
+        let p99 = profiler.percentile_bytes(99.0);
+        assert!(p50 <= p99, "p50 must be <= p99");
+    }
+
+    #[test]
+    fn test_memory_report_display() {
+        let report = MemoryReport {
+            baseline_bytes: 1024 * 1024,
+            peak_bytes: 2 * 1024 * 1024,
+            p50_bytes: 1024 * 1024 + 512 * 1024,
+            p99_bytes: 2 * 1024 * 1024,
+            sample_count: 42,
+        };
+        let s = report.display();
+        assert!(s.contains("baseline="));
+        assert!(s.contains("peak="));
+        assert!(s.contains("samples=42"));
+    }
+
+    #[test]
+    fn test_memory_report_growth_bytes() {
+        let report = MemoryReport {
+            baseline_bytes: 1_000_000,
+            peak_bytes: 1_500_000,
+            p50_bytes: 1_200_000,
+            p99_bytes: 1_490_000,
+            sample_count: 10,
+        };
+        assert_eq!(report.growth_bytes(), 500_000);
     }
 }

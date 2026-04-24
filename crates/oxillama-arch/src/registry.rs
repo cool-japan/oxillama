@@ -53,6 +53,36 @@ impl ArchitectureRegistry {
         #[cfg(feature = "llava")]
         registry.register(Box::new(crate::llava::LlavaArchitecture::new()));
 
+        #[cfg(feature = "falcon")]
+        registry.register(Box::new(crate::falcon::FalconArchitecture::new()));
+
+        #[cfg(feature = "minicpm")]
+        registry.register(Box::new(crate::minicpm::MiniCpmArchitecture::new()));
+
+        #[cfg(feature = "olmo2")]
+        registry.register(Box::new(crate::olmo2::Olmo2Architecture::new()));
+
+        #[cfg(feature = "granite")]
+        registry.register(Box::new(crate::granite::GraniteArchitecture::new()));
+
+        registry.register(Box::new(crate::yi::YiArchitecture::new()));
+        registry.register(Box::new(crate::internlm3::InternLm3Architecture::new()));
+
+        #[cfg(feature = "deepseek")]
+        registry.register(Box::new(crate::deepseek::DeepSeekArchitecture::new()));
+
+        #[cfg(feature = "dbrx")]
+        registry.register(Box::new(crate::dbrx::DbrxArchitecture::new()));
+
+        #[cfg(feature = "grok")]
+        registry.register(Box::new(crate::grok::GrokArchitecture::new()));
+
+        #[cfg(feature = "mamba2")]
+        registry.register(Box::new(crate::mamba2::Mamba2Architecture::new()));
+
+        #[cfg(feature = "jamba")]
+        registry.register(Box::new(crate::jamba::JambaArchitecture::new()));
+
         registry
     }
 
@@ -106,9 +136,10 @@ mod tests {
     }
 
     #[test]
-    fn test_with_builtins_has_eight_architectures() {
+    fn test_with_builtins_has_twelve_architectures() {
         let reg = ArchitectureRegistry::with_builtins();
-        assert_eq!(reg.len(), 8, "expected 8 builtin architectures");
+        // 18 previous + 1 new (jamba) = 19
+        assert_eq!(reg.len(), 19, "expected 19 builtin architectures");
         assert!(!reg.is_empty());
     }
 
@@ -124,6 +155,10 @@ mod tests {
             "command-r",
             "starcoder",
             "llava",
+            "deepseek2",
+            "dbrx",
+            "grok",
+            "mamba2",
         ];
         for id in expected_ids {
             assert!(
@@ -154,6 +189,10 @@ mod tests {
             "command-r",
             "starcoder",
             "llava",
+            "deepseek2",
+            "dbrx",
+            "grok",
+            "mamba2",
         ];
         for id in ids {
             let arch = reg
@@ -192,13 +231,24 @@ mod tests {
         listed.sort_unstable();
         let mut expected = vec![
             "command-r",
+            "dbrx",
+            "deepseek2",
+            "falcon",
             "gemma",
+            "granite",
+            "grok",
+            "internlm3",
+            "jamba",
             "llama",
             "llava",
+            "mamba2",
+            "minicpm",
             "mistral",
+            "olmo2",
             "phi3",
             "qwen3",
             "starcoder",
+            "yi",
         ];
         expected.sort_unstable();
         assert_eq!(listed, expected);

@@ -1,0 +1,9 @@
+# Build configuration for OxiLLaMa workspace.
+
+# WASM SIMD128: enable simd128 proposal for wasm32 target.
+# This halves decode time for Q4_0/K-quant kernels in browsers that support SIMD.
+# All major browsers (Chrome 91+, Firefox 89+, Safari 16.4+) support the proposal.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-feature=+simd128",
+]

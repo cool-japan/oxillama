@@ -5,28 +5,48 @@
 //! Orchestrates the complete inference pipeline: model loading, tokenization,
 //! forward pass execution, KV caching, and token sampling.
 
+pub mod batched_attention;
 pub mod engine;
 pub mod error;
 pub mod flash_attention;
 pub mod kv_cache;
+pub mod kv_pool;
 pub mod lora_loader;
+pub mod metrics;
 pub mod sampling;
 pub mod scheduler;
+pub mod sequence_pool;
+pub mod snapshot;
 pub mod speculative;
+pub mod speculative_async;
 pub mod tokenizer_bridge;
+pub mod tool_dispatch;
 
-pub use engine::{EngineConfig, InferenceEngine};
+pub use batched_attention::batched_flash_attention;
+pub use engine::{EngineConfig, InferenceEngine, FLASH_ATTN_THRESHOLD};
 pub use error::{RuntimeError, RuntimeResult};
 pub use flash_attention::{
-    flash_attention, flash_attention_gqa, flash_attention_multi_head, FlashAttentionConfig,
+    flash_attention, flash_attention_forward, flash_attention_gqa, flash_attention_multi_head,
+    FlashAttentionConfig,
 };
-pub use kv_cache::KvCache;
+pub use kv_cache::{BatchedKvView, KvCache, KvCacheSnapshot, KvSlot, VecBatchedKvView};
+pub use kv_pool::KvCachePool;
 pub use lora_loader::apply_lora;
+pub use metrics::{EngineMetrics, MetricsSnapshot};
+pub use oxillama_arch::LoraStack;
 pub use sampling::chain::{SamplerChain, SamplerStage};
 pub use sampling::grammar::{Grammar, GrammarError, GrammarState};
 pub use sampling::{sample, Sampler, SamplerConfig};
-pub use scheduler::{Scheduler, SchedulerConfig};
-pub use speculative::{SpeculativeConfig, SpeculativeEngine};
+pub use scheduler::{Scheduler, SchedulerConfig, MAX_DECODE_WAIT_MS, PREFILL_CHUNK};
+pub use sequence_pool::{PoolError, PoolResult, SequencePool, SequenceSlot, SsmStatePool};
+pub use speculative::{SpeculativeConfig, SpeculativeDeltaSync, SpeculativeEngine};
+pub use speculative_async::{
+    AsyncSpecConfig, RewindError, Rewindable, SpecStats, SpeculativeDecoder,
+};
+pub use tool_dispatch::{
+    no_op_dispatcher, NoOpDispatcher, ToolCall, ToolCallDetector, ToolCallGrammar, ToolDispatcher,
+    ToolResult,
+};
 // TokenizerBridge is always exported — when neither `tokenizer-wasm` nor
 // `tokenizer-onig` is enabled the struct still exists but all methods return
 // TokenizerNotAvailable.

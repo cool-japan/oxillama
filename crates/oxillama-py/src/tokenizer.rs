@@ -5,9 +5,11 @@
 //! IDs, and decode IDs back to strings.
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use oxillama_runtime::TokenizerBridge;
 
+use crate::chat_template::apply_template;
 use crate::error::runtime_to_py;
 
 /// A standalone tokenizer loaded from a HuggingFace `tokenizer.json` file.
@@ -106,6 +108,56 @@ impl PyTokenizer {
 
     fn __repr__(&self) -> String {
         format!("Tokenizer(vocab_size={})", self.inner.vocab_size())
+    }
+
+    /// Encode a batch of texts into token ID lists in one call.
+    ///
+    /// This is a convenience wrapper that applies `encode` to each element.
+    ///
+    /// Args:
+    ///     texts: List of input strings.
+    ///
+    /// Returns:
+    ///     `List[List[int]]`: Token IDs for each input string, in order.
+    ///
+    /// Raises:
+    ///     TokenizerError: if encoding fails for any input.
+    pub fn encode_batch(&self, texts: Vec<String>) -> PyResult<Vec<Vec<u32>>> {
+        texts
+            .iter()
+            .map(|t| self.inner.encode(t).map_err(runtime_to_py))
+            .collect()
+    }
+
+    /// Apply a chat template to a list of messages.
+    ///
+    /// Formats a conversation (list of `{role, content}` dicts) into the
+    /// prompt string expected by the target model family.
+    ///
+    /// Args:
+    ///     messages:             List of dicts with ``"role"`` and ``"content"`` keys.
+    ///     template:             Template name — ``"chatml"`` (default), ``"llama3"``,
+    ///                           or ``"alpaca"``.
+    ///     add_generation_prompt: When ``True`` (default), append the
+    ///                           assistant start token so the model knows to continue.
+    ///
+    /// Returns:
+    ///     str: The formatted prompt string.
+    ///
+    /// Raises:
+    ///     ValueError: if an unsupported template name is given or a message
+    ///                 dict is missing required keys.
+    #[pyo3(signature = (messages, template = None, add_generation_prompt = None))]
+    pub fn apply_chat_template(
+        &self,
+        _py: Python<'_>,
+        messages: Vec<Bound<'_, PyDict>>,
+        template: Option<String>,
+        add_generation_prompt: Option<bool>,
+    ) -> PyResult<String> {
+        let tpl = template.as_deref().unwrap_or("chatml");
+        let add_gen = add_generation_prompt.unwrap_or(true);
+        apply_template(tpl, &messages, add_gen)
     }
 }
 

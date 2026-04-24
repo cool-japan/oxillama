@@ -88,7 +88,13 @@ impl MistralModel {
         let max_ctx = config.max_context_length;
         let sliding_window = config.sliding_window;
 
-        let rope = RopeTable::new(head_dim, max_ctx, config.rope_freq_base);
+        let rope = RopeTable::new(
+            head_dim,
+            max_ctx,
+            config.rope_freq_base,
+            config.rope_scaling_type,
+            config.rope_scaling_factor,
+        );
         let dispatcher = KernelDispatcher::new();
 
         Self {
@@ -351,6 +357,10 @@ impl ForwardPass for MistralModel {
 
     fn hidden_size(&self) -> usize {
         self.config.hidden_size
+    }
+
+    fn swa_config(&self) -> Option<(u32, bool)> {
+        self.config.swa_window.map(|w| (w, false))
     }
 }
 

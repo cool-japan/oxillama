@@ -7,6 +7,46 @@ OxiLLaMa uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-24
+
+### Added
+
+#### GGUF Loader Hardening (`oxillama-gguf`)
+- **Partial-download resume** (`resume.rs`): `GgufModel::resume()` reads an adjacent `.oxiresume` sidecar checkpoint, validates the last-valid byte offset, and provides a `ResumeHandle::finish()` path once the download completes — survives interrupted HuggingFace pulls without re-downloading
+- **Sharded multi-file loading** (`sharded.rs`): `ShardedGgufModel::load_sharded()` auto-discovers all HuggingFace-named sibling shards (`<base>-NNNNN-of-MMMMM.gguf`) from a single shard path and presents a unified logical model
+- **Quantize-on-the-fly** (`quantize_on_load.rs`): optional pass that dequantizes and re-quantizes tensors to a target format during load, eliminating a separate conversion step for deployment
+
+#### Runtime Snapshot/Resume (`oxillama-runtime`)
+- **`EngineSnapshot`** (`snapshot.rs`): captures the full KV-cache and sampler RNG state into a byte blob via `InferenceEngine::snapshot()`; `InferenceEngine::resume()` validates the model fingerprint and restores from the blob, enabling session persistence across process restarts
+- **Oxicode serialization**: `EngineSnapshot` is serialized with `oxicode` (COOLJAPAN Pure Rust codec) rather than `bincode`, in compliance with the workspace serialization policy
+
+#### Facade Examples & Cookbook (`oxillama`)
+- **`examples/load_and_generate.rs`**: end-to-end example: load a GGUF, configure the sampler, and stream tokens to stdout
+- **`examples/lora_apply.rs`**: demonstrates hot-swapping two LoRA adapters on a running engine without model reload
+- **`examples/speculative.rs`**: shows the `SpeculativeEngine` API with a 1B draft model and 70B target
+- **`RECIPES.md`**: 8-recipe task-oriented cookbook covering generation, serving, LoRA, speculative decoding, snapshot/resume, WASM browser chat, partial-download resume, and sharded model loading
+
+#### Quantization (`oxillama-quant`)
+- **AVX2 kernels**: Q4_1, Q5_0, Q5_1, Q8_1 — 4 new legacy-quant AVX2 dot-product kernels, completing full AVX2 coverage for all legacy quantization types
+- **NEON kernels**: Q4_1, Q5_0, Q5_1, Q8_1, Q2_K, Q3_K — 6 new Apple Silicon NEON kernels; combined with IQ/TQ additions gives near-complete NEON coverage across all quantization families
+- **NEON AArch64 kernels**: IQ2_XXS, IQ2_XS, IQ3_S, IQ4_XS, IQ4_NL, TQ1_0, TQ2_0, IQ1_S, IQ1_M, IQ3_XXS, IQ2_S — all 11 IQ types now have Apple Silicon NEON acceleration
+- **AVX-512 kernels**: TQ1_0, TQ2_0, Q5_0, Q8_K — AVX-512 coverage extended to 10 types
+
+#### GPU Backend (`oxillama-gpu`)
+- **Q2_K GEMV shader**: WGSL compute shader for Q2_K dequant + dot-product on GPU
+- **Q3_K GEMV shader**: WGSL compute shader for Q3_K dequant + dot-product on GPU
+- **Q8_K GEMV shader**: WGSL compute shader for Q8_K dequant + dot-product on GPU
+- **IQ4_XS GEMV shader**: WGSL compute shader for IQ4_XS dequant + dot-product on GPU
+- **Async WebGPU bridge** (`gpu_bridge.rs`): `initWebGpuDevice()`, `webgpuDequantQ4_0Async()`, `webgpuGemvAsync()` using `wasm_bindgen_futures::JsFuture` for real GPU dispatch in browsers with WebGPU support
+
+#### Architectures (`oxillama-arch`)
+- **Multi-head Latent Attention (MLA)**: Low-rank KV compression primitive (`MlaLayer`) with decoupled RoPE — reduces KV-cache memory footprint by up to 93% vs standard MHA
+- **DeepSeek-V2 architecture**: Full `DeepSeekV2Model` with MLA attention, DeepSeekMoE sparse FFN routing (N shared experts + top-K routed experts), 3-bit/8-bit quantized expert dispatch
+
+#### Developer Experience
+- **oxillama (meta)**: `openai_server.rs` example showing programmatic server startup; `python_bridge.rs` example documenting Rust↔Python API parity
+- **oxillama-cli**: Colorized output via `colored` (cyan/bold key labels, green banners); `indicatif` spinner progress bar during model loading; 5 integration smoke tests in `tests/cli_smoke.rs`
+
 ## [0.1.0] - 2026-04-15
 
 ### Added
@@ -60,4 +100,5 @@ OxiLLaMa uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `oxillama` meta crate: unified re-export of all subcrates (`oxillama::gguf`, `oxillama::quant`, etc.)
 - `oxillama-cli` binary crate: CLI moved from workspace root to `crates/oxillama-cli/`
 
+[0.1.1]: https://github.com/cool-japan/oxillama/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cool-japan/oxillama/releases/tag/v0.1.0

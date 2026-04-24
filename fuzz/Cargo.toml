@@ -15,6 +15,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
 oxillama-gguf = { path = "../crates/oxillama-gguf" }
 
 [[bin]]
@@ -32,5 +33,11 @@ doc = false
 [[bin]]
 name = "gguf_from_bytes"
 path = "fuzz_targets/gguf_from_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gguf_metadata_arbitrary"
+path = "fuzz_targets/gguf_metadata_arbitrary.rs"
 test = false
 doc = false

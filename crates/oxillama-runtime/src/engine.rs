@@ -2,14 +2,30 @@
 
 use std::path::Path;
 
+/// Sequence-length threshold above which the engine routes attention through
+/// the memory-efficient tiled flash-attention kernel rather than the naïve
+/// full-score-matrix path.
+///
+/// At and above this threshold the O(N²) memory cost of materialising the
+/// full attention matrix becomes a bottleneck; the tiled kernel keeps memory
+/// at O(BQ × BK) per tile instead.
+///
+/// The actual dispatch lives inside `oxillama-arch`'s `ForwardPass::forward`
+/// implementations.  This constant is exported so that arch crates and
+/// callers can apply the same policy without hard-coding the threshold.
+pub const FLASH_ATTN_THRESHOLD: usize = 512;
+
 use oxillama_arch::config::ModelConfig;
 use oxillama_arch::traits::{ForwardPass, KvCacheAccess};
 use oxillama_gguf::GgufModel;
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::kv_cache::KvCache;
+use crate::kv_cache::{KvCache, KvCacheSnapshot};
+use crate::metrics::{EngineMetrics, MetricsSnapshot};
 use crate::sampling::{Sampler, SamplerConfig};
 use crate::tokenizer_bridge::TokenizerBridge;
+use std::sync::Arc;
+use std::time::Instant;
 
 /// Configuration for the inference engine.
 #[derive(Debug, Clone)]
@@ -64,6 +80,10 @@ pub struct InferenceEngine {
     tokenizer: Option<TokenizerBridge>,
     /// EOS token ID for stopping generation.
     eos_token_id: Option<u32>,
+    /// Live metrics counters.
+    metrics: Arc<EngineMetrics>,
+    /// Stack of active LoRA adapters (in insertion order).
+    lora_stack: oxillama_arch::LoraStack,
 }
 
 impl InferenceEngine {
@@ -77,6 +97,8 @@ impl InferenceEngine {
             kv_cache: None,
             tokenizer: None,
             eos_token_id: None,
+            metrics: EngineMetrics::new(),
+            lora_stack: oxillama_arch::LoraStack::new(),
         }
     }
 
@@ -299,7 +321,11 @@ impl InferenceEngine {
                 tokens = prompt_tokens.len(),
                 "prefill: single batch"
             );
-            forward_pass.forward(&prompt_tokens, kv_cache)?
+            let prefill_start = Instant::now();
+            let result = forward_pass.forward(&prompt_tokens, kv_cache)?;
+            self.metrics
+                .record_prefill(prompt_tokens.len() as u64, prefill_start.elapsed());
+            result
         } else {
             // Long prompt: chunked prefill
             let n_chunks = prompt_tokens.len().div_ceil(chunk_size);
@@ -310,6 +336,7 @@ impl InferenceEngine {
                 "prefill: chunked"
             );
 
+            let prefill_start = Instant::now();
             let mut last_logits = Vec::new();
             for (i, chunk) in prompt_tokens.chunks(chunk_size).enumerate() {
                 tracing::trace!(
@@ -320,6 +347,8 @@ impl InferenceEngine {
                 );
                 last_logits = forward_pass.forward(chunk, kv_cache)?;
             }
+            self.metrics
+                .record_prefill(prompt_tokens.len() as u64, prefill_start.elapsed());
             last_logits
         };
 
@@ -327,6 +356,7 @@ impl InferenceEngine {
         let mut sampler = Sampler::new(self.config.sampler.clone());
 
         // Step 3: Autoregressive decode loop
+        self.metrics.record_request_start();
         for _step in 0..max_tokens {
             // Sample next token (grammar masking happens inside the sampler)
             let next_token = sampler.sample(&logits, &recent_tokens);
@@ -353,8 +383,11 @@ impl InferenceEngine {
             generated_tokens.push(next_token);
 
             // Forward pass for next token
+            let decode_start = Instant::now();
             logits = forward_pass.forward(&[next_token], kv_cache)?;
+            self.metrics.record_decode_token(decode_start.elapsed());
         }
+        self.metrics.record_request_complete();
 
         tracing::info!(
             prompt_tokens = prompt_tokens.len(),
@@ -403,7 +436,7 @@ impl InferenceEngine {
         let mut logits = forward_pass.forward(&[last], kv_cache)?;
 
         let mut sampler = Sampler::new(sampler_config);
-
+        self.metrics.record_request_start();
         for _step in 0..max_tokens {
             let next_token = sampler.sample(&logits, &recent_tokens);
 
@@ -424,8 +457,11 @@ impl InferenceEngine {
             recent_tokens.push(next_token);
             generated_tokens.push(next_token);
 
+            let decode_start = Instant::now();
             logits = forward_pass.forward(&[next_token], kv_cache)?;
+            self.metrics.record_decode_token(decode_start.elapsed());
         }
+        self.metrics.record_request_complete();
 
         tracing::info!(
             prompt_tokens = prompt_tokens.len(),
@@ -465,6 +501,54 @@ impl InferenceEngine {
         Ok(())
     }
 
+    // -------------------------------------------------------------------------
+    // Multi-LoRA hot-swap
+    // -------------------------------------------------------------------------
+
+    /// Push a LoRA adapter onto the stack with a per-entry scale multiplier.
+    ///
+    /// The adapter is applied additively during inference:
+    /// `output += scale · (alpha/rank) · B @ A @ input`
+    pub fn push_lora(&mut self, lora: std::sync::Arc<oxillama_arch::lora::LoadedLora>, scale: f32) {
+        self.lora_stack.push(lora, scale);
+    }
+
+    /// Remove the last adapter pushed onto the stack.
+    ///
+    /// Returns `None` if the stack is empty.
+    pub fn pop_lora(&mut self) -> Option<(std::sync::Arc<oxillama_arch::lora::LoadedLora>, f32)> {
+        self.lora_stack.pop()
+    }
+
+    /// Remove all LoRA adapters from the stack.
+    pub fn clear_loras(&mut self) {
+        self.lora_stack.clear();
+    }
+
+    /// Inspect the current LoRA stack.
+    pub fn lora_stack(&self) -> &oxillama_arch::LoraStack {
+        &self.lora_stack
+    }
+
+    /// Apply the stacked LoRA adapters to the loaded model's linear layers.
+    ///
+    /// This is a hot-swap operation: it can be called at any time without
+    /// reloading the model.  If the stack is empty this is a no-op.
+    ///
+    /// Returns [`RuntimeError::ModelNotLoaded`] if no model has been loaded.
+    pub fn apply_lora_stack(&mut self) -> RuntimeResult<()> {
+        if self.lora_stack.is_empty() {
+            return Ok(());
+        }
+        let fp = self
+            .forward_pass
+            .as_mut()
+            .ok_or(RuntimeError::ModelNotLoaded)?;
+        fp.apply_lora_stack(&self.lora_stack)
+            .map_err(RuntimeError::Arch)?;
+        Ok(())
+    }
+
     /// Returns whether a model is currently loaded.
     pub fn is_loaded(&self) -> bool {
         self.forward_pass.is_some()
@@ -478,6 +562,16 @@ impl InferenceEngine {
     /// Returns the model configuration, if loaded.
     pub fn model_config(&self) -> Option<&ModelConfig> {
         self.model_config.as_ref()
+    }
+
+    /// Returns a shared reference to the KV cache, if a model is loaded.
+    pub(crate) fn kv_cache_ref(&self) -> Option<&KvCache> {
+        self.kv_cache.as_ref()
+    }
+
+    /// Returns a mutable reference to the KV cache, if a model is loaded.
+    pub(crate) fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
+        self.kv_cache.as_mut()
     }
 
     /// Reset the KV cache (for starting a new conversation).
@@ -522,6 +616,80 @@ impl InferenceEngine {
         Ok(())
     }
 
+    /// Run a batched prefill forward pass for the given chunk of tokens.
+    ///
+    /// This is the per-chunk entry point for the chunked-prefill scheduler
+    /// fairness path (A3).  It differs from `prefill` in two ways:
+    ///
+    /// 1. It accepts a multi-token slice and dispatches a *single* batched
+    ///    forward call, matching the `generate` path's chunked prefill logic.
+    /// 2. It returns the logits of the last token in the chunk so that the
+    ///    caller can immediately begin decode sampling if `pos_end` equals the
+    ///    full prompt length.
+    ///
+    /// `pos_start` is the KV-cache position at which this chunk begins.  It
+    /// must equal the current `kv_cache.seq_len()` on entry; the parameter is
+    /// provided explicitly so that callers (e.g. the scheduler) can assert the
+    /// invariant in debug builds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::ModelNotLoaded`] if no model is loaded, or
+    /// any arch-level error from the forward pass.
+    pub fn forward_prefill(&mut self, tokens: &[u32], pos_start: usize) -> RuntimeResult<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(RuntimeError::ModelLoadError {
+                message: "forward_prefill called with empty token slice".to_string(),
+            });
+        }
+        let forward_pass = self
+            .forward_pass
+            .as_mut()
+            .ok_or(RuntimeError::ModelNotLoaded)?;
+        let kv_cache = self.kv_cache.as_mut().ok_or(RuntimeError::ModelNotLoaded)?;
+
+        debug_assert_eq!(
+            kv_cache.seq_len(),
+            pos_start,
+            "forward_prefill: pos_start ({pos_start}) must equal kv_cache.seq_len() ({})",
+            kv_cache.seq_len(),
+        );
+
+        let logits = forward_pass.forward(tokens, kv_cache)?;
+        Ok(logits)
+    }
+
+    /// Run a single autoregressive decode step for `token` and return logits.
+    ///
+    /// This is the per-step entry point for the chunked-prefill scheduler
+    /// fairness path (A3).  It is semantically equivalent to `forward_one`
+    /// but named differently to make the prefill/decode distinction explicit
+    /// in call sites inside the engine and scheduler integration layer.
+    ///
+    /// `pos` is the current sequence position (= `kv_cache.seq_len()`).  It
+    /// is accepted as a parameter so that callers can assert the invariant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::ModelNotLoaded`] if no model is loaded.
+    pub fn forward_decode(&mut self, token: u32, pos: usize) -> RuntimeResult<Vec<f32>> {
+        let forward_pass = self
+            .forward_pass
+            .as_mut()
+            .ok_or(RuntimeError::ModelNotLoaded)?;
+        let kv_cache = self.kv_cache.as_mut().ok_or(RuntimeError::ModelNotLoaded)?;
+
+        debug_assert_eq!(
+            kv_cache.seq_len(),
+            pos,
+            "forward_decode: pos ({pos}) must equal kv_cache.seq_len() ({})",
+            kv_cache.seq_len(),
+        );
+
+        let logits = forward_pass.forward(&[token], kv_cache)?;
+        Ok(logits)
+    }
+
     /// Run a single forward pass for `token` and return raw logits.
     ///
     /// The KV cache is updated (one position advanced).
@@ -547,6 +715,54 @@ impl InferenceEngine {
             .as_ref()
             .ok_or(RuntimeError::ModelNotLoaded)?;
         tokenizer.decode(&[token])
+    }
+
+    /// Returns a shared reference to the engine's live metrics counters.
+    pub fn metrics(&self) -> Arc<EngineMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// Returns a point-in-time [`MetricsSnapshot`] of the engine's counters.
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Capture a [`KvCacheSnapshot`] from the current KV cache state.
+    ///
+    /// Returns `None` if no model (and thus no KV cache) is loaded.
+    pub fn kv_snapshot(&self) -> Option<KvCacheSnapshot> {
+        self.kv_cache.as_ref().map(|c| c.snapshot())
+    }
+
+    /// Restore the KV cache state from a previously captured [`KvCacheSnapshot`].
+    ///
+    /// Returns [`RuntimeError::ModelNotLoaded`] if no model is loaded.
+    pub fn kv_restore(&mut self, snapshot: &KvCacheSnapshot) -> RuntimeResult<()> {
+        let kv = self.kv_cache.as_mut().ok_or(RuntimeError::ModelNotLoaded)?;
+        kv.restore_from_snapshot(&snapshot.keys, &snapshot.values, snapshot.seq_len);
+        Ok(())
+    }
+
+    /// Truncate the KV cache to `n` tokens.
+    ///
+    /// After this call the engine behaves as if only `n` tokens have been
+    /// processed.  This is the low-level primitive used by speculative
+    /// decoding on divergence rollback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::ModelNotLoaded`] if no model is loaded.
+    pub fn truncate(&mut self, n: usize) -> RuntimeResult<()> {
+        let kv = self.kv_cache.as_mut().ok_or(RuntimeError::ModelNotLoaded)?;
+        kv.truncate(n);
+        Ok(())
+    }
+
+    /// Return the current KV cache sequence length.
+    ///
+    /// Returns 0 if no model is loaded.
+    pub fn kv_cache_seq_len(&self) -> usize {
+        self.kv_cache.as_ref().map(|c| c.seq_len()).unwrap_or(0)
     }
 
     /// Returns the model's hidden state dimension, if a model is loaded.
@@ -741,6 +957,151 @@ fn load_tokenizer(config: &EngineConfig, gguf: &GgufModel) -> RuntimeResult<Toke
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── A3: forward_prefill / forward_decode tests ───────────────────────────
+
+    /// `forward_prefill` must return `ModelNotLoaded` when no model is loaded.
+    #[test]
+    fn test_forward_prefill_errors_when_not_loaded() {
+        let mut engine = InferenceEngine::new(EngineConfig::default());
+        let result = engine.forward_prefill(&[1, 2, 3], 0);
+        assert!(
+            matches!(result, Err(RuntimeError::ModelNotLoaded)),
+            "expected ModelNotLoaded from forward_prefill, got {result:?}"
+        );
+    }
+
+    /// `forward_prefill` with empty token slice must return an error
+    /// (even if a model were loaded — callers must supply at least one token).
+    #[test]
+    fn test_forward_prefill_empty_slice_errors() {
+        let mut engine = InferenceEngine::new(EngineConfig::default());
+        // No model loaded; empty slice should error with ModelNotLoaded because
+        // the empty-slice guard fires first (returns ModelLoadError), but any
+        // error is acceptable — the point is that it never returns Ok.
+        let result = engine.forward_prefill(&[], 0);
+        assert!(
+            result.is_err(),
+            "forward_prefill with empty slice must return Err, got Ok"
+        );
+    }
+
+    /// `forward_decode` must return `ModelNotLoaded` when no model is loaded.
+    #[test]
+    fn test_forward_decode_errors_when_not_loaded() {
+        let mut engine = InferenceEngine::new(EngineConfig::default());
+        let result = engine.forward_decode(42, 0);
+        assert!(
+            matches!(result, Err(RuntimeError::ModelNotLoaded)),
+            "expected ModelNotLoaded from forward_decode, got {result:?}"
+        );
+    }
+
+    // ── A3: forward_prefill / forward_decode with loaded model ────────────────
+
+    /// `forward_prefill` with a loaded model must return a logits vector whose
+    /// length equals the model's vocab size (32 in the synthetic fixture).
+    #[cfg(any(feature = "tokenizer-onig", feature = "tokenizer-wasm"))]
+    #[test]
+    fn test_forward_prefill_returns_logits_after_load() {
+        let mut engine = make_loaded_engine();
+        // Fresh engine: KV cache is empty so pos_start = 0.
+        let result = engine.forward_prefill(&[3, 4, 5], 0);
+        assert!(
+            result.is_ok(),
+            "forward_prefill must return Ok when model is loaded, got {result:?}"
+        );
+        let logits = result.expect("forward_prefill Ok");
+        assert_eq!(
+            logits.len(),
+            32,
+            "logits length must equal vocab_size=32, got {}",
+            logits.len()
+        );
+    }
+
+    /// `forward_decode` with a loaded model must return a logits vector of
+    /// the correct vocab-size length.
+    #[cfg(any(feature = "tokenizer-onig", feature = "tokenizer-wasm"))]
+    #[test]
+    fn test_forward_decode_returns_logits_after_load() {
+        let mut engine = make_loaded_engine();
+        // Prefill one token to prime the KV cache (pos becomes 1).
+        engine
+            .forward_prefill(&[3], 0)
+            .expect("prefill must succeed");
+        // Now KV cache seq_len == 1.
+        let result = engine.forward_decode(4, 1);
+        assert!(
+            result.is_ok(),
+            "forward_decode must return Ok when model is loaded, got {result:?}"
+        );
+        let logits = result.expect("forward_decode Ok");
+        assert_eq!(
+            logits.len(),
+            32,
+            "logits length must equal vocab_size=32, got {}",
+            logits.len()
+        );
+    }
+
+    /// Verify that chunked-prefill produces the same final logits as
+    /// single-shot prefill (the core KV-state invariant from A3).
+    ///
+    /// Both paths must agree on the logit vector produced after processing
+    /// the same prompt tokens, within floating-point tolerance.
+    #[cfg(any(feature = "tokenizer-onig", feature = "tokenizer-wasm"))]
+    #[test]
+    fn chunked_prefill_kv_matches_singleshot() {
+        let model_bytes = oxillama_gguf::test_utils::build_minimal_llama_gguf();
+        let tokenizer_json = oxillama_gguf::test_utils::minimal_tokenizer_json();
+        let prompt_tokens = vec![3u32, 4, 5, 6];
+
+        // ── Single-shot path ──────────────────────────────────────────────────
+        let mut engine_single = InferenceEngine::new(EngineConfig::default());
+        engine_single
+            .load_model_from_bytes(&model_bytes, tokenizer_json)
+            .expect("single-shot load");
+        // Fresh engine: pos_start = 0.
+        let logits_single = engine_single
+            .forward_prefill(&prompt_tokens, 0)
+            .expect("single-shot prefill");
+
+        // ── Chunked path (chunk = 2) ──────────────────────────────────────────
+        let mut engine_chunked = InferenceEngine::new(EngineConfig::default());
+        engine_chunked
+            .load_model_from_bytes(&model_bytes, tokenizer_json)
+            .expect("chunked load");
+
+        let mut logits_chunked = Vec::new();
+        let chunk_size = 2usize;
+        let mut pos = 0usize;
+        for slice in prompt_tokens.chunks(chunk_size) {
+            logits_chunked = engine_chunked
+                .forward_prefill(slice, pos)
+                .expect("chunked prefill");
+            pos += slice.len();
+        }
+
+        // ── Compare logits ────────────────────────────────────────────────────
+        assert_eq!(
+            logits_single.len(),
+            logits_chunked.len(),
+            "logit vector lengths must match"
+        );
+        let tol = 1e-4f32;
+        let max_diff = logits_single
+            .iter()
+            .zip(logits_chunked.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < tol,
+            "chunked and single-shot prefill logits differ by {max_diff} > tolerance {tol}"
+        );
+    }
+
+    // ── End A3 ────────────────────────────────────────────────────────────────
 
     /// embed() must return an error when no model has been loaded,
     /// rather than panicking or producing a garbage vector.
@@ -1426,5 +1787,82 @@ mod tests {
         let _out = engine
             .generate("abc", 2, |_| {})
             .expect("test: generate starcoder");
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-LoRA hot-swap tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn lora_stack_push_pop() {
+        use oxillama_arch::lora::LoadedLora;
+        use oxillama_quant::LoraAdapter;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        fn make_lora() -> Arc<LoadedLora> {
+            let adapter = LoraAdapter::new(vec![0.0f32; 4 * 8], vec![0.0f32; 8 * 4], 4, 1.0, 8, 8)
+                .expect("valid lora adapter");
+            let mut adapters = HashMap::new();
+            adapters.insert("test.weight".to_string(), Arc::new(adapter));
+            Arc::new(LoadedLora {
+                adapters,
+                rank: 4,
+                alpha: 1.0,
+            })
+        }
+
+        let mut engine = InferenceEngine::new(EngineConfig::default());
+
+        // Initially empty
+        assert!(engine.lora_stack().is_empty());
+        assert_eq!(engine.lora_stack().len(), 0);
+
+        // Push two adapters
+        engine.push_lora(make_lora(), 1.0);
+        engine.push_lora(make_lora(), 0.5);
+        assert_eq!(engine.lora_stack().len(), 2);
+        assert!(!engine.lora_stack().is_empty());
+
+        // Pop one
+        let popped = engine.pop_lora();
+        assert!(popped.is_some());
+        let (_, scale) = popped.expect("pop must return Some");
+        assert!((scale - 0.5).abs() < 1e-6);
+        assert_eq!(engine.lora_stack().len(), 1);
+
+        // Clear
+        engine.clear_loras();
+        assert!(engine.lora_stack().is_empty());
+
+        // Pop from empty returns None
+        assert!(engine.pop_lora().is_none());
+    }
+
+    #[test]
+    fn lora_apply_stack_errors_when_not_loaded() {
+        use oxillama_arch::lora::LoadedLora;
+        use oxillama_quant::LoraAdapter;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let adapter = LoraAdapter::new(vec![0.0f32; 4 * 8], vec![0.0f32; 8 * 4], 4, 1.0, 8, 8)
+            .expect("valid lora adapter");
+        let mut adapters = HashMap::new();
+        adapters.insert("test.weight".to_string(), Arc::new(adapter));
+        let lora = Arc::new(LoadedLora {
+            adapters,
+            rank: 4,
+            alpha: 1.0,
+        });
+
+        let mut engine = InferenceEngine::new(EngineConfig::default());
+        engine.push_lora(lora, 1.0);
+        let result = engine.apply_lora_stack();
+        assert!(
+            matches!(result, Err(RuntimeError::ModelNotLoaded)),
+            "expected ModelNotLoaded, got {:?}",
+            result
+        );
     }
 }

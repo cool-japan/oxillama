@@ -287,6 +287,22 @@ impl Sampler {
     pub fn config(&self) -> &SamplerConfig {
         &self.config
     }
+
+    /// Return the raw RNG state for snapshot/resume.
+    pub fn rng_state(&self) -> u64 {
+        self.rng.state_value()
+    }
+
+    /// Return the current mirostat mu value for snapshot/resume.
+    pub fn mirostat_mu_value(&self) -> f32 {
+        self.mirostat_mu
+    }
+
+    /// Restore the RNG state and mirostat mu (for resume).
+    pub fn restore_rng_state(&mut self, state: u64, mu: f32) {
+        self.rng = Xorshift64::from_state_value(state);
+        self.mirostat_mu = mu;
+    }
 }
 
 /// Sample a token ID from logits using the given configuration.
@@ -510,6 +526,18 @@ impl Xorshift64 {
     /// Generate a uniform f32 in [0, 1).
     fn next_f32(&mut self) -> f32 {
         (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// Return the raw internal state for snapshot/resume.
+    pub(crate) fn state_value(&self) -> u64 {
+        self.state
+    }
+
+    /// Reconstruct from a raw state value (for resume).
+    pub(crate) fn from_state_value(state: u64) -> Self {
+        Self {
+            state: if state == 0 { 1 } else { state },
+        }
     }
 }
 

@@ -11,11 +11,136 @@
 pub mod paged;
 pub mod prefix;
 
+use oxicode::{Decode, Encode};
 use oxillama_arch::traits::KvCacheAccess;
 use oxillama_arch::ArchResult;
 
 pub use paged::PagedKvCache;
 pub use prefix::{PrefixCacheConfig, PrefixKvCache};
+
+/// A point-in-time snapshot of a [`KvCache`] state.
+///
+/// Created by [`KvCache::snapshot`] and restored via
+/// [`KvCache::restore_from_snapshot`].  Used by
+/// [`crate::speculative::SpeculativeDeltaSync`] to roll back the KV cache
+/// after a draft token is rejected.
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct KvCacheSnapshot {
+    /// Per-layer key vectors, each of length `seq_len * kv_dim`.
+    pub keys: Vec<Vec<f32>>,
+    /// Per-layer value vectors, each of length `seq_len * kv_dim`.
+    pub values: Vec<Vec<f32>>,
+    /// The sequence length at snapshot time.
+    pub seq_len: usize,
+}
+
+/// A single request's slot within the shared KV pool.
+///
+/// Each in-flight request receives one `KvSlot` that identifies which
+/// position in the KV pool belongs to it.  The slot is released back to the
+/// pool when the request finishes (EOS or max-token limit reached).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvSlot {
+    /// Unique identifier of the request that owns this slot.
+    pub request_id: u64,
+    /// Index into the shared KV cache pool (e.g. the row within a paged KV
+    /// cache or the sequence slot index in a flat pool).
+    pub kv_cache_idx: usize,
+    /// Current sequence position (number of tokens committed so far).
+    pub position: usize,
+}
+
+impl KvSlot {
+    /// Construct a new `KvSlot`.
+    pub fn new(request_id: u64, kv_cache_idx: usize, position: usize) -> Self {
+        Self {
+            request_id,
+            kv_cache_idx,
+            position,
+        }
+    }
+}
+
+/// A view over the KV caches of multiple concurrent requests for batched
+/// decode attention.
+///
+/// During the decode phase each request has already accumulated keys and
+/// values from the prefill + prior decode steps.  `BatchedKvView` provides
+/// the batched-attention kernel with access to per-request KV slices without
+/// requiring the caller to lay out memory in any particular way.
+///
+/// Implementors typically wrap a pool of [`KvCache`] buffers indexed by
+/// [`KvSlot`].
+pub trait BatchedKvView: Sync {
+    /// Number of concurrent request slots in this batch.
+    fn slot_count(&self) -> usize;
+
+    /// Return the flattened key and value slices for slot `slot`.
+    ///
+    /// Both slices have length `position(slot) * kv_dim`, laid out as
+    /// `[seq_len, kv_dim]` in row-major order.
+    ///
+    /// # Panics
+    ///
+    /// Implementations are permitted to panic if `slot >= slot_count()`.
+    fn kv_for_slot(&self, slot: usize) -> (&[f32], &[f32]);
+
+    /// Number of KV tokens already committed for slot `slot`
+    /// (= the sequence position the next token will be written to).
+    fn position(&self, slot: usize) -> usize;
+}
+
+/// Simple contiguous `BatchedKvView` backed by a `Vec<KvSlot>` paired with
+/// a pool of flat key/value buffers.
+///
+/// Each entry `i` refers to slot `slots[i]`.  The key buffer for slot `i`
+/// has length `position * kv_dim` and the value buffer likewise.
+pub struct VecBatchedKvView {
+    slots: Vec<KvSlot>,
+    /// Flat key buffers, one per slot, length `position * kv_dim`.
+    keys: Vec<Vec<f32>>,
+    /// Flat value buffers, one per slot, length `position * kv_dim`.
+    values: Vec<Vec<f32>>,
+}
+
+impl VecBatchedKvView {
+    /// Construct a new `VecBatchedKvView` from parallel vecs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `slots.len() != keys.len()` or `slots.len() != values.len()`.
+    pub fn new(slots: Vec<KvSlot>, keys: Vec<Vec<f32>>, values: Vec<Vec<f32>>) -> Self {
+        assert_eq!(
+            slots.len(),
+            keys.len(),
+            "slots and keys vecs must have equal length"
+        );
+        assert_eq!(
+            slots.len(),
+            values.len(),
+            "slots and values vecs must have equal length"
+        );
+        Self {
+            slots,
+            keys,
+            values,
+        }
+    }
+}
+
+impl BatchedKvView for VecBatchedKvView {
+    fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn kv_for_slot(&self, slot: usize) -> (&[f32], &[f32]) {
+        (&self.keys[slot], &self.values[slot])
+    }
+
+    fn position(&self, slot: usize) -> usize {
+        self.slots[slot].position
+    }
+}
 
 /// Simple contiguous KV cache implementation.
 ///
@@ -133,6 +258,98 @@ impl KvCache {
 
         self.seq_len = seq_len.min(self.max_seq_len);
         self.stored_len = self.seq_len;
+    }
+
+    /// Truncate the KV cache to `n` tokens.
+    ///
+    /// After this call `seq_len()` returns `n` (clamped to the current
+    /// `seq_len` if `n` is already beyond it — truncate never extends the
+    /// cache).  The underlying buffers are **not** zeroed; the truncated
+    /// region is simply considered invalid and will be overwritten on the
+    /// next `store_kv` call.
+    ///
+    /// This is the low-level primitive for speculative-decoding rollback: the
+    /// target engine calls `truncate(divergence_pos)` after rejecting a draft
+    /// token, then continues generating from `divergence_pos`.
+    pub fn truncate(&mut self, n: usize) {
+        let n = n.min(self.seq_len);
+        self.seq_len = n;
+        self.stored_len = n;
+    }
+
+    /// Capture a snapshot of the current KV state.
+    ///
+    /// Only the data up to `seq_len * kv_dim` is copied per layer, keeping
+    /// the snapshot compact.
+    pub fn snapshot(&self) -> KvCacheSnapshot {
+        let copy_len = self.seq_len * self.kv_dim;
+        let keys = self
+            .keys
+            .iter()
+            .map(|k| k[..copy_len.min(k.len())].to_vec())
+            .collect();
+        let values = self
+            .values
+            .iter()
+            .map(|v| v[..copy_len.min(v.len())].to_vec())
+            .collect();
+        KvCacheSnapshot {
+            keys,
+            values,
+            seq_len: self.seq_len,
+        }
+    }
+
+    /// Build a serializable [`crate::snapshot::KvStatePayload`] from the current state.
+    pub fn to_payload(&self) -> crate::snapshot::KvStatePayload {
+        let copy_len = self.seq_len * self.kv_dim;
+        let keys = self
+            .keys
+            .iter()
+            .map(|k| k[..copy_len.min(k.len())].to_vec())
+            .collect();
+        let values = self
+            .values
+            .iter()
+            .map(|v| v[..copy_len.min(v.len())].to_vec())
+            .collect();
+        crate::snapshot::KvStatePayload {
+            keys,
+            values,
+            seq_len: self.seq_len,
+            num_layers: self.num_layers,
+            max_seq_len: self.max_seq_len,
+            kv_dim: self.kv_dim,
+        }
+    }
+
+    /// Restore cache state from a [`crate::snapshot::KvStatePayload`].
+    ///
+    /// Validates that layer count and dimensions match the cache configuration,
+    /// then restores the key/value buffers and sequence length.
+    pub fn restore_from_payload(
+        &mut self,
+        payload: &crate::snapshot::KvStatePayload,
+    ) -> crate::error::RuntimeResult<()> {
+        use crate::error::RuntimeError;
+        if payload.num_layers != self.num_layers {
+            return Err(RuntimeError::SnapshotIncompatible {
+                detail: format!(
+                    "layer count mismatch: snapshot has {}, cache has {}",
+                    payload.num_layers, self.num_layers
+                ),
+            });
+        }
+        if payload.kv_dim != self.kv_dim {
+            return Err(RuntimeError::SnapshotIncompatible {
+                detail: format!(
+                    "kv_dim mismatch: snapshot has {}, cache has {}",
+                    payload.kv_dim, self.kv_dim
+                ),
+            });
+        }
+        self.restore_from_snapshot(&payload.keys, &payload.values, payload.seq_len);
+        Ok(())
     }
 }
 

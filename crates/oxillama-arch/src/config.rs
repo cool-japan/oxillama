@@ -2,7 +2,109 @@
 
 use oxillama_gguf::{GgufTensorType, MetadataStore};
 
+use crate::common::rope::RopeScalingType;
 use crate::error::{ArchError, ArchResult};
+
+/// DeepSeek-V2/V3 specific configuration for Multi-head Latent Attention (MLA)
+/// and Mixture-of-Experts (MoE) layers.
+///
+/// Populated from GGUF KV entries prefixed with `deepseek2.*`.
+#[derive(Debug, Clone)]
+pub struct DeepSeekConfig {
+    /// Rank of the Q low-rank projection (compressed Q latent dimension).
+    pub q_lora_rank: usize,
+    /// Rank of the KV low-rank projection (compressed KV latent dimension).
+    pub kv_lora_rank: usize,
+    /// Head dimension for the nope (no-positional-encoding) part of Q and K.
+    pub qk_nope_head_dim: usize,
+    /// Head dimension for the rope (positional-encoding) part of Q and K.
+    pub qk_rope_head_dim: usize,
+    /// Head dimension for V.
+    pub v_head_dim: usize,
+    /// Number of shared experts (always active, applied every token).
+    pub n_shared_experts: usize,
+    /// Total number of routed experts.
+    pub n_routed_experts: usize,
+    /// Number of experts activated per token via top-k routing.
+    pub top_k_routed: usize,
+    /// Intermediate size for each shared expert's SwiGLU FFN.
+    pub shared_expert_intermediate_size: usize,
+    /// Scaling factor for the routing score normalisation (if sigmoid mode).
+    pub routed_scaling_factor: f32,
+}
+
+impl DeepSeekConfig {
+    /// Parse a `DeepSeekConfig` from GGUF metadata.
+    ///
+    /// Reads `deepseek2.*` keys with sensible defaults for any missing entries.
+    ///
+    /// # Errors
+    /// Returns `ArchError::UnknownArchitecture` if `general.architecture` is absent
+    /// (delegated to the outer `ModelConfig::from_metadata` call).
+    pub fn from_metadata(metadata: &MetadataStore, hidden_size: usize) -> Self {
+        let q_lora_rank = metadata
+            .get_u32("deepseek2.attention.q_lora_rank")
+            .map(|v| v as usize)
+            .unwrap_or(1536);
+
+        let kv_lora_rank = metadata
+            .get_u32("deepseek2.attention.kv_lora_rank")
+            .map(|v| v as usize)
+            .unwrap_or(512);
+
+        let qk_nope_head_dim = metadata
+            .get_u32("deepseek2.attention.key_length")
+            .map(|v| v as usize)
+            .unwrap_or(128);
+
+        let qk_rope_head_dim = metadata
+            .get_u32("deepseek2.attention.rope_head_dim")
+            .map(|v| v as usize)
+            .unwrap_or(64);
+
+        let v_head_dim = metadata
+            .get_u32("deepseek2.attention.value_length")
+            .map(|v| v as usize)
+            .unwrap_or(128);
+
+        let n_shared_experts = metadata
+            .get_u32("deepseek2.expert_shared_count")
+            .map(|v| v as usize)
+            .unwrap_or(1);
+
+        let n_routed_experts = metadata
+            .get_u32("deepseek2.expert_count")
+            .map(|v| v as usize)
+            .unwrap_or(64);
+
+        let top_k_routed = metadata
+            .get_u32("deepseek2.expert_used_count")
+            .map(|v| v as usize)
+            .unwrap_or(6);
+
+        let shared_expert_intermediate_size = metadata
+            .get_u32("deepseek2.expert_shared_feed_forward_length")
+            .map(|v| v as usize)
+            .unwrap_or(hidden_size * 2);
+
+        let routed_scaling_factor = metadata
+            .get_f32("deepseek2.expert_weights_scale")
+            .unwrap_or(1.0);
+
+        Self {
+            q_lora_rank,
+            kv_lora_rank,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+            n_shared_experts,
+            n_routed_experts,
+            top_k_routed,
+            shared_expert_intermediate_size,
+            routed_scaling_factor,
+        }
+    }
+}
 
 /// Model configuration parsed from GGUF metadata.
 ///
@@ -51,6 +153,50 @@ pub struct ModelConfig {
     pub num_experts: usize,
     /// Number of experts used per token (top-K routing; 0 = no MoE).
     pub num_experts_used: usize,
+    /// Sliding-window attention span in tokens, unified across arch families.
+    /// `None` means global attention on all layers.
+    /// Alias kept alongside `sliding_window` for cross-arch consistency;
+    /// both are populated from the same GGUF key.
+    pub swa_window: Option<u32>,
+    /// Interleaved SWA pattern: `true` means SWA alternates with global
+    /// attention (Gemma style). `false` means all layers use `swa_window`
+    /// (Mistral style).
+    pub swa_interleaved: bool,
+    /// RoPE scaling strategy for extending context beyond the training length.
+    pub rope_scaling_type: RopeScalingType,
+    /// RoPE scaling factor (`1.0` = no scaling).
+    pub rope_scaling_factor: f32,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            architecture: String::new(),
+            model_name: String::new(),
+            hidden_size: 4096,
+            intermediate_size: 16384,
+            num_layers: 32,
+            num_attention_heads: 32,
+            num_kv_heads: 32,
+            head_dim: 128,
+            vocab_size: 32000,
+            max_context_length: 4096,
+            rms_norm_eps: 1e-5,
+            rope_freq_base: 10000.0,
+            quant_type: None,
+            attention_bias: false,
+            ffn_bias: false,
+            activation: "silu".to_string(),
+            sliding_window: None,
+            logit_scale: 1.0,
+            num_experts: 0,
+            num_experts_used: 0,
+            swa_window: None,
+            swa_interleaved: false,
+            rope_scaling_type: RopeScalingType::Standard,
+            rope_scaling_factor: 1.0,
+        }
+    }
 }
 
 impl ModelConfig {
@@ -123,6 +269,12 @@ impl ModelConfig {
             .ok()
             .map(|v| v as usize);
 
+        let swa_window = sliding_window.map(|v| v as u32);
+
+        // Gemma-family models use interleaved SWA (even layers = global).
+        // Detect by architecture name prefix.
+        let swa_interleaved = architecture.starts_with("gemma");
+
         let logit_scale = metadata
             .get_f32(&format!("{arch}.logit_scale"))
             .unwrap_or(1.0);
@@ -136,6 +288,19 @@ impl ModelConfig {
             .get_u32(&format!("{arch}.expert_used_count"))
             .map(|v| v as usize)
             .unwrap_or(0);
+
+        let rope_scaling_factor = metadata
+            .get_f32(&format!("{arch}.rope.scaling.factor"))
+            .unwrap_or(1.0);
+
+        let rope_scaling_type = metadata
+            .get_string(&format!("{arch}.rope.scaling.type"))
+            .map(|s| match s {
+                "linear" => RopeScalingType::Linear,
+                "yarn" => RopeScalingType::Yarn,
+                _ => RopeScalingType::Standard,
+            })
+            .unwrap_or(RopeScalingType::Standard);
 
         Ok(Self {
             architecture,
@@ -158,6 +323,10 @@ impl ModelConfig {
             logit_scale,
             num_experts,
             num_experts_used,
+            swa_window,
+            swa_interleaved,
+            rope_scaling_type,
+            rope_scaling_factor,
         })
     }
 }
@@ -458,5 +627,81 @@ mod tests {
             cfg.num_experts_used, 2,
             "num_experts_used should be 2 (top-2)"
         );
+    }
+}
+
+#[cfg(test)]
+mod swa_tests {
+    use super::*;
+    use crate::common::effective_attention_span;
+
+    #[test]
+    fn test_global_attention() {
+        let config = ModelConfig {
+            swa_window: None,
+            ..ModelConfig::default()
+        };
+        assert_eq!(effective_attention_span(&config, 0), u32::MAX);
+        assert_eq!(effective_attention_span(&config, 5), u32::MAX);
+    }
+
+    #[test]
+    fn test_mistral_swa_all_layers() {
+        let config = ModelConfig {
+            swa_window: Some(4096),
+            swa_interleaved: false,
+            ..ModelConfig::default()
+        };
+        assert_eq!(effective_attention_span(&config, 0), 4096);
+        assert_eq!(effective_attention_span(&config, 3), 4096);
+    }
+
+    #[test]
+    fn test_gemma_interleaved_swa() {
+        let config = ModelConfig {
+            swa_window: Some(4096),
+            swa_interleaved: true,
+            ..ModelConfig::default()
+        };
+        // Layer 0 is global (interleaved, even index)
+        assert_eq!(effective_attention_span(&config, 0), u32::MAX);
+        // Layer 1 is sliding window
+        assert_eq!(effective_attention_span(&config, 1), 4096);
+        // Layer 2 is global again
+        assert_eq!(effective_attention_span(&config, 2), u32::MAX);
+    }
+
+    #[test]
+    fn test_mistral_swa_from_metadata() {
+        use oxillama_gguf::MetadataValue;
+        let mut store = MetadataStore::new();
+        store.insert(
+            "general.architecture".to_string(),
+            MetadataValue::String("mistral".to_string()),
+        );
+        store.insert(
+            "mistral.attention.sliding_window".to_string(),
+            MetadataValue::Uint32(4096),
+        );
+        let cfg = ModelConfig::from_metadata(&store).expect("should succeed");
+        assert_eq!(cfg.swa_window, Some(4096));
+        assert!(!cfg.swa_interleaved, "mistral is not interleaved");
+    }
+
+    #[test]
+    fn test_gemma_swa_interleaved_from_metadata() {
+        use oxillama_gguf::MetadataValue;
+        let mut store = MetadataStore::new();
+        store.insert(
+            "general.architecture".to_string(),
+            MetadataValue::String("gemma".to_string()),
+        );
+        store.insert(
+            "gemma.attention.sliding_window".to_string(),
+            MetadataValue::Uint32(2048),
+        );
+        let cfg = ModelConfig::from_metadata(&store).expect("should succeed");
+        assert_eq!(cfg.swa_window, Some(2048));
+        assert!(cfg.swa_interleaved, "gemma should be interleaved");
     }
 }

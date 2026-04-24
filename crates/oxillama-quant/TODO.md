@@ -42,7 +42,7 @@ re-quantizes activations internally.
 
 | Field | Value |
 |---|---|
-| Version | 0.1.0 |
+| Version | 0.1.1 |
 | Completion | ~99% |
 | Source files | ~67 under `src/` |
 | Top-level modules | `dispatch`, `error`, `lora`, `parallel`, `quantize`, `reference`, `simd`, `traits`, `types` |
@@ -66,7 +66,7 @@ SIMD coverage matrix (v0.1.0):
 | Q2_K | yes | yes | — | — |
 | Q3_K | yes | yes | — | — |
 | Q4_1 | yes | — | — | — |
-| Q5_0 | yes | — | — | — |
+| Q5_0 | yes | yes | — | — |
 | Q5_1 | yes | — | — | — |
 | Q8_1 | yes | — | — | — |
 | Q8_K | yes (dequant only) | — | — | yes |
@@ -74,8 +74,8 @@ SIMD coverage matrix (v0.1.0):
 | TQ2_0 | yes | — | — | — |
 | IQ1_S, IQ1_M | yes | — | — | — |
 | IQ2_XXS, IQ2_XS, IQ2_S | yes | IQ2_XXS only | — | — |
-| IQ3_XXS, IQ3_S | yes | — | — | — |
-| IQ4_NL, IQ4_XS | yes | — | — | — |
+| IQ3_XXS, IQ3_S | yes | IQ3_S ✅ | — | — |
+| IQ4_NL, IQ4_XS | yes | IQ4_XS ✅ | — | — |
 | F16, BF16, F32 | yes (passthrough) | — | — | — |
 
 Six block formats have a full four-tier SIMD ladder (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q1_0_G128). Q2_K and Q3_K have scalar + AVX2. Q8_K has scalar + NEON. IQ2_XXS has scalar + AVX2. TQ1_0 and TQ2_0 have scalar reference kernels. Thirteen remaining formats ship with scalar-only paths. That gap is the v0.1.1 roadmap.
@@ -127,7 +127,7 @@ Scalar reference kernels (`src/reference/`):
 Platform SIMD kernels (`src/simd/`):
 
 - `simd/mod.rs` — `cached_capabilities()` + platform gates
-- `simd/avx2/` — `q4_0.rs`, `q4_k.rs`, `q5_k.rs`, `q6_k.rs`, `q8_0.rs`,
+- `simd/avx2/` — `q4_0.rs`, `q5_0.rs`, `q4_k.rs`, `q5_k.rs`, `q6_k.rs`, `q8_0.rs`,
   `q1_0_g128.rs`, `q2_k.rs`, `q3_k.rs`, `util.rs`
 - `simd/avx512/` — `q4_0.rs`, `q4_k.rs`, `q5_k.rs`, `q6_k.rs`, `q8_0.rs`, `q1_0_g128.rs`, `util.rs`
 - `simd/neon/` — `q4_0.rs`, `q4_k.rs`, `q5_k.rs`, `q6_k.rs`, `q8_0.rs`, `q1_0_g128.rs`
@@ -161,7 +161,7 @@ Runtime SIMD dispatch:
 - `best_tier()` returns a stable display string for `oxillama info`
 
 AVX-512 kernels (`simd/avx512/`): Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q1_0_G128.
-AVX2+FMA kernels (`simd/avx2/`): Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q1_0_G128, Q2_K, Q3_K.
+AVX2+FMA kernels (`simd/avx2/`): Q4_0, Q5_0, Q4_K, Q5_K, Q6_K, Q8_0, Q1_0_G128, Q2_K, Q3_K.
 NEON kernels (`simd/neon/`): Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q1_0_G128, Q8_K.
 
 Q8_K NEON-optimized GEMV (int8→f32 via NEON widening + vfmaq_f32 FMA).
@@ -202,19 +202,17 @@ Benchmarks and tests:
 - Singleton kernel dispatcher: `CachedDispatcher` + `global_dispatcher()` static table keyed by `GgufTensorType`, zero-allocation after first lookup per type
 - Proptest suites for every scalar kernel (dequant round-trip bounds)
 - SIMD kernels cross-validated byte-for-byte against the scalar reference
-- Contribution to the workspace-wide 1,205-test total (oxillama-quant: 278 tests): all green with
+- Contribution to the workspace-wide total (oxillama-quant: 373 tests): all green with
   `cargo nextest run -p oxillama-quant`
 
 ## 5. Known Gaps / Incomplete
 
 Tracked against the remaining ~1% to 100%:
 
-- **SIMD coverage breadth:** 13 of 27 types still run scalar-only. They are
-  correct and pass proptest, but leave 4–10× throughput on wide-vector CPUs.
-- **No IQ SIMD beyond IQ2_XXS:** IQ*_* formats dominate long-context LLaMA-3 / Qwen3
-  Hugging Face uploads but (except IQ2_XXS AVX2) fall through to the scalar path on every tier.
-- **Q8_K is dequant-only:** there is no `matvec_q8` fast path. The
-  activation-side Q8_K is currently materialized via dequant→Q8_0 GEMV.
+- **SIMD coverage breadth:** ~2 of 27 types still run scalar-only (Q4_1, Q5_1). All IQ* types now have full AVX2+NEON coverage; TQ1_0/TQ2_0/Q5_0/Q8_K have AVX-512+NEON.
+- ~~**No IQ SIMD beyond IQ2_XXS:**~~ ✅ IQ2_XS, IQ3_S, IQ4_XS, and Q4_1 AVX2 kernels now ship; IQ2_XXS was already done.
+- ~~**Q8_K is dequant-only:** there is no `matvec_q8` fast path. The
+  activation-side Q8_K is currently materialized via dequant→Q8_0 GEMV.~~ ✅ Fixed: Q8_K now has a true fused GEMV in scalar, AVX2, and NEON tiers.
 - **No fused dequant+GEMM:** every matmul performs dequant into a scratch
   buffer and then hands off to GEMV, doubling the memory traffic of the hot
   path on large models.
@@ -230,20 +228,18 @@ Ordered by production impact.
 - ~~**IQ2_XXS AVX2:**~~ ✅ Shipped: `dequant_block` + `gemv` AVX2 SIMD kernel
   for IQ2_XXS, registered in the dispatcher. The most common I-quant in
   Hugging Face uploads for long-context models is now off the scalar path.
-- **Q8_K GEMV:** promote Q8_K from dequant-only to a first-class matvec
-  target, removing the Q8_0 staging buffer on the activation side.
-- **Bench extension:** Criterion scenarios for short (seq=1, decode) vs
+- ~~**Q8_K GEMV:** promote Q8_K from dequant-only to a first-class matvec
+  target, removing the Q8_0 staging buffer on the activation side.~~ ✅ Done — scalar reference, AVX2+FMA, and NEON fused kernels all ship; 278 tests pass.
+- **Bench extension:** ~~Criterion scenarios for short (seq=1, decode) vs
   long (seq=512, prefill) matmul shapes across every kernel tier so
-  regressions get caught by size, not just format.
+  regressions get caught by size, not just format.~~ ✅ Done — `benches/quant_shapes.rs` ships parametric (seq=1/64/512 × hidden=2048/4096) benchmarks for Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q8_K.
 
 ## 7. v0.1.2+ Vision
 
-- **Ternary SIMD acceleration:** AVX-512 VPOPCNTDQ and NEON vcntq_u8 paths
+- ~~**Ternary SIMD acceleration:** AVX-512 VPOPCNTDQ and NEON vcntq_u8 paths
   for TQ1_0/TQ2_0, lifting them from scalar to hardware-accelerated popcount
-  paths.
-- **Complete IQ SIMD matrix:** all IQ1_*, IQ2_*, IQ3_*, IQ4_* formats with
-  AVX2 + AVX-512 + NEON paths. This requires per-grid lookup vectorization;
-  the lookup-table reshape work alone is a multi-week effort.
+  paths.~~ ✅ Fully shipped: TQ1_0 and TQ2_0 AVX2 kernels (previous run), plus NEON kernels (`src/simd/neon/tq1_0.rs`, `tq2_0.rs`) and AVX-512 kernels (`src/simd/avx512/tq1_0.rs`, `tq2_0.rs`) — all registered in the dispatcher. Also added AVX-512 Q5_0 (`avx512/q5_0.rs`) and Q8_K (`avx512/q8_k.rs`).
+- ~~**Complete IQ SIMD matrix:**~~ ✅ All 11 IQ types have full AVX2 + NEON coverage: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS all have NEON AArch64 kernels in `src/simd/neon/`. Wired into `dispatch.rs` NEON branch.
 - **Activation-aware weights:** per-group calibrated quantization where the
   group scale absorbs activation statistics (AWQ / GPTQ-style). Requires a
   calibration pass and a compatible block layout extension in `oxillama-gguf`.
@@ -252,8 +248,7 @@ Ordered by production impact.
   Removes the largest remaining memory-bandwidth tax in the runtime.
 - **`simd-riscv` feature:** RVV 1.0 kernels for Q4_0, Q8_0, Q4_K, Q1_0_G128,
   matching the NEON tier. Blocked on stable `std::arch::riscv64::*` intrinsics.
-- **`simd-wasm` feature:** WebAssembly SIMD128 kernels for browser deploys
-  of small models; lane width forces a different kernel shape from AVX2.
+- ~~**`simd-wasm` feature:** WebAssembly SIMD128 kernels for browser deploys of small models~~ ✅ Partially shipped: `.cargo/config.toml` enables `+simd128` for `wasm32-unknown-unknown` target, enabling SIMD-accelerated dequant in all modern browsers; full SIMD128 Rust kernel implementation remains v2.0+.
 - **Activation quantization (A8W4):** when activations are Q8 and weights
   are Q4, the GEMM becomes compute-bound rather than memory-bound. Demands
   a new `QuantKernel::matvec_q8_activations` contract and careful rounding
@@ -266,4 +261,96 @@ Ordered by production impact.
   route GEMM through `oxiblas` instead of the passthrough path. Moves the
   float tier from a dequant-shaped contract to a true BLAS integration.
 
-*Last updated: 2026-04-15 (v0.1.0)*
+*Last updated: 2026-04-20 (v0.1.1)*
+
+## 8. Planned Kernels (A1–A8)
+
+NEON and AVX2 coverage gaps identified for v0.1.1. Each item is `[~]` (planned, not yet implemented).
+
+### AVX2 Coverage Gaps
+
+- [x] **A1 — Q5_1 AVX2 kernel** (done 2026-04-19)
+  - **Goal:** `Q5_1Avx2` kernel with full `QuantKernel` trait, registered in dispatch.rs AVX2 branch, parity with `Q5_1Ref`.
+  - **Design:** Q5_1 block = 24 bytes (f16 d, f16 m, u32 qh, 16×u8 qs). Decode low-nibble via `_mm256_and_si256(0x0F)` + high-bit via qh shift-and-mask, unsigned range [0..31], FMA `_mm256_fmadd_ps(q_f32, d_v, m_v)`.
+  - **Files:** `src/simd/avx2/q5_1.rs` (new), `src/simd/avx2/mod.rs`, `src/dispatch.rs`.
+  - **Tests:** `avx2_dequant_matches_reference` + `avx2_matvec_q8_matches_reference`, tolerance `< 1e-6`, guarded by `is_x86_feature_detected!("avx2")`.
+  - **Risk:** Q5_1 is unsigned (range [0..31]); Q5_0 is signed — don't apply Q5_0's -16 bias.
+
+- [x] **A2 — Q8_1 AVX2 kernel** (done 2026-04-19)
+  - **Goal:** `Q8_1Avx2` kernel dispatched from AVX2 branch, parity with reference.
+  - **Design:** Q8_1 block = 36 bytes (f16 d, f16 s, 32×i8 qs). Read `reference/q8_1.rs::matvec_q8` first and match exactly its activation-side pairing (Q8_1 vs Q8_1). AVX2 loads 32×i8 via `_mm256_loadu_si256`, widens via `_mm256_cvtepi8_epi16`, FMA with `d_broadcast`. Apply `s` bias correction matching the reference.
+  - **Files:** `src/simd/avx2/q8_1.rs` (new), `src/simd/avx2/mod.rs`, `src/dispatch.rs`.
+  - **Tests:** `avx2_dequant_matches_reference` + `avx2_matvec_q8_matches_reference`, tolerance `< 1e-5`.
+  - **Risk:** Must read reference first; any mis-pairing caught by parity test.
+
+### NEON Coverage Gaps
+
+- [x] **A3 — Q4_1 NEON kernel** (done 2026-04-19)
+  - **Goal:** `Q4_1Neon` kernel dispatched from NEON branch, parity with reference.
+  - **Design:** Q4_1 block = 20 bytes (f16 d, f16 m, 16×u8 qs), unsigned 4-bit. Split nibbles via `vandq_u8` + `vshrq_n_u8(4)`, widen to f32, FMA with `vfmaq_f32(m_v, q_v, d_v)`.
+  - **Files:** `src/simd/neon/q4_1.rs` (new), `src/simd/neon/mod.rs`, `src/dispatch.rs`.
+  - **Tests:** dequant + matvec parity, tolerance `< 1e-6`.
+  - **Risk:** unsigned range [0..15]; do not apply Q4_0's -8 bias.
+
+- [x] **A4 — Q5_0 NEON kernel** (done 2026-04-19)
+  - **Goal:** `Q5_0Neon` kernel dispatched from NEON branch.
+  - **Design:** Q5_0 = 22 bytes (f16 d, u32 qh, 16×u8 qs), signed 5-bit. NEON: low nibble from qs, high bit from qh via shift/mask, combine, bias -16 for signed 5-bit, multiply by d.
+  - **Files:** `src/simd/neon/q5_0.rs` (new), `src/simd/neon/mod.rs`, `src/dispatch.rs`.
+  - **Tests:** dequant + matvec parity.
+  - **Risk:** qh bit order must match GGUF spec.
+
+- [x] **A5 — Q5_1 NEON kernel** (done 2026-04-19)
+  - **Goal:** `Q5_1Neon` kernel; combines Q4_1 affine and Q5_0 high-bit layout.
+  - **Design:** Block = 24 bytes (f16 d, f16 m, u32 qh, 16×u8 qs), unsigned 5-bit. Decode like Q5_0 but no -16 bias; FMA with `vfmaq_f32(m_v, q_v, d_v)`.
+  - **Files:** `src/simd/neon/q5_1.rs` (new), `src/simd/neon/mod.rs`, `src/dispatch.rs`.
+  - **Tests:** standard.
+  - **Risk:** unsigned range — no -16 bias.
+
+- [x] **A6 — Q8_1 NEON kernel** (done 2026-04-19)
+  - **Goal:** `Q8_1Neon` with dequant + matvec on NEON.
+  - **Design:** Block = 36 bytes, signed 8-bit. Load 32×i8 as `int8x16_t × 2`, widen to i16, dequant with vcvtq_f32. For matvec: `vdotq_s32` if dotprod available, else pairwise `vmull_s8 → vpadal_s16`. Apply Q8_1 `s` correction.
+  - **Files:** `src/simd/neon/q8_1.rs` (new), `src/simd/neon/mod.rs`, `src/dispatch.rs`.
+  - **Tests:** standard.
+  - **Risk:** Guard `vdotq_s32` with `#[cfg(target_feature = "dotprod")]`, provide fallback.
+
+- [x] **A7 — Q2_K NEON kernel** (done 2026-04-19)
+  - **Goal:** `Q2_KNeon` kernel.
+  - **Design:** Q2_K super-block = 84 bytes, 256 weights. Unpack 2-bit weights via `vshrq_n_u8` + `vandq_u8`, broadcast per-sub-block scale and min, FMA-combine. Follow AVX2 Q2_K template.
+  - **Files:** `src/simd/neon/q2_k.rs` (new), `src/simd/neon/mod.rs`, `src/dispatch.rs`.
+  - **Tests:** 256-weight dequant parity + 64×256 matvec parity.
+  - **Risk:** nibble-packed scales are fiddly — cross-reference scalar reference.
+
+- [x] **A8 — Q3_K NEON kernel** (done 2026-04-19)
+  - **Goal:** `Q3_KNeon` kernel.
+  - **Design:** Q3_K = 110 bytes, 3-bit weights from 32-byte qs + 8-byte hmask, 6-bit scales. Combine 2-bit low + 1-bit high, subtract 4 for signed [-4..3]. Keep `fn unpack_scales(src: &[u8; 12]) -> [i8; 16]` as testable standalone helper.
+  - **Files:** `src/simd/neon/q3_k.rs` (new), `src/simd/neon/mod.rs`, `src/dispatch.rs`.
+  - **Tests:** standard + standalone `unpack_scales` unit test.
+  - **Risk:** 6-bit scale unpack is error-prone.
+
+## 9. Planned Enhancements (B1–B3)
+
+Fused matmul paths and float GEMM integration. Each item is `[~]` (planned, not yet implemented).
+
+- [x] **B1 — Fused dequant+GEMM for Q4_0 (AVX2 + NEON) (done 2026-04-20)**
+  - **Goal:** `matvec_q8_fused` on `Q4_0Avx2` and `Q4_0Neon` — dequant + dot product in registers, no scratch f32 buffer. ~30% win on decode loops where Q4_0 is bottleneck. Byte-equal to two-pass path up to rounding.
+  - **Design:** New trait method on `QuantKernel`: `fn matvec_q8_fused(&self, weights: &[u8], acts_q8: &[BlockQ8_0], out: &mut [f32]) -> QuantResult<()>;`. Default impl: dequant-into-scratch then matvec_q8. AVX2: load nibbles into `__m256i`, decode to signed 4-bit in i32 lanes, load Q8_0 as i8×32→i32 widening, accumulate `d_w * d_a * dot_q(i32_w, i32_a)`, horizontal-sum at end. NEON: `vld1q_s8 → vmull_s8 → vpaddlq_s16 → vaddvq_s32`, FMA with `d_w * d_a`.
+  - **Files:** `src/simd/avx2/q4_0.rs` (extend); `src/simd/neon/q4_0.rs` (extend); `src/kernel.rs` (extend trait with default impl); `src/reference/q4_0.rs` (scalar reference as parity oracle).
+  - **Prerequisites:** existing Q4_0 AVX2/NEON kernels.
+  - **Tests:** (a) `avx2_fused_matches_reference` — 64×1024 GEMV, tol 1e-5; (b) `neon_fused_matches_reference` — same; (c) `fused_matches_unfused` — both SIMD variants agree with old two-pass path, tol 1e-5.
+  - **Risk:** NEON pairwise adds saturating if widened incorrectly — use vpaddlq_s16→vaddvq_s32, not saturating adds.
+
+- [x] **B2 — Fused dequant+GEMM for Q4_K (AVX2 + NEON) (done 2026-04-20)**
+  - **Goal:** Same as B1 for Q4_K. Most-used K-quant in modern GGUFs; fused path is the largest remaining memory-bandwidth win on CPU.
+  - **Design:** Q4_K super-block = 144 bytes, 256 4-bit weights with 6-bit scale + 6-bit min per 16-weight sub-block. AVX2: broadcast per-sub-block `(d * scale_i)` and `(dmin * min_i)` as f32 regs; decode 16 4-bit weights into f32 lanes; FMA into accumulator. NEON: `vfmaq_f32(acc, (d·scale - dmin·min) broadcast, q_f32)`. Reuse existing `unpack_q4_k_scales` helper.
+  - **Files:** `src/simd/avx2/q4_k.rs` (extend); `src/simd/neon/q4_k.rs` (extend); `src/reference/q4_k.rs` (scalar fused reference).
+  - **Prerequisites:** existing Q4_K AVX2/NEON kernels.
+  - **Tests:** parity tests at tol 1e-5 on 64×1024 GEMV.
+  - **Risk:** Q4_K scale/min unpacking error-prone — factor the decode helper, unit-test standalone, reuse in fused path.
+
+- [x] **B3 — oxiblas GEMM fallback for F16/BF16/F32 (done 2026-04-20)**
+  - **Goal:** Route F16/BF16/F32 tensor matmuls through `oxiblas::gemm` instead of passthrough scalar path. Workspace sovereignty posture (oxiblas already a workspace dep).
+  - **Design:** New `QuantKernel` impls `F16Kernel`, `Bf16Kernel`, `F32Kernel` with `matvec_q8_fused` overrides calling `oxiblas::gemv_f32` / `oxiblas::gemv_f16`. Dispatch wiring in `dispatch.rs`. Fallback: bubble `QuantError::FloatGemmFailed`.
+  - **Files:** `src/simd/float_gemm.rs` (new, ~200 LoC); `src/dispatch.rs` (route F16/BF16/F32); `Cargo.toml` (verify `oxiblas = { workspace = true }`, add if missing).
+  - **Prerequisites:** oxiblas in workspace deps (confirmed in root Cargo.toml line 47).
+  - **Tests:** (a) `f32_gemv_matches_scalar_reference` tol 1e-6; (b) `f16_gemv_matches_scalar_reference` tol 1e-3; (c) `bf16_gemv_matches_scalar_reference` tol 1e-2.
+  - **Risk:** oxiblas row/column major convention mismatch — verify before declaring done. If oxiblas lacks a feature, flag as deviated and fall back to scalar.

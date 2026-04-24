@@ -66,7 +66,13 @@ impl Qwen3Model {
         let vocab_size = config.vocab_size;
         let max_ctx = config.max_context_length;
 
-        let rope = RopeTable::new(head_dim, max_ctx, config.rope_freq_base);
+        let rope = RopeTable::new(
+            head_dim,
+            max_ctx,
+            config.rope_freq_base,
+            config.rope_scaling_type,
+            config.rope_scaling_factor,
+        );
         let dispatcher = KernelDispatcher::new();
 
         Self {

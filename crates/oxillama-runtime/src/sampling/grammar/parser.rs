@@ -75,13 +75,17 @@ pub struct Grammar {
     pub rules: HashMap<String, GrammarNode>,
     /// The root rule name (first rule defined, or "root" if present).
     pub root: String,
+    /// The original GBNF source string (retained for snapshot/resume).
+    pub source: String,
 }
 
 impl Grammar {
     /// Parse a GBNF grammar string into a `Grammar` structure.
     pub fn parse(input: &str) -> GrammarResult<Self> {
         let mut parser = GbnfParser::new(input);
-        parser.parse_grammar()
+        let mut grammar = parser.parse_grammar()?;
+        grammar.source = input.to_string();
+        Ok(grammar)
     }
 
     /// Get the grammar node for the root rule.
@@ -230,7 +234,11 @@ impl<'a> GbnfParser<'a> {
             first_rule.unwrap_or_default()
         };
 
-        Ok(Grammar { rules, root })
+        Ok(Grammar {
+            rules,
+            root,
+            source: String::new(), // filled in by Grammar::parse()
+        })
     }
 
     // ── Identifier parsing ───────────────────────────────────────────────────
@@ -872,6 +880,7 @@ ws ::= [ \t\n]*"#;
         let g = Grammar {
             rules: std::collections::HashMap::new(),
             root: "missing".to_string(),
+            source: String::new(),
         };
         let result = g.root_node();
         assert!(result.is_err(), "root_node() on missing rule should error");

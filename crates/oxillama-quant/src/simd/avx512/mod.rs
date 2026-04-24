@@ -15,20 +15,32 @@
 //! | [`Q5_KAvx512`]      | Q5_K       | 256 | 176 | ~2× |
 //! | [`Q6_KAvx512`]      | Q6_K       | 256 | 210 | ~2× |
 //! | [`Q1_0G128Avx512`]  | Q1_0_G128  | 128 | 18  | ~2× |
+//! | [`Tq1_0Avx512`]     | TQ1_0      | 256 | 54  | ~2× |
+//! | [`Tq2_0Avx512`]     | TQ2_0      | 256 | 66  | ~2× |
+//! | [`Q5_0Avx512`]      | Q5_0       | 32  | 22  | ~2× |
+//! | [`Q8_KAvx512`]      | Q8_K       | 256 | 292 | ~2× |
 
 #![cfg(all(feature = "simd-avx512", target_arch = "x86_64"))]
 
 pub mod q1_0_g128;
 pub mod q4_0;
 pub mod q4_k;
+pub mod q5_0;
 pub mod q5_k;
 pub mod q6_k;
 pub mod q8_0;
+pub mod q8_k;
+pub mod tq1_0;
+pub mod tq2_0;
 mod util;
 
 pub use q1_0_g128::Q1_0G128Avx512;
 pub use q4_0::Q4_0Avx512;
 pub use q4_k::Q4_KAvx512;
+pub use q5_0::Q5_0Avx512;
 pub use q5_k::Q5_KAvx512;
 pub use q6_k::Q6_KAvx512;
 pub use q8_0::Q8_0Avx512;
+pub use q8_k::Q8_KAvx512;
+pub use tq1_0::Tq1_0Avx512;
+pub use tq2_0::Tq2_0Avx512;

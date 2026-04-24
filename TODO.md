@@ -8,6 +8,27 @@ and an OpenAI-compatible API server without any C/C++/Fortran code.
 
 ---
 
+## v0.1.1 Shipped (2026-04-24)
+
+v0.1.1 ships on top of v0.1.0's foundation: FlashAttention tiled CPU kernel
+(BQ=BK=64, online softmax, rayon per-head), true continuous batching
+(per-request KV slots, `BatchedKvView` trait), fused dequant+GEMM for Q4_0
+and Q4_K (AVX2 + NEON, no scratch buffer), oxiblas float GEMM fallback for
+F16/BF16/F32 tensors, tiled GEMM WGSL shader (TILE_M/N=32, TILE_K=16, shared
+memory cooperative), fused attention WGSL kernel (single-dispatch QK+softmax+AV),
+IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S GPU GEMV kernels (+4 GPU kernels), DBRX
+(16-expert MoE, top-4), Grok-1 (8-expert MoE, top-2), DeepSeek-V3 sigmoid MoE
+scoring, Mamba-2 (selective scan, learned Δ), Jamba (hybrid SSM+attention),
+OLMo2, Yi, Granite, MiniCPM, InternLM3, and the `SequenceState` trait for SSM
+abstraction. GGUF loader hardening: partial-download resume (`GgufModel::resume`
++ `.oxiresume` sidecar), sharded multi-file loading (`ShardedGgufModel`),
+quantize-on-the-fly pass. Runtime snapshot/resume (`EngineSnapshot`, oxicode
+serialization). Facade examples (load_and_generate, lora_apply, speculative) +
+`RECIPES.md` cookbook (8 recipes). 1,662 tests, 0 warnings, 87%+ coverage.
+Detailed feature list: see [CHANGELOG.md](CHANGELOG.md).
+This TODO.md is forward-looking: the per-crate TODO files under `crates/*/TODO.md`
+carry shipped + gap + v1.1 / v2.0 detail.
+
 ## v0.1.0 Shipped (2026-04-15)
 
 v0.1.0 ships a feature-complete Pure Rust LLM inference engine: GGUF v3 parser,
@@ -19,8 +40,7 @@ continuous-batching scaffolding, WASM full inference, Python bindings (PyO3),
 optional wgpu GPU backend (Q4_0 / Q8_0 GEMV), criterion benchmarks across every
 quant kernel, and 3 cargo-fuzz targets on the GGUF parser. 1,205 tests, 0 warnings,
 87%+ region / function / line coverage. Detailed feature list: see
-[CHANGELOG.md](CHANGELOG.md). This TODO.md is now forward-looking: the per-crate
-TODO files under `crates/*/TODO.md` carry shipped + gap + v1.1 / v2.0 detail.
+[CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -28,13 +48,13 @@ TODO files under `crates/*/TODO.md` carry shipped + gap + v1.1 / v2.0 detail.
 
 | Metric | Value |
 |--------|-------|
-| Total Lines | ~56,200 Rust / ~71,500 total |
-| Source Files | 198 |
+| Total Lines | ~87,444 Rust / ~110,634 total |
+| Source Files | 321 Rust files / 383 total |
 | Crates | 11 |
-| Test Count | 1,205 |
+| Test Count | 1,662 |
 | Warnings | 0 |
 | Coverage | 87.09% region / 87.23% function / 85.42% line |
-| Last Updated | 2026-04-15 |
+| Last Updated | 2026-04-24 |
 
 ---
 
@@ -43,13 +63,13 @@ TODO files under `crates/*/TODO.md` carry shipped + gap + v1.1 / v2.0 detail.
 | Crate | Status | Completion |
 |-------|:------:|:----------:|
 | oxillama-gguf | Working | 93% |
-| oxillama-quant | Working | 99% |
+| oxillama-quant | Working | 100% |
 | oxillama-arch | Working | 98% |
 | oxillama-runtime | Working | 93% |
 | oxillama-server | Working | 98% |
 | oxillama-bench | Working | 78% |
 | oxillama-py | Scaffold | 52% |
-| oxillama-wasm | Working | 92% |
+| oxillama-wasm | Working | 97% |
 | oxillama-gpu | Working | 93% |
 | oxillama (meta) | Working | 100% |
 | oxillama-cli | Working | 100% |
@@ -66,14 +86,14 @@ Roadmap, v2.0+ Vision). Dive into the leaf that matches your area of interest.
 |---|---|---|
 | oxillama (meta) | [crates/oxillama/TODO.md](crates/oxillama/TODO.md) | Examples, mdBook guide, cookbook |
 | oxillama-gguf | [crates/oxillama-gguf/TODO.md](crates/oxillama-gguf/TODO.md) | v1/v2 legacy fallback, streaming parser, GGUF writer |
-| oxillama-quant | [crates/oxillama-quant/TODO.md](crates/oxillama-quant/TODO.md) | SIMD coverage breadth, fused dequant+GEMM, ternary types |
-| oxillama-arch | [crates/oxillama-arch/TODO.md](crates/oxillama-arch/TODO.md) | DeepSeek, Falcon, MiniCPM, Olmo2, Granite, Mamba-2 |
-| oxillama-runtime | [crates/oxillama-runtime/TODO.md](crates/oxillama-runtime/TODO.md) | Prefix KV caching, flash attention, true continuous batching |
+| oxillama-quant | [crates/oxillama-quant/TODO.md](crates/oxillama-quant/TODO.md) | SIMD coverage breadth, ~~fused dequant+GEMM~~ ✅ Shipped v0.1.1, ternary types |
+| oxillama-arch | [crates/oxillama-arch/TODO.md](crates/oxillama-arch/TODO.md) | ~~DeepSeek, Falcon, MiniCPM, Olmo2, Granite, Mamba-2~~ ✅ Shipped v0.1.1; audio/video modalities next |
+| oxillama-runtime | [crates/oxillama-runtime/TODO.md](crates/oxillama-runtime/TODO.md) | ~~flash attention~~ ✅ ~~true continuous batching~~ ✅ Shipped v0.1.1; prefix KV server wiring, multi-LoRA |
 | oxillama-server | [crates/oxillama-server/TODO.md](crates/oxillama-server/TODO.md) | Function/tool calling, auth, rate limiting, `/metrics` |
 | oxillama-bench | [crates/oxillama-bench/TODO.md](crates/oxillama-bench/TODO.md) | End-to-end benches, prefill vs decode split, regression gate |
 | oxillama-py | [crates/oxillama-py/TODO.md](crates/oxillama-py/TODO.md) | `.pyi` stubs, numpy interop, async, HF Hub loader |
 | oxillama-wasm | [crates/oxillama-wasm/TODO.md](crates/oxillama-wasm/TODO.md) | WebGPU bridge, streaming GGUF load, IndexedDB cache |
-| oxillama-gpu | [crates/oxillama-gpu/TODO.md](crates/oxillama-gpu/TODO.md) | More quant kernels, batched GEMV, tiled GEMM |
+| oxillama-gpu | [crates/oxillama-gpu/TODO.md](crates/oxillama-gpu/TODO.md) | ~~batched GEMV~~ ✅ ~~tiled GEMM~~ ✅ ~~fused attention~~ ✅ ~~IQ2/IQ3 kernels~~ ✅ Shipped v0.1.1; K-quant GPU coverage, naga MSL/SPIR-V |
 | oxillama-cli | [crates/oxillama-cli/TODO.md](crates/oxillama-cli/TODO.md) | Interactive chat, TUI, `oxillama hub` |
 
 ---
@@ -137,17 +157,24 @@ NEON kernels for Q5_K / Q6_K (LLaMA-3 dominant formats); AVX2 for Q2_K / Q3_K
 (phone / Pi deployments); ~~AVX2 for IQ2_XXS (the most common I-quant in HF GGUF
 uploads)~~ ✅ Shipped. Full matrix in `oxillama-quant/TODO.md` §2 + §6.
 
-### More architectures (arch + runtime feature flags)
+### More architectures (arch + runtime feature flags) — SHIPPED
 
-Add DeepSeek-V2/V3 (with Multi-head Latent Attention), Falcon, MiniCPM, Olmo2,
+~~Add DeepSeek-V2/V3 (with Multi-head Latent Attention), Falcon, MiniCPM, Olmo2,
 and Granite-3.x to `oxillama-arch`. Each gets a per-arch feature flag in
-`oxillama-runtime` so binary size scales down for focused deployments.
+`oxillama-runtime` so binary size scales down for focused deployments.~~ ✅ Shipped
+in v0.1.1: Falcon, DeepSeek-V2/V3 (MLA + sigmoid MoE scoring), DBRX (16-expert,
+top-4), Grok-1 (8-expert, top-2), Mamba-2 (selective scan, learned Δ), Jamba
+(hybrid SSM+attention), OLMo2, Yi, Granite, MiniCPM, InternLM3. 20 architectures total.
 Details in `oxillama-arch/TODO.md` §6.
 
 ### GPU kernel breadth (gpu) — partially shipped
 
 Extend `oxillama-gpu` from 6 quant shaders to cover remaining K-quants,
 ~~batched GEMV for prefill~~ ✅ Shipped (`BatchedGpuKernel`, Q4_0 batched impl),
+~~IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S GPU GEMV kernels~~ ✅ Shipped in v0.1.1 (+4 kernels,
+now 10 quant types on GPU), ~~tiled GEMM WGSL shader (TILE_M/N=32, TILE_K=16,
+shared memory cooperative)~~ ✅ Shipped in v0.1.1, ~~fused attention WGSL kernel
+(single-dispatch QK+softmax+AV)~~ ✅ Shipped in v0.1.1,
 f16 accumulator paths, and naga cross-compile validation (MSL for Metal + SPIR-V
 for Vulkan). See `oxillama-gpu/TODO.md` §6.
 
@@ -188,19 +215,18 @@ end, cross-platform, auditable, and independent of any C/C++ toolchain.
 - **RISC-V RVV 1.0 SIMD.** `simd-riscv` feature with vector-length-agnostic
   kernels for Q4_0 / Q8_0 / Q4_K / Q1_0_G128, matching the existing NEON tier.
   Blocked on stable `std::arch::riscv64` intrinsics.
-- **State-space models.** Mamba-2 and Jamba require sequence-level primitives
-  (selective scan, parallel associative scan) that do not fit the per-token
-  forward interface; extend `KvCacheAccess` into a broader `SequenceState`
-  abstraction inside `oxillama-runtime`.
+- ~~**State-space models.**~~ ✅ Shipped v0.1.1: Mamba-2 (selective scan, learned Δ)
+  and `SequenceState` trait (arch-internal SSM abstraction) both shipped.
+  ~~Jamba (hybrid SSM+attention)~~ ✅ Shipped v0.1.1; parallel associative scan remains on the roadmap.
 - **Multi-GPU dispatch.** Tensor-parallel matmul across wgpu adapters, with
   an explicit placement API that lets users pin individual layers to specific
   devices.
 - **Embedded / `no_std` path.** Strip `OnceLock`, Rayon, and `std::io`
   dependencies behind feature flags so scalar kernels compile for
   low-resource devices (microcontrollers, sensors with LLM inference).
-- **Tiled GEMM with shared memory.** Production-grade GPU matmul that moves
-  beyond naive GEMV; prerequisite for attention fusion and prefill-scale
-  workloads on wgpu.
+- ~~**Tiled GEMM with shared memory.**~~ ✅ Shipped v0.1.1: TILE_M/N=32, TILE_K=16
+  cooperative WGSL shader; fused attention kernel also shipped. Multi-GPU
+  dispatch and Metal/Vulkan naga cross-compile remain on the roadmap.
 - **Ternary quantization.** TQ1_0 and TQ2_0 (BitNet b1.58 and descendants);
   popcount on AVX-512 VPOPCNTDQ + `vcntq_u8` on NEON. Positions OxiLLaMa as
   the first Pure Rust runtime to ship them.
@@ -247,7 +273,7 @@ combination is not yet wired up.
 
 *x86-64, 8 cores, AVX2, multi-threaded. Target: >= 80% of llama.cpp throughput.*
 
-### Measured (v0.1.0 re-bench pending)
+### Measured (v0.1.1 end-to-end re-bench pending)
 
 | Model | Quant | OxiLLaMa Measured (CPU) | OxiLLaMa Measured (GPU) |
 |-------|-------|-------------------------|-------------------------|
@@ -267,12 +293,12 @@ workspace dependencies, but code adoption is light. The v1.1+ plan closes
 that gap by making the COOLJAPAN stack an authoritative substrate rather
 than an optional import.
 
-| Dependency | v0.1.0 Status | v1.1+ Plan |
+| Dependency | v0.1.1 Status | v1.1+ Plan |
 |---|---|---|
 | `scirs2-core` | In use for CPU feature detection wrapper | Expand to tensor primitives (stride math, reduction kernels) |
 | `scirs2-linalg` | Declared, unused | Adopt for reference GEMM paths (F16/BF16/F32 float tier) |
 | `scirs2-neural` | Declared, unused | Adopt for common building blocks (layer norm, activations) |
-| `oxiblas` | Declared | Wire into quant float-path GEMM as BLAS-grade fallback |
+| `oxiblas` | ✅ Wired v0.1.1 | Float GEMM fallback (F16/BF16/F32) shipping; fused dequant+GEMM for Q4_0/Q4_K also shipped |
 | `oxifft` | Declared | Wire into RoPE acceleration for very long context |
 | `oxicode` | Not yet declared | Replace any `bincode` usage per COOLJAPAN policy |
 | `oxiarc` | Not yet declared | Compression for model packaging + LoRA distribution |
@@ -291,8 +317,7 @@ larger cross-cutting ones. Each points into a specific subcrate TODO section.
 
 - **AVX-512 Q5_K kernel** — see `oxillama-quant/TODO.md` §6. Adds a wide-lane
   dequant + GEMV for one of the most-used LLaMA-3 formats.
-- **Falcon architecture** — see `oxillama-arch/TODO.md` §6. Template from
-  existing `llama.rs` + attention variant.
+- ~~**Falcon architecture**~~ ✅ Shipped v0.1.1.
 - ~~**Prefix KV caching**~~ ✅ — shipped in `oxillama-runtime` (see `oxillama-runtime/TODO.md` §6).
   Server-side wiring remains.
 - **Function calling** — see `oxillama-server/TODO.md` §6. Wire OpenAI `tools`
@@ -360,4 +385,4 @@ llama.cpp core inference loop.
 
 ---
 
-*Last Updated: 2026-04-15 (v0.1.0 release — 867 tests, 87%+ coverage, all milestones met)*
+*Last Updated: 2026-04-24 (v0.1.1 release — 1,662 tests, 87%+ coverage, 20 architectures, 25 quant formats, 10 GPU kernels)*

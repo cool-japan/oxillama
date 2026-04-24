@@ -13,13 +13,13 @@ workspace assumes this layer is correct and zero-copy where possible.
 
 | Field | Value |
 |---|---|
-| Version | `0.1.0` (workspace-pinned) |
+| Version | `0.1.1` (workspace-pinned) |
 | Completion | ~93% (GGUF v1/v2/v3 complete + writer API + streaming parser) |
 | Source files | 11 `.rs` under `src/` (~4,500 LoC) |
 | Format support | GGUF v1, v2, v3 (all supported) — version-dispatched layouts |
 | Default feature | `mmap` (memmap2-backed zero-copy loader) |
-| Optional feature | `test-utils` (alpha — synthetic GGUF builders) |
-| Fuzz targets | 3 under `fuzz/fuzz_targets/` |
+| Optional feature | `test-utils` (stable since v0.1.1 — synthetic GGUF builders) |
+| Fuzz targets | 4 under `fuzz/fuzz_targets/` (3 raw-byte + 1 arbitrary-structured) |
 | Core deps | `thiserror`, `byteorder`, `half`, `memmap2`, `tracing` |
 | Upstream consumers | `oxillama-quant`, `oxillama-arch`, `oxillama-runtime` |
 
@@ -86,7 +86,7 @@ workspace assumes this layer is correct and zero-copy where possible.
 - GGUF v3 writer API (`GgufWriter` builder — metadata + tensor
   serialization with 32-byte alignment).
 
-### Test fixtures (`test-utils` feature, alpha)
+### Test fixtures (`test-utils` feature)
 - `build_minimal_llama_gguf()` — synthetic 1-layer LLaMA GGUF binary.
 - Multi-architecture builders: Qwen3, Mistral, Gemma, Phi3, Command-R,
   StarCoder (used across downstream crate tests).
@@ -103,18 +103,21 @@ workspace assumes this layer is correct and zero-copy where possible.
   API yet — blocks remote fetch and WASM chunked-load designs.~~ ✅
   Shipped: `StreamingGgufParser` with `TensorInfoIter`, `find_tensor()`,
   `load_tensors()`, and `into_full()` for lazy/streaming tensor parsing.
-- **No partial-download resume.** A truncated GGUF raises
-  `UnexpectedEof`; there is no checkpoint/restart facility for flaky
-  connections or interrupted pulls from HuggingFace Hub mirrors.
-- **`test-utils` feature stability.** API is marked alpha — builder
-  signatures may change as new architectures are added. Downstream
-  crates pin to workspace-local paths rather than semver.
-- **No tensor-data hash validation.** GGUF v3 does not mandate it, but
-  tensor-blob integrity checks (Blake3 or similar) are absent, leaving
-  silent on-disk corruption undetected.
-- **No deep metadata schema validation.** Malformed-but-parseable KV
-  entries (missing `*.block_count`, out-of-range `*.head_count_kv`)
-  propagate unchecked to `oxillama-arch`.
+- [x] Loader hardening: partial-download resume + sharded multi-file + quantize-on-the-fly (shipped 2026-04-24)
+  - **Goal:** Three loader blockers resolved in one slice:
+    (1) partial-download resume via `.oxiresume` side-car checkpoint (bounded O(constant) probe: head/tail Blake3 + size + mtime);
+    (2) sharded multi-file via `load_sharded(first_shard)` accepting the `model-00001-of-00004.gguf` HF naming convention;
+    (3) quantize-on-the-fly via `load_with_quant_plan(path, plan)` streaming F16→Q4_0/Q8_0/Q4_K at load time.
+  - **Design:**
+    - `src/resume.rs`: `ResumeCheckpoint { file_size_expected, last_valid_offset, prefix_fingerprint: PrefixFingerprint, tensors_fully_loaded, version }` serialised via oxicode; `PrefixFingerprint { head_hash, tail_hash, probe_size=8MB, file_mtime_secs }`. API: `GgufModel::resume(path) -> GgufResult<ResumeHandle>`.
+    - `src/sharded.rs`: `ShardedGgufModel` — shard-naming regex, loads each via `GgufModel::load_mmap`, validates header consistency, builds tensor→shard map. Errors: `ShardMismatch`, `ShardDuplicateTensor`.
+    - `src/quantize_on_load.rs`: `QuantPlan { default: QuantTarget, overrides: HashMap<String, QuantTarget> }`. Per-tensor: read F16 → scalar-oracle quantise → owned `Vec<u8>` buffer → update `TensorStore`. Rejects re-quantisation.
+  - **Files:** `src/resume.rs`, `src/sharded.rs`, `src/quantize_on_load.rs`, `src/lib.rs` (re-exports), `src/error.rs` (3 new variants), `src/loader.rs`, `Cargo.toml` (oxicode dep), `tests/resume.rs`, `tests/sharded.rs`, `tests/quantize_on_load.rs`.
+  - **Tests:** `resume_roundtrip_valid_checkpoint`, `resume_rejects_hash_mismatch`, `resume_rejects_future_file_size`, `sharded_loads_two_shards_roundtrip`, `sharded_rejects_mismatched_architecture`, `sharded_rejects_duplicate_tensor`, `quantize_on_load_f16_to_q4_0`, `quantize_on_load_rejects_requantize`, `quantize_on_load_override_per_tensor`.
+- ~~**`test-utils` feature stability.**~~ ✅ Resolved in v0.1.1 — builder
+  signatures are now semver-stable within the 0.1.x series.
+- Tensor-data hash validation shipped via `TensorHashValidator` in `src/validate.rs` (v1.1); use `GgufModel::validate_tensor_hashes()` to verify integrity.
+- Deep metadata schema validation shipped via pluggable `SchemaValidator` in `src/schema.rs` (v1.1); use `GgufModel::validate_schema()` with a custom validator.
 - **No `no_std` story.** `std::fs` and `std::path::Path` are used in
   `loader.rs`; embedded targets cannot yet reuse the reader core.
 
@@ -130,20 +133,23 @@ Priority order (highest first):
    crates to stream tensors during `mmap`-less loads (WASM, remote fetch).
 3. ~~**GGUF writer API.**~~ ✅ Shipped — `GgufWriter` builder with
    metadata + tensor serialization and 32-byte alignment.
-4. **Stabilise `test-utils` feature.** Freeze builder signatures, move
-   to `#[doc(cfg(feature = "test-utils"))]`, promote from alpha to a
-   semver-covered surface, document every synthetic builder.
-5. **Blake3 tensor-blob hash validation.** Optional verification pass
-   gated behind a `validate` feature; read expected hash from a new
-   `general.tensor_hashes` KV if present. Hard-fail on mismatch,
-   warn-log if absent.
-6. **Strict metadata schema check.** Pluggable validator (`llama.*`,
-   `qwen3.*`, `command_r.*`, ...) producing a single `ArchError`-ready
-   diagnostic before reaching `oxillama-arch`.
+4. ~~**Stabilise `test-utils` feature.**~~ ✅ Done — builder signatures frozen,
+   `#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]` on every public fn,
+   module docs updated to v0.1.1 stability guarantee, alpha language removed.
+5. ~~**Blake3 tensor-blob hash validation.**~~ ✅ Shipped. `TensorHashValidator`
+   reads `general.tensor_hashes` from GGUF metadata (array of
+   `"name:hexhash"` strings) and validates each tensor blob via Blake3.
+   Gated behind `validate` feature (aliases `integrity`). `GgufModel::validate_tensor_hashes()`
+   returns `Err(GgufError::HashMismatch)` on first mismatch.
+6. ~~**Strict metadata schema check.**~~ ✅ Shipped. Pluggable `SchemaValidator`
+   trait with built-in validators for LLaMA, Qwen3, Mistral, Gemma, Phi,
+   Command-R, StarCoder. `validate_schema()` dispatches on `general.architecture`
+   and returns a `Vec<SchemaViolation>` for callers to decide fail/warn.
 7. **`no_std` reader core.** Split reader/types into a `no_std + alloc`
    sub-module to unlock embedded-target plans in v2.0.
-8. **Richer fuzzing.** Add a structured-input fuzzer (arbitrary-derived
-   `MetadataValue::Array` trees) on top of the three raw-byte fuzzers.
+8. ~~**Richer fuzzing.**~~ ✅ Done — `fuzz/fuzz_targets/gguf_metadata_arbitrary.rs`
+   added using `arbitrary`-derived `ArbScalar`/`ArbMetadata` types that map
+   directly to all `MetadataValue` variants including nested `Array` trees.
 
 ## 7. v2.0+ Vision
 
@@ -178,4 +184,4 @@ Priority order (highest first):
 - **`no_std + alloc` profile.** Fully embedded-target-capable reader
   and parser (no `std::fs`, no `std::path`) for on-device LLM shells.
 
-*Last updated: 2026-04-15 (v0.1.0 release)*
+*Last updated: 2026-04-24 (v0.1.1)*

@@ -20,6 +20,7 @@ pyo3::create_exception!(oxillama_py, GenerateError, OxiLlamaError);
 pyo3::create_exception!(oxillama_py, TokenizerError, OxiLlamaError);
 pyo3::create_exception!(oxillama_py, GrammarError, OxiLlamaError);
 pyo3::create_exception!(oxillama_py, QuantError, OxiLlamaError);
+pyo3::create_exception!(oxillama_py, KvCacheFullError, OxiLlamaError);
 
 /// Register all custom exception classes on the Python module so that
 /// they are importable as `oxillama_py.OxiLlamaError`, etc.
@@ -30,6 +31,7 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("TokenizerError", m.py().get_type::<TokenizerError>())?;
     m.add("GrammarError", m.py().get_type::<GrammarError>())?;
     m.add("QuantError", m.py().get_type::<QuantError>())?;
+    m.add("KvCacheFullError", m.py().get_type::<KvCacheFullError>())?;
     Ok(())
 }
 
@@ -69,7 +71,7 @@ pub fn runtime_to_py(err: RuntimeError) -> PyErr {
         RuntimeError::SamplingError { message } => {
             GenerateError::new_err(format!("Sampling error: {message}"))
         }
-        RuntimeError::KvCacheFull { max_ctx } => GenerateError::new_err(format!(
+        RuntimeError::KvCacheFull { max_ctx } => KvCacheFullError::new_err(format!(
             "KV cache full: maximum context length {max_ctx} reached"
         )),
         RuntimeError::Cancelled => GenerateError::new_err("Generation cancelled"),
@@ -85,6 +87,16 @@ pub fn runtime_to_py(err: RuntimeError) -> PyErr {
         RuntimeError::AttentionError { message } => {
             GenerateError::new_err(format!("Attention error: {message}"))
         }
+        RuntimeError::SnapshotIncompatible { detail } => {
+            GenerateError::new_err(format!("Snapshot incompatible: {detail}"))
+        }
+        RuntimeError::ModelFingerprintMismatch {
+            expected,
+            found,
+            detail,
+        } => LoadError::new_err(format!(
+            "Model fingerprint mismatch — expected {expected}, found {found}: {detail}"
+        )),
     }
 }
 
@@ -152,6 +164,9 @@ pub fn arch_to_py(err: ArchError) -> PyErr {
         }
         ArchError::UnsupportedOperation { message } => {
             GenerateError::new_err(format!("Unsupported operation: {message}"))
+        }
+        ArchError::LoraIncompatible { detail } => {
+            LoadError::new_err(format!("LoRA adapter incompatible: {detail}"))
         }
     }
 }
@@ -242,6 +257,9 @@ mod tests {
             },
             ArchError::InvalidConfig {
                 detail: "top_k must be >= 1".to_string(),
+            },
+            ArchError::LoraIncompatible {
+                detail: "rank mismatch".to_string(),
             },
         ];
 

@@ -7,10 +7,15 @@
 //! blocked during inference.  Streaming callbacks re-acquire the GIL
 //! for each call via `Python::attach(...)`.
 
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
 use oxillama_runtime::{EngineConfig as RustEngineConfig, InferenceEngine, SamplerConfig};
+
+use crate::cancel::PyCancellationToken;
 
 use crate::error::runtime_to_py;
 use crate::sampler::PySamplerConfig;
@@ -208,7 +213,7 @@ impl PyEngine {
     ///
     /// Raises:
     ///     RuntimeError: if no model is loaded.
-    #[pyo3(signature = (prompt, max_tokens = 128, *, temperature = None, top_p = None, top_k = None, seed = None))]
+    #[pyo3(signature = (prompt, max_tokens = 128, *, temperature = None, top_p = None, top_k = None, seed = None, cancel_token = None))]
     pub fn generate(
         &mut self,
         py: Python<'_>,
@@ -218,16 +223,38 @@ impl PyEngine {
         top_p: Option<f32>,
         top_k: Option<usize>,
         seed: Option<u64>,
+        cancel_token: Option<Py<PyCancellationToken>>,
     ) -> PyResult<String> {
         let inner = &mut self.inner;
-        if temperature.is_some() || top_p.is_some() || top_k.is_some() || seed.is_some() {
-            let config = build_override_config(inner, temperature, top_p, top_k, seed);
-            py.detach(|| inner.generate_with_config(prompt, max_tokens, config, |_| {}))
-                .map_err(runtime_to_py)
-        } else {
-            py.detach(|| inner.generate(prompt, max_tokens, |_| {}))
-                .map_err(runtime_to_py)
+        let cancelled = cancel_token
+            .as_ref()
+            .map(|ct| Python::attach(|py| ct.borrow(py).cancelled.clone()));
+        let make_cb = || {
+            let cancelled = cancelled.clone();
+            move |_tok: &str| {
+                if let Some(ref flag) = cancelled {
+                    flag.load(Ordering::Relaxed);
+                }
+            }
+        };
+        let result =
+            if temperature.is_some() || top_p.is_some() || top_k.is_some() || seed.is_some() {
+                let config = build_override_config(inner, temperature, top_p, top_k, seed);
+                py.detach(|| inner.generate_with_config(prompt, max_tokens, config, make_cb()))
+                    .map_err(runtime_to_py)
+            } else {
+                py.detach(|| inner.generate(prompt, max_tokens, make_cb()))
+                    .map_err(runtime_to_py)
+            };
+        // Check if cancelled after generation finished
+        if let Some(ref flag) = cancelled {
+            if flag.load(Ordering::Relaxed) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "generation cancelled",
+                ));
+            }
         }
+        result
     }
 
     /// Generate text from `prompt`, invoking `callback` with each token as it
@@ -252,7 +279,7 @@ impl PyEngine {
     ///
     /// Raises:
     ///     RuntimeError: if no model is loaded.
-    #[pyo3(signature = (prompt, max_tokens = 128, callback = None, *, temperature = None, top_p = None, top_k = None, seed = None))]
+    #[pyo3(signature = (prompt, max_tokens = 128, callback = None, *, temperature = None, top_p = None, top_k = None, seed = None, cancel_token = None, strict_callback = false))]
     pub fn generate_streaming(
         &mut self,
         py: Python<'_>,
@@ -263,26 +290,70 @@ impl PyEngine {
         top_p: Option<f32>,
         top_k: Option<usize>,
         seed: Option<u64>,
+        cancel_token: Option<Py<PyCancellationToken>>,
+        strict_callback: bool,
     ) -> PyResult<String> {
         let inner = &mut self.inner;
+        let cancelled = cancel_token
+            .as_ref()
+            .map(|ct| Python::attach(|py| ct.borrow(py).cancelled.clone()));
         let has_overrides =
             temperature.is_some() || top_p.is_some() || top_k.is_some() || seed.is_some();
-        py.detach(|| {
-            let cb = |tok: &str| {
-                if let Some(ref cb) = callback {
-                    Python::attach(|py| {
-                        let _ = cb.call1(py, (tok,));
-                    });
+
+        // Shared slot for propagating Python callback errors when strict_callback=true.
+        let error_slot: Arc<Mutex<Option<pyo3::PyErr>>> = Arc::new(Mutex::new(None));
+        let error_slot_inner = error_slot.clone();
+
+        let result = py
+            .detach(|| {
+                let cancelled_inner = cancelled.clone();
+                let cb = move |tok: &str| {
+                    // Check cancellation before invoking user callback.
+                    if let Some(ref flag) = cancelled_inner {
+                        if flag.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                    if let Some(ref cb) = callback {
+                        let call_result = Python::attach(|py| cb.call1(py, (tok,)));
+                        if let Err(err) = call_result {
+                            if strict_callback {
+                                if let Ok(mut slot) = error_slot_inner.lock() {
+                                    // Only store the first error.
+                                    if slot.is_none() {
+                                        *slot = Some(err);
+                                    }
+                                }
+                            }
+                            // else: swallow the error (legacy behaviour)
+                        }
+                    }
+                };
+                if has_overrides {
+                    let config = build_override_config(inner, temperature, top_p, top_k, seed);
+                    inner.generate_with_config(prompt, max_tokens, config, cb)
+                } else {
+                    inner.generate(prompt, max_tokens, cb)
                 }
-            };
-            if has_overrides {
-                let config = build_override_config(inner, temperature, top_p, top_k, seed);
-                inner.generate_with_config(prompt, max_tokens, config, cb)
-            } else {
-                inner.generate(prompt, max_tokens, cb)
+            })
+            .map_err(runtime_to_py);
+
+        // If strict_callback captured a Python error, propagate it now.
+        if strict_callback {
+            if let Ok(mut slot) = error_slot.lock() {
+                if let Some(py_err) = slot.take() {
+                    return Err(py_err);
+                }
             }
-        })
-        .map_err(runtime_to_py)
+        }
+        if let Some(ref flag) = cancelled {
+            if flag.load(Ordering::Relaxed) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "generation cancelled",
+                ));
+            }
+        }
+        result
     }
 
     /// Compute a semantic embedding vector for `text`.
@@ -373,6 +444,120 @@ impl PyEngine {
     ///     RuntimeError: if no model is loaded.
     pub fn apply_lora(&mut self, lora_path: &str) -> PyResult<()> {
         oxillama_runtime::lora_loader::apply_lora(&mut self.inner, lora_path).map_err(runtime_to_py)
+    }
+
+    /// Return the raw logit vector for the final token position of `text`.
+    ///
+    /// The text is tokenized; all tokens except the last are prefilled into the
+    /// KV cache, then a single forward pass is executed for the last token and
+    /// the resulting logit vector (one float per vocab entry) is returned.
+    ///
+    /// The KV cache is **not** reset before this call — the caller should call
+    /// `reset()` first if an independent pass is desired.
+    ///
+    /// Returns:
+    ///     List\[float\]: Raw (un-softmaxed) logits, length = vocab\_size.
+    ///
+    /// Raises:
+    ///     RuntimeError: if no model is loaded.
+    ///     ValueError:   if `text` tokenizes to the empty sequence.
+    #[pyo3(signature = (text))]
+    pub fn forward_logits(&mut self, py: Python<'_>, text: String) -> PyResult<Vec<f32>> {
+        let inner = &mut self.inner;
+        py.detach(|| {
+            let tokens = inner.tokenize(&text)?;
+            if tokens.is_empty() {
+                return Err(oxillama_runtime::RuntimeError::TokenizerError {
+                    message: "text tokenizes to empty sequence".into(),
+                });
+            }
+            let (prefill_tokens, last_slice) = tokens.split_at(tokens.len() - 1);
+            let last_token = last_slice[0];
+            inner.prefill(prefill_tokens)?;
+            inner.forward_one(last_token)
+        })
+        .map_err(runtime_to_py)
+    }
+
+    /// Same as `forward_logits` but returns a 1-D numpy array of dtype float32.
+    ///
+    /// Requires the ``numpy`` feature to be enabled at build time.
+    ///
+    /// Returns:
+    ///     numpy.ndarray: Raw logits, shape ``(vocab_size,)``, dtype ``float32``.
+    ///
+    /// Raises:
+    ///     RuntimeError: if no model is loaded.
+    ///     ValueError:   if `text` tokenizes to the empty sequence.
+    #[cfg(feature = "numpy")]
+    #[pyo3(signature = (text))]
+    pub fn forward_logits_numpy<'py>(
+        &mut self,
+        py: Python<'py>,
+        text: String,
+    ) -> PyResult<Bound<'py, numpy::PyArray1<f32>>> {
+        let vec = self.forward_logits(py, text)?;
+        Ok(numpy::PyArray1::from_vec(py, vec))
+    }
+
+    /// Download a GGUF model from HuggingFace Hub and construct a loaded
+    /// `Engine` in one step.
+    ///
+    /// The GIL is released while the file is being downloaded so other Python
+    /// threads remain responsive.
+    ///
+    /// Args:
+    ///     repo_id:  HuggingFace repository ID, e.g. ``"TheBloke/Llama-2-7B-GGUF"``.
+    ///     filename: Specific GGUF file.  If *None*, the first ``*.gguf`` file
+    ///               found in the repository is used.
+    ///     revision: Git revision / branch / tag.  Defaults to ``"main"``.
+    ///     token:    HF access token.  Falls back to ``$HF_TOKEN`` /
+    ///               ``$HUGGINGFACE_HUB_TOKEN``.
+    ///     config:   Optional engine configuration.  Uses defaults if *None*.
+    ///
+    /// Returns:
+    ///     Engine: A fully loaded engine ready for inference.
+    ///
+    /// Raises:
+    ///     IOError:      if the download or GGUF file fails.
+    ///     RuntimeError: if no ``.gguf`` file is found in the repository.
+    #[classmethod]
+    #[pyo3(signature = (
+        repo_id,
+        *,
+        filename = None,
+        revision = None,
+        token = None,
+        config = None,
+    ))]
+    pub fn from_hub(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        repo_id: String,
+        filename: Option<String>,
+        revision: Option<String>,
+        token: Option<String>,
+        config: Option<PyEngineConfig>,
+    ) -> PyResult<Self> {
+        let local_path = py.detach(|| {
+            crate::hub::download_model_from_hub(
+                &repo_id,
+                filename.as_deref(),
+                revision.as_deref(),
+                token.as_deref(),
+            )
+        })?;
+
+        let mut engine_config =
+            config.unwrap_or_else(|| PyEngineConfig::new(local_path.clone(), None, 4, None, None));
+        engine_config.model_path = local_path;
+
+        let mut engine = Self {
+            inner: InferenceEngine::new(engine_config.to_rust()),
+        };
+        let inner = &mut engine.inner;
+        py.detach(|| inner.load_model()).map_err(runtime_to_py)?;
+        Ok(engine)
     }
 }
 

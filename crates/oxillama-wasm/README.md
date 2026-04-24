@@ -7,9 +7,16 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 ## What It Provides
 
 - GGUF metadata and tensor catalogue parsing from a `Uint8Array` in the browser
-- Full text generation via `oxillama-runtime` (behind the `inference` feature)
+- Typed metadata export via `parseGgufMetadata()` returning a `GgufMetadataJs` object (arch, context_length, embedding_length, etc.)
+- Full text generation via `oxillama-runtime` (behind the `inference` feature) with optional per-token `onToken` callback
+- K-quant dequantization bindings: `dequantQ4_0`, `dequantQ4K`, `dequantQ5K`, `dequantQ6K`
+- Model loading with progress callbacks: `loadModelFromBytesWithProgress(bytes, onProgress)`
+- WebGPU async bridge: `initWebGpuDevice()`, `webgpuDequantQ4_0Async()`, `webgpuGemvAsync()`
+- IndexedDB model cache: `cacheModel()`, `loadCachedModel()`, `listCachedModels()`, `deleteCachedModel()`
+- Streaming GGUF load via `GgufChunkLoader` for incremental byte feeds
+- Web-worker message-passing API: `parseWorkerMessage()` / `workerTokenEvent()`
 - Pure-Rust tokenizer backend (`fancy-regex`, no Oniguruma C library) — safe for `wasm32-unknown-unknown`
-- No SIMD rayon threads — single-threaded, browser-compatible
+- No SIMD rayon threads — single-threaded, browser-compatible; SIMD128 proposal enabled at compile time
 
 ## Feature Flags
 
@@ -35,20 +42,40 @@ wasm-pack build --release --target web -p oxillama-wasm
 ## Usage (JavaScript)
 
 ```js
-import init, { GgufWasm, InferenceWasm } from "./pkg/oxillama_wasm.js";
+import init, {
+  parseGgufHeader, parseGgufMetadata, listTensorNames,
+  dequantQ4_0, dequantQ4K, dequantQ5K, dequantQ6K,
+  loadModelFromBytesWithProgress, WasmEngine,
+} from "./pkg/oxillama_wasm.js";
 
 await init();
 
-// Parse GGUF metadata from a fetched ArrayBuffer
+// Fetch and parse GGUF metadata (no weights loaded)
 const resp   = await fetch("/models/llama-3.2-1b.Q4_K_M.gguf");
-const buf    = await resp.arrayBuffer();
-const gguf   = new GgufWasm(new Uint8Array(buf));
-console.log("arch:", gguf.get_metadata("general.architecture"));
+const bytes  = new Uint8Array(await resp.arrayBuffer());
+const header = parseGgufHeader(bytes);
+const meta   = parseGgufMetadata(bytes);
+console.log("arch:", meta.arch, "context:", meta.context_length);
+console.log("tensors:", listTensorNames(bytes));
 
-// Run inference (requires `inference` feature)
-const engine = new InferenceWasm(new Uint8Array(buf));
-const output = engine.generate("Hello, world!", 128, 0.8);
+// Load model with progress callback (requires `inference` feature)
+const engine = await loadModelFromBytesWithProgress(bytes, (pct) => {
+  console.log(`loading: ${pct}%`);
+});
+
+// Generate text with per-token streaming
+const output = engine.generate("Hello, world!", 128, 0.8, (token) => {
+  process.stdout.write(token);
+});
 console.log(output);
+
+// IndexedDB cache — persist across reloads
+await cacheModel("llama-3b", bytes);
+const cached = await loadCachedModel("llama-3b");
+
+// WebGPU acceleration (where supported)
+await initWebGpuDevice();
+const result = await webgpuDequantQ4_0Async(quantizedBlock);
 ```
 
 ## License

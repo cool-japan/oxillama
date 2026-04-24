@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxillama"
@@ -28,17 +28,17 @@ categories = ["science", "algorithms", "command-line-utilities"]
 
 [workspace.dependencies]
 # ── Internal crates ──
-oxillama-gguf = { path = "crates/oxillama-gguf", version = "0.1.0", default-features = false }
-oxillama-quant = { path = "crates/oxillama-quant", version = "0.1.0", default-features = false }
-oxillama-arch = { path = "crates/oxillama-arch", version = "0.1.0" }
-oxillama-runtime = { path = "crates/oxillama-runtime", version = "0.1.0", default-features = false }
-oxillama-server = { path = "crates/oxillama-server", version = "0.1.0" }
-oxillama-bench = { path = "crates/oxillama-bench", version = "0.1.0" }
-oxillama-py = { path = "crates/oxillama-py", version = "0.1.0" }
-oxillama-wasm = { path = "crates/oxillama-wasm", version = "0.1.0" }
-oxillama-gpu = { path = "crates/oxillama-gpu", version = "0.1.0", default-features = false }
-oxillama = { path = "crates/oxillama", version = "0.1.0", default-features = false }
-oxillama-cli = { path = "crates/oxillama-cli", version = "0.1.0" }
+oxillama-gguf = { path = "crates/oxillama-gguf", version = "0.1.1", default-features = false }
+oxillama-quant = { path = "crates/oxillama-quant", version = "0.1.1", default-features = false }
+oxillama-arch = { path = "crates/oxillama-arch", version = "0.1.1" }
+oxillama-runtime = { path = "crates/oxillama-runtime", version = "0.1.1", default-features = false }
+oxillama-server = { path = "crates/oxillama-server", version = "0.1.1" }
+oxillama-bench = { path = "crates/oxillama-bench", version = "0.1.1" }
+oxillama-py = { path = "crates/oxillama-py", version = "0.1.1" }
+oxillama-wasm = { path = "crates/oxillama-wasm", version = "0.1.1" }
+oxillama-gpu = { path = "crates/oxillama-gpu", version = "0.1.1", default-features = false }
+oxillama = { path = "crates/oxillama", version = "0.1.1", default-features = false }
+oxillama-cli = { path = "crates/oxillama-cli", version = "0.1.1" }
 
 # ── COOLJAPAN Ecosystem (Pure Rust Policy) ──
 scirs2-core = { version = "0.4.2", default-features = false }
@@ -58,18 +58,28 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 # ── Serialization ──
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+oxicode = "0.2.1"
+uuid = { version = "1", features = ["v4", "fast-rng", "macro-diagnostics"] }
 
 # ── Async runtime ──
-tokio = { version = "1.52.0", features = ["full"] }
+tokio = { version = "1.52.1", features = ["full"] }
 tokio-stream = "0.1.18"
+tokio-util = { version = "0.7.18", features = ["full"] }
 
 # ── HTTP server ──
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 tower = "0.5.3"
 tower-http = { version = "0.6.8", features = ["cors", "limit", "trace"] }
 
 # ── CLI ──
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
+colored = "3"
+indicatif = "0.18"
+rustyline = "18.0.0"
+clap_complete = "4.6.2"
+clap_mangen = "0.3.0"
+dirs = "6.0.0"
+toml = "1.1.2"
 
 # ── Binary / memory / numerics ──
 memmap2 = "0.9.10"
@@ -82,16 +92,25 @@ rayon = "1.12.0"
 # ── Tokenizer ──
 tokenizers = { version = "0.22.2", default-features = false }
 
+# ── HuggingFace Hub ──
+hf-hub = "0.5.0"
+
 # ── Python / WASM bindings ──
 pyo3 = { version = "0.28", features = ["abi3-py38"] }
 numpy = { version = "0.28.0", default-features = false }
 wasm-bindgen = "0.2.118"
+wasm-bindgen-futures = "0.4.68"
 js-sys = "0.3.95"
 console_error_panic_hook = "0.1.7"
 serde-wasm-bindgen = "0.6.5"
+wasm-streams = "0.5.0"
+
+# ── Temp files / atomic writes ──
+tempfile = "3.20.0"
 
 # ── Benchmarking (dev) ──
 criterion = { version = "0.8.2", features = ["html_reports"] }
+proptest = "1.11.0"
 
 
 

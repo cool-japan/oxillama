@@ -7,7 +7,10 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 ## What It Provides
 
 - **25 quantization types**: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K_S/M/L, Q4_K_S/M, Q5_K_S/M, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ2_M, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, Q1_0_G128
-- SIMD-accelerated paths: AVX-512, AVX2, ARM NEON, and portable scalar fallback
+- SIMD-accelerated paths: AVX-512, AVX2 (27 kernels), ARM NEON (27 kernels), and portable scalar fallback; 11 AVX-512 kernels
+- Fused dequant+GEMM for Q4_0 and Q4_K on AVX2 and NEON — single-pass matmul with no intermediate f32 scratch buffer
+- `matvec_q8_fused` trait method on `QuantKernel` with scalar default impl and SIMD overrides
+- `oxiblas` float GEMM fallback for F16/BF16/F32 tensors via `oxiblas::gemv_f32/f16`
 - Parallel dequantization via `rayon` (feature-gated)
 - Property-based test coverage for all kernels
 

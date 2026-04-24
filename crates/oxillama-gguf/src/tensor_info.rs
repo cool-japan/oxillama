@@ -115,6 +115,20 @@ impl TensorStore {
         self.infos.keys()
     }
 
+    /// Update the tensor type for a named tensor in-place.
+    ///
+    /// Used after on-load quantization to keep the stored [`TensorInfo`] in
+    /// sync with the override map so that downstream consumers reading
+    /// `tensor_type` see the correct quantization format.
+    ///
+    /// Does nothing if `name` is not found (caller is responsible for
+    /// ensuring the tensor exists before inserting into the override map).
+    pub fn set_type(&mut self, name: &str, new_type: GgufTensorType) {
+        if let Some(info) = self.infos.get_mut(name) {
+            info.tensor_type = new_type;
+        }
+    }
+
     /// Returns the absolute byte offset of a tensor's data in the file.
     pub fn absolute_offset(&self, name: &str) -> GgufResult<u64> {
         let info = self.get(name)?;

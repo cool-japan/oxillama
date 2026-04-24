@@ -233,6 +233,134 @@ fn tensor_data_slice<'a>(
     Ok(&data[abs_offset_usize..end_usize])
 }
 
+// ─── TensorHashValidator ─────────────────────────────────────────────────────
+//
+// Validates tensor blobs against Blake3 hashes stored in GGUF metadata under
+// the key `general.tensor_hashes`.  The value must be an array of strings,
+// each formatted as `"<tensor_name>:<hex_hash>"` (64 hex chars = 32 bytes).
+
+use crate::metadata::MetadataStore;
+
+/// Expected hash for a single tensor blob, sourced from GGUF metadata.
+#[derive(Debug, Clone)]
+pub struct TensorHashEntry {
+    /// Name of the tensor this hash covers.
+    pub tensor_name: String,
+    /// Expected Blake3 hash (32 bytes).
+    pub expected: [u8; 32],
+}
+
+/// Validates tensor blobs against Blake3 hashes stored in GGUF metadata.
+///
+/// Build one via [`TensorHashValidator::from_metadata`], then call
+/// [`TensorHashValidator::validate`] for each tensor blob to check.
+pub struct TensorHashValidator {
+    entries: std::collections::HashMap<String, [u8; 32]>,
+}
+
+impl TensorHashValidator {
+    /// Build from GGUF metadata.
+    ///
+    /// Reads `general.tensor_hashes` — an array of `"name:hexhash"` strings.
+    /// Returns `Ok(None)` when the key is absent (validation opt-out).
+    /// Returns `Err` if the key is present but malformed.
+    pub fn from_metadata(metadata: &MetadataStore) -> GgufResult<Option<Self>> {
+        let Some(value) = metadata.get("general.tensor_hashes") else {
+            return Ok(None);
+        };
+
+        let arr = value.as_array().ok_or_else(|| GgufError::InvalidMetadata {
+            key: "general.tensor_hashes".to_string(),
+            reason: "expected array value".to_string(),
+        })?;
+
+        let mut entries = std::collections::HashMap::with_capacity(arr.len());
+
+        for item in arr {
+            let s = item.as_str().ok_or_else(|| GgufError::InvalidMetadata {
+                key: "general.tensor_hashes".to_string(),
+                reason: "array element is not a string".to_string(),
+            })?;
+
+            // Format: "<tensor_name>:<64-char-hex>"
+            let colon = s.rfind(':').ok_or_else(|| GgufError::InvalidMetadata {
+                key: "general.tensor_hashes".to_string(),
+                reason: format!("entry missing ':' separator: {s}"),
+            })?;
+            let tensor_name = s[..colon].to_string();
+            let hex = &s[colon + 1..];
+            if hex.len() != 64 {
+                return Err(GgufError::InvalidMetadata {
+                    key: "general.tensor_hashes".to_string(),
+                    reason: format!(
+                        "hash for '{tensor_name}' must be 64 hex chars, got {}",
+                        hex.len()
+                    ),
+                });
+            }
+            let hash = hex_to_bytes32(hex).map_err(|e| GgufError::InvalidMetadata {
+                key: "general.tensor_hashes".to_string(),
+                reason: format!("invalid hex in entry for '{tensor_name}': {e}"),
+            })?;
+            entries.insert(tensor_name, hash);
+        }
+
+        Ok(Some(Self { entries }))
+    }
+
+    /// Validate a tensor blob against its expected hash.
+    ///
+    /// Returns `Ok(())` if the hash matches or if no entry exists for this
+    /// tensor name (unknown tensors are allowed through).
+    /// Returns `Err(GgufError::HashMismatch)` on mismatch.
+    pub fn validate(&self, tensor_name: &str, data: &[u8]) -> GgufResult<()> {
+        let Some(expected) = self.entries.get(tensor_name) else {
+            return Ok(());
+        };
+
+        let actual = *blake3::hash(data).as_bytes();
+        if &actual == expected {
+            return Ok(());
+        }
+
+        Err(GgufError::HashMismatch {
+            name: tensor_name.to_string(),
+            expected: hash_to_hex(expected),
+            actual: hash_to_hex(&actual),
+        })
+    }
+
+    /// Number of hash entries loaded from metadata.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` if no hash entries were loaded.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Parse a 64-char hex string into 32 bytes.
+fn hex_to_bytes32(hex: &str) -> Result<[u8; 32], String> {
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(format!("invalid hex char: {b}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +541,84 @@ mod tests {
         assert!(report.contains("Model Hash Manifest"));
         assert!(report.contains("layer.0.weight"));
         assert!(report.contains("Tensor count:  1"));
+    }
+
+    // ── TensorHashValidator tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_validator_no_metadata_key_returns_none() {
+        let metadata = crate::metadata::MetadataStore::new();
+        let result = TensorHashValidator::from_metadata(&metadata);
+        assert!(result.is_ok());
+        assert!(result.expect("ok").is_none());
+    }
+
+    #[test]
+    fn test_validator_matching_hash_passes() {
+        let data = b"hello world tensor data";
+        let actual_hash = *blake3::hash(data).as_bytes();
+        let hex = hash_to_hex(&actual_hash);
+        let entry = format!("my_tensor:{hex}");
+
+        let mut metadata = crate::metadata::MetadataStore::new();
+        metadata.insert(
+            "general.tensor_hashes".to_string(),
+            crate::metadata::MetadataValue::Array(vec![crate::metadata::MetadataValue::String(
+                entry,
+            )]),
+        );
+
+        let validator = TensorHashValidator::from_metadata(&metadata)
+            .expect("ok")
+            .expect("some");
+        assert_eq!(validator.len(), 1);
+        assert!(validator.validate("my_tensor", data).is_ok());
+    }
+
+    #[test]
+    fn test_validator_mismatched_hash_returns_error() {
+        let real_data = b"real tensor bytes";
+        let wrong_hash = [0xABu8; 32];
+        let hex = hash_to_hex(&wrong_hash);
+        let entry = format!("bad_tensor:{hex}");
+
+        let mut metadata = crate::metadata::MetadataStore::new();
+        metadata.insert(
+            "general.tensor_hashes".to_string(),
+            crate::metadata::MetadataValue::Array(vec![crate::metadata::MetadataValue::String(
+                entry,
+            )]),
+        );
+
+        let validator = TensorHashValidator::from_metadata(&metadata)
+            .expect("ok")
+            .expect("some");
+        let result = validator.validate("bad_tensor", real_data);
+        assert!(result.is_err());
+        match result.expect_err("should be hash mismatch") {
+            GgufError::HashMismatch { name, .. } => assert_eq!(name, "bad_tensor"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_validator_unknown_tensor_passes() {
+        let real_data = b"some data";
+        let hex = hash_to_hex(&[0xFFu8; 32]);
+        let entry = format!("other_tensor:{hex}");
+
+        let mut metadata = crate::metadata::MetadataStore::new();
+        metadata.insert(
+            "general.tensor_hashes".to_string(),
+            crate::metadata::MetadataValue::Array(vec![crate::metadata::MetadataValue::String(
+                entry,
+            )]),
+        );
+
+        let validator = TensorHashValidator::from_metadata(&metadata)
+            .expect("ok")
+            .expect("some");
+        // "unknown_tensor" is not in the validator's entries → passes through
+        assert!(validator.validate("unknown_tensor", real_data).is_ok());
     }
 }

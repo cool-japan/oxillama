@@ -80,7 +80,7 @@ pub struct SimdComparisonResult {
 /// Scale byte offset within a block for each benchmarked type.
 ///
 /// Returns `(offset, len)` where `len` is always 2 (FP16).
-fn scale_offset_for_type(tensor_type: GgufTensorType) -> (usize, usize) {
+pub(crate) fn scale_offset_for_type(tensor_type: GgufTensorType) -> (usize, usize) {
     match tensor_type {
         // Q4_0/Q8_0: scale is the first 2 bytes of the block.
         GgufTensorType::Q4_0 | GgufTensorType::Q8_0 => (0, 2),
@@ -93,7 +93,7 @@ fn scale_offset_for_type(tensor_type: GgufTensorType) -> (usize, usize) {
 }
 
 /// Create synthetic quantized block data for benchmarking.
-fn make_synthetic_blocks(tensor_type: GgufTensorType, num_blocks: usize) -> Vec<u8> {
+pub(crate) fn make_synthetic_blocks(tensor_type: GgufTensorType, num_blocks: usize) -> Vec<u8> {
     let block_bytes = tensor_type.block_bytes();
     let total = block_bytes * num_blocks;
     let mut data = vec![0u8; total];
@@ -120,7 +120,11 @@ fn make_synthetic_blocks(tensor_type: GgufTensorType, num_blocks: usize) -> Vec<
 }
 
 /// Create a synthetic `QuantTensor` suitable for GEMV benchmarking.
-fn make_synthetic_tensor(tensor_type: GgufTensorType, rows: usize, cols: usize) -> QuantTensor {
+pub(crate) fn make_synthetic_tensor(
+    tensor_type: GgufTensorType,
+    rows: usize,
+    cols: usize,
+) -> QuantTensor {
     let block_size = tensor_type.block_size();
     // Round cols up to a multiple of block_size
     let cols_aligned = if block_size > 0 {

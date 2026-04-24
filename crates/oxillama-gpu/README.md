@@ -6,14 +6,19 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 
 ## What It Provides
 
-- wgpu compute shaders (WGSL) for Q4_0 and Q8_0 dequantization
+- wgpu compute shaders (WGSL) for quantized GEMV and GEMM on GPU
+- Tiled GEMM (TILE_M/N=32, TILE_K=16) for production-grade matmul — **new in v0.1.1**
+- Fused attention WGSL kernel (online softmax, single dispatch) — **new in v0.1.1**
+- IQ2_XXS / IQ2_S / IQ3_XXS / IQ3_S GPU GEMV kernels — **new in v0.1.1**
 - Async GPU tensor dispatch with `pollster` for synchronous usage
 - Graceful CPU fallback when no compatible GPU adapter is found
 - Works on Vulkan, Metal, DX12, and WebGPU backends via `wgpu`
 
 ## Status
 
-**Tests:** 77 passing
+**Version:** 0.1.1 — **Tests:** 151 passing — **Status:** Alpha (optional feature)
+
+**Total GPU kernels:** Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q8_K, Q1_0_G128, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, tiled GEMM, fused attention
 
 ## Feature Flags
 

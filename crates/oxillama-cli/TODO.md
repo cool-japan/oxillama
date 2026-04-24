@@ -10,17 +10,19 @@ Terminal leaf in the workspace dependency chain: nothing depends on this crate, 
 
 | Field | Value |
 |---|---|
-| Version | 0.1.0 (workspace) |
+| Version | 0.1.1 (workspace) |
 | Completion | 100% |
 | Source files | 1 (`src/main.rs`, ~420 lines) |
 | Binary name | `oxillama` |
-| Subcommands | `run`, `serve`, `info`, `bench` |
+| Subcommands | `run`, `serve`, `info`, `bench`, `chat`, `completions`, `generate-manpage`, `version --verbose` |
 | llama.cpp flag aliases | 3 primary (`-n/--n-predict`, `-c/--n-ctx`, `--temperature`) plus llama.cpp-style `--repeat-penalty`, `--min-p`, `-s/--seed`, `-t/--threads` |
 | Default features | `server` |
 | Optional features | `bench`, `simd-avx2`, `simd-avx512`, `simd-neon` |
 | Async runtime | `tokio` (multi-thread) |
 | CLI parser | `clap` v4 derive |
-| Config format | `toml` (loader wired, schema pending) |
+| Config format | `toml` typed `OxillamaConfig` with validation |
+| Tests | 15 passing |
+| Public API | 5 items (`config` module + `exit_codes` module) |
 
 ## 3. Module Map
 
@@ -35,7 +37,7 @@ Terminal leaf in the workspace dependency chain: nothing depends on this crate, 
 | `Cargo.toml` | `[[bin]] name = "oxillama"`, feature flags fanning out to workspace crates. |
 | `README.md` | End-user install / usage snippets for the four subcommands. |
 
-Single-file at ~420 lines — well within the 2000-line splitrs budget; split is not yet warranted. When `chat`, `completions`, `hub`, and `convert` land, `src/main.rs` will be split into `src/cli/{run,serve,info,bench,chat,...}.rs` submodules.
+With `chat`, `completions`, `generate-manpage`, and `version --verbose` now shipping, `src/main.rs` has grown beyond the original ~420 lines; if it approaches 800 lines it will be split into `src/cli/{run,serve,info,bench,chat,...}.rs` submodules via splitrs.
 
 ## 4. Shipped in v0.1.0
 
@@ -57,33 +59,47 @@ Single-file at ~420 lines — well within the 2000-line splitrs budget; split is
 - Streaming stdout via closure callback `|token| print!("{token}")` — zero-allocation printing loop.
 - All subcommand branches return `anyhow::Result<()>`, so errors propagate to the process exit code.
 
+## 4.1 Shipped in v0.1.1
+
+- `chat` subcommand — interactive REPL via `rustyline` (history, Ctrl-R, arrow keys); multi-turn KV-cache reuse; `indicatif` spinner during model load.
+- `completions <shell>` subcommand — shell completion scripts via `clap_complete` for bash, zsh, fish, powershell, elvish.
+- `generate-manpage --output-dir <dir>` subcommand — writes `oxillama.1` via `clap_mangen`.
+- `version --verbose` subcommand — prints build target, enabled SIMD feature flags, and wired architectures.
+- Typed `OxillamaConfig` struct (`serde` + JSON-schema): validation with descriptive errors on unknown keys.
+- Per-model profile files (`~/.config/oxillama/models/*.toml`); `--profile <name>` resolves to a profile.
+- `--config <path>` CLI flag + `OXILLAMA_CONFIG` env var; layered resolution order: CLI > env > profile > global defaults.
+- Structured exit codes: 2 = invalid args, 3 = model load failure, 4 = runtime error.
+- `--file <path>` and `--stdin` flags on `run` for piped prompts.
+- `colored` output: cyan/bold key labels, green banners; `indicatif` spinner in `run`, `chat`, and `serve`.
+- 15 passing tests (up from 5 smoke tests in v0.1.0).
+
 ## 5. Known Gaps / Incomplete
 
-- No interactive chat REPL — multi-turn conversations require repeated `run` invocations with manual prompt assembly.
-- No shell-completion generation (bash / zsh / fish / powershell / elvish).
-- No config schema or validation — toml files are parsed but not structurally checked or documented.
-- No per-model profile files (e.g. `~/.config/oxillama/models/qwen3-7b.toml` with baked-in sampler defaults).
-- No readline-style line editing — no input history, no Ctrl-R search, no completion.
+- ~~No interactive chat REPL~~ ✅ `chat` REPL with rustyline (history, Ctrl-R, arrow keys).
+- ~~No shell-completion generation~~ ✅ `completions` subcommand via `clap_complete` (bash/zsh/fish/powershell/elvish).
+- ~~No readline-style line editing~~ ✅ `rustyline::DefaultEditor` with persistent history at `~/.local/state/oxillama/history`.
+- ~~No config schema or validation — toml files are parsed but not structurally checked or documented.~~ ✅ Typed `OxillamaConfig` struct with `serde` + JSON-schema export; unknown keys produce clear errors.
+- ~~No per-model profile files (e.g. `~/.config/oxillama/models/qwen3-7b.toml` with baked-in sampler defaults).~~ ✅ Per-model profiles in `~/.config/oxillama/models/*.toml`; resolved via `--profile <name>`.
 - No conversation save/resume — token streams and KV-cache state are not persisted between invocations.
 - `serve`'s `model_id` extraction falls back to `"oxillama-model"` when file stem is non-UTF8; no override flag.
-- No `--config <path>` flag or `OXILLAMA_CONFIG` env var wired into clap — toml loader is staged for v1.1.
-- No man-page generation (clap_mangen not yet wired).
-- No `--version` detail (uses clap default; no build-hash / feature-flag banner).
-- No integration test harness — current coverage is exercised via downstream `oxillama-runtime` / `oxillama-server` tests.
-- No pipe-input mode (`oxillama run -` for stdin) or `--file prompt.txt` loader.
-- No colorized output or progress bar for long generations; stdout is plain text only.
+- ~~No `--config <path>` flag or `OXILLAMA_CONFIG` env var wired into clap — toml loader is staged for v1.1.~~ ✅ `--config` flag + `OXILLAMA_CONFIG` env var wired; layered resolution: CLI flag > env > profile > defaults.
+- ~~No man-page generation (clap_mangen not yet wired).~~ ✅ `generate-manpage` subcommand writes `oxillama.1` to `--output-dir`.
+- ~~No `--version` detail (uses clap default; no build-hash / feature-flag banner).~~ ✅ `oxillama version --verbose` prints build target, enabled SIMD features, and wired architectures.
+- ~~No integration test harness~~ ✅ Shipped: `tests/cli_smoke.rs` with 5 smoke tests covering `--help`, `--version`, `completions bash`, and failure modes.
+- ~~No pipe-input mode (`oxillama run -` for stdin) or `--file prompt.txt` loader.~~ ✅ `--file <path>` and `--stdin` flags on `run`.
+- ~~No colorized output or progress bar~~ ✅ Shipped: `colored` for cyan/bold key labels and green banners; `indicatif` spinner during model loading in `run`, `chat`, and `serve` subcommands.
 
 ## 6. v1.1 Roadmap
 
-- `oxillama chat` — interactive REPL subcommand using `rustyline` for line editing, history file (`~/.local/state/oxillama/history`), optional readline-compatible keybindings; multi-turn KV-cache reuse inside one session.
-- `oxillama completions <shell>` — emit completion script via `clap_complete` for bash, zsh, fish, powershell, elvish.
-- Config schema — typed `OxillamaConfig` struct with `serde` + JSON-schema export for editor tooling; clear errors on unknown keys.
-- Per-model profiles — `~/.config/oxillama/models/*.toml` with sampler defaults, context size, tokenizer hints, chat template; `oxillama run --profile qwen3-7b` resolves a profile name to its toml.
-- `--config <path>` flag + `OXILLAMA_CONFIG` env var, layered: CLI flag > env > profile > global defaults.
-- Man-page generation via `clap_mangen` (installed to `$OUT_DIR/man/`).
-- `--version --verbose` banner listing build target, enabled SIMD features, wired architectures.
-- Structured error surface: map `anyhow` context into exit codes (2 = invalid args, 3 = model load, 4 = runtime).
-- `oxillama run --file prompt.txt` and `oxillama run -` (stdin) for piped prompts.
+- [x] `oxillama chat` — interactive REPL subcommand using `rustyline` for line editing, history file (`~/.local/state/oxillama/history`), optional readline-compatible keybindings; multi-turn KV-cache reuse inside one session.
+- [x] `oxillama completions <shell>` — emit completion script via `clap_complete` for bash, zsh, fish, powershell, elvish.
+- [x] Config schema — typed `OxillamaConfig` struct with `serde` + JSON-schema export for editor tooling; clear errors on unknown keys.
+- [x] Per-model profiles — `~/.config/oxillama/models/*.toml` with sampler defaults, context size, tokenizer hints, chat template; `oxillama run --profile qwen3-7b` resolves a profile name to its toml.
+- [x] `--config <path>` flag + `OXILLAMA_CONFIG` env var, layered: CLI flag > env > profile > global defaults.
+- [x] Man-page generation via `clap_mangen` — `oxillama generate-manpage --output-dir <dir>` writes `oxillama.1`.
+- [x] `--version --verbose` banner listing build target, enabled SIMD features, wired architectures.
+- [x] Structured error surface: map `anyhow` context into exit codes (2 = invalid args, 3 = model load, 4 = runtime).
+- [x] `oxillama run --file prompt.txt` and `oxillama run --stdin` for piped prompts.
 
 ## 7. v2.0+ Vision
 
@@ -97,4 +113,4 @@ Single-file at ~420 lines — well within the 2000-line splitrs budget; split is
 - `oxillama convert` — GGUF from safetensors / HF snapshot, reusing `oxillama-gguf` writer + `oxillama-quant` kernels.
 - Self-contained `scirs2-core` / `oxiblas` / `oxifft` feature-flag banner surfaced via `oxillama --about` so end users can see their sovereignty posture at a glance.
 
-*Last updated: 2026-04-15 (v0.1.0 release)*
+*Last updated: 2026-04-20 (v0.1.1 — chat, completions, generate-manpage, version --verbose, config schema, per-model profiles, OXILLAMA_CONFIG, --file/--stdin, colored output, indicatif spinner, exit codes)*

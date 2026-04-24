@@ -304,3 +304,255 @@ mod token_throughput_tests {
         assert!(result.tokens_per_sec > 0.0);
     }
 }
+
+// ── Tokenizer throughput helpers ─────────────────────────────────────────
+
+/// A fixed 1024-token Lorem Ipsum sample text used as tokenizer benchmark input.
+///
+/// This is a deterministic ASCII string that approximates real prose density.
+pub const TOKENIZER_SAMPLE_TEXT: &str = concat!(
+    "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor ",
+    "incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud ",
+    "exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure ",
+    "dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. ",
+    "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt ",
+    "mollit anim id est laborum. ",
+    "Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque ",
+    "laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi ",
+    "architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas ",
+    "sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione ",
+    "voluptatem sequi nesciunt. Neque porro quisquam est, qui dolorem ipsum quia dolor sit ",
+    "amet, consectetur, adipisci velit, sed quia non numquam eius modi tempora incidunt ut ",
+    "labore et dolore magnam aliquam quaerat voluptatem. Ut enim ad minima veniam, quis ",
+    "nostrum exercitationem ullam corporis suscipit laboriosam, nisi ut aliquid ex ea ",
+    "commodi consequatur. Quis autem vel eum iure reprehenderit qui in ea voluptate velit ",
+    "esse quam nihil molestiae consequatur, vel illum qui dolorem eum fugiat quo voluptas ",
+    "nulla pariatur. At vero eos et accusamus et iusto odio dignissimos ducimus qui ",
+    "blanditiis praesentium voluptatum deleniti atque corrupti quos dolores et quas molestias ",
+    "excepturi sint occaecati cupiditate non provident, similique sunt in culpa qui officia ",
+    "deserunt mollitia animi, id est laborum et dolorum fuga.",
+);
+
+/// Configuration for tokenizer throughput benchmarks.
+#[derive(Debug, Clone)]
+pub struct TokenizerBenchConfig {
+    /// Number of times to repeat the sample text to reach the target token count.
+    pub repetitions: usize,
+    /// Number of warm-up passes before measurement.
+    pub warmup_iters: usize,
+    /// Number of measurement iterations.
+    pub measure_iters: usize,
+}
+
+impl Default for TokenizerBenchConfig {
+    fn default() -> Self {
+        Self {
+            repetitions: 2,
+            warmup_iters: 3,
+            measure_iters: 20,
+        }
+    }
+}
+
+/// Throughput result for tokenizer encode/decode operations.
+#[derive(Debug, Clone)]
+pub struct TokenizerThroughputResult {
+    /// Number of tokens processed.
+    pub token_count: usize,
+    /// Average time per iteration (ms).
+    pub avg_ms: f64,
+    /// Minimum time per iteration (ms).
+    pub min_ms: f64,
+    /// Maximum time per iteration (ms).
+    pub max_ms: f64,
+    /// Tokens per second.
+    pub tokens_per_sec: f64,
+    /// Megabytes of text per second (text_bytes / time).
+    pub mb_per_sec: f64,
+}
+
+/// Trait for tokenizer implementations that can be benchmarked.
+///
+/// Implementations should not allocate results eagerly; the harness controls
+/// timing.
+pub trait TokenizerBench {
+    /// Encode the input text and return the number of tokens produced.
+    fn encode(&mut self, text: &str) -> usize;
+    /// Decode a slice of token IDs back to text (returns byte length of result).
+    fn decode(&mut self, token_ids: &[u32]) -> usize;
+}
+
+/// Measure encode throughput using the provided tokenizer.
+pub fn bench_tokenizer_encode<T: TokenizerBench>(
+    tokenizer: &mut T,
+    text: &str,
+    config: &TokenizerBenchConfig,
+) -> TokenizerThroughputResult {
+    let text_bytes = text.len();
+
+    // Warm-up
+    for _ in 0..config.warmup_iters {
+        let _ = tokenizer.encode(text);
+    }
+
+    // Measurement
+    let mut times_ms = Vec::with_capacity(config.measure_iters);
+    let mut last_token_count = 0usize;
+    for _ in 0..config.measure_iters {
+        let start = std::time::Instant::now();
+        last_token_count = tokenizer.encode(text);
+        times_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
+    }
+
+    compute_tokenizer_stats(last_token_count, text_bytes, &times_ms)
+}
+
+/// Measure decode throughput using the provided tokenizer.
+///
+/// `token_ids` is the token sequence to decode on each iteration.
+pub fn bench_tokenizer_decode<T: TokenizerBench>(
+    tokenizer: &mut T,
+    token_ids: &[u32],
+    config: &TokenizerBenchConfig,
+) -> TokenizerThroughputResult {
+    let token_count = token_ids.len();
+
+    // Warm-up
+    for _ in 0..config.warmup_iters {
+        let _ = tokenizer.decode(token_ids);
+    }
+
+    // Measurement
+    let mut times_ms = Vec::with_capacity(config.measure_iters);
+    let mut last_byte_count = 0usize;
+    for _ in 0..config.measure_iters {
+        let start = std::time::Instant::now();
+        last_byte_count = tokenizer.decode(token_ids);
+        times_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
+    }
+
+    compute_tokenizer_stats(token_count, last_byte_count, &times_ms)
+}
+
+fn compute_tokenizer_stats(
+    token_count: usize,
+    byte_count: usize,
+    times_ms: &[f64],
+) -> TokenizerThroughputResult {
+    if times_ms.is_empty() {
+        return TokenizerThroughputResult {
+            token_count,
+            avg_ms: 0.0,
+            min_ms: 0.0,
+            max_ms: 0.0,
+            tokens_per_sec: 0.0,
+            mb_per_sec: 0.0,
+        };
+    }
+
+    let sum: f64 = times_ms.iter().sum();
+    let avg_ms = sum / times_ms.len() as f64;
+    let min_ms = times_ms.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_ms = times_ms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    let min_ms = if min_ms.is_infinite() { 0.0 } else { min_ms };
+    let max_ms = if max_ms.is_infinite() { 0.0 } else { max_ms };
+
+    let tokens_per_sec = if avg_ms > 0.0 {
+        token_count as f64 / avg_ms * 1_000.0
+    } else {
+        0.0
+    };
+
+    let mb_per_sec = if avg_ms > 0.0 {
+        byte_count as f64 / avg_ms / 1_000.0 // bytes / ms / 1000 = MB/s
+    } else {
+        0.0
+    };
+
+    TokenizerThroughputResult {
+        token_count,
+        avg_ms,
+        min_ms,
+        max_ms,
+        tokens_per_sec,
+        mb_per_sec,
+    }
+}
+
+/// A stub BPE tokenizer for benchmarking without a real model file.
+///
+/// Splits on whitespace; encodes each word-piece as a 16-bit hash.
+/// Suitable only for measuring the benchmark harness overhead, not real
+/// tokenizer performance.
+pub struct StubBpeTokenizer;
+
+impl TokenizerBench for StubBpeTokenizer {
+    fn encode(&mut self, text: &str) -> usize {
+        // Approximate BPE: split on whitespace and punctuation boundaries.
+        text.split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+            .filter(|s| !s.is_empty())
+            .count()
+    }
+
+    fn decode(&mut self, token_ids: &[u32]) -> usize {
+        // Each token ID maps to a 4-byte ASCII stub "tok\0".
+        token_ids.len() * 4
+    }
+}
+
+#[cfg(test)]
+mod tokenizer_tests {
+    use super::*;
+
+    #[test]
+    fn test_stub_bpe_encode_nonempty() {
+        let mut tok = StubBpeTokenizer;
+        let n = tok.encode("Hello world foo bar");
+        assert!(n > 0, "expected non-zero token count");
+    }
+
+    #[test]
+    fn test_stub_bpe_decode_byte_count() {
+        let mut tok = StubBpeTokenizer;
+        let ids = vec![1u32, 2, 3, 4];
+        let bytes = tok.decode(&ids);
+        assert_eq!(bytes, 16); // 4 ids × 4 bytes each
+    }
+
+    #[test]
+    fn test_bench_tokenizer_encode_returns_result() {
+        let mut tok = StubBpeTokenizer;
+        let config = TokenizerBenchConfig {
+            repetitions: 1,
+            warmup_iters: 1,
+            measure_iters: 3,
+        };
+        let result = bench_tokenizer_encode(&mut tok, TOKENIZER_SAMPLE_TEXT, &config);
+        assert!(result.token_count > 0);
+        assert!(result.avg_ms >= 0.0);
+        assert!(result.tokens_per_sec >= 0.0);
+    }
+
+    #[test]
+    fn test_bench_tokenizer_decode_returns_result() {
+        let ids: Vec<u32> = (0..1024).collect();
+        let mut tok = StubBpeTokenizer;
+        let config = TokenizerBenchConfig {
+            repetitions: 1,
+            warmup_iters: 1,
+            measure_iters: 3,
+        };
+        let result = bench_tokenizer_decode(&mut tok, &ids, &config);
+        assert_eq!(result.token_count, 1024);
+        assert!(result.avg_ms >= 0.0);
+    }
+
+    #[test]
+    fn test_tokenizer_throughput_result_empty_times() {
+        let result = compute_tokenizer_stats(100, 500, &[]);
+        assert_eq!(result.token_count, 100);
+        assert_eq!(result.avg_ms, 0.0);
+        assert_eq!(result.tokens_per_sec, 0.0);
+    }
+}

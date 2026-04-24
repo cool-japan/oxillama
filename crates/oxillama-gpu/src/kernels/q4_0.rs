@@ -122,6 +122,13 @@ fn gpu_gemv_q4_0(
         });
     }
 
+    // Fast path: f16 accumulator when adapter supports SHADER_F16.
+    if crate::kernels::supports_f16(ctx) {
+        use crate::kernels::f16_accumulator::{dequant_q4_0_to_f16, f16_gemv};
+        let f16_weights = dequant_q4_0_to_f16(weight_bytes, rows, cols)?;
+        return f16_gemv(ctx, &f16_weights, input, output, rows, cols);
+    }
+
     // Step 1 — dequantise on CPU.
     let f32_weights = dequant_q4_0_to_f32(weight_bytes, rows, cols)?;
 
@@ -327,5 +334,29 @@ mod tests {
         // Verify the kernel is constructible and satisfies the GpuKernel bound
         // regardless of whether the gpu feature is active.
         let _kernel: &dyn GpuKernel = &Q4_0GpuKernel;
+    }
+
+    /// Verify that `dequant_q4_0_to_f16` produces the same element count as
+    /// `dequant_q4_0_to_f32`, confirming the f16 path covers every weight.
+    #[test]
+    fn test_f16_path_element_count_matches_f32() {
+        use crate::kernels::f16_accumulator::dequant_q4_0_to_f16;
+
+        let block = make_q4_0_block(1.0, &[0x88u8; 16]);
+        let mut data = Vec::new();
+        for _ in 0..4 {
+            data.extend_from_slice(&block);
+        }
+        let (rows, cols) = (4, 32);
+        let f16_count = dequant_q4_0_to_f16(&data, rows, cols)
+            .expect("f16 dequant")
+            .len();
+        let f32_count = dequant_q4_0_to_f32(&data, rows, cols)
+            .expect("f32 dequant")
+            .len();
+        assert_eq!(
+            f16_count, f32_count,
+            "f16 and f32 paths must produce same element count"
+        );
     }
 }

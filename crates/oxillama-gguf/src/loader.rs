@@ -7,17 +7,24 @@ use std::path::Path;
 
 use crate::error::{GgufError, GgufResult};
 use crate::parser::GgufFile;
+use crate::quantize_on_load::OverrideMap;
 
 /// A loaded GGUF model file with its backing data.
 ///
 /// The data is either memory-mapped (zero-copy) or fully loaded into memory.
 /// The `GgufFile` metadata is parsed eagerly; tensor data is accessed lazily
 /// via slicing into the backing data.
+///
+/// Quantized-on-load tensors are stored in `quant_overrides`.  When
+/// [`GgufModel::tensor_data`] is called for a tensor that has an override, the
+/// quantized bytes are returned instead of the raw backing-store bytes.
 pub struct GgufModel {
     /// Parsed GGUF metadata and tensor registry.
     pub file: GgufFile,
     /// Backing data (either mmap or `Vec<u8>`).
     data: GgufData,
+    /// In-memory quantization overrides set by [`crate::quantize_on_load`].
+    pub(crate) quant_overrides: OverrideMap,
 }
 
 enum GgufData {
@@ -57,6 +64,7 @@ impl GgufModel {
         Ok(Self {
             file: parsed,
             data: GgufData::Mmap(mmap),
+            quant_overrides: OverrideMap::new(),
         })
     }
 
@@ -71,6 +79,7 @@ impl GgufModel {
         Ok(Self {
             file: parsed,
             data: GgufData::Owned(data),
+            quant_overrides: OverrideMap::new(),
         })
     }
 
@@ -94,11 +103,19 @@ impl GgufModel {
         Ok(Self {
             file: parsed,
             data: GgufData::Owned(data),
+            quant_overrides: OverrideMap::new(),
         })
     }
 
     /// Get raw tensor data bytes for a named tensor.
+    ///
+    /// If an in-memory quantization override exists for this tensor (set by
+    /// [`crate::quantize_on_load`]), the quantized bytes are returned instead
+    /// of the original backing-store bytes.
     pub fn tensor_data(&self, name: &str) -> GgufResult<&[u8]> {
+        if let Some(ovr) = self.quant_overrides.get(name) {
+            return Ok(&ovr.data);
+        }
         self.file.tensor_data(self.data.as_bytes(), name)
     }
 
@@ -146,6 +163,69 @@ impl GgufModel {
             self.file_size() as f64 / 1_048_576.0
         )?;
         writeln!(w, "Data Offset:   0x{:X}", self.file.tensors.data_offset())?;
+        Ok(())
+    }
+
+    /// Validate loaded metadata against the resolved architecture schema.
+    ///
+    /// Returns a (potentially empty) list of violations.  Violations are not
+    /// raised as errors —- the caller decides whether to hard-fail or warn.
+    pub fn validate_schema(&self) -> Vec<crate::schema::SchemaViolation> {
+        crate::schema::validate_schema(&self.file.metadata)
+    }
+
+    /// Validate all tensor blobs against Blake3 hashes stored in metadata.
+    ///
+    /// When the `integrity` feature is enabled and `general.tensor_hashes` is
+    /// present, each tensor blob is hashed and compared to its expected value.
+    /// Returns `Ok(())` if all hashes match.  Returns `Err(GgufError::HashMismatch)`
+    /// for the first mismatch encountered.
+    ///
+    /// When the metadata key is absent, or the `integrity` feature is disabled,
+    /// this is a no-op that returns `Ok(())`.
+    #[cfg(feature = "integrity")]
+    pub fn validate_tensor_hashes(&self) -> GgufResult<()> {
+        use crate::integrity::TensorHashValidator;
+
+        let Some(validator) = TensorHashValidator::from_metadata(&self.file.metadata)? else {
+            return Ok(());
+        };
+
+        let data_offset = self.file.tensors.data_offset();
+        let raw = self.data.as_bytes();
+
+        for (name, info) in self.file.tensors.iter() {
+            let abs =
+                data_offset
+                    .checked_add(info.offset)
+                    .ok_or_else(|| GgufError::IntegrityError {
+                        tensor_name: name.clone(),
+                        reason: "offset overflow".to_string(),
+                    })?;
+            let size = info.data_size();
+            let end = abs
+                .checked_add(size)
+                .ok_or_else(|| GgufError::IntegrityError {
+                    tensor_name: name.clone(),
+                    reason: "offset + size overflow".to_string(),
+                })?;
+            let abs_us = usize::try_from(abs).map_err(|_| GgufError::IntegrityError {
+                tensor_name: name.clone(),
+                reason: format!("offset {abs} exceeds usize"),
+            })?;
+            let end_us = usize::try_from(end).map_err(|_| GgufError::IntegrityError {
+                tensor_name: name.clone(),
+                reason: format!("end {end} exceeds usize"),
+            })?;
+            let blob = raw
+                .get(abs_us..end_us)
+                .ok_or_else(|| GgufError::IntegrityError {
+                    tensor_name: name.clone(),
+                    reason: "blob out of bounds".to_string(),
+                })?;
+            validator.validate(name, blob)?;
+        }
+
         Ok(())
     }
 }

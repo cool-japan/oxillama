@@ -89,4 +89,49 @@ pub enum GgufError {
         /// Description of what went wrong.
         reason: String,
     },
+
+    /// Tensor hash mismatch during validation.
+    #[error("tensor hash mismatch for '{name}': expected {expected}, got {actual}")]
+    HashMismatch {
+        /// Name of the tensor.
+        name: String,
+        /// Expected hash (hex-encoded).
+        expected: String,
+        /// Actual hash (hex-encoded).
+        actual: String,
+    },
+
+    /// Resume checkpoint mismatch (file changed since checkpoint was saved).
+    #[error("resume mismatch: {detail} (expected={expected}, found={found})")]
+    ResumeMismatch {
+        /// Human-readable description of the field that mismatched.
+        detail: String,
+        /// Expected value as a string.
+        expected: String,
+        /// Actual found value as a string.
+        found: String,
+    },
+
+    /// Shard header or metadata inconsistency across shards.
+    #[error("shard mismatch: {detail}")]
+    ShardMismatch {
+        /// Description of the inconsistency.
+        detail: String,
+    },
+
+    /// A tensor name appears in more than one shard.
+    #[error("duplicate tensor '{name}' across shards")]
+    ShardDuplicateTensor {
+        /// Name of the duplicated tensor.
+        name: String,
+    },
+
+    /// Attempt to quantize a tensor that is already in a quantized format.
+    #[error("cannot requantize '{name}': already {existing}")]
+    CannotRequantize {
+        /// Name of the tensor.
+        name: String,
+        /// Existing quantization format description.
+        existing: String,
+    },
 }

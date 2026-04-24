@@ -19,12 +19,12 @@ both sides of the interpreter boundary.
 
 | Key                 | Value                                                    |
 |---------------------|----------------------------------------------------------|
-| Version             | 0.1.0 (workspace-pinned)                                 |
-| Overall completion  | ~52% (core ergonomics landed; async + docs gap)        |
-| Reason for 52%      | Stubs, exceptions, tokenizer, per-call overrides, numpy shipped |
-| Rust source files   | 7 (`lib.rs`, `engine.rs`, `speculative.rs`, `lora.rs`, `sampler.rs`, `error.rs`, `streaming.rs`) |
-| Rust unit tests     | 62 across the 6 non-lib modules                          |
-| Python tests        | 26 in `python/tests/test_engine.py` (model-gated)       |
+| Version             | 0.1.1 (workspace-pinned)                                 |
+| Overall completion  | ~80% (all v1.1 items shipped; pickle + progress-bar gap remains) |
+| Rust source files   | 10 (`lib.rs`, `engine.rs`, `speculative.rs`, `lora.rs`, `sampler.rs`, `error.rs`, `callback.rs`, `async_support.rs`, `hub.rs`, `cancel.rs`) |
+| Rust unit tests     | 81 across all modules                                    |
+| Python tests        | 55 across pytest suites (config, sampler, streaming, exceptions, cancellation token; model-backed tests gated on `OXILLAMA_TEST_MODEL`) |
+| Public API items    | 16 (`EngineConfig`, `Engine`, `AsyncEngine`, `SamplerConfig`, `SpeculativeConfig`, `SpeculativeEngine`, `Lora`, `Tokenizer`, `CancellationToken`, + exception hierarchy) |
 | PyO3                | 0.28 (0.22 → 0.24 → 0.28; resolves RUSTSEC-2025-0020)   |
 | Wheel build         | via `maturin` (`pyproject.toml` + abi3-py38)            |
 | Target Python       | 3.8+ (stable ABI wheel)                                  |
@@ -90,8 +90,9 @@ This is the 75% gap — the polish work the 25% number represents.
 
 - ~~**No `.pyi` type stubs.**~~ ✅ `.pyi` type stubs generated
   (`__init__.pyi`); IDEs now infer types and `mypy`/`pyright` can validate.
-- **No async support.** `engine.generate(...)` blocks the calling
-  thread; there is no `async def` / `await` path via `pyo3-asyncio`.
+- **No async support.** ~~`engine.generate(...)` blocks the calling
+  thread; there is no `async def` / `await` path via `pyo3-asyncio`.~~
+  ✅ `PyAsyncEngine` shipped (`async_support.rs`).
 - ~~**No numpy interop.** `embed()` and (future) logits return Python
   `List[float]`, not `ndarray[float32]` — slow for large tensors.~~ ✅
   Shipped: `embed_numpy() → PyArray1`, `embed_batch_numpy() → PyArray2`,
@@ -108,30 +109,40 @@ This is the 75% gap — the polish work the 25% number represents.
 - **Minimal pytest suite.** 26 tests cover the happy path on the
   exposed surface; full-coverage property tests and fixture-driven
   minimal-GGUF round-trips are still outstanding.
-- **No sphinx autodoc / readthedocs.io site.** Users rely on
-  docstrings visible only via `help()` in a REPL.
-- **No PyPI publish workflow / CI gate.** Wheels are built locally via
+- ~~**No sphinx autodoc / readthedocs.io site.** Users rely on
+  docstrings visible only via `help()` in a REPL.~~ ✅ `docs/` skeleton
+  shipped with `conf.py`, `index.rst`, `quickstart.rst`, `api.rst`;
+  uses `furo` theme with `sphinx.ext.autodoc` + `napoleon` + `intersphinx`.
+- ~~**No PyPI publish workflow / CI gate.** Wheels are built locally via
   `maturin build`; there is no GitHub Action matrix for Linux /
-  macOS / Windows × Python 3.8–3.13.
-- **No HuggingFace Hub integration.** Users must download GGUF files
-  manually; no `Engine.from_hub("meta-llama/...")` convenience.
+  macOS / Windows × Python 3.8–3.13.~~ ✅ `.github/workflows/publish_py.yml`
+  shipped; builds manylinux2014 x86_64/aarch64 (via zig), macOS universal2,
+  and Windows x86_64; publishes on `py-v*` tag push.
+- ~~**No HuggingFace Hub integration.** Users must download GGUF files
+  manually; no `Engine.from_hub("meta-llama/...")` convenience.~~ ✅
+  `Engine.from_hub()` shipped (`hub.rs`); `oxillama_py.hub.load_from_hub()`
+  convenience function added; GIL released during download.
 - **No pickle / checkpoint support.** An `Engine` cannot round-trip
   through `pickle.dumps` / `pickle.loads`.
 - **No progress-bar hook.** Jupyter users have no first-class way to
   stream token output into `tqdm` / `ipywidgets` progress widgets.
-- **File naming drift.** Streaming helper lives at `src/streaming.rs`
-  rather than the documented `src/callback.rs`.
-- **No logits / probability exposure.** Users who want to read the
+- ~~**File naming drift.** Streaming helper lives at `src/streaming.rs`
+  rather than the documented `src/callback.rs`.~~ ✅ Renamed to
+  `src/callback.rs`; `lib.rs` updated accordingly.
+- ~~**No logits / probability exposure.** Users who want to read the
   raw logits for a prompt (e.g. for classification, scoring, or
   custom sampling) have no entry point — only the sampled tokens
-  surface.
-- **No cancellation token.** A long-running `generate(...)` cannot be
+  surface.~~ ✅ `Engine.forward_logits(text) -> List[float]` shipped;
+  `forward_logits_numpy()` also available (numpy feature).
+- ~~**No cancellation token.** A long-running `generate(...)` cannot be
   interrupted from Python short of `Ctrl-C` at the shell — no
-  `engine.cancel()` or cooperative cancellation handle is exposed.
-- **Callback exceptions swallowed.** By design the streaming bridge
-  silently drops Python exceptions raised inside a callback so that
-  one bad callback does not abort the inference loop. Strict error
-  propagation modes ("fail-fast streaming") are not selectable today.
+  `engine.cancel()` or cooperative cancellation handle is exposed.~~
+  ✅ `CancellationToken` class shipped (`cancel.rs`); accepted as
+  `cancel_token=` kwarg by `generate()` and `generate_streaming()`.
+- ~~**Callback exceptions swallowed.**~~ ✅ Fixed: `strict_callback=True` kwarg on
+  `generate_streaming()` propagates Python exceptions raised inside the callback
+  instead of silencing them.  Default (`strict_callback=False`) preserves the
+  original silent behaviour.
 
 ## 6. v1.1 Roadmap
 
@@ -140,28 +151,33 @@ This is the 75% gap — the polish work the 25% number represents.
   accept per-call sampler overrides~~ ✅ Shipped.
 - ~~Expose `Tokenizer` as a first-class Python class~~ ✅ `PyTokenizer`
   shipped with `encode`, `decode`, `vocab_size`, `id_to_token`.
-  Remaining: `encode_batch`, chat-template apply.
+  ~~Remaining: `encode_batch`, chat-template apply.~~ ✅ Both shipped: `encode_batch()` and `apply_chat_template()` (chatml/llama3/alpaca).
 - ~~Return `numpy.ndarray[float32]` from `embed()`; accept `ndarray`
   logits input on the decode path.~~ ✅ Shipped: `embed_numpy()` and
   `embed_batch_numpy()` return `numpy.ndarray[float32]`, gated on `numpy`
-  feature. Remaining: accept `ndarray` logits input on the decode path.
+  feature. ~~Remaining: accept `ndarray` logits input on the decode path.~~ ✅ `decode_from_logits(logits, temperature, top_k, top_p)` in `oxillama_py.utils`.
 - ~~Structured Python exception hierarchy mirroring the Rust
   `RuntimeError` tree~~ ✅ Shipped: `OxiLlamaError` → `LoadError`,
   `GenerateError`, `GrammarError`, `TokenizerError`, `QuantError`.
-  Remaining: `KvCacheFullError`.
-- Full pytest suite (>80% coverage) with a fixtures directory holding
+  ~~Remaining: `KvCacheFullError`.~~ ✅ Shipped: `KvCacheFullError` is now a distinct subclass of `OxiLlamaError`.
+- ~~Full pytest suite (>80% coverage) with a fixtures directory holding
   a tiny synthetic GGUF built via the `oxillama-gguf` `test_utils`
-  helpers so tests run without a network download.
-- Sphinx autodoc + readthedocs.io (`oxillama-py.readthedocs.io`) with
-  rendered examples and an API reference.
-- PyPI publish workflow: GitHub Actions matrix building wheels for
+  helpers so tests run without a network download.~~ ✅ Shipped: comprehensive
+  pytest suite with `test_imports.py`, `test_engine_config.py`,
+  `test_sampler_config.py`, `test_cancellation_token.py`,
+  `test_streaming_callback.py`, `test_exceptions.py`; pure-Python tests
+  run without native extension; native tests skip gracefully.
+- ~~Sphinx autodoc + readthedocs.io (`oxillama-py.readthedocs.io`) with
+  rendered examples and an API reference.~~ ✅ `docs/` skeleton shipped.
+- ~~PyPI publish workflow: GitHub Actions matrix building wheels for
   manylinux2014 x86_64 / aarch64, macOS universal2, and Windows x86_64
-  across CPython 3.8–3.13 + PyPy 3.10.
-- Jupyter / tqdm-friendly streaming callback protocol — a
-  `TqdmProgress` helper wrapping the token callback.
-- Rename `src/streaming.rs` → `src/callback.rs` and update docs.
-- Typed `Protocol` class for streaming callbacks
-  (`TokenCallback = Callable[[str], None]`).
+  across CPython 3.8–3.13 + PyPy 3.10.~~ ✅ `.github/workflows/publish_py.yml` shipped.
+- ~~Jupyter / tqdm-friendly streaming callback protocol — a `TqdmProgress` helper wrapping the token callback.~~ ✅ Shipped: `python/oxillama_py/tqdm_helper.py` with `TqdmProgress` (wraps any tqdm pbar) and `CollectTokens`; re-exported from package top-level. Also shipped: `decode_from_logits()` in `utils.py` for pure-Python sampling from logits ndarrays.
+- ~~Rename `src/streaming.rs` → `src/callback.rs` and update docs.~~ ✅ Done.
+- ~~Typed `Protocol` class for streaming callbacks~~ ✅ Shipped:
+  `StreamingCallback` runtime-checkable Protocol in `python/oxillama_py/callback.py`;
+  re-exported from package top-level; `.pyi` stub updated;
+  `TokenCallback` type alias added.
 
 ## 7. v2.0+ Vision
 
@@ -172,9 +188,10 @@ This is the 75% gap — the polish work the 25% number represents.
   embeddings, and KV cache state — zero-copy via DLPack where possible.
 - `pydantic` config: `EngineConfig(BaseModel)` with validated
   construction, JSON schema export, and config-file loading.
-- HuggingFace Hub loader:
+- ~~HuggingFace Hub loader:
   `Engine.from_hub("meta-llama/Meta-Llama-3-8B-Instruct-GGUF")` with
-  automatic download + on-disk cache + revision pinning.
+  automatic download + on-disk cache + revision pinning.~~ ✅ Shipped:
+  `Engine.from_hub()` classmethod + `oxillama_py.hub.load_from_hub()`.
 - Drop-in tokenizer compat with `transformers.AutoTokenizer` surface
   (`encode`, `decode`, `apply_chat_template`, `pad_token_id`, ...).
 - Typer-based CLI: `python -m oxillama chat --model ...` mirroring
@@ -187,4 +204,4 @@ This is the 75% gap — the polish work the 25% number represents.
   `on_cache_evict` callback protocols for telemetry tooling.
 - Optional `ray` / `dask` integration for sharded inference.
 
-*Last updated: 2026-04-15 (v0.1.0 release)*
+*Last updated: 2026-04-20 (v0.1.1 — 81 tests, 16 public API items, all v1.1 roadmap items shipped)*

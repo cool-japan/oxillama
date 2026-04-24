@@ -30,6 +30,7 @@
 
 use crate::engine::{EngineConfig, InferenceEngine};
 use crate::error::{RuntimeError, RuntimeResult};
+use crate::kv_cache::KvCacheSnapshot;
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -79,6 +80,7 @@ pub struct SpeculativeEngine {
     target: InferenceEngine,
     num_speculative: usize,
     rng: Xorshift64,
+    delta_sync: SpeculativeDeltaSync,
 }
 
 impl SpeculativeEngine {
@@ -97,6 +99,7 @@ impl SpeculativeEngine {
             target,
             num_speculative: config.num_speculative,
             rng: Xorshift64::new(seed),
+            delta_sync: SpeculativeDeltaSync::new(),
         })
     }
 
@@ -259,7 +262,7 @@ impl SpeculativeEngine {
                     tokens_generated += 1;
                 }
                 // Re-sync draft KV cache to match the target's accepted context.
-                resync_draft(&mut self.draft, &all_tokens)?;
+                resync_draft(&mut self.draft, &all_tokens, &mut self.delta_sync)?;
             } else if accepted == draft_tokens.len() {
                 // All candidates accepted: sample one bonus token from target
                 // (required to maintain the correct output distribution).
@@ -274,8 +277,9 @@ impl SpeculativeEngine {
                 all_tokens.push(bonus);
                 tokens_generated += 1;
 
-                // Re-sync draft KV cache.
-                resync_draft(&mut self.draft, &all_tokens)?;
+                // Checkpoint verified state, then re-sync draft KV cache.
+                let _ = self.delta_sync.checkpoint(&self.draft);
+                resync_draft(&mut self.draft, &all_tokens, &mut self.delta_sync)?;
             }
         }
 
@@ -291,16 +295,75 @@ impl SpeculativeEngine {
 /// accepted token history.  The last token is *not* prefilled here — it will
 /// be forwarded at the start of the next draft phase.
 ///
-/// TODO: replace with delta-KV sync (only process newly accepted tokens)
-/// once the `InferenceEngine` exposes KV-cache snapshot/restore primitives.
-fn resync_draft(draft: &mut InferenceEngine, all_tokens: &[u32]) -> RuntimeResult<()> {
-    draft.reset();
-    // Prefill everything except the last token — that will be forwarded at the
-    // start of the next iteration's draft phase.
-    if all_tokens.len() > 1 {
-        draft.prefill(&all_tokens[..all_tokens.len() - 1])?;
+/// Uses [`SpeculativeDeltaSync`] when a verified checkpoint is available,
+/// falling back to full re-prefill on the first round.
+fn resync_draft(
+    draft: &mut InferenceEngine,
+    all_tokens: &[u32],
+    delta: &mut SpeculativeDeltaSync,
+) -> RuntimeResult<()> {
+    // Attempt delta restoration from the last verified checkpoint.
+    if let Err(_e) = delta.restore(draft) {
+        // No checkpoint yet — fall back to full reset + re-prefill.
+        draft.reset();
+        if all_tokens.len() > 1 {
+            draft.prefill(&all_tokens[..all_tokens.len() - 1])?;
+        }
     }
     Ok(())
+}
+
+// ─── Delta KV sync ──────────────────────────────────────────────────────────
+
+/// Delta-sync manager for speculative decoding KV cache.
+///
+/// After each round of accepted tokens the caller should call [`checkpoint`]
+/// to save the current KV state.  On rejection, [`restore`] rolls the draft
+/// model back to the snapshot so only the corrected token needs to be
+/// re-run, rather than the entire token history.
+///
+/// [`checkpoint`]: SpeculativeDeltaSync::checkpoint
+/// [`restore`]: SpeculativeDeltaSync::restore
+pub struct SpeculativeDeltaSync {
+    /// Snapshot of the KV cache at the last verified token boundary.
+    verified_snapshot: Option<KvCacheSnapshot>,
+}
+
+impl SpeculativeDeltaSync {
+    /// Create a new delta-sync manager with no checkpoint.
+    pub fn new() -> Self {
+        Self {
+            verified_snapshot: None,
+        }
+    }
+
+    /// Capture the current KV cache state from `engine` as the latest
+    /// verified checkpoint.
+    ///
+    /// Returns [`RuntimeError::ModelNotLoaded`] if no model is loaded.
+    pub fn checkpoint(&mut self, engine: &InferenceEngine) -> RuntimeResult<()> {
+        let snap = engine.kv_snapshot().ok_or(RuntimeError::ModelNotLoaded)?;
+        self.verified_snapshot = Some(snap);
+        Ok(())
+    }
+
+    /// Restore the engine's KV cache to the last verified checkpoint.
+    ///
+    /// Returns [`RuntimeError::ModelNotLoaded`] if no model is loaded, or
+    /// [`RuntimeError::Cancelled`] if no checkpoint has been taken yet.
+    pub fn restore(&self, engine: &mut InferenceEngine) -> RuntimeResult<()> {
+        let snap = self
+            .verified_snapshot
+            .as_ref()
+            .ok_or(RuntimeError::Cancelled)?;
+        engine.kv_restore(snap)
+    }
+}
+
+impl Default for SpeculativeDeltaSync {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ─── Accept / reject helpers ─────────────────────────────────────────────────
@@ -674,6 +737,7 @@ mod tests {
             target,
             num_speculative,
             rng: Xorshift64::new(42),
+            delta_sync: SpeculativeDeltaSync::new(),
         })
     }
 
@@ -828,6 +892,7 @@ mod tests {
                 target,
                 num_speculative: 2,
                 rng: Xorshift64::new(seed),
+                delta_sync: SpeculativeDeltaSync::new(),
             };
             engine.generate("test", 4, |_| {}).ok()
         };
@@ -858,6 +923,50 @@ mod tests {
             r2.is_ok(),
             "second generate should succeed (state reset): {:?}",
             r2.err()
+        );
+    }
+
+    // ── SpeculativeDeltaSync tests ────────────────────────────────────────────
+
+    /// `restore` before any `checkpoint` returns Err (Cancelled).
+    #[test]
+    fn test_delta_sync_restore_without_checkpoint_is_err() {
+        use crate::engine::EngineConfig;
+
+        let sync = SpeculativeDeltaSync::new();
+        let mut engine = InferenceEngine::new(EngineConfig::default());
+        // No model loaded — restore must fail (either ModelNotLoaded or no checkpoint).
+        assert!(sync.restore(&mut engine).is_err());
+    }
+
+    /// `checkpoint` followed by `restore` preserves `seq_len`.
+    #[cfg(any(feature = "tokenizer-onig", feature = "tokenizer-wasm"))]
+    #[test]
+    fn test_delta_sync_checkpoint_restore_seq_len() {
+        use oxillama_gguf::test_utils::{build_minimal_llama_gguf, minimal_tokenizer_json};
+
+        let bytes = build_minimal_llama_gguf();
+        let json = minimal_tokenizer_json();
+        let mut engine = InferenceEngine::new(crate::engine::EngineConfig::default());
+        engine
+            .load_model_from_bytes(&bytes, json)
+            .expect("load model for delta sync test");
+
+        // Take a checkpoint at the initial (empty) state.
+        let mut sync = SpeculativeDeltaSync::new();
+        sync.checkpoint(&engine).expect("checkpoint must succeed");
+
+        // Run a couple of forward steps to change seq_len.
+        engine.prefill(&[1, 2]).expect("prefill");
+        let seq_after_prefill = engine.kv_snapshot().map(|s| s.seq_len).unwrap_or(0);
+        assert!(seq_after_prefill > 0, "seq_len should have advanced");
+
+        // Restore to checkpoint — seq_len should be 0.
+        sync.restore(&mut engine).expect("restore must succeed");
+        let snap_after_restore = engine.kv_snapshot().expect("snapshot after restore");
+        assert_eq!(
+            snap_after_restore.seq_len, 0,
+            "restored seq_len should match checkpoint (0)"
         );
     }
 }

@@ -52,3 +52,15 @@ pub use oxillama_bench as bench;
 /// Optional wgpu GPU compute backend.
 #[cfg(feature = "gpu")]
 pub use oxillama_gpu as gpu;
+
+// ── Recipe compilation checks ─────────────────────────────────────────────────
+//
+// Every `rust,no_run` fenced block in RECIPES.md is extracted and compiled by
+// rustdoc when docs are built (`cargo test --doc -p oxillama`).  The `js,no_run`
+// block for Recipe 6 is transparently ignored because it is not a `rust` fence.
+//
+// This module is `#[doc(hidden)]` so it does not appear on docs.rs but is still
+// compiled and tested during `cargo test --doc`.
+#[doc(hidden)]
+#[doc = include_str!("../RECIPES.md")]
+pub mod recipes_doc {}

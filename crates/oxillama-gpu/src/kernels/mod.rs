@@ -12,12 +12,23 @@
 
 pub mod batched_gemv;
 pub mod f16_accumulator;
+pub mod fused_attention;
+pub mod iq2_s;
+pub mod iq2_xxs;
+pub mod iq3_s;
+pub mod iq3_xxs;
+pub mod iq4_xs;
+pub mod iq_grids;
 pub mod q1_0_g128;
+pub mod q2_k;
+pub mod q3_k;
 pub mod q4_0;
 pub mod q4_k;
 pub mod q5_k;
 pub mod q6_k;
 pub mod q8_0;
+pub mod q8_k;
+pub mod tiled_gemm;
 
 pub use batched_gemv::{batched_gemv_f32, BatchedGemvConfig, BatchedGpuKernel};
 #[cfg(any(feature = "gpu", test))]
@@ -25,12 +36,22 @@ pub use f16_accumulator::{dequant_q4_0_to_f16, dequant_q8_0_to_f16};
 #[cfg(feature = "gpu")]
 pub use f16_accumulator::{f16_gemv, upload_f16};
 pub use f16_accumulator::{supports_f16, F16AccumulatorConfig};
+pub use fused_attention::FusedAttentionKernel;
+pub use iq2_s::Iq2SGpuKernel;
+pub use iq2_xxs::Iq2XxsGpuKernel;
+pub use iq3_s::Iq3SGpuKernel;
+pub use iq3_xxs::Iq3XxsGpuKernel;
+pub use iq4_xs::Iq4XsGpuKernel;
 pub use q1_0_g128::Q1_0_G128GpuKernel;
+pub use q2_k::Q2_KGpuKernel;
+pub use q3_k::Q3_KGpuKernel;
 pub use q4_0::Q4_0GpuKernel;
 pub use q4_k::Q4_KGpuKernel;
 pub use q5_k::Q5_KGpuKernel;
 pub use q6_k::Q6_KGpuKernel;
 pub use q8_0::Q8_0GpuKernel;
+pub use q8_k::Q8_KGpuKernel;
+pub use tiled_gemm::TiledGemmKernel;
 
 use crate::context::GpuContext;
 use crate::error::GpuResult;

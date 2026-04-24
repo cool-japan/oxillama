@@ -45,3 +45,9 @@ pub mod avx512;
 /// AArch64 NEON kernels (`simd-neon` feature).
 #[cfg(all(feature = "simd-neon", target_arch = "aarch64"))]
 pub mod neon;
+
+/// oxiblas-backed GEMM kernels for F32, F16, and BF16.
+///
+/// Always available — no CPU feature gate required since oxiblas is a
+/// workspace dependency for all configurations.
+pub mod float_gemm;

@@ -106,7 +106,13 @@ impl GemmaModel {
         let sliding_window = config.sliding_window;
         let embed_scale = (hidden_size as f32).sqrt();
 
-        let rope = RopeTable::new(head_dim, max_ctx, config.rope_freq_base);
+        let rope = RopeTable::new(
+            head_dim,
+            max_ctx,
+            config.rope_freq_base,
+            config.rope_scaling_type,
+            config.rope_scaling_factor,
+        );
         let dispatcher = KernelDispatcher::new();
 
         Self {
@@ -433,6 +439,12 @@ impl ForwardPass for GemmaModel {
 
     fn hidden_size(&self) -> usize {
         self.config.hidden_size
+    }
+
+    fn swa_config(&self) -> Option<(u32, bool)> {
+        self.config
+            .swa_window
+            .map(|w| (w, self.config.swa_interleaved))
     }
 }
 

@@ -22,11 +22,13 @@ inference = ["dep:oxillama-runtime"]
 
 [dependencies]
 wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
 js-sys = { workspace = true }
 console_error_panic_hook = { workspace = true, optional = true }
-# serde + serde-wasm-bindgen retained for future metadata serialisation exports
-serde = { workspace = true, optional = true }
-serde-wasm-bindgen = { workspace = true, optional = true }
+# serde + serde-wasm-bindgen for typed metadata exports
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde-wasm-bindgen = { workspace = true }
 # Pure-compute crates used regardless of feature set.
 # `parallel` is intentionally omitted so rayon is NOT compiled into WASM.
 oxillama-gguf = { workspace = true, default-features = false }
@@ -35,5 +37,8 @@ oxillama-quant = { workspace = true, default-features = false }
 # feature is active.  Uses `tokenizer-wasm` (fancy-regex) instead of the
 # C-backed `tokenizer-onig` backend to remain wasm32-unknown-unknown clean.
 oxillama-runtime = { workspace = true, default-features = false, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi"], optional = true }
+# wasm-streams bridges between Web Streams API (ReadableStream) and Rust async
+# iterators, used by StreamingGgufLoader for push-mode ReadableStream ingestion.
+wasm-streams = { workspace = true }
 
 

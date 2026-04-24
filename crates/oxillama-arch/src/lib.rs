@@ -20,27 +20,49 @@
 pub mod command_r;
 pub mod common;
 pub mod config;
+#[cfg(feature = "dbrx")]
+pub mod dbrx;
+#[cfg(feature = "deepseek")]
+pub mod deepseek;
 pub mod error;
+#[cfg(feature = "falcon")]
+pub mod falcon;
 #[cfg(feature = "gemma")]
 pub mod gemma;
+#[cfg(feature = "granite")]
+pub mod granite;
+#[cfg(feature = "grok")]
+pub mod grok;
+pub mod internlm3;
+#[cfg(feature = "jamba")]
+pub mod jamba;
 #[cfg(feature = "llama")]
 pub mod llama;
 #[cfg(feature = "llava")]
 pub mod llava;
 pub mod lora;
+#[cfg(feature = "mamba2")]
+pub mod mamba2;
+#[cfg(feature = "minicpm")]
+pub mod minicpm;
 #[cfg(feature = "mistral")]
 pub mod mistral;
+#[cfg(feature = "olmo2")]
+pub mod olmo2;
 #[cfg(feature = "phi")]
 pub mod phi;
 #[cfg(feature = "qwen3")]
 pub mod qwen3;
+pub mod reference;
 pub mod registry;
 #[cfg(feature = "starcoder")]
 pub mod starcoder;
 pub mod traits;
+pub mod yi;
 
+pub use common::rope::RopeScalingType;
 pub use config::ModelConfig;
 pub use error::{ArchError, ArchResult};
-pub use lora::LoadedLora;
+pub use lora::{LoadedLora, LoraAdapterTrait, LoraDelta, LoraStack, TargetModule};
 pub use registry::ArchitectureRegistry;
 pub use traits::{ForwardPass, KvCacheAccess, ModelArchitecture, TensorNamePattern};

@@ -112,6 +112,58 @@ impl QuantKernel for Q4_0Avx2 {
         Ok(())
     }
 
+    /// Fused Q4_0 weight × Q8_0 activation GEMV using AVX2+FMA intrinsics.
+    ///
+    /// Computes `out[row] += Σ_block (q4_0_weight · q8_0_act)` with ACCUMULATE semantics.
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let acts_needed = blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for row in 0..n_rows {
+            let row_start = row * row_bytes;
+            // SAFETY: bounds checked above; CPU avx2+fma guaranteed by KernelDispatcher.
+            let row_sum = unsafe {
+                fused_q4_0_q8_0_row_avx2(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            out[row] += row_sum; // ACCUMULATE
+        }
+
+        Ok(())
+    }
+
     fn block_size(&self) -> usize {
         BLOCK_SIZE
     }
@@ -123,6 +175,136 @@ impl QuantKernel for Q4_0Avx2 {
     fn name(&self) -> &'static str {
         "Q4_0"
     }
+}
+
+/// Q8_0 block bytes for fused GEMV.
+const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Compute fused Q4_0 weight × Q8_0 activation dot product for one row using AVX2+FMA.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * Q8_0_BLOCK_BYTES`
+/// - CPU must support `avx2` and `fma`
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fused_q4_0_q8_0_row_avx2(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    let mut row_sum = 0.0f32;
+    let eight_i32 = _mm256_set1_epi32(8);
+
+    for blk in 0..blocks_per_row {
+        // Weight block.
+        let w_off = blk * BLOCK_BYTES;
+        // SAFETY: row_data.len() == blocks_per_row * BLOCK_BYTES; blk < blocks_per_row.
+        let w_block = &row_data[w_off..w_off + BLOCK_BYTES];
+        let d_w = f16_to_f32(w_block);
+
+        // Q8_0 activation block (1:1 with weight block).
+        let a_off = blk * Q8_0_BLOCK_BYTES;
+        // SAFETY: acts_q8.len() >= blocks_per_row * Q8_0_BLOCK_BYTES.
+        let a_block = &acts_q8[a_off..a_off + Q8_0_BLOCK_BYTES];
+        let d_a = f16_to_f32(a_block);
+        let scale = d_w * d_a;
+
+        let input_offset = blk * BLOCK_SIZE;
+        let remaining = n_cols.saturating_sub(input_offset);
+
+        if remaining >= BLOCK_SIZE {
+            // Fast path: full block.
+            // SAFETY: w_block has 18 bytes; nibbles at [2..18] = 16 bytes.
+            // a_block has 34 bytes; q8 at [2..34] = 32 i8s.
+            let raw = _mm_loadu_si128(w_block.as_ptr().add(2) as *const __m128i);
+            let mask_lo = _mm_set1_epi8(0x0F_u8 as i8);
+            let lo_bytes = _mm_and_si128(raw, mask_lo);
+            let hi_bytes = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo);
+
+            // Interleave lo/hi to match sequential Q8_0 layout.
+            let weights_0_15 = _mm_unpacklo_epi8(lo_bytes, hi_bytes);
+            let weights_16_31 = _mm_unpackhi_epi8(lo_bytes, hi_bytes);
+
+            // Load Q8_0 i8 activations.
+            // SAFETY: a_block[2..34] = 32 valid i8 bytes.
+            let qa_ptr = a_block.as_ptr().add(2) as *const __m128i;
+            let qa_0 = _mm_loadu_si128(qa_ptr);
+            let qa_1 = _mm_loadu_si128(qa_ptr.add(1));
+
+            // Compute dot(w - 8, qa) = dot(w, qa) - 8 * sum(qa).
+            // Use _mm256_madd_epi16 for 16-bit multiply-add after widening.
+            // Convert u8 nibbles to i16 and subtract 8, then multiply by i8 activations.
+
+            // Group A (weights 0-7): first 8 bytes of weights_0_15 × first 8 i8s of qa_0.
+            let w_a = _mm256_sub_epi32(_mm256_cvtepu8_epi32(weights_0_15), eight_i32);
+            let q_a = _mm256_cvtepi8_epi32(qa_0);
+            let mut acc = _mm256_mullo_epi32(w_a, q_a);
+
+            // Group B (weights 8-15): next 8 bytes of weights_0_15 × next 8 i8s of qa_0.
+            let w0_hi = _mm_srli_si128(weights_0_15, 8);
+            let w_b = _mm256_sub_epi32(_mm256_cvtepu8_epi32(w0_hi), eight_i32);
+            let qa0_hi = _mm_srli_si128(qa_0, 8);
+            let q_b = _mm256_cvtepi8_epi32(qa0_hi);
+            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(w_b, q_b));
+
+            // Group C (weights 16-23): first 8 bytes of weights_16_31 × first 8 i8s of qa_1.
+            let w_c = _mm256_sub_epi32(_mm256_cvtepu8_epi32(weights_16_31), eight_i32);
+            let q_c = _mm256_cvtepi8_epi32(qa_1);
+            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(w_c, q_c));
+
+            // Group D (weights 24-31): next 8 bytes of weights_16_31 × next 8 i8s of qa_1.
+            let w1_hi = _mm_srli_si128(weights_16_31, 8);
+            let w_d = _mm256_sub_epi32(_mm256_cvtepu8_epi32(w1_hi), eight_i32);
+            let qa1_hi = _mm_srli_si128(qa_1, 8);
+            let q_d = _mm256_cvtepi8_epi32(qa1_hi);
+            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(w_d, q_d));
+
+            // Horizontal sum of i32 accumulator.
+            let dot_i32 = hsum_i32_avx(acc);
+            row_sum += scale * dot_i32 as f32;
+        } else if remaining > 0 {
+            // Scalar tail path.
+            let q8_bytes = &a_block[2..];
+            let valid = remaining;
+
+            for i in 0..(valid / 2) {
+                let byte = w_block[2 + i];
+                let q_lo = (byte & 0x0F) as i32 - 8;
+                let q_hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                let a_lo = q8_bytes[i * 2] as i8 as i32;
+                let a_hi = q8_bytes[i * 2 + 1] as i8 as i32;
+                row_sum += scale * (q_lo * a_lo + q_hi * a_hi) as f32;
+            }
+            if valid % 2 == 1 {
+                let i = valid / 2;
+                let byte = w_block[2 + i];
+                let q_lo = (byte & 0x0F) as i32 - 8;
+                let a_lo = q8_bytes[i * 2] as i8 as i32;
+                row_sum += scale * (q_lo * a_lo) as f32;
+            }
+        }
+    }
+
+    row_sum
+}
+
+/// Horizontal sum of an `__m256i` i32 register.
+///
+/// # Safety
+/// Caller must have `avx2` CPU feature.
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_i32_avx(v: __m256i) -> i32 {
+    // Fold high 128 into low 128.
+    let hi = _mm256_extracti128_si256(v, 1);
+    let lo = _mm256_castsi256_si128(v);
+    let sum128 = _mm_add_epi32(hi, lo);
+    // Horizontal add within 128 bits.
+    let shuf = _mm_shuffle_epi32(sum128, 0b10_11_00_01);
+    let sums = _mm_add_epi32(sum128, shuf);
+    let shuf2 = _mm_shuffle_epi32(sums, 0b00_00_10_10);
+    let sums2 = _mm_add_epi32(sums, shuf2);
+    _mm_cvtsi128_si32(sums2)
 }
 
 // ---------------------------------------------------------------------------
@@ -437,5 +619,129 @@ mod tests {
                 "gemm mismatch at [{i}]: avx2={a}, ref={r}"
             );
         }
+    }
+
+    // ── matvec_q8_fused ───────────────────────────────────────────────────
+
+    fn make_q8_0_block(scale: f32, qs: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(34);
+        let d_bits = half::f16::from_f32(scale).to_bits();
+        block.extend_from_slice(&d_bits.to_le_bytes());
+        for &q in qs {
+            block.push(q as u8);
+        }
+        block
+    }
+
+    #[test]
+    fn avx2_fused_matches_reference() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let nibbles: [u8; 16] = [
+            0x5A, 0xF0, 0x13, 0x7E, 0xC2, 0x48, 0x9D, 0x6B, 0xA3, 0x2F, 0x71, 0xE4, 0x0C, 0x58,
+            0xB6, 0xD9,
+        ];
+        let w_block = make_q4_0_block(0.25, &nibbles);
+        let q8_vals: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, -1, 2, -3, 4, -5, 6, -7,
+            8, -9, 10, -11, 12, -13, 14, -15, 16,
+        ];
+        let a_block = make_q8_0_block(0.5, &q8_vals);
+
+        let mut out_avx2 = vec![0.0f32; 1];
+        let mut out_ref = vec![0.0f32; 1];
+
+        Q4_0Avx2
+            .matvec_q8_fused(&w_block, &a_block, &mut out_avx2, 1, 32)
+            .expect("avx2 fused");
+        crate::reference::q4_0::matvec_q8_fused_reference(&w_block, &a_block, &mut out_ref, 1, 32)
+            .expect("ref fused");
+
+        let err = (out_avx2[0] - out_ref[0]).abs();
+        assert!(
+            err < 1e-3,
+            "avx2_fused_matches_reference: avx2={} ref={} err={}",
+            out_avx2[0],
+            out_ref[0],
+            err
+        );
+    }
+
+    #[test]
+    fn avx2_fused_multi_row() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let n_rows = 4usize;
+        let n_cols = 64usize;
+        let blocks_per_row = 2usize;
+        let nibbles: [u8; 16] = [
+            0x13, 0x57, 0x9B, 0xDF, 0x24, 0x68, 0xAC, 0xE0, 0x5F, 0x3A, 0x72, 0x8D, 0xC6, 0x4E,
+            0x91, 0xB7,
+        ];
+        let scales = [0.1f32, 0.25f32, 0.5f32, 1.0f32];
+        let d_a = 0.5f32;
+        let q8_vals: [i8; 32] = [
+            2, 4, -6, 8, -10, 12, -14, 16, 1, -3, 5, -7, 9, -11, 13, -15, 0, 1, -2, 3, -4, 5, -6,
+            7, -8, 9, -10, 11, -12, 13, -14, 15,
+        ];
+
+        let mut weights: Vec<u8> = Vec::new();
+        for &s in &scales {
+            for _ in 0..blocks_per_row {
+                weights.extend_from_slice(&make_q4_0_block(s, &nibbles));
+            }
+        }
+
+        let mut acts: Vec<u8> = Vec::new();
+        for _ in 0..blocks_per_row {
+            acts.extend_from_slice(&make_q8_0_block(d_a, &q8_vals));
+        }
+
+        let mut out_avx2 = vec![0.0f32; n_rows];
+        let mut out_ref = vec![0.0f32; n_rows];
+
+        Q4_0Avx2
+            .matvec_q8_fused(&weights, &acts, &mut out_avx2, n_rows, n_cols)
+            .expect("avx2 fused multi-row");
+        crate::reference::q4_0::matvec_q8_fused_reference(
+            &weights,
+            &acts,
+            &mut out_ref,
+            n_rows,
+            n_cols,
+        )
+        .expect("ref fused multi-row");
+
+        for i in 0..n_rows {
+            let err = (out_avx2[i] - out_ref[i]).abs();
+            assert!(
+                err < 1e-3,
+                "row {i}: avx2={} ref={} err={}",
+                out_avx2[i],
+                out_ref[i],
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn avx2_fused_accumulate_semantics() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let w_block = make_q4_0_block(1.0, &[0x88u8; 16]); // zero weights
+        let a_block = make_q8_0_block(1.0, &[0i8; 32]);
+
+        let mut out = vec![42.0f32; 1];
+        Q4_0Avx2
+            .matvec_q8_fused(&w_block, &a_block, &mut out, 1, 32)
+            .expect("avx2 fused accumulate");
+        assert!(
+            (out[0] - 42.0).abs() < 1e-5,
+            "accumulation broken: got {}",
+            out[0]
+        );
     }
 }

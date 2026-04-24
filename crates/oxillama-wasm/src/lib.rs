@@ -27,9 +27,18 @@
 //! console.log(text);
 //! ```
 
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
+pub mod gpu_bridge;
+pub mod idb_cache;
+pub mod streaming_load;
+pub mod streaming_loader;
 pub mod webgpu;
+pub mod worker;
+
+pub use streaming_loader::StreamingGgufLoader;
+pub use streaming_loader::StreamingLoadOptions;
 
 // ── Panic hook (default feature) ─────────────────────────────────────────────
 
@@ -317,6 +326,176 @@ pub fn dequant_q6_k(data: &[u8]) -> Result<Vec<f32>, JsValue> {
     Ok(out)
 }
 
+// ── Load model with progress callback ────────────────────────────────────────
+
+/// Typed GGUF metadata returned by [`parse_gguf_metadata`].
+///
+/// Optional fields are `None` when the corresponding key is absent in the file.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GgufMetadataJs {
+    pub version: u32,
+    pub tensor_count: u64,
+    pub kv_count: u64,
+    pub arch: Option<String>,
+    pub context_length: Option<u64>,
+    pub embedding_length: Option<u64>,
+    pub feed_forward_length: Option<u64>,
+    pub attention_head_count: Option<u64>,
+    pub block_count: Option<u64>,
+    pub quantization_version: Option<u32>,
+    pub general_name: Option<String>,
+    pub general_author: Option<String>,
+    pub general_description: Option<String>,
+}
+
+/// Core model-loading logic shared by `load_model_from_bytes_with_progress`
+/// and the inference `generate` function.
+///
+/// Emits progress percentages (0, 25, 100) to `on_progress` if provided.
+/// Returns an error as a `JsValue` string if loading fails.
+#[cfg(feature = "inference")]
+fn load_model_core(
+    model_bytes: &[u8],
+    tokenizer_json: &str,
+    on_progress: Option<&js_sys::Function>,
+) -> Result<oxillama_runtime::InferenceEngine, JsValue> {
+    use oxillama_runtime::{EngineConfig, InferenceEngine};
+
+    let emit = |pct: u32| {
+        if let Some(cb) = on_progress {
+            let _ = cb.call1(&JsValue::UNDEFINED, &JsValue::from(pct));
+        }
+    };
+
+    emit(0);
+    let mut engine = InferenceEngine::new(EngineConfig::default());
+    emit(25);
+    engine
+        .load_model_from_bytes(model_bytes, tokenizer_json)
+        .map_err(|e| JsValue::from_str(&format!("model load error: {e}")))?;
+    emit(100);
+
+    Ok(engine)
+}
+
+/// Load a GGUF model from raw bytes, reporting progress via an optional JS callback.
+///
+/// The callback is invoked with a percentage value (`0`, `25`, `100`) at key
+/// milestones during loading.  Pass `undefined` / `null` to skip progress
+/// reporting.
+///
+/// Returns an opaque `WasmEngine` handle on success, or throws a JS error.
+#[cfg(feature = "inference")]
+#[wasm_bindgen(js_name = loadModelFromBytesWithProgress)]
+pub fn load_model_from_bytes_with_progress(
+    model_bytes: &[u8],
+    tokenizer_json: &str,
+    on_progress: Option<js_sys::Function>,
+) -> Result<WasmEngine, JsValue> {
+    let engine = load_model_core(model_bytes, tokenizer_json, on_progress.as_ref())?;
+    Ok(WasmEngine { inner: engine })
+}
+
+/// Opaque handle wrapping a loaded `InferenceEngine` for use from JS.
+#[cfg(feature = "inference")]
+#[wasm_bindgen]
+pub struct WasmEngine {
+    inner: oxillama_runtime::InferenceEngine,
+}
+
+#[cfg(feature = "inference")]
+#[wasm_bindgen]
+impl WasmEngine {
+    /// Run text generation on this engine.
+    ///
+    /// Equivalent to the top-level [`generate`] function but reuses an already
+    /// loaded model, avoiding the expensive load step on subsequent calls.
+    pub fn generate(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        on_token: Option<js_sys::Function>,
+    ) -> Result<String, JsValue> {
+        self.inner
+            .generate(prompt, max_tokens, |tok| {
+                if let Some(ref cb) = on_token {
+                    let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(tok));
+                }
+            })
+            .map_err(|e| JsValue::from_str(&format!("generation error: {e}")))
+    }
+}
+
+// ── Typed GGUF metadata export ────────────────────────────────────────────────
+
+/// Parse a GGUF file and return typed metadata as a JS object.
+///
+/// The returned object conforms to the [`GgufMetadataJs`] schema.  Optional
+/// fields are `null` when the corresponding metadata key is absent.
+///
+/// Throws a JavaScript error string if parsing fails.
+#[wasm_bindgen(js_name = parseGgufMetadata)]
+pub fn parse_gguf_metadata(data: &[u8]) -> Result<JsValue, JsValue> {
+    let gguf = oxillama_gguf::GgufFile::parse(data)
+        .map_err(|e| JsValue::from_str(&format!("GGUF parse error: {e}")))?;
+
+    let meta = &gguf.metadata;
+
+    // Detect architecture first — used as prefix for architecture-specific keys.
+    let arch: Option<String> = meta
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+
+    // Helper: look up an integer key, trying the arch-prefixed form first then
+    // falling back to common prefixes.
+    let get_u64 = |suffix: &str| -> Option<u64> {
+        let prefixes: &[&str] = match arch.as_deref() {
+            Some(a) => {
+                // Use the detected arch plus a handful of common fallbacks.
+                &[a, "llama", "mistral", "qwen3", "gemma", "phi"][..]
+            }
+            None => &["llama", "mistral", "qwen3", "gemma", "phi"][..],
+        };
+        for prefix in prefixes {
+            let key = format!("{prefix}.{suffix}");
+            if let Some(val) = meta.get(&key).and_then(|v| v.as_u64()) {
+                return Some(val);
+            }
+        }
+        None
+    };
+
+    let metadata_js = GgufMetadataJs {
+        version: gguf.header.version,
+        tensor_count: gguf.header.tensor_count,
+        kv_count: gguf.header.metadata_kv_count,
+        context_length: get_u64("context_length"),
+        embedding_length: get_u64("embedding_length"),
+        feed_forward_length: get_u64("feed_forward_length"),
+        attention_head_count: get_u64("attention.head_count"),
+        block_count: get_u64("block_count"),
+        quantization_version: meta
+            .get("general.quantization_version")
+            .and_then(|v| v.as_u32()),
+        general_name: meta
+            .get("general.name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned()),
+        general_author: meta
+            .get("general.author")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned()),
+        general_description: meta
+            .get("general.description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned()),
+        arch,
+    };
+
+    serde_wasm_bindgen::to_value(&metadata_js).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -492,5 +671,21 @@ mod tests {
         for (i, &v) in out.iter().enumerate() {
             assert!(v.abs() < 1e-5, "Q6_K weight[{i}] = {v}, expected ~0.0");
         }
+    }
+
+    // ── Progress callback / metadata tests ───────────────────────────────────
+
+    #[test]
+    fn test_load_model_with_progress_empty_fails() {
+        // Empty bytes must return an error (not panic) when no progress cb given.
+        let result = oxillama_gguf::GgufFile::parse(&[]);
+        assert!(result.is_err(), "empty bytes must fail GGUF parse");
+    }
+
+    #[test]
+    fn test_parse_gguf_metadata_empty_fails() {
+        // parse_gguf_metadata on empty input must propagate the parse error.
+        let result = oxillama_gguf::GgufFile::parse(&[]);
+        assert!(result.is_err(), "empty bytes must fail metadata extraction");
     }
 }

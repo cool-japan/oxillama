@@ -6,9 +6,11 @@
 //! end-to-end benchmarking tools with architecture-specific configurations.
 
 pub mod arch_config;
+pub mod dispatch_matrix;
 pub mod e2e;
 pub mod latency;
 pub mod memory;
+pub mod memory_profiler;
 pub mod prefill_decode;
 pub mod simd_comparison;
 pub mod throughput;
@@ -19,17 +21,22 @@ pub use latency::{
     compute_latency_stats, LatencyConfig, LatencyResult, LatencyTimer, TokenLatencyResult,
 };
 pub use memory::{
-    current_rss_bytes, estimate_memory, MemoryConfig, MemoryEstimate, MemoryResult, RssTracker,
+    current_rss_bytes, estimate_memory, MemoryConfig, MemoryEstimate, MemoryProfiler, MemoryReport,
+    MemoryResult, RssTracker,
 };
 pub use prefill_decode::{
-    run_prefill_decode_bench, PrefillDecodeBench, PrefillDecodeConfig, PrefillDecodePoint,
-    PrefillDecodeResult,
+    run_kv_cache_scaling, run_prefill_decode_bench, run_prefill_vs_decode_isolation,
+    KvCacheScalingConfig, KvCacheScalingPoint, KvCacheScalingResult, PrefillDecodeBench,
+    PrefillDecodeConfig, PrefillDecodePoint, PrefillDecodeResult, PrefillVsDecodeResult,
+    KV_CACHE_CONTEXT_SIZES,
 };
 pub use simd_comparison::{
     format_comparison_table, run_dequant_comparison, run_gemv_comparison, KernelBenchResult,
     SimdComparisonConfig, SimdComparisonResult,
 };
 pub use throughput::{
-    aggregate_throughput, compute_throughput, ThroughputConfig, ThroughputResult,
-    ThroughputTracker, TokenThroughputResult, TrackerConfig,
+    aggregate_throughput, bench_tokenizer_decode, bench_tokenizer_encode, compute_throughput,
+    StubBpeTokenizer, ThroughputConfig, ThroughputResult, ThroughputTracker, TokenThroughputResult,
+    TokenizerBench, TokenizerBenchConfig, TokenizerThroughputResult, TrackerConfig,
+    TOKENIZER_SAMPLE_TEXT,
 };
