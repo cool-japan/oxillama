@@ -96,4 +96,23 @@ pub enum RuntimeError {
         /// Additional detail about the mismatch.
         detail: String,
     },
+
+    /// Offload pager read past end of backing store.
+    #[error("offload: unexpected EOF at offset {offset}, needed {needed} bytes, {available} available")]
+    OffloadEof {
+        /// Byte offset at which the read was attempted.
+        offset: u64,
+        /// Number of bytes requested.
+        needed: usize,
+        /// Number of bytes available from `offset` to end.
+        available: usize,
+    },
+
+    /// A tensor name was not found in the weight offset map.
+    #[error("tensor not found in weight map: {0}")]
+    TensorNotFound(String),
+
+    /// An internal RwLock or Mutex was poisoned.
+    #[error("lock poisoned")]
+    LockPoisoned,
 }

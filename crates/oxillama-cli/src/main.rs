@@ -2,6 +2,10 @@
 
 mod config;
 mod exit_codes;
+mod hub;
+mod session;
+#[cfg(feature = "tui")]
+mod tui;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -234,6 +238,17 @@ enum Commands {
         /// Seed for reproducible sampling (0 = random).
         #[arg(short = 's', long, default_value_t = 0u64)]
         seed: u64,
+
+        /// Launch the full-screen ratatui TUI interface instead of the REPL.
+        /// Requires the `tui` feature to be enabled at compile time.
+        #[arg(long)]
+        tui: bool,
+    },
+
+    /// HuggingFace Hub operations (pull, list, rm).
+    Hub {
+        #[command(subcommand)]
+        command: HubCommand,
     },
 
     /// Generate shell completion scripts.
@@ -253,6 +268,45 @@ enum Commands {
 
     /// Print verbose version information.
     Version,
+}
+
+/// Subcommands for `oxillama hub`.
+#[derive(Debug, clap::Subcommand)]
+enum HubCommand {
+    /// Download a model from HuggingFace Hub.
+    Pull {
+        /// Repository ID (e.g. "cool-japan/bonsai-8b").
+        repo: String,
+        /// Specific GGUF file to download (auto-selected if omitted).
+        #[arg(long)]
+        file: Option<String>,
+        /// Git revision / branch / commit SHA.
+        #[arg(long, default_value = "main")]
+        revision: String,
+        /// Force re-download even if already cached.
+        #[arg(long)]
+        force: bool,
+        /// Override cache directory.
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// Verify SHA-256 after download (hex string).
+        #[arg(long)]
+        verify_sha256: Option<String>,
+    },
+    /// List cached models.
+    List {
+        /// Override cache directory.
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
+    /// Remove a cached model.
+    Rm {
+        /// Repository ID (e.g. "cool-japan/bonsai-8b").
+        repo: String,
+        /// Override cache directory.
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -586,6 +640,7 @@ async fn run() -> Result<()> {
                 num_threads: threads,
                 sampler: oxillama_runtime::SamplerConfig::default(),
                 prefill_chunk_size: 512,
+                offload_policy: oxillama_runtime::OffloadPolicy::None,
             };
 
             let mut engine = oxillama_runtime::InferenceEngine::new(config);
@@ -623,7 +678,31 @@ async fn run() -> Result<()> {
             top_p,
             top_k,
             seed,
+            tui,
         } => {
+            // ── TUI branch ────────────────────────────────────────────────────
+            if tui {
+                let model_id = std::path::Path::new(&model)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("model")
+                    .to_string();
+                let model_path = std::path::PathBuf::from(&model);
+
+                #[cfg(feature = "tui")]
+                return crate::tui::run_tui(model_path, model_id);
+
+                #[cfg(not(feature = "tui"))]
+                {
+                    let _ = model_path;
+                    let _ = model_id;
+                    return Err(anyhow::anyhow!(
+                        "TUI feature not enabled. \
+                         Rebuild with --features tui to use the full-screen interface."
+                    ));
+                }
+            }
+
             let effective_seed = if seed == 0 { None } else { Some(seed) };
 
             let sampler = oxillama_runtime::SamplerConfig {
@@ -633,6 +712,13 @@ async fn run() -> Result<()> {
                 seed: effective_seed,
                 ..Default::default()
             };
+
+            // Derive model_id before moving `model` into the engine config.
+            let chat_model_id_pre = std::path::Path::new(&model)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model")
+                .to_string();
 
             let config = oxillama_runtime::EngineConfig {
                 model_path: model,
@@ -671,9 +757,22 @@ async fn run() -> Result<()> {
 
             let mut system_prompt: Option<String> = None;
 
+            // Use the model_id derived before the move.
+            let chat_model_id = chat_model_id_pre;
+
+            // Active session snapshot (tracks conversation turns).
+            let mut chat_session = session::SessionSnapshot::new(chat_model_id.clone());
+            chat_session.sampler = session::SamplerConfig {
+                temperature: temp,
+                top_p,
+                top_k: top_k as u32,
+                repeat_penalty: 1.1,
+                seed: effective_seed,
+            };
+
             eprintln!(
                 "{}",
-                "OxiLLaMa Chat  (type /quit to exit, /reset, /system <text>)"
+                "OxiLLaMa Chat  (type /quit to exit, /reset, /system <text>, /save <path>, /load <path>)"
                     .green()
                     .bold()
             );
@@ -704,11 +803,35 @@ async fn run() -> Result<()> {
                     break;
                 } else if input == "/reset" {
                     engine.reset();
-                    println!("[KV cache cleared]");
+                    chat_session.messages.clear();
+                    println!("[KV cache cleared, conversation reset]");
                     continue;
                 } else if let Some(rest) = input.strip_prefix("/system ") {
                     system_prompt = Some(rest.to_string());
                     println!("[System prompt set]");
+                    continue;
+                } else if let Some(rest) = input.strip_prefix("/save ") {
+                    let save_path = std::path::Path::new(rest.trim());
+                    match session::save(&chat_session, save_path) {
+                        Ok(()) => println!("[Session saved to {}]", save_path.display()),
+                        Err(e) => eprintln!("[save error: {e}]"),
+                    }
+                    continue;
+                } else if let Some(rest) = input.strip_prefix("/load ") {
+                    let load_path = std::path::Path::new(rest.trim());
+                    match session::load_for_model(load_path, &chat_model_id) {
+                        Ok(loaded) => {
+                            // Reset KV cache and restore message history.
+                            engine.reset();
+                            chat_session = loaded;
+                            println!(
+                                "[Session loaded from {} ({} messages)]",
+                                load_path.display(),
+                                chat_session.messages.len()
+                            );
+                        }
+                        Err(e) => eprintln!("[load error: {e}]"),
+                    }
                     continue;
                 }
 
@@ -718,19 +841,63 @@ async fn run() -> Result<()> {
                     format!("User: {input}\nAssistant:")
                 };
 
+                // Record user turn.
+                chat_session.messages.push(session::ChatMessage {
+                    role: "user".into(),
+                    content: input.clone(),
+                });
+
                 print!("Assistant: ");
                 use std::io::Write;
                 std::io::stdout().flush()?;
 
+                let mut assistant_reply = String::new();
                 engine.generate(&full_prompt, 512, |token| {
+                    assistant_reply.push_str(token);
                     print!("{token}");
                     let _ = std::io::stdout().flush();
                 })?;
                 println!();
+
+                // Record assistant turn.
+                chat_session.messages.push(session::ChatMessage {
+                    role: "assistant".into(),
+                    content: assistant_reply,
+                });
             }
 
             let _ = rl.save_history(&history_path);
         }
+
+        Commands::Hub { command } => match command {
+            HubCommand::List { cache } => {
+                let cache_dir = cache.unwrap_or_else(hub::default_cache_dir);
+                hub::print_list(&cache_dir);
+            }
+            HubCommand::Rm { repo, cache } => {
+                let cache_dir = cache.unwrap_or_else(hub::default_cache_dir);
+                hub::remove_cached(&cache_dir, &repo)
+                    .map_err(|e| anyhow::anyhow!("hub rm failed: {e}"))?;
+            }
+            HubCommand::Pull {
+                repo,
+                file,
+                revision,
+                force,
+                cache,
+                verify_sha256,
+            } => {
+                let opts = hub::PullOptions {
+                    repo,
+                    file,
+                    revision,
+                    force,
+                    cache,
+                    verify_sha256,
+                };
+                hub::pull(opts).map_err(|e| anyhow::anyhow!("hub pull failed: {e}"))?;
+            }
+        },
 
         Commands::Completions { shell } => {
             clap_complete::generate(

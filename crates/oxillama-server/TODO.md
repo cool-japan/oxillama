@@ -201,9 +201,14 @@ Implementation highlights:
   Mirror the HTTP surface behind a `tonic` server for lower-overhead
   internal deployments. Same `AppState` and queue — new framing only.
 
-- **JWT auth with scopes.**
+- [x] **JWT auth with scopes (done 2026-04-24)**
   Move beyond static bearer keys: signed JWTs carrying scopes
   (`chat:read`, `embed:read`, `admin:write`) enforced per-route.
+  - **Feature flag:** `jwt` (opt-in, default off).
+  - **Algorithms:** HS256 (constant-time HMAC-SHA256), RS256 (RSA PKCS1v15 + SHA-256, DER public key).
+  - **Security:** `alg: "none"` always rejected. Only configured algorithms accepted.
+  - **Module:** `crates/oxillama-server/src/jwt_auth/{mod,scopes,verifier,middleware}.rs`.
+  - **Tests:** 15 unit tests (HS256 sign/verify, expired, nbf, wrong aud/iss, malformed, alg:none, scopes); RS256 `#[ignore]`d (slow key gen).
 
 - [x] **Admin API (load/unload/status) (done 2026-04-20)**
   - **Goal:** HTTP endpoints under `/admin/*` for fleet management. Bound to `127.0.0.1` by default; optional bearer-token auth.
@@ -222,4 +227,4 @@ Implementation highlights:
   - **Tests:** (a) `admin_load_unload_cycle`. (b) `admin_bearer_auth_rejects_missing_token`. (c) `admin_loopback_only_when_no_auth`. (d) `admin_stats_returns_metrics`.
   - **Risk:** Non-auth + public interface = full fleet control to anyone. Mitigate with hard startup error.
 
-*Last updated: 2026-04-20 (v0.1.1 — 115 tests, SSE streaming, auth, rate limiting, WebSocket, batch processing all shipped)*
+*Last updated: 2026-04-24 (v0.1.2 — 165 tests, JWT auth with scopes shipped)*

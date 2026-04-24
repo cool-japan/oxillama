@@ -80,7 +80,7 @@ With `chat`, `completions`, `generate-manpage`, and `version --verbose` now ship
 - ~~No readline-style line editing~~ ✅ `rustyline::DefaultEditor` with persistent history at `~/.local/state/oxillama/history`.
 - ~~No config schema or validation — toml files are parsed but not structurally checked or documented.~~ ✅ Typed `OxillamaConfig` struct with `serde` + JSON-schema export; unknown keys produce clear errors.
 - ~~No per-model profile files (e.g. `~/.config/oxillama/models/qwen3-7b.toml` with baked-in sampler defaults).~~ ✅ Per-model profiles in `~/.config/oxillama/models/*.toml`; resolved via `--profile <name>`.
-- No conversation save/resume — token streams and KV-cache state are not persisted between invocations.
+- ~~No conversation save/resume — token streams and KV-cache state are not persisted between invocations.~~ ✅ `session.rs` — `/save <path>` and `/load <path>` slash-commands in chat REPL; atomic write via tempfile+rename; oxicode-serde serialisation; SHA-256 KV-sidecar verification; schema version guard.
 - `serve`'s `model_id` extraction falls back to `"oxillama-model"` when file stem is non-UTF8; no override flag.
 - ~~No `--config <path>` flag or `OXILLAMA_CONFIG` env var wired into clap — toml loader is staged for v1.1.~~ ✅ `--config` flag + `OXILLAMA_CONFIG` env var wired; layered resolution: CLI flag > env > profile > defaults.
 - ~~No man-page generation (clap_mangen not yet wired).~~ ✅ `generate-manpage` subcommand writes `oxillama.1` to `--output-dir`.
@@ -101,16 +101,20 @@ With `chat`, `completions`, `generate-manpage`, and `version --verbose` now ship
 - [x] Structured error surface: map `anyhow` context into exit codes (2 = invalid args, 3 = model load, 4 = runtime).
 - [x] `oxillama run --file prompt.txt` and `oxillama run --stdin` for piped prompts.
 
-## 7. v2.0+ Vision
+## 7. Shipped in v0.1.2
+
+- [x] Conversation save/resume — `session.rs` module with `/save <path>` and `/load <path>` slash-commands wired into the chat REPL. Snapshots are written atomically (tempfile+rename) using oxicode-serde binary serialisation. Schema version guard (rejects future formats), SHA-256 KV-cache sidecar integrity check, and model-ID mismatch detection. 5 unit tests.
+- [x] `oxillama hub pull/list/rm` — HuggingFace Hub subcommand group (`feature = "hub"`). Pure Rust transport via `hf-hub 0.5.0 + ureq + rustls`. `hub list` enumerates `**/*.gguf` under the platform cache dir. `hub rm` removes a cached repo directory. `hub pull` downloads via `hf-hub` with optional SHA-256 verification and auto-selects the first `.gguf` from the repo manifest. Cache dir: `~/Library/Caches/oxillama/models` (macOS) / `~/.cache/oxillama/models` (Linux) via `directories` crate. 5 unit tests (no live network needed).
+- [x] TUI chat mode — `feature = "tui"` gated `crates/oxillama-cli/src/tui/` module tree using `ratatui 0.30` + `crossterm 0.29`. Full-screen layout: conversation pane (scrollable), stats sidebar (tokens/s, KV usage), status bar, and multi-line input box. Slash commands: `/save <path>`, `/load <path>`, `/clear`, `/quit`, `/help`. Activated with `oxillama chat --tui`. 6 unit tests via `ratatui::TestBackend` (no real TTY). Note: generation in TUI mode is currently stubbed with a placeholder message — full async engine hand-off is deferred; use `oxillama chat` (without `--tui`) for actual inference.
+
+## 8. v2.0+ Vision
 
 - TUI mode — `ratatui`-based dashboard with live token-stream pane, GPU utilization chart, KV-cache heatmap, per-layer attention summary, sampler histogram; keyboard shortcuts for pausing, reseeding, switching samplers mid-generation.
 - Plugin hooks — custom sampler / logits-processor callbacks invoked as shell scripts (stdin: logits, stdout: modified logits) and as WASM modules via `oxillama-wasm` for sandboxed execution.
-- `oxillama hub pull <model>` — HuggingFace Hub downloads (resumable, hash-verified, GGUF-manifest-aware) using Pure Rust HTTP via `oxillama-server` dependencies; sibling `oxillama hub ls` and `oxillama hub prune`.
 - Multi-model orchestration — `oxillama run --model a.gguf --model b.gguf` with arbiter sampling (majority vote, logit-average).
-- Session snapshotting — `oxillama chat --save session.bin` with `oxicode`-serialized KV-cache and conversation state.
 - Interactive prompt composer — in-TUI template editor with live token-count + context-fit visualization.
 - `oxillama serve --multi-model` — fleet mode with per-model warm slots, request routing by requested `model` field.
 - `oxillama convert` — GGUF from safetensors / HF snapshot, reusing `oxillama-gguf` writer + `oxillama-quant` kernels.
 - Self-contained `scirs2-core` / `oxiblas` / `oxifft` feature-flag banner surfaced via `oxillama --about` so end users can see their sovereignty posture at a glance.
 
-*Last updated: 2026-04-20 (v0.1.1 — chat, completions, generate-manpage, version --verbose, config schema, per-model profiles, OXILLAMA_CONFIG, --file/--stdin, colored output, indicatif spinner, exit codes)*
+*Last updated: 2026-04-24 (v0.1.2 — conversation save/resume, hub pull/list/rm)*

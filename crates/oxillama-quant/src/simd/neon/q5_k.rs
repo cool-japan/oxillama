@@ -666,7 +666,7 @@ impl QuantKernel for Q5_KNeon {
             });
         }
 
-        for row in 0..n_rows {
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
             let row_start = row * row_bytes;
             // SAFETY: bounds checked above.
             let row_sum = unsafe {
@@ -677,7 +677,7 @@ impl QuantKernel for Q5_KNeon {
                     n_cols,
                 )
             };
-            out[row] += row_sum;
+            *out_val += row_sum;
         }
 
         Ok(())
@@ -1061,5 +1061,142 @@ mod tests {
                 err
             );
         }
+    }
+
+    // ── matvec_q8_fused ───────────────────────────────────────────────────
+
+    fn make_q8_0_block(scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(34);
+        block.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+        for &v in values {
+            block.push(v as u8);
+        }
+        block
+    }
+
+    fn make_q8_acts(n_q8_blocks: usize, scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        make_q8_0_block(scale, values).repeat(n_q8_blocks)
+    }
+
+    #[test]
+    fn test_q5k_neon_fused_matches_reference_single_block() {
+        let mut scales = [0u8; 12];
+        for (i, s) in scales.iter_mut().enumerate() {
+            *s = ((i * 7 + 5) & 0x3F) as u8;
+        }
+        let mut qh = [0u8; 32];
+        for (i, h) in qh.iter_mut().enumerate() {
+            *h = ((i * 13 + 3) & 0xFF) as u8;
+        }
+        let mut qs = [0u8; 128];
+        for (i, q) in qs.iter_mut().enumerate() {
+            *q = ((i * 5 + 11) & 0xFF) as u8;
+        }
+
+        let w_block = make_q5k_block(0.5, 0.25, &scales, &qh, &qs);
+        let act_vals: [i8; 32] = [
+            2, -3, 5, -7, 1, -1, 4, -4, 6, -6, 3, -3, 2, -2, 1, -1,
+            8, -8, 7, -7, 6, -6, 5, -5, 4, -4, 3, -3, 2, -2, 1, -1,
+        ];
+        let acts = make_q8_acts(8, 0.1, &act_vals);
+
+        let mut out_neon = vec![0.0f32; 1];
+        let mut out_ref = vec![0.0f32; 1];
+
+        Q5_KNeon
+            .matvec_q8_fused(&w_block, &acts, &mut out_neon, 1, 256)
+            .expect("neon fused single block");
+        Q5KRef
+            .matvec_q8_fused(&w_block, &acts, &mut out_ref, 1, 256)
+            .expect("ref fused single block");
+
+        let err = (out_neon[0] - out_ref[0]).abs();
+        assert!(
+            err < 1e-3,
+            "fused single-block mismatch: neon={} ref={} err={}",
+            out_neon[0],
+            out_ref[0],
+            err
+        );
+    }
+
+    #[test]
+    fn test_q5k_neon_fused_multi_row() {
+        let n_rows = 3usize;
+        let n_cols = 512usize;
+        let blocks_per_row = 2usize;
+        let q8_blocks_per_row = blocks_per_row * 8;
+
+        let mut all_weights = Vec::new();
+        for r in 0..n_rows {
+            for b in 0..blocks_per_row {
+                let mut scales = [0u8; 12];
+                for (i, s) in scales.iter_mut().enumerate() {
+                    *s = ((r * 17 + b * 11 + i * 7 + 5) & 0x3F) as u8;
+                }
+                let mut qh = [0u8; 32];
+                for (i, h) in qh.iter_mut().enumerate() {
+                    *h = ((r * 13 + b * 19 + i * 3) & 0xFF) as u8;
+                }
+                let mut qs = [0u8; 128];
+                for (i, q) in qs.iter_mut().enumerate() {
+                    *q = ((r * 5 + b * 23 + i * 11) & 0xFF) as u8;
+                }
+                all_weights.extend(make_q5k_block(
+                    0.5 + r as f32 * 0.1,
+                    0.1 + b as f32 * 0.05,
+                    &scales,
+                    &qh,
+                    &qs,
+                ));
+            }
+        }
+
+        let act_vals: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16,
+            0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8,
+        ];
+        let acts = make_q8_acts(q8_blocks_per_row, 0.05, &act_vals);
+
+        let mut out_neon = vec![0.0f32; n_rows];
+        let mut out_ref = vec![0.0f32; n_rows];
+
+        Q5_KNeon
+            .matvec_q8_fused(&all_weights, &acts, &mut out_neon, n_rows, n_cols)
+            .expect("neon fused multi-row");
+        Q5KRef
+            .matvec_q8_fused(&all_weights, &acts, &mut out_ref, n_rows, n_cols)
+            .expect("ref fused multi-row");
+
+        for i in 0..n_rows {
+            let err = (out_neon[i] - out_ref[i]).abs();
+            assert!(
+                err < 1e-3,
+                "fused multi-row row {i}: neon={} ref={} err={}",
+                out_neon[i],
+                out_ref[i],
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_q5k_neon_fused_accumulate_semantics() {
+        let mut scales = [0u8; 12];
+        scales[..4].fill(1);
+        scales[8..12].fill(1);
+        let w_block = make_q5k_block(0.0, 0.0, &scales, &[0u8; 32], &[0u8; 128]);
+        let acts = make_q8_acts(8, 0.0, &[0i8; 32]);
+
+        let mut out = vec![99.0f32; 1];
+        Q5_KNeon
+            .matvec_q8_fused(&w_block, &acts, &mut out, 1, 256)
+            .expect("neon fused accumulate");
+
+        assert!(
+            (out[0] - 99.0).abs() < 1e-5,
+            "accumulate semantics broken: expected 99.0, got {}",
+            out[0]
+        );
     }
 }

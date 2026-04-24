@@ -13,6 +13,7 @@ pub mod kv_cache;
 pub mod kv_pool;
 pub mod lora_loader;
 pub mod metrics;
+pub mod offload;
 pub mod sampling;
 pub mod scheduler;
 pub mod sequence_pool;
@@ -26,6 +27,10 @@ pub mod tool_dispatch;
 pub use batched_attention::batched_flash_attention;
 pub use engine::{EngineConfig, InferenceEngine, FLASH_ATTN_THRESHOLD};
 pub use error::{RuntimeError, RuntimeResult};
+pub use offload::{
+    FilePagerSource, LayerPager, MemoryPressureProbe, OffloadPolicy, PagerSource, ResidentTensor,
+    TensorEntry, TensorId,
+};
 pub use flash_attention::{
     flash_attention, flash_attention_forward, flash_attention_gqa, flash_attention_multi_head,
     FlashAttentionConfig,

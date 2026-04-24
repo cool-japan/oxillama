@@ -262,9 +262,19 @@ Cached vocabulary
     - OpenAI compat: `"arguments"` key accepted as alias for `"args"`.
     - Exported from `lib.rs`: `no_op_dispatcher`, `NoOpDispatcher`, `ToolCall`, `ToolCallDetector`, `ToolCallGrammar`, `ToolDispatcher`, `ToolResult`.
   - **Tests (13):** All from original spec plus grammar-delimiter accessors and reset test.
-- CPU / disk offload: lazy tensor paging, on-demand dequant of cold
-  layers, pinned hot-layer set; pairs with the GPU crate's staging buffer
-  and with `oxillama-gguf` mmap ranges.
+- [x] CPU / disk offload: lazy tensor paging, pinned hot-layer set ✅ **Done (2026-04-24)**
+  - **Shipped:** `src/offload/{mod,policy,pager,pressure}.rs` (~660 LoC of pager logic):
+    - `OffloadPolicy` enum (None / Budget / PinnedHotSet) with `#[derive(Default)]` via `#[default]` on `None`.
+    - `LayerPager` — LRU weight pager with `RwLock`-protected resident map, `Mutex`-protected LRU queue, `AtomicU64` byte counter, pinned tensor set. `acquire()` has fast path (read-lock only) and slow path (evict → load from source → write-lock).
+    - `PagerSource` trait (`read_bytes_at`, `total_size_bytes`) for `dyn` dispatch.
+    - `FilePagerSource` (seek+read, always available) + `MmapPagerSource` (behind `mmap` feature).
+    - `MemoryPressureProbe` with Linux `/proc` parsing; macOS/other returns `None`.
+    - `OffloadPolicy::None` (default) wires to `layer_pager: None` in `InferenceEngine` — existing inference path unchanged.
+    - `EngineConfig::with_offload(policy)` builder method; `InferenceEngine::layer_pager()` / `set_layer_pager()` inspection hooks.
+    - 3 new `RuntimeError` variants: `OffloadEof`, `TensorNotFound`, `LockPoisoned`.
+  - **Tests (15 new in `offload/pager.rs`, 6 in `policy.rs`, 6 in `pressure.rs`):** budget eviction, pinned survival, correct bytes, unknown tensor error, double acquire, `FilePagerSource` correctness + EOF error, resident count tracking, `is_pinned`, strict budget, `TensorId` display.
+  - **Deferred:** linear-layer per-GEMM integration lives in `oxillama-arch/src/common/linear.rs` (out of R1 scope); the `layer_pager` field on `InferenceEngine` is the integration hook for that follow-up.
+  - **Feature:** `offload = []` (always-on by default); `mmap` feature now also gates `dep:memmap2` for `MmapPagerSource`.
 - Automatic draft-model selection: given a target GGUF, pick the best
   compatible draft (same tokenizer, compatible vocab, smaller variant) or
   synthesise a quantised draft in-process.
@@ -281,4 +291,4 @@ Cached vocabulary
   - **Files:** `src/snapshot.rs`, `src/engine.rs` (+80 LoC), `src/error.rs` (2 new variants), `src/kv_cache/mod.rs` (+100 LoC), `src/kv_cache/paged.rs`, `src/sampling/mod.rs` (Xorshift64 accessors), `src/sampling/grammar/machine.rs` (GrammarState::from_state_id), `crates/oxillama-arch/src/common/sequence_state.rs` (additive trait methods + Mamba2/Jamba overrides), `Cargo.toml` (oxicode dep), `tests/snapshot.rs`.
   - **Tests:** `snapshot_roundtrip_small`, `snapshot_rejects_wrong_model_fingerprint`, `snapshot_rejects_incompatible_version`, `snapshot_preserves_mirostat_mu`, `snapshot_preserves_grammar_state`, `snapshot_ssm_roundtrip`, `snapshot_paged_kv_roundtrip`, `snapshot_cross_process_determinism`.
 
-*Last updated: 2026-04-24 (v0.1.1)*
+*Last updated: 2026-04-24 (v0.1.2)*

@@ -531,4 +531,126 @@ mod tests {
             out_ref[0]
         );
     }
+
+    // ── matvec_q8_fused ───────────────────────────────────────────────────
+
+    fn make_q8_0_block_fused(scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(BLOCK_BYTES);
+        block.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+        for &v in values {
+            block.push(v as u8);
+        }
+        block
+    }
+
+    #[test]
+    fn test_q8_0_avx2_fused_matches_reference_single_block() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let w_vals: [i8; 32] = [
+            10, -20, 30, -40, 50, -60, 70, -80, 90, -100, 110, -120, 100, -90, 80, -70,
+            60, -50, 40, -30, 20, -10, 5, -15, 25, -35, 45, -55, 65, -75, 85, -95,
+        ];
+        let a_vals: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16,
+            0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8,
+        ];
+        let w_block = make_q8_0_block_fused(0.5, &w_vals);
+        let a_block = make_q8_0_block_fused(0.1, &a_vals);
+
+        let mut out_avx2 = vec![0.0f32; 1];
+        let mut out_ref = vec![0.0f32; 1];
+
+        Q8_0Avx2
+            .matvec_q8_fused(&w_block, &a_block, &mut out_avx2, 1, 32)
+            .expect("avx2 fused single block");
+        Q8_0Ref
+            .matvec_q8_fused(&w_block, &a_block, &mut out_ref, 1, 32)
+            .expect("ref fused single block");
+
+        let err = (out_avx2[0] - out_ref[0]).abs();
+        assert!(
+            err < 1e-3,
+            "fused single-block mismatch: avx2={} ref={} err={}",
+            out_avx2[0],
+            out_ref[0],
+            err
+        );
+    }
+
+    #[test]
+    fn test_q8_0_avx2_fused_multi_row() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let n_rows = 3usize;
+        let n_cols = 64usize;
+        let blocks_per_row = 2usize; // 64 / 32 = 2
+
+        let w_vals_a: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16,
+            -1, 2, -3, 4, -5, 6, -7, 8, -9, 10, -11, 12, -13, 14, -15, 16,
+        ];
+        let w_vals_b: [i8; 32] = [
+            20, -30, 40, -50, 60, -70, 80, -90, 100, -110, 120, -127, 100, -90, 80, -70,
+            50, -40, 30, -20, 10, -5, 15, -25, 35, -45, 55, -65, 75, -85, 95, -100,
+        ];
+        let scales = [0.25f32, 0.5f32, 1.0f32];
+        let mut all_weights = Vec::new();
+        for &s in &scales {
+            all_weights.extend(make_q8_0_block_fused(s, &w_vals_a));
+            all_weights.extend(make_q8_0_block_fused(s * 0.5, &w_vals_b));
+        }
+
+        let a_vals: [i8; 32] = [
+            2, -3, 5, -7, 1, -1, 4, -4, 6, -6, 3, -3, 2, -2, 1, -1,
+            8, -8, 7, -7, 6, -6, 5, -5, 4, -4, 3, -3, 2, -2, 1, -1,
+        ];
+        let mut acts = Vec::new();
+        for _ in 0..blocks_per_row {
+            acts.extend(make_q8_0_block_fused(0.05, &a_vals));
+        }
+
+        let mut out_avx2 = vec![0.0f32; n_rows];
+        let mut out_ref = vec![0.0f32; n_rows];
+
+        Q8_0Avx2
+            .matvec_q8_fused(&all_weights, &acts, &mut out_avx2, n_rows, n_cols)
+            .expect("avx2 fused multi-row");
+        Q8_0Ref
+            .matvec_q8_fused(&all_weights, &acts, &mut out_ref, n_rows, n_cols)
+            .expect("ref fused multi-row");
+
+        for i in 0..n_rows {
+            let err = (out_avx2[i] - out_ref[i]).abs();
+            assert!(
+                err < 1e-3,
+                "fused multi-row row {i}: avx2={} ref={} err={}",
+                out_avx2[i],
+                out_ref[i],
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_q8_0_avx2_fused_accumulate_semantics() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let w_block = make_q8_0_block_fused(1.0, &[0i8; 32]);
+        let a_block = make_q8_0_block_fused(1.0, &[0i8; 32]);
+
+        let mut out = vec![55.0f32; 1];
+        Q8_0Avx2
+            .matvec_q8_fused(&w_block, &a_block, &mut out, 1, 32)
+            .expect("avx2 fused accumulate");
+
+        assert!(
+            (out[0] - 55.0).abs() < 1e-5,
+            "accumulate semantics broken: expected 55.0, got {}",
+            out[0]
+        );
+    }
 }

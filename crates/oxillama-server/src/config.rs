@@ -5,6 +5,16 @@ use serde::{Deserialize, Serialize};
 /// Configuration for the OxiLLaMa API server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    // ── JWT authentication ────────────────────────────────────────────────
+    /// JWT verifier configuration (not serialized — set programmatically
+    /// at startup from file paths / environment variables).
+    ///
+    /// When `Some`, JWT verification is enabled and takes priority over
+    /// `api_keys` bearer-token auth.  When `None`, the existing bearer-key
+    /// path is used.
+    #[serde(skip)]
+    #[cfg(feature = "jwt")]
+    pub jwt: Option<crate::jwt_auth::JwtConfig>,
     /// Host address to bind to.
     pub host: String,
     /// Port number.
@@ -56,6 +66,9 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "jwt")]
+            jwt: None,
+
             host: "127.0.0.1".to_string(),
             port: 8080,
             max_concurrent: 64,

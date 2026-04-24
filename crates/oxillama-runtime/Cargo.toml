@@ -12,7 +12,7 @@ categories = ["science", "algorithms"]
 readme = "README.md"
 
 [features]
-default = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "tokenizer-wasm", "parallel", "native-async", "mmap"]
+default = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "tokenizer-wasm", "parallel", "native-async", "mmap", "offload"]
 llama = ["oxillama-arch/llama"]
 qwen3 = ["oxillama-arch/qwen3"]
 mistral = ["oxillama-arch/mistral"]
@@ -24,7 +24,8 @@ tokenizer-onig = ["dep:tokenizers", "tokenizers/onig"]
 tokenizer-wasm = ["dep:tokenizers", "tokenizers/unstable_wasm"]
 parallel = ["dep:rayon", "oxillama-quant/parallel"]
 native-async = ["dep:tokio", "dep:tokio-util"]
-mmap = ["oxillama-gguf/mmap"]
+mmap = ["oxillama-gguf/mmap", "dep:memmap2"]
+offload = []
 
 [dependencies]
 oxillama-gguf = { workspace = true }
@@ -37,6 +38,7 @@ rayon = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true, default-features = false }
+memmap2 = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 oxicode.workspace = true
@@ -45,6 +47,7 @@ blake3.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 oxillama-gguf = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true
 
 [[bench]]
 name = "sampling"

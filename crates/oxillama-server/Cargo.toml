@@ -11,6 +11,9 @@ keywords = ["llm", "openai", "api-server", "inference", "llama"]
 categories = ["web-programming::http-server", "science"]
 readme = "README.md"
 
+[features]
+jwt = ["dep:hmac", "dep:sha2", "dep:rsa", "dep:base64"]
+
 [dependencies]
 oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi", "parallel", "native-async", "mmap"] }
 axum.workspace = true
@@ -26,5 +29,12 @@ thiserror.workspace = true
 tempfile.workspace = true
 tokio-util.workspace = true
 
+# ── JWT auth (optional, feature = "jwt") ──
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+rsa = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
+rand = { workspace = true }

@@ -25,6 +25,8 @@
 pub mod admin;
 pub mod app;
 pub mod auth;
+#[cfg(feature = "jwt")]
+pub mod jwt_auth;
 pub mod batch;
 pub mod batch_spool;
 pub mod body_limit;
