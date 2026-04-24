@@ -24,7 +24,7 @@ oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "q
 oxillama-arch = { workspace = true }
 oxillama-gguf = { workspace = true, features = ["mmap"] }
 numpy = { workspace = true, optional = true }
-hf-hub = { workspace = true }
+hf-hub = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Only needed for error.rs tests that reference quant error variants.
@@ -33,3 +33,4 @@ oxillama-quant = { workspace = true, features = ["parallel"] }
 [features]
 default = []
 numpy = ["dep:numpy"]
+hub = ["dep:hf-hub"]

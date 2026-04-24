@@ -44,6 +44,7 @@ pub mod cancel;
 pub mod chat_template;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "hub")]
 pub mod hub;
 pub mod lora;
 pub mod sampler;

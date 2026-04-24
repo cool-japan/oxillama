@@ -521,6 +521,7 @@ impl PyEngine {
     /// Raises:
     ///     IOError:      if the download or GGUF file fails.
     ///     RuntimeError: if no ``.gguf`` file is found in the repository.
+    #[cfg(feature = "hub")]
     #[classmethod]
     #[pyo3(signature = (
         repo_id,
