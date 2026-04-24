@@ -18,6 +18,7 @@ pub mod scheduler;
 pub mod sequence_pool;
 pub mod snapshot;
 pub mod speculative;
+#[cfg(feature = "native-async")]
 pub mod speculative_async;
 pub mod tokenizer_bridge;
 pub mod tool_dispatch;
@@ -40,6 +41,7 @@ pub use sampling::{sample, Sampler, SamplerConfig};
 pub use scheduler::{Scheduler, SchedulerConfig, MAX_DECODE_WAIT_MS, PREFILL_CHUNK};
 pub use sequence_pool::{PoolError, PoolResult, SequencePool, SequenceSlot, SsmStatePool};
 pub use speculative::{SpeculativeConfig, SpeculativeDeltaSync, SpeculativeEngine};
+#[cfg(feature = "native-async")]
 pub use speculative_async::{
     AsyncSpecConfig, RewindError, Rewindable, SpecStats, SpeculativeDecoder,
 };

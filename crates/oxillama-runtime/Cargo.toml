@@ -12,7 +12,7 @@ categories = ["science", "algorithms"]
 readme = "README.md"
 
 [features]
-default = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "tokenizer-wasm"]
+default = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "tokenizer-wasm", "parallel", "native-async", "mmap"]
 llama = ["oxillama-arch/llama"]
 qwen3 = ["oxillama-arch/qwen3"]
 mistral = ["oxillama-arch/mistral"]
@@ -22,17 +22,20 @@ command-r = ["oxillama-arch/command-r"]
 starcoder = ["oxillama-arch/starcoder"]
 tokenizer-onig = ["dep:tokenizers", "tokenizers/onig"]
 tokenizer-wasm = ["dep:tokenizers", "tokenizers/unstable_wasm"]
+parallel = ["dep:rayon", "oxillama-quant/parallel"]
+native-async = ["dep:tokio", "dep:tokio-util"]
+mmap = ["oxillama-gguf/mmap"]
 
 [dependencies]
-oxillama-gguf = { workspace = true, features = ["mmap"] }
-oxillama-quant = { workspace = true, features = ["parallel"] }
+oxillama-gguf = { workspace = true }
+oxillama-quant = { workspace = true }
 oxillama-arch.workspace = true
 half.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-rayon.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
+rayon = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true, default-features = false }
 serde.workspace = true
 serde_json.workspace = true

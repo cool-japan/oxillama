@@ -28,7 +28,7 @@ simd-neon = ["oxillama-quant/simd-neon"]
 oxillama-gguf = { workspace = true, features = ["mmap"] }
 oxillama-quant = { workspace = true, features = ["parallel"] }
 oxillama-arch.workspace = true
-oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi"] }
+oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi", "parallel", "native-async", "mmap"] }
 oxillama-server = { workspace = true, optional = true }
 oxillama-bench = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
