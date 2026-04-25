@@ -2,14 +2,13 @@
 
 /// Events that the TUI loop can receive.
 ///
-/// Currently unused — event dispatch is handled inline in [`crate::tui::app::TuiApp::run`].
-/// Reserved for a future dedicated event thread that decouples input from rendering.
-#[allow(dead_code)]
+/// Token, GenerationDone, and GenerationError are produced by the background
+/// inference worker and consumed in the main draw loop via `event_rx.try_recv()`.
 pub enum TuiEvent {
-    /// A keyboard event from the terminal.
-    Key(crossterm::event::KeyEvent),
-    /// Terminal was resized to the given (width, height).
-    Resize(u16, u16),
-    /// A periodic tick — used for polling live stats.
-    Tick,
+    /// A decoded token string emitted by the inference worker.
+    Token(String),
+    /// Inference completed successfully.
+    GenerationDone,
+    /// Inference terminated with an error.
+    GenerationError(String),
 }

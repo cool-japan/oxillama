@@ -311,6 +311,18 @@ impl KvCacheAccess for PagedKvCache {
             self.seq_len += 1;
         }
     }
+
+    fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
+
+    fn for_each_key(&self, layer: usize, f: &mut dyn FnMut(usize, &[f32])) -> ArchResult<()> {
+        self.iter_keys(layer, |pos, slice| f(pos, slice))
+    }
+
+    fn for_each_value(&self, layer: usize, f: &mut dyn FnMut(usize, &[f32])) -> ArchResult<()> {
+        self.iter_values(layer, |pos, slice| f(pos, slice))
+    }
 }
 
 /// Extended paged KV cache operations (not part of the base trait).
@@ -628,5 +640,90 @@ mod tests {
         // Should fail — at max
         let result = cache.store_kv(0, &[9.0, 10.0], &[11.0, 12.0]);
         assert!(result.is_err());
+    }
+
+    // ── for_each_key / for_each_value override ───────────────────────────────
+
+    #[test]
+    fn paged_for_each_key_multi_page() {
+        use oxillama_arch::traits::KvCacheAccess;
+
+        let kv_dim = 2usize;
+        // Fill PAGE_SIZE + 4 tokens so we span two pages.
+        let seq_len = PAGE_SIZE + 4;
+        let mut cache = PagedKvCache::new(1, seq_len + 10, kv_dim);
+
+        for t in 0..seq_len {
+            let key = [t as f32, t as f32 * 2.0];
+            let val = [0.0f32; 2];
+            cache.store_kv(0, &key, &val).expect("store_kv");
+            cache.advance();
+        }
+
+        assert_eq!(cache.seq_len(), seq_len);
+        assert_eq!(cache.layers[0].num_pages(), 2, "must span two pages");
+
+        // get_keys() returns error for multi-page
+        assert!(cache.get_keys(0).is_err());
+
+        // for_each_key must visit all tokens via page-aware path
+        let mut positions_seen: Vec<usize> = Vec::new();
+        let mut first_elements: Vec<f32> = Vec::new();
+        cache
+            .for_each_key(0, &mut |pos, slice| {
+                positions_seen.push(pos);
+                first_elements.push(slice[0]);
+            })
+            .expect("for_each_key must succeed on paged cache");
+
+        assert_eq!(
+            positions_seen.len(),
+            seq_len,
+            "must visit all {} positions",
+            seq_len
+        );
+        assert_eq!(positions_seen, (0..seq_len).collect::<Vec<_>>());
+
+        // Verify key data at a few positions
+        for (t, &first) in first_elements.iter().enumerate() {
+            let expected = t as f32;
+            assert!(
+                (first - expected).abs() < 1e-6,
+                "token {t}: expected first element {expected}, got {first}"
+            );
+        }
+    }
+
+    #[test]
+    fn paged_for_each_value_multi_page() {
+        use oxillama_arch::traits::KvCacheAccess;
+
+        let kv_dim = 3usize;
+        let seq_len = PAGE_SIZE + 2;
+        let mut cache = PagedKvCache::new(1, seq_len + 10, kv_dim);
+
+        for t in 0..seq_len {
+            let key = [0.0f32; 3];
+            let val = [t as f32, t as f32 * 10.0, t as f32 * 100.0];
+            cache.store_kv(0, &key, &val).expect("store_kv");
+            cache.advance();
+        }
+
+        let mut count = 0usize;
+        let mut sum_first: f32 = 0.0;
+        cache
+            .for_each_value(0, &mut |_pos, slice| {
+                count += 1;
+                sum_first += slice[0];
+            })
+            .expect("for_each_value must succeed");
+
+        assert_eq!(count, seq_len, "must visit all tokens");
+        // sum of 0..seq_len = seq_len*(seq_len-1)/2
+        let expected_sum = (seq_len * (seq_len - 1) / 2) as f32;
+        assert!(
+            (sum_first - expected_sum).abs() < 1e-4,
+            "sum of first value elements: expected {expected_sum}, got {sum_first}"
+        );
     }
 }

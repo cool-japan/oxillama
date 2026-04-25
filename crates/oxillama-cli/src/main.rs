@@ -680,27 +680,13 @@ async fn run() -> Result<()> {
             seed,
             tui,
         } => {
-            // ── TUI branch ────────────────────────────────────────────────────
+            // ── Check TUI feature gate before doing any work ──────────────────
+            #[cfg(not(feature = "tui"))]
             if tui {
-                let model_id = std::path::Path::new(&model)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("model")
-                    .to_string();
-                let model_path = std::path::PathBuf::from(&model);
-
-                #[cfg(feature = "tui")]
-                return crate::tui::run_tui(model_path, model_id);
-
-                #[cfg(not(feature = "tui"))]
-                {
-                    let _ = model_path;
-                    let _ = model_id;
-                    return Err(anyhow::anyhow!(
-                        "TUI feature not enabled. \
-                         Rebuild with --features tui to use the full-screen interface."
-                    ));
-                }
+                return Err(anyhow::anyhow!(
+                    "TUI feature not enabled. \
+                     Rebuild with --features tui to use the full-screen interface."
+                ));
             }
 
             let effective_seed = if seed == 0 { None } else { Some(seed) };
@@ -720,12 +706,14 @@ async fn run() -> Result<()> {
                 .unwrap_or("model")
                 .to_string();
 
+            let model_path_buf = std::path::PathBuf::from(&model);
+
             let config = oxillama_runtime::EngineConfig {
                 model_path: model,
                 tokenizer_path: tokenizer,
                 context_size: Some(ctx_size),
                 num_threads: threads,
-                sampler,
+                sampler: sampler.clone(),
                 ..Default::default()
             };
 
@@ -740,6 +728,21 @@ async fn run() -> Result<()> {
                 pb_chat.enable_steady_tick(std::time::Duration::from_millis(100));
                 engine.load_model()?;
                 pb_chat.finish_and_clear();
+            }
+
+            // ── TUI branch ────────────────────────────────────────────────────
+            #[cfg(feature = "tui")]
+            if tui {
+                use std::sync::{Arc, Mutex};
+                let model_id = chat_model_id_pre;
+                let engine_arc = Arc::new(Mutex::new(engine));
+                return crate::tui::run_tui(
+                    model_path_buf,
+                    model_id,
+                    engine_arc,
+                    sampler,
+                    512,
+                );
             }
 
             // Set up history file directory.

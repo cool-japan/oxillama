@@ -15,11 +15,20 @@ pub use app::TuiApp;
 ///
 /// `model_path` is the path to the GGUF file.
 /// `model_id` is the short name shown in the stats sidebar.
+/// `engine` is the already-loaded inference engine wrapped in an `Arc<Mutex<...>>`.
+/// `sampler` is the sampling configuration to use for generation.
+/// `max_tokens` caps the number of tokens generated per turn.
 ///
 /// The function blocks until the user quits (`Ctrl+C`, `Ctrl+Q`, or `/quit`).
 /// The terminal is restored to its previous state before returning, even when
 /// an error occurs.
-pub fn run_tui(model_path: std::path::PathBuf, model_id: String) -> anyhow::Result<()> {
+pub fn run_tui(
+    model_path: std::path::PathBuf,
+    model_id: String,
+    engine: std::sync::Arc<std::sync::Mutex<oxillama_runtime::InferenceEngine>>,
+    sampler: oxillama_runtime::SamplerConfig,
+    max_tokens: usize,
+) -> anyhow::Result<()> {
     use crossterm::{
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
         ExecutableCommand,
@@ -33,7 +42,7 @@ pub fn run_tui(model_path: std::path::PathBuf, model_id: String) -> anyhow::Resu
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = TuiApp::new(model_path, model_id);
+    let mut app = TuiApp::new(model_path, model_id, engine, sampler, max_tokens);
     let result = app.run(&mut terminal);
 
     // Always restore the terminal, regardless of success or error.
@@ -62,7 +71,7 @@ mod tests {
     #[test]
     fn tui_renders_empty_state() {
         let mut terminal = make_test_terminal(120, 40);
-        let app = TuiApp::new(PathBuf::from("test.gguf"), "test-model".to_string());
+        let app = TuiApp::new_ui_test(PathBuf::from("test.gguf"), "test-model".to_string());
         terminal
             .draw(|f| super::ui::draw(f, &app))
             .expect("draw should not fail");
@@ -90,7 +99,7 @@ mod tests {
 
     #[test]
     fn tui_appends_user_message_on_submit() {
-        let mut app = TuiApp::new(PathBuf::from("test.gguf"), "test-model".to_string());
+        let mut app = TuiApp::new_ui_test(PathBuf::from("test.gguf"), "test-model".to_string());
         app.input_buffer = "Hello world".to_string();
         app.cursor_pos = 11;
         app.submit_prompt().expect("submit should not fail");
@@ -105,7 +114,7 @@ mod tests {
 
     #[test]
     fn tui_slash_save_invokes_session_save() {
-        let mut app = TuiApp::new(PathBuf::from("test.gguf"), "test-model".to_string());
+        let mut app = TuiApp::new_ui_test(PathBuf::from("test.gguf"), "test-model".to_string());
         let tmp = std::env::temp_dir().join("tui_test_save.bin");
         app.handle_slash_command(&format!("/save {}", tmp.display()))
             .expect("slash save should not fail");
@@ -115,7 +124,7 @@ mod tests {
 
     #[test]
     fn tui_slash_clear_empties_messages() {
-        let mut app = TuiApp::new(PathBuf::from("test.gguf"), "test-model".to_string());
+        let mut app = TuiApp::new_ui_test(PathBuf::from("test.gguf"), "test-model".to_string());
         app.session.messages.push(ChatMessage {
             role: "user".into(),
             content: "hi".into(),
@@ -132,7 +141,7 @@ mod tests {
     fn tui_ctrlc_sets_quitting_state() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let mut app = TuiApp::new(PathBuf::from("test.gguf"), "test-model".to_string());
+        let mut app = TuiApp::new_ui_test(PathBuf::from("test.gguf"), "test-model".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
             .expect("handle_key should not fail");
         assert!(
@@ -143,7 +152,7 @@ mod tests {
 
     #[test]
     fn tui_slash_load_fails_gracefully_on_missing_file() {
-        let mut app = TuiApp::new(PathBuf::from("test.gguf"), "test-model".to_string());
+        let mut app = TuiApp::new_ui_test(PathBuf::from("test.gguf"), "test-model".to_string());
         // Loading a non-existent file should set a status message, not panic.
         app.handle_slash_command("/load /tmp/nonexistent_tui_test_abc123.bin")
             .expect("handle_slash_command should not propagate IO errors as anyhow::Error");

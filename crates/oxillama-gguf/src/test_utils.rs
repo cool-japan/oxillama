@@ -1063,10 +1063,10 @@ const DEEPSEEK_TENSORS: &[TensorDesc] = &[
         n_elements: 32,
     },
     // ── Layer 0: MLA weights ──
-    // w_q_a: [q_lora_rank=8, hidden=32]
+    // w_q_a: [q_lora_rank=8, hidden=32] — row-major: [out_features, in_features]
     TensorDesc {
         name: "blk.0.attn_q_a_proj.weight",
-        dims: &[32, 8],
+        dims: &[8, 32],
         n_elements: 256,
     },
     // q_a_norm: [q_lora_rank=8]
@@ -1075,16 +1075,16 @@ const DEEPSEEK_TENSORS: &[TensorDesc] = &[
         dims: &[8],
         n_elements: 8,
     },
-    // w_q_b: [q_full=2*(4+4)=16, q_lora_rank=8]
+    // w_q_b: [q_full=2*(4+4)=16, q_lora_rank=8] — row-major: [out, in]
     TensorDesc {
         name: "blk.0.attn_q_b_proj.weight",
-        dims: &[8, 16],
+        dims: &[16, 8],
         n_elements: 128,
     },
-    // w_kv_a: [kv_comb=8+4=12, hidden=32]
+    // w_kv_a: [kv_comb=8+4=12, hidden=32] — row-major: [out, in]
     TensorDesc {
         name: "blk.0.attn_kv_a_proj.weight",
-        dims: &[32, 12],
+        dims: &[12, 32],
         n_elements: 384,
     },
     // kv_a_norm: [kv_lora_rank=8]
@@ -1093,16 +1093,16 @@ const DEEPSEEK_TENSORS: &[TensorDesc] = &[
         dims: &[8],
         n_elements: 8,
     },
-    // w_kv_b: [kv_b_full=2*(4+4)=16, kv_lora_rank=8]
+    // w_kv_b: [kv_b_full=2*(4+4)=16, kv_lora_rank=8] — row-major: [out, in]
     TensorDesc {
         name: "blk.0.attn_kv_b_proj.weight",
-        dims: &[8, 16],
+        dims: &[16, 8],
         n_elements: 128,
     },
-    // w_o: [hidden=32, attn_out=2*4=8]
+    // w_o: [hidden=32, attn_out=2*4=8] — row-major: [out, in]
     TensorDesc {
         name: "blk.0.attn_output.weight",
-        dims: &[8, 32],
+        dims: &[32, 8],
         n_elements: 256,
     },
     // ── Layer 0: pre-FFN norm ──
@@ -1112,74 +1112,76 @@ const DEEPSEEK_TENSORS: &[TensorDesc] = &[
         n_elements: 32,
     },
     // ── Layer 0: Dense FFN (layer 0 is dense in DeepSeek-V2) ──
+    // gate/up: [intermediate=64, hidden=32] — row-major: [out, in]
     TensorDesc {
         name: "blk.0.ffn_gate.weight",
-        dims: &[32, 64],
+        dims: &[64, 32],
         n_elements: 2048,
     },
     TensorDesc {
         name: "blk.0.ffn_up.weight",
-        dims: &[32, 64],
-        n_elements: 2048,
-    },
-    TensorDesc {
-        name: "blk.0.ffn_down.weight",
         dims: &[64, 32],
         n_elements: 2048,
     },
+    // down: [hidden=32, intermediate=64] — row-major: [out, in]
+    TensorDesc {
+        name: "blk.0.ffn_down.weight",
+        dims: &[32, 64],
+        n_elements: 2048,
+    },
     // ── Layer 0: Router (for completeness; dense layer, router unused) ──
-    // Router: [n_routed_experts=2, hidden=32]
+    // Router: [n_routed_experts=2, hidden=32] — row-major: [out, in]
     TensorDesc {
         name: "blk.0.ffn_gate_inp.weight",
-        dims: &[32, 2],
+        dims: &[2, 32],
         n_elements: 64,
     },
     // ── Layer 0: Routed expert 0 (2D layout) ──
     TensorDesc {
         name: "blk.0.ffn_exp.0.ffn_gate.weight",
-        dims: &[32, 64],
+        dims: &[64, 32],
         n_elements: 2048,
     },
     TensorDesc {
         name: "blk.0.ffn_exp.0.ffn_up.weight",
-        dims: &[32, 64],
+        dims: &[64, 32],
         n_elements: 2048,
     },
     TensorDesc {
         name: "blk.0.ffn_exp.0.ffn_down.weight",
-        dims: &[64, 32],
+        dims: &[32, 64],
         n_elements: 2048,
     },
     // ── Layer 0: Routed expert 1 ──
     TensorDesc {
         name: "blk.0.ffn_exp.1.ffn_gate.weight",
-        dims: &[32, 64],
+        dims: &[64, 32],
         n_elements: 2048,
     },
     TensorDesc {
         name: "blk.0.ffn_exp.1.ffn_up.weight",
-        dims: &[32, 64],
+        dims: &[64, 32],
         n_elements: 2048,
     },
     TensorDesc {
         name: "blk.0.ffn_exp.1.ffn_down.weight",
-        dims: &[64, 32],
+        dims: &[32, 64],
         n_elements: 2048,
     },
     // ── Layer 0: Shared expert 0 ──
     TensorDesc {
         name: "blk.0.ffn_shared_exp.0.ffn_gate.weight",
-        dims: &[32, 64],
+        dims: &[64, 32],
         n_elements: 2048,
     },
     TensorDesc {
         name: "blk.0.ffn_shared_exp.0.ffn_up.weight",
-        dims: &[32, 64],
+        dims: &[64, 32],
         n_elements: 2048,
     },
     TensorDesc {
         name: "blk.0.ffn_shared_exp.0.ffn_down.weight",
-        dims: &[64, 32],
+        dims: &[32, 64],
         n_elements: 2048,
     },
     // ── Output ──
@@ -1568,7 +1570,7 @@ pub fn build_minimal_deepseek_v3_gguf() -> Vec<u8> {
         },
         TensorDesc {
             name: "blk.0.attn_q_a_proj.weight",
-            dims: &[32, 8],
+            dims: &[8, 32],
             n_elements: 256,
         },
         TensorDesc {
@@ -1578,12 +1580,12 @@ pub fn build_minimal_deepseek_v3_gguf() -> Vec<u8> {
         },
         TensorDesc {
             name: "blk.0.attn_q_b_proj.weight",
-            dims: &[8, 16],
+            dims: &[16, 8],
             n_elements: 128,
         },
         TensorDesc {
             name: "blk.0.attn_kv_a_proj.weight",
-            dims: &[32, 12],
+            dims: &[12, 32],
             n_elements: 384,
         },
         TensorDesc {
@@ -1593,12 +1595,12 @@ pub fn build_minimal_deepseek_v3_gguf() -> Vec<u8> {
         },
         TensorDesc {
             name: "blk.0.attn_kv_b_proj.weight",
-            dims: &[8, 16],
+            dims: &[16, 8],
             n_elements: 128,
         },
         TensorDesc {
             name: "blk.0.attn_output.weight",
-            dims: &[8, 32],
+            dims: &[32, 8],
             n_elements: 256,
         },
         TensorDesc {
@@ -1608,67 +1610,67 @@ pub fn build_minimal_deepseek_v3_gguf() -> Vec<u8> {
         },
         TensorDesc {
             name: "blk.0.ffn_gate.weight",
-            dims: &[32, 64],
+            dims: &[64, 32],
             n_elements: 2048,
         },
         TensorDesc {
             name: "blk.0.ffn_up.weight",
-            dims: &[32, 64],
+            dims: &[64, 32],
             n_elements: 2048,
         },
         TensorDesc {
             name: "blk.0.ffn_down.weight",
-            dims: &[64, 32],
+            dims: &[32, 64],
             n_elements: 2048,
         },
         TensorDesc {
             name: "blk.0.ffn_gate_inp.weight",
-            dims: &[32, 2],
+            dims: &[2, 32],
             n_elements: 64,
         },
         TensorDesc {
             name: "blk.0.ffn_exp.0.ffn_gate.weight",
-            dims: &[32, 64],
+            dims: &[64, 32],
             n_elements: 2048,
         },
         TensorDesc {
             name: "blk.0.ffn_exp.0.ffn_up.weight",
-            dims: &[32, 64],
+            dims: &[64, 32],
             n_elements: 2048,
         },
         TensorDesc {
             name: "blk.0.ffn_exp.0.ffn_down.weight",
-            dims: &[64, 32],
+            dims: &[32, 64],
             n_elements: 2048,
         },
         TensorDesc {
             name: "blk.0.ffn_exp.1.ffn_gate.weight",
-            dims: &[32, 64],
+            dims: &[64, 32],
             n_elements: 2048,
         },
         TensorDesc {
             name: "blk.0.ffn_exp.1.ffn_up.weight",
-            dims: &[32, 64],
+            dims: &[64, 32],
             n_elements: 2048,
         },
         TensorDesc {
             name: "blk.0.ffn_exp.1.ffn_down.weight",
-            dims: &[64, 32],
+            dims: &[32, 64],
             n_elements: 2048,
         },
         TensorDesc {
             name: "blk.0.ffn_shared_exp.0.ffn_gate.weight",
-            dims: &[32, 64],
+            dims: &[64, 32],
             n_elements: 2048,
         },
         TensorDesc {
             name: "blk.0.ffn_shared_exp.0.ffn_up.weight",
-            dims: &[32, 64],
+            dims: &[64, 32],
             n_elements: 2048,
         },
         TensorDesc {
             name: "blk.0.ffn_shared_exp.0.ffn_down.weight",
-            dims: &[64, 32],
+            dims: &[32, 64],
             n_elements: 2048,
         },
         // Per-expert bias for sigmoid+bias routing: [n_routed_experts=2]
@@ -1711,8 +1713,11 @@ pub fn build_minimal_deepseek_v3_gguf() -> Vec<u8> {
             KvEntry::U32("deepseek2.expert_used_count", 1),
             KvEntry::U32("deepseek2.expert_shared_count", 1),
             KvEntry::U32("deepseek2.expert_shared_feed_forward_length", 64),
-            // Non-unit expert_weights_scale triggers SigmoidWithBias auto-detection.
+            // Non-unit expert_weights_scale for SigmoidWithBias mode.
             KvEntry::F32("deepseek2.expert_weights_scale", 2.5),
+            // All layers are MoE (no leading dense block) so the single layer
+            // exercises the MoE path.
+            KvEntry::U32("deepseek2.leading_dense_block_count", 0),
             KvEntry::Str("tokenizer.ggml.model", "deepseek"),
         ],
         DEEPSEEK_V3_TENSORS,

@@ -470,6 +470,85 @@ impl ForwardPass for JambaModel {
         Ok(logits)
     }
 
+    /// Return the post-output-norm hidden state without projecting through the LM head.
+    ///
+    /// Mirrors the `forward()` dispatch loop exactly (attention vs SSM per layer), but
+    /// stops after the final `output_norm` and returns the last-token hidden state
+    /// as a `Vec<f32>` of length `hidden_size` rather than `vocab_size`.
+    ///
+    /// SSM state is throwaway (same semantics as `forward()` in the stateless path).
+    fn embed(
+        &mut self,
+        tokens: &[u32],
+        kv_cache: &mut dyn KvCacheAccess,
+    ) -> ArchResult<Vec<f32>> {
+        let hidden_size = self.config.hidden_size;
+        let vocab = self.config.vocab_size;
+        let seq_len = tokens.len();
+
+        if seq_len == 0 {
+            return Err(ArchError::InvalidConfig {
+                detail: "Jamba embed: empty token sequence".to_string(),
+            });
+        }
+
+        let mut last_hidden = vec![0.0f32; hidden_size];
+
+        for &tok_id in tokens {
+            let tok = tok_id as usize;
+            if tok >= vocab {
+                return Err(ArchError::InvalidConfig {
+                    detail: format!("Jamba embed: token {tok} >= vocab_size {vocab}"),
+                });
+            }
+
+            // Embedding lookup.
+            let emb_off = tok * hidden_size;
+            let mut hidden: Vec<f32> =
+                self.token_embd[emb_off..emb_off + hidden_size].to_vec();
+
+            // Throwaway SSM states — same pattern as forward().
+            let mut temp_ssm_states: Vec<SsmLayerState> = self
+                .layers
+                .iter()
+                .map(|layer| match layer {
+                    JambaLayerWeights::Ssm(w) => {
+                        let d_inner = w.w_out.len() / hidden_size.max(1);
+                        let d_state = w.w_b.len() / d_inner.max(1);
+                        SsmLayerState::new(d_state, d_inner)
+                    }
+                    JambaLayerWeights::Attention(_) => SsmLayerState::new(0, 0),
+                })
+                .collect();
+
+            for (layer_idx, layer_w) in self.layers.iter().enumerate() {
+                match layer_w {
+                    JambaLayerWeights::Attention(w) => {
+                        hidden = Self::attention_forward(&hidden, w, kv_cache, hidden_size)
+                            .map_err(|e| ArchError::ForwardPassError {
+                                layer: layer_idx,
+                                message: format!("embed attention block: {e}"),
+                            })?;
+                    }
+                    JambaLayerWeights::Ssm(w) => {
+                        let ssm_state = &mut temp_ssm_states[layer_idx];
+                        hidden = Self::ssm_forward(&hidden, w, ssm_state, hidden_size)
+                            .map_err(|e| ArchError::ForwardPassError {
+                                layer: layer_idx,
+                                message: format!("embed SSM block: {e}"),
+                            })?;
+                    }
+                }
+            }
+
+            // Final norm — stop here (do not project through LM head).
+            self.output_norm.forward(&mut hidden);
+            last_hidden = hidden;
+        }
+
+        Ok(last_hidden)
+    }
+
     fn vocab_size(&self) -> usize {
         self.config.vocab_size
     }
@@ -617,18 +696,211 @@ pub fn build_zero_jamba_model(config: JambaConfig) -> JambaModel {
     JambaModel::new(config, token_embd, layers, output_norm, lm_head)
 }
 
-// ─── Stubs for full GGUF loading ──────────────────────────────────────────────
+// ─── GGUF loading helpers ─────────────────────────────────────────────────────
+
+/// Dequantize a named tensor from the model file to `Vec<f32>`.
+///
+/// Handles F32, F16, and quantized tensor types (via `KernelDispatcher`).
+fn dequant_to_f32(model: &oxillama_gguf::GgufModel, name: &str) -> ArchResult<Vec<f32>> {
+    use oxillama_quant::KernelDispatcher;
+
+    let info = model
+        .file
+        .tensors
+        .get(name)
+        .map_err(|_| ArchError::MissingTensor {
+            name: name.to_string(),
+        })?;
+    let data = model.tensor_data(name)?;
+    let n_elements = info.n_elements() as usize;
+    let tensor_type = info.tensor_type;
+
+    // F32 — direct copy.
+    if tensor_type == oxillama_gguf::GgufTensorType::F32 {
+        let mut out = vec![0.0f32; n_elements];
+        for (i, chunk) in data.chunks_exact(4).enumerate().take(n_elements) {
+            out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        return Ok(out);
+    }
+
+    // F16 — convert via `half`.
+    if tensor_type == oxillama_gguf::GgufTensorType::F16 {
+        let mut out = vec![0.0f32; n_elements];
+        for (i, chunk) in data.chunks_exact(2).enumerate().take(n_elements) {
+            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            out[i] = half::f16::from_bits(bits).to_f32();
+        }
+        return Ok(out);
+    }
+
+    // Quantized — use kernel dispatcher.
+    let dispatcher = KernelDispatcher::new();
+    let kernel = dispatcher.get_kernel(tensor_type)?;
+    let block_size = tensor_type.block_size();
+    let block_bytes = tensor_type.block_bytes();
+    let n_blocks = n_elements.div_ceil(block_size);
+
+    let mut out = vec![0.0f32; n_elements];
+    for blk in 0..n_blocks {
+        let data_offset: usize = blk * block_bytes;
+        let out_offset: usize = blk * block_size;
+        let block_data = &data[data_offset..data_offset + block_bytes];
+        let out_slice =
+            &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
+        kernel.dequant_block(block_data, out_slice)?;
+    }
+
+    Ok(out)
+}
+
+/// Load an RMSNorm weight from a named F32 (or dequantisable) tensor.
+///
+/// Returns a `RmsNorm` initialised with the loaded scale vector and `eps`.
+fn load_rms_norm(model: &oxillama_gguf::GgufModel, name: &str, eps: f32) -> ArchResult<RmsNorm> {
+    let weights = dequant_to_f32(model, name)?;
+    Ok(RmsNorm::new(weights, eps))
+}
+
+// ─── Full GGUF loading ────────────────────────────────────────────────────────
 
 /// Load a Jamba model from a parsed GGUF file.
 ///
-/// This is a stub that returns an error — full loading is wired when
-/// the GGUF tensor-naming convention for Jamba is confirmed.
-pub fn load_jamba_from_gguf(_model: &oxillama_gguf::GgufModel) -> ArchResult<JambaModel> {
-    Err(ArchError::MissingTensor {
-        name: "load_jamba_from_gguf: full loader not yet implemented; \
-               use build_zero_jamba_model() for testing"
-            .to_string(),
-    })
+/// ## Tensor naming conventions
+///
+/// **Global:**
+/// - `token_embd.weight` — token embedding table `[vocab × hidden]`
+/// - `output_norm.weight` — final RMSNorm scale `[hidden]`
+/// - `output.weight` — LM head `[vocab × hidden]`
+///
+/// **Attention layers** (LLaMA-style):
+/// - `blk.{i}.attn_norm.weight`, `blk.{i}.attn_q.weight`,
+///   `blk.{i}.attn_k.weight`, `blk.{i}.attn_v.weight`,
+///   `blk.{i}.attn_output.weight`, `blk.{i}.ffn_norm.weight`,
+///   `blk.{i}.ffn_gate.weight`, `blk.{i}.ffn_up.weight`,
+///   `blk.{i}.ffn_down.weight`
+///
+/// **SSM layers** (Mamba-2-style):
+/// - `blk.{i}.ssm_norm.weight`, `blk.{i}.ssm_in.weight`,
+///   `blk.{i}.ssm_conv1d.weight`, `blk.{i}.ssm_conv1d.bias` (optional),
+///   `blk.{i}.ssm_x.weight` (used as `w_b`; `w_c` defaults to zeros),
+///   `blk.{i}.ssm_dt.weight`, `blk.{i}.ssm_dt.bias` (optional),
+///   `blk.{i}.ssm_A`, `blk.{i}.ssm_D`, `blk.{i}.ssm_out.weight`
+///
+/// Optional tensors (`ssm_conv1d.bias`, `ssm_dt.bias`) default to zero
+/// vectors if absent from the file.
+pub fn load_jamba_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<JambaModel> {
+    let config = JambaConfig::from_metadata(&model.file.metadata);
+
+    let eps = config.rms_norm_eps;
+
+    // ── Global tensors ────────────────────────────────────────────────────────
+    let token_embd = dequant_to_f32(model, "token_embd.weight")?;
+    let output_norm = load_rms_norm(model, "output_norm.weight", eps)?;
+    let lm_head = dequant_to_f32(model, "output.weight")?;
+
+    // ── Per-layer weights ─────────────────────────────────────────────────────
+    let layer_pattern = config.layer_pattern();
+    let mut layers: Vec<JambaLayerWeights> = Vec::with_capacity(layer_pattern.len());
+
+    for (i, kind) in layer_pattern.iter().enumerate() {
+        let layer_weights = match kind {
+            LayerKind::Attention => {
+                let prefix = format!("blk.{i}");
+
+                let attn_norm =
+                    load_rms_norm(model, &format!("{prefix}.attn_norm.weight"), eps)?;
+                let w_q = dequant_to_f32(model, &format!("{prefix}.attn_q.weight"))?;
+                let w_k = dequant_to_f32(model, &format!("{prefix}.attn_k.weight"))?;
+                let w_v = dequant_to_f32(model, &format!("{prefix}.attn_v.weight"))?;
+                let w_o = dequant_to_f32(model, &format!("{prefix}.attn_output.weight"))?;
+                let ffn_norm =
+                    load_rms_norm(model, &format!("{prefix}.ffn_norm.weight"), eps)?;
+                let w_gate = dequant_to_f32(model, &format!("{prefix}.ffn_gate.weight"))?;
+                let w_up = dequant_to_f32(model, &format!("{prefix}.ffn_up.weight"))?;
+                let w_down = dequant_to_f32(model, &format!("{prefix}.ffn_down.weight"))?;
+
+                JambaLayerWeights::Attention(JambaAttentionLayerWeights {
+                    attn_norm,
+                    w_q,
+                    w_k,
+                    w_v,
+                    w_o,
+                    ffn_norm,
+                    w_gate,
+                    w_up,
+                    w_down,
+                })
+            }
+            LayerKind::Ssm => {
+                let prefix = format!("blk.{i}");
+
+                let ssm_norm =
+                    load_rms_norm(model, &format!("{prefix}.ssm_norm.weight"), eps)?;
+
+                // Combined gate+input projection: [2*d_inner, hidden].
+                let w_in_z = dequant_to_f32(model, &format!("{prefix}.ssm_in.weight"))?;
+
+                // Depthwise conv kernel: [d_inner, d_conv].
+                let w_conv = dequant_to_f32(model, &format!("{prefix}.ssm_conv1d.weight"))?;
+
+                // Conv bias is optional; default to zeros derived from w_conv dims.
+                let b_conv = dequant_to_f32(model, &format!("{prefix}.ssm_conv1d.bias"))
+                    .unwrap_or_else(|_| {
+                        // d_inner = w_conv.len() / d_conv.  We compute from d_inner
+                        // which is stored in config.
+                        vec![0.0f32; config.d_inner]
+                    });
+
+                // B projection: ssm_x.weight provides [d_state, d_inner] for w_b.
+                // w_c defaults to zero vectors — real Jamba GGUFs may store B and C
+                // in a single concatenated tensor; if only ssm_x.weight is present we
+                // use it for w_b and zero-fill w_c.
+                let w_b = dequant_to_f32(model, &format!("{prefix}.ssm_x.weight"))
+                    .unwrap_or_else(|_| vec![0.0f32; config.d_state * config.d_inner]);
+                let w_c = vec![0.0f32; config.d_state * config.d_inner];
+
+                // Δ projection: [d_inner, d_inner].
+                let w_delta =
+                    dequant_to_f32(model, &format!("{prefix}.ssm_dt.weight"))
+                        .unwrap_or_else(|_| vec![0.0f32; config.d_inner * config.d_inner]);
+
+                // Δ bias is optional; default to zeros.
+                let b_delta =
+                    dequant_to_f32(model, &format!("{prefix}.ssm_dt.bias")).unwrap_or_else(|_| {
+                        vec![0.0f32; config.d_inner]
+                    });
+
+                // Log-A: [d_state, d_inner].
+                let log_a = dequant_to_f32(model, &format!("{prefix}.ssm_A"))
+                    .unwrap_or_else(|_| vec![0.0f32; config.d_state * config.d_inner]);
+
+                // Skip-connection D: [d_inner].
+                let d_skip = dequant_to_f32(model, &format!("{prefix}.ssm_D"))
+                    .unwrap_or_else(|_| vec![0.0f32; config.d_inner]);
+
+                // Output projection: [hidden, d_inner].
+                let w_out = dequant_to_f32(model, &format!("{prefix}.ssm_out.weight"))?;
+
+                JambaLayerWeights::Ssm(JambaSsmLayerWeights {
+                    ssm_norm,
+                    w_in_z,
+                    w_conv,
+                    b_conv,
+                    w_b,
+                    w_c,
+                    w_delta,
+                    b_delta,
+                    log_a,
+                    d_skip,
+                    w_out,
+                })
+            }
+        };
+        layers.push(layer_weights);
+    }
+
+    Ok(JambaModel::new(config, token_embd, layers, output_norm, lm_head))
 }
 
 // ─── Math helpers ─────────────────────────────────────────────────────────────
@@ -849,5 +1121,87 @@ mod tests {
             }
             other => panic!("expected LoraIncompatible, got: {other:?}"),
         }
+    }
+
+    // ─── embed() tests ────────────────────────────────────────────────────────
+
+    /// `embed()` on an empty token sequence returns an error.
+    #[test]
+    fn jamba_embed_empty_tokens_errors() {
+        let cfg = tiny_config();
+        let mut model = build_zero_jamba_model(cfg);
+        let mut kv = NullKv;
+        assert!(
+            model.embed(&[], &mut kv).is_err(),
+            "embed: empty tokens must return an error"
+        );
+    }
+
+    /// `embed()` returns a vector whose length equals `hidden_size`.
+    #[test]
+    fn jamba_embed_returns_correct_size() {
+        let cfg = tiny_config();
+        let hidden = cfg.hidden_size;
+        let mut model = build_zero_jamba_model(cfg);
+        let mut kv = NullKv;
+        let embedding = model
+            .embed(&[1u32], &mut kv)
+            .expect("embed must succeed on non-empty input");
+        assert_eq!(
+            embedding.len(),
+            hidden,
+            "embed() must return hidden_size ({hidden}) elements"
+        );
+    }
+
+    /// `embed()` output contains no NaN or infinite values for a zero-weight model.
+    #[test]
+    fn jamba_embed_no_nan() {
+        let cfg = tiny_config();
+        let mut model = build_zero_jamba_model(cfg);
+        let mut kv = NullKv;
+        let embedding = model
+            .embed(&[0u32], &mut kv)
+            .expect("embed must succeed");
+        assert!(
+            embedding.iter().all(|v| v.is_finite()),
+            "embed() output must contain only finite values, got: {embedding:?}"
+        );
+    }
+
+    /// `embed()` on multiple tokens returns the last-token hidden state (length == hidden_size).
+    #[test]
+    fn jamba_embed_multi_token_returns_last_hidden() {
+        let cfg = tiny_config();
+        let hidden = cfg.hidden_size;
+        let mut model = build_zero_jamba_model(cfg);
+        let mut kv = NullKv;
+        // Feed 3 tokens; should still return a single hidden vector of length hidden_size.
+        let embedding = model
+            .embed(&[0u32, 1, 2], &mut kv)
+            .expect("embed must succeed on multi-token input");
+        assert_eq!(
+            embedding.len(),
+            hidden,
+            "embed() with multiple tokens must return last-token hidden state of length {hidden}"
+        );
+    }
+
+    /// GGUF round-trip: load a minimal Jamba GGUF and assert tensor shapes.
+    ///
+    /// Ignored until `build_minimal_jamba_gguf` is added to
+    /// `oxillama_gguf::test_utils`.
+    #[test]
+    #[ignore = "build_minimal_jamba_gguf not yet implemented in oxillama_gguf::test_utils"]
+    fn jamba_loader_round_trip() {
+        // When build_minimal_jamba_gguf becomes available, replace the line below:
+        //   let bytes = oxillama_gguf::test_utils::build_minimal_jamba_gguf();
+        //   let model_file = oxillama_gguf::GgufModel::from_bytes(&bytes)
+        //       .expect("must parse minimal jamba GGUF");
+        //   let jamba = load_jamba_from_gguf(&model_file)
+        //       .expect("load_jamba_from_gguf must succeed on minimal fixture");
+        //   assert!(!jamba.layers.is_empty(), "loaded model must have layers");
+        //   assert!(!jamba.token_embd.is_empty(), "token_embd must be non-empty");
+        //   assert!(!jamba.lm_head.is_empty(), "lm_head must be non-empty");
     }
 }

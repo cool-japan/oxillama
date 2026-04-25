@@ -284,6 +284,158 @@ impl ForwardPass for DeepSeekModel {
         Ok(logits)
     }
 
+    /// Extract the post-output-norm hidden state for embedding.
+    ///
+    /// Identical to `forward()` through to and including `output_norm.forward(last)`.
+    /// Does NOT call the LM-head projection (`self.output.forward`). Returns a
+    /// `hidden_size`-dimensional vector suitable for semantic embedding use.
+    fn embed(
+        &mut self,
+        tokens: &[u32],
+        _kv_cache: &mut dyn KvCacheAccess,
+    ) -> ArchResult<Vec<f32>> {
+        let hidden = self.config.hidden_size;
+        let seq_len = tokens.len();
+
+        if seq_len == 0 {
+            return Err(ArchError::InvalidConfig {
+                detail: "embed: empty token sequence".to_string(),
+            });
+        }
+
+        // ── Token embedding lookup ──────────────────────────────────────────────
+        let mut hidden_states = vec![0.0f32; seq_len * hidden];
+        for (t, &tok_id) in tokens.iter().enumerate() {
+            let tok = tok_id as usize;
+            if tok >= self.config.vocab_size {
+                return Err(ArchError::InvalidConfig {
+                    detail: format!(
+                        "token id {tok} out of range (vocab_size={})",
+                        self.config.vocab_size
+                    ),
+                });
+            }
+            let embd_off = tok * hidden;
+            hidden_states[t * hidden..(t + 1) * hidden]
+                .copy_from_slice(&self.token_embd[embd_off..embd_off + hidden]);
+        }
+
+        let position = self.current_pos;
+
+        // ── Transformer layers ──────────────────────────────────────────────────
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // ─ Pre-attention norm ──────────────────────────────────────────────
+            let mut normed = vec![0.0f32; seq_len * hidden];
+            for t in 0..seq_len {
+                let src = &hidden_states[t * hidden..(t + 1) * hidden];
+                let dst = &mut normed[t * hidden..(t + 1) * hidden];
+                dst.copy_from_slice(src);
+                layer
+                    .attn_norm
+                    .forward(&mut normed[t * hidden..(t + 1) * hidden]);
+            }
+
+            // ─ MLA forward ────────────────────────────────────────────────────
+            let attn_out = mla_forward(
+                &normed,
+                &layer.mla_weights,
+                &layer.mla_config,
+                &mut layer.mla_cache,
+                position,
+            )
+            .map_err(|e| ArchError::ForwardPassError {
+                layer: layer_idx,
+                message: format!("MLA: {e}"),
+            })?;
+
+            // ─ Residual connection ─────────────────────────────────────────────
+            for (h, a) in hidden_states.iter_mut().zip(attn_out.iter()) {
+                *h += a;
+            }
+
+            // ─ Pre-FFN norm ────────────────────────────────────────────────────
+            let mut ffn_normed = hidden_states.clone();
+            for t in 0..seq_len {
+                layer
+                    .ffn_norm
+                    .forward(&mut ffn_normed[t * hidden..(t + 1) * hidden]);
+            }
+
+            // ─ FFN (dense or MoE) ──────────────────────────────────────────────
+            let mut ffn_out = vec![0.0f32; seq_len * hidden];
+            match &layer.ffn {
+                FfnKind::Dense(dense) => {
+                    let kernel_gate = layer_dispatcher_kernel(
+                        &self.dispatcher,
+                        &dense.gate.weight,
+                        layer_idx,
+                        "gate",
+                    )?;
+                    let kernel_up = layer_dispatcher_kernel(
+                        &self.dispatcher,
+                        &dense.up.weight,
+                        layer_idx,
+                        "up",
+                    )?;
+                    let kernel_down = layer_dispatcher_kernel(
+                        &self.dispatcher,
+                        &dense.down.weight,
+                        layer_idx,
+                        "down",
+                    )?;
+
+                    let intermediate = dense.gate.out_features;
+                    let mut buf_gate = vec![0.0f32; intermediate];
+                    let mut buf_up = vec![0.0f32; intermediate];
+                    let mut buf_ffn = vec![0.0f32; hidden];
+
+                    for t in 0..seq_len {
+                        let x_t = &ffn_normed[t * hidden..(t + 1) * hidden];
+                        dense
+                            .gate
+                            .forward(&*kernel_gate, x_t, &mut buf_gate)
+                            .map_err(ArchError::from)?;
+                        dense
+                            .up
+                            .forward(&*kernel_up, x_t, &mut buf_up)
+                            .map_err(ArchError::from)?;
+                        swiglu_inplace(&mut buf_gate, &buf_up);
+                        dense
+                            .down
+                            .forward(&*kernel_down, &buf_gate, &mut buf_ffn)
+                            .map_err(ArchError::from)?;
+                        ffn_out[t * hidden..(t + 1) * hidden].copy_from_slice(&buf_ffn);
+                    }
+                }
+                FfnKind::Moe { weights, config } => {
+                    for t in 0..seq_len {
+                        let x_t = &ffn_normed[t * hidden..(t + 1) * hidden];
+                        let tok_out = moe_forward(x_t, weights, config).map_err(|e| {
+                            ArchError::ForwardPassError {
+                                layer: layer_idx,
+                                message: format!("MoE: {e}"),
+                            }
+                        })?;
+                        ffn_out[t * hidden..(t + 1) * hidden].copy_from_slice(&tok_out);
+                    }
+                }
+            }
+
+            // ─ Residual after FFN ──────────────────────────────────────────────
+            for (h, f) in hidden_states.iter_mut().zip(ffn_out.iter()) {
+                *h += f;
+            }
+        }
+
+        // ── Final norm on last token (stop before LM head) ──────────────────────
+        let last = &mut hidden_states[(seq_len - 1) * hidden..seq_len * hidden];
+        self.output_norm.forward(last);
+
+        self.current_pos += seq_len;
+
+        Ok(last.to_vec())
+    }
+
     fn vocab_size(&self) -> usize {
         self.config.vocab_size
     }
@@ -313,25 +465,449 @@ fn layer_dispatcher_kernel(
         })
 }
 
-// ─── GGUF loader (stub) ───────────────────────────────────────────────────────
+// ─── GGUF loader helpers ──────────────────────────────────────────────────────
 
-/// Load a DeepSeek-V2 model from a parsed GGUF `TensorStore`.
+/// Dequantize tensor data to f32.
+///
+/// Handles F32 (direct copy), F16 (half-precision conversion), and all
+/// quantized block formats via the kernel dispatcher.
+fn dequant_to_f32(
+    info: &oxillama_gguf::TensorInfo,
+    data: &[u8],
+    dispatcher: &KernelDispatcher,
+) -> ArchResult<Vec<f32>> {
+    use oxillama_gguf::GgufTensorType;
+
+    let n_elements = info.n_elements() as usize;
+    let tensor_type = info.tensor_type;
+
+    if tensor_type == GgufTensorType::F32 {
+        let mut out = vec![0.0f32; n_elements];
+        for (i, chunk) in data.chunks_exact(4).enumerate().take(n_elements) {
+            out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        return Ok(out);
+    }
+
+    if tensor_type == GgufTensorType::F16 {
+        let mut out = vec![0.0f32; n_elements];
+        for (i, chunk) in data.chunks_exact(2).enumerate().take(n_elements) {
+            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            out[i] = half::f16::from_bits(bits).to_f32();
+        }
+        return Ok(out);
+    }
+
+    let kernel = dispatcher.get_kernel(tensor_type)?;
+    let block_size = tensor_type.block_size();
+    let block_bytes = tensor_type.block_bytes();
+    let n_blocks = n_elements.div_ceil(block_size);
+
+    let mut out = vec![0.0f32; n_elements];
+    for blk in 0..n_blocks {
+        let data_offset = blk * block_bytes;
+        let out_offset = blk * block_size;
+        let block_data = &data[data_offset..data_offset + block_bytes];
+        let out_slice =
+            &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
+        kernel.dequant_block(block_data, out_slice)?;
+    }
+
+    Ok(out)
+}
+
+/// Load a tensor and dequantize it to f32, looking it up by name.
+fn load_dequant_tensor(
+    model: &oxillama_gguf::GgufModel,
+    dispatcher: &KernelDispatcher,
+    name: &str,
+) -> ArchResult<Vec<f32>> {
+    let info = model
+        .file
+        .tensors
+        .get(name)
+        .map_err(|_| ArchError::MissingTensor {
+            name: name.to_string(),
+        })?;
+    let data = model
+        .tensor_data(name)
+        .map_err(|_| ArchError::MissingTensor {
+            name: name.to_string(),
+        })?;
+    dequant_to_f32(info, data, dispatcher)
+}
+
+/// Load a quantized linear layer from GGUF by tensor name.
+fn load_quant_linear(
+    model: &oxillama_gguf::GgufModel,
+    name: &str,
+) -> ArchResult<QuantLinear> {
+    let info = model
+        .file
+        .tensors
+        .get(name)
+        .map_err(|_| ArchError::MissingTensor {
+            name: name.to_string(),
+        })?;
+    let data = model
+        .tensor_data(name)
+        .map_err(|_| ArchError::MissingTensor {
+            name: name.to_string(),
+        })?;
+
+    let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+    let tensor = QuantTensor::new(data.to_vec(), shape, info.tensor_type);
+    Ok(QuantLinear::new(tensor, None))
+}
+
+/// Load an RMSNorm weight vector from GGUF (always dequantized to F32).
+fn load_rms_norm_weight(
+    model: &oxillama_gguf::GgufModel,
+    name: &str,
+) -> ArchResult<Vec<f32>> {
+    let dispatcher = KernelDispatcher::new();
+    load_dequant_tensor(model, &dispatcher, name)
+}
+
+/// Load MLA weights for one layer from GGUF.
+///
+/// Tensor name format: `blk.{layer}.attn_{qka_proj|qa_norm|qkb_proj|kva_proj|kva_norm|kvb_proj|output}.weight`
+///
+/// The `_proj` suffix convention is used first (matching GGUF v3 synthetic fixtures).
+/// If a tensor is absent under the `_proj` name, we fall back to the short form
+/// (e.g., `blk.0.attn_q_a.weight`) for compatibility with external converters.
+fn load_mla_weights(
+    model: &oxillama_gguf::GgufModel,
+    mla_cfg: &crate::common::mla::MlaConfig,
+    layer_idx: usize,
+    max_seq: usize,
+) -> ArchResult<MlaWeights> {
+    let p = format!("blk.{layer_idx}");
+
+    /// Try `primary` first; if missing, fall back to `fallback`.
+    fn try_quant(
+        model: &oxillama_gguf::GgufModel,
+        primary: &str,
+        fallback: &str,
+    ) -> ArchResult<QuantLinear> {
+        if model.file.tensors.contains(primary) {
+            load_quant_linear(model, primary)
+        } else {
+            load_quant_linear(model, fallback)
+        }
+    }
+
+    fn try_norm(
+        model: &oxillama_gguf::GgufModel,
+        primary: &str,
+        fallback: &str,
+        eps: f32,
+    ) -> ArchResult<RmsNorm> {
+        let name = if model.file.tensors.contains(primary) {
+            primary
+        } else {
+            fallback
+        };
+        let w = load_rms_norm_weight(model, name)?;
+        Ok(RmsNorm::new(w, eps))
+    }
+
+    let rms_eps = 1e-5f32;
+
+    let w_q_a = try_quant(
+        model,
+        &format!("{p}.attn_q_a_proj.weight"),
+        &format!("{p}.attn_q_a.weight"),
+    )?;
+    let q_a_norm = try_norm(
+        model,
+        &format!("{p}.attn_q_a_norm.weight"),
+        &format!("{p}.attn_q_norm.weight"),
+        rms_eps,
+    )?;
+    let w_q_b = try_quant(
+        model,
+        &format!("{p}.attn_q_b_proj.weight"),
+        &format!("{p}.attn_q_b.weight"),
+    )?;
+    let w_kv_a = try_quant(
+        model,
+        &format!("{p}.attn_kv_a_proj.weight"),
+        &format!("{p}.attn_kv_a.weight"),
+    )?;
+    let kv_a_norm = try_norm(
+        model,
+        &format!("{p}.attn_kv_a_norm.weight"),
+        &format!("{p}.attn_kv_norm.weight"),
+        rms_eps,
+    )?;
+    let w_kv_b = try_quant(
+        model,
+        &format!("{p}.attn_kv_b_proj.weight"),
+        &format!("{p}.attn_kv_b.weight"),
+    )?;
+    let w_o = load_quant_linear(model, &format!("{p}.attn_output.weight"))?;
+
+    let rope = crate::common::rope::RopeTable::new_standard(
+        mla_cfg.qk_rope_head_dim,
+        max_seq,
+        mla_cfg.rope_theta,
+    );
+
+    Ok(MlaWeights {
+        w_q_a,
+        q_a_norm,
+        w_q_b,
+        w_kv_a,
+        kv_a_norm,
+        w_kv_b,
+        w_o,
+        rope,
+    })
+}
+
+/// Load a single DeepSeek expert (gate/up/down projections) from GGUF.
+fn load_expert(
+    model: &oxillama_gguf::GgufModel,
+    dispatcher: &KernelDispatcher,
+    name_prefix: &str,
+    hidden_size: usize,
+    intermediate_size: usize,
+) -> ArchResult<crate::deepseek::moe::DeepSeekExpert> {
+    let gate = load_dequant_tensor(
+        model,
+        dispatcher,
+        &format!("{name_prefix}.ffn_gate.weight"),
+    )?;
+    let up = load_dequant_tensor(
+        model,
+        dispatcher,
+        &format!("{name_prefix}.ffn_up.weight"),
+    )?;
+    let down = load_dequant_tensor(
+        model,
+        dispatcher,
+        &format!("{name_prefix}.ffn_down.weight"),
+    )?;
+
+    Ok(crate::deepseek::moe::DeepSeekExpert {
+        gate,
+        up,
+        down,
+        hidden_size,
+        intermediate_size,
+    })
+}
+
+/// Load dense FFN weights for one layer from GGUF.
+fn load_dense_ffn(
+    model: &oxillama_gguf::GgufModel,
+    layer_idx: usize,
+) -> ArchResult<DenseFfn> {
+    let p = format!("blk.{layer_idx}");
+    Ok(DenseFfn {
+        gate: load_quant_linear(model, &format!("{p}.ffn_gate.weight"))?,
+        up: load_quant_linear(model, &format!("{p}.ffn_up.weight"))?,
+        down: load_quant_linear(model, &format!("{p}.ffn_down.weight"))?,
+    })
+}
+
+/// Load MoE FFN weights for one layer from GGUF.
+///
+/// Builds:
+/// - Router: `blk.{i}.ffn_gate_inp.weight`
+/// - Routed experts: `blk.{i}.ffn_exp.{e}.ffn_{gate,up,down}.weight`
+/// - Shared experts: `blk.{i}.ffn_shared_exp.{e}.ffn_{gate,up,down}.weight`
+/// - Optional expert bias: `blk.{i}.exp_probs_b.weight` (SigmoidWithBias mode)
+fn load_moe_ffn(
+    model: &oxillama_gguf::GgufModel,
+    dispatcher: &KernelDispatcher,
+    ds_cfg: &DeepSeekConfig,
+    layer_idx: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+) -> ArchResult<(MoeWeights, MoeConfig)> {
+    let p = format!("blk.{layer_idx}");
+
+    // Router: [n_routed_experts, hidden_size]
+    let router = load_dequant_tensor(
+        model,
+        dispatcher,
+        &format!("{p}.ffn_gate_inp.weight"),
+    )?;
+
+    // Routed experts
+    let routed_experts: Vec<crate::deepseek::moe::DeepSeekExpert> = (0
+        ..ds_cfg.n_routed_experts)
+        .map(|e| {
+            load_expert(
+                model,
+                dispatcher,
+                &format!("{p}.ffn_exp.{e}"),
+                hidden_size,
+                intermediate_size,
+            )
+        })
+        .collect::<ArchResult<Vec<_>>>()?;
+
+    // Shared experts
+    let shared_experts: Vec<crate::deepseek::moe::DeepSeekExpert> = (0
+        ..ds_cfg.n_shared_experts)
+        .map(|e| {
+            load_expert(
+                model,
+                dispatcher,
+                &format!("{p}.ffn_shared_exp.{e}"),
+                hidden_size,
+                ds_cfg.shared_expert_intermediate_size,
+            )
+        })
+        .collect::<ArchResult<Vec<_>>>()?;
+
+    // Optional per-expert bias (indicates SigmoidWithBias mode)
+    let bias_name = format!("{p}.exp_probs_b.weight");
+    let (expert_bias, scoring_mode) = if model.file.tensors.contains(&bias_name) {
+        let bias = load_dequant_tensor(model, dispatcher, &bias_name)?;
+        (
+            Some(bias),
+            crate::deepseek::moe::ScoringMode::SigmoidWithBias,
+        )
+    } else {
+        (None, crate::deepseek::moe::ScoringMode::Softmax)
+    };
+
+    let moe_weights = MoeWeights {
+        router,
+        routed_experts,
+        shared_experts,
+        expert_bias,
+    };
+
+    let moe_config = MoeConfig {
+        hidden_size,
+        expert_intermediate_size: intermediate_size,
+        n_shared_experts: ds_cfg.n_shared_experts,
+        n_routed_experts: ds_cfg.n_routed_experts,
+        top_k: ds_cfg.top_k_routed,
+        routed_scaling_factor: ds_cfg.routed_scaling_factor,
+        scoring_mode,
+        shared_expert_intermediate_size: ds_cfg.shared_expert_intermediate_size,
+    };
+
+    Ok((moe_weights, moe_config))
+}
+
+// ─── GGUF loader ──────────────────────────────────────────────────────────────
+
+/// Load a DeepSeek-V2/V3 model from a parsed GGUF file.
+///
+/// Reads all model hyperparameters from GGUF metadata, then loads each layer's
+/// weights (MLA + FFN) and the output projection. All tensors are either kept
+/// in their quantized form (`QuantLinear`) or dequantized to f32 (expert
+/// weights, RMSNorm vectors, token embeddings).
+///
+/// # DeepSeek-V3 detection
+/// If any layer contains `blk.{i}.exp_probs_b.weight`, the MoE router for that
+/// layer switches to `ScoringMode::SigmoidWithBias` (V3 style). Otherwise the
+/// standard `Softmax` routing (V2) is used.
+///
+/// # Dense vs. MoE layers
+/// Layers `0..ds_config.first_k_dense_replace` use a dense SwiGLU FFN.
+/// Layers `ds_config.first_k_dense_replace..num_layers` use sparse MoE FFN.
 ///
 /// # Errors
-/// Returns `ArchError::MissingTensor` if any required tensor is absent.
-///
-/// # Current status
-/// This function provides a structurally complete skeleton: it parses the
-/// model config and verifies the tensor store is non-empty. Full tensor loading
-/// (dequant, shape validation, per-layer weight construction) is deferred to a
-/// follow-up implementation once the GGUF API for bulk tensor iteration is
-/// stabilised.
-pub fn load_deepseek_from_gguf(_model: &oxillama_gguf::GgufModel) -> ArchResult<DeepSeekModel> {
-    Err(ArchError::MissingTensor {
-        name: "load_deepseek_from_gguf: full loader not yet implemented; \
-               use build_deepseek_model() directly for testing"
-            .to_string(),
-    })
+/// Returns `ArchError::MissingTensor` if any required tensor is absent, or
+/// other `ArchError` variants on shape mismatches or metadata errors.
+pub fn load_deepseek_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<DeepSeekModel> {
+    // ── Parse model configuration ─────────────────────────────────────────────
+    let config = ModelConfig::from_metadata(&model.file.metadata)?;
+    let ds_config =
+        DeepSeekConfig::from_metadata(&model.file.metadata, config.hidden_size);
+
+    let hidden_size = config.hidden_size;
+    let intermediate_size = config.intermediate_size;
+    let num_layers = config.num_layers;
+    let max_seq = config.max_context_length;
+
+    let dispatcher = KernelDispatcher::new();
+
+    // ── MLA configuration derived from metadata ────────────────────────────────
+    let qk_head_dim = ds_config.qk_nope_head_dim + ds_config.qk_rope_head_dim;
+    let softmax_scale = 1.0 / (qk_head_dim as f32).sqrt();
+    let mla_cfg = crate::common::mla::MlaConfig {
+        num_heads: config.num_attention_heads,
+        q_lora_rank: ds_config.q_lora_rank,
+        kv_lora_rank: ds_config.kv_lora_rank,
+        qk_nope_head_dim: ds_config.qk_nope_head_dim,
+        qk_rope_head_dim: ds_config.qk_rope_head_dim,
+        v_head_dim: ds_config.v_head_dim,
+        rope_theta: config.rope_freq_base,
+        softmax_scale,
+    };
+
+    // ── Token embedding ───────────────────────────────────────────────────────
+    let token_embd = load_dequant_tensor(model, &dispatcher, "token_embd.weight")?;
+
+    // ── Transformer layers ────────────────────────────────────────────────────
+    let first_k_dense = ds_config.first_k_dense_replace;
+
+    let layers: Vec<DeepSeekLayer> = (0..num_layers)
+        .map(|layer_idx| {
+            let p = format!("blk.{layer_idx}");
+
+            let attn_norm_w = load_rms_norm_weight(model, &format!("{p}.attn_norm.weight"))?;
+            let attn_norm = RmsNorm::new(attn_norm_w, config.rms_norm_eps);
+
+            let ffn_norm_w = load_rms_norm_weight(model, &format!("{p}.ffn_norm.weight"))?;
+            let ffn_norm = RmsNorm::new(ffn_norm_w, config.rms_norm_eps);
+
+            let mla_weights =
+                load_mla_weights(model, &mla_cfg, layer_idx, max_seq)?;
+            let mla_cache = crate::common::mla::MlaLatentCache::new(max_seq, &mla_cfg);
+
+            let ffn = if layer_idx < first_k_dense {
+                let dense = load_dense_ffn(model, layer_idx)?;
+                FfnKind::Dense(Box::new(dense))
+            } else {
+                let (moe_weights, moe_config) = load_moe_ffn(
+                    model,
+                    &dispatcher,
+                    &ds_config,
+                    layer_idx,
+                    hidden_size,
+                    intermediate_size,
+                )?;
+                FfnKind::Moe {
+                    weights: Box::new(moe_weights),
+                    config: moe_config,
+                }
+            };
+
+            Ok(DeepSeekLayer {
+                attn_norm,
+                mla_weights,
+                mla_config: mla_cfg.clone(),
+                mla_cache,
+                ffn_norm,
+                ffn,
+            })
+        })
+        .collect::<ArchResult<Vec<_>>>()?;
+
+    // ── Output norm + LM head ─────────────────────────────────────────────────
+    let output_norm_w = load_rms_norm_weight(model, "output_norm.weight")?;
+    let output_norm = RmsNorm::new(output_norm_w, config.rms_norm_eps);
+
+    let output = load_quant_linear(model, "output.weight")?;
+
+    Ok(DeepSeekModel::new(
+        config,
+        ds_config,
+        token_embd,
+        layers,
+        output_norm,
+        output,
+    ))
 }
 
 /// Construct a `DeepSeekModel` from raw weights (intended for tests and
@@ -523,6 +1099,7 @@ mod tests {
             top_k_routed: 2,
             shared_expert_intermediate_size: 16,
             routed_scaling_factor: 1.0,
+            first_k_dense_replace: N_DENSE_LAYERS,
         };
 
         let model_config = ModelConfig {
@@ -664,5 +1241,212 @@ mod tests {
                 "logits[{i}] must be bit-for-bit identical: {a} vs {b}"
             );
         }
+    }
+
+    /// embed() returns a vector of length hidden_size (not vocab_size).
+    #[test]
+    fn embed_returns_hidden_size() {
+        let mut lcg = Lcg::new(5678);
+        let mut model = build_test_model(&mut lcg);
+
+        struct NullKv;
+        impl KvCacheAccess for NullKv {
+            fn seq_len(&self) -> usize {
+                0
+            }
+            fn store_kv(&mut self, _: usize, _: &[f32], _: &[f32]) -> ArchResult<()> {
+                Ok(())
+            }
+            fn get_keys(&self, _: usize) -> ArchResult<&[f32]> {
+                Ok(&[])
+            }
+            fn get_values(&self, _: usize) -> ArchResult<&[f32]> {
+                Ok(&[])
+            }
+            fn advance(&mut self) {}
+        }
+
+        let mut kv = NullKv;
+        let embedding = model
+            .embed(&[1u32], &mut kv)
+            .expect("embed must succeed");
+        assert_eq!(
+            embedding.len(),
+            16,
+            "embed output must have hidden_size=16 elements, got {}",
+            embedding.len()
+        );
+    }
+
+    /// embed() output is all finite.
+    #[test]
+    fn embed_all_finite() {
+        let mut lcg = Lcg::new(1111);
+        let mut model = build_test_model(&mut lcg);
+
+        struct NullKv;
+        impl KvCacheAccess for NullKv {
+            fn seq_len(&self) -> usize {
+                0
+            }
+            fn store_kv(&mut self, _: usize, _: &[f32], _: &[f32]) -> ArchResult<()> {
+                Ok(())
+            }
+            fn get_keys(&self, _: usize) -> ArchResult<&[f32]> {
+                Ok(&[])
+            }
+            fn get_values(&self, _: usize) -> ArchResult<&[f32]> {
+                Ok(&[])
+            }
+            fn advance(&mut self) {}
+        }
+
+        let mut kv = NullKv;
+        let embedding = model
+            .embed(&[0u32], &mut kv)
+            .expect("embed must succeed");
+        assert!(
+            embedding.iter().all(|v| v.is_finite()),
+            "all embedding values must be finite"
+        );
+    }
+
+    /// embed() errors on empty token slice.
+    #[test]
+    fn embed_empty_tokens_returns_error() {
+        let mut lcg = Lcg::new(2222);
+        let mut model = build_test_model(&mut lcg);
+
+        struct NullKv;
+        impl KvCacheAccess for NullKv {
+            fn seq_len(&self) -> usize {
+                0
+            }
+            fn store_kv(&mut self, _: usize, _: &[f32], _: &[f32]) -> ArchResult<()> {
+                Ok(())
+            }
+            fn get_keys(&self, _: usize) -> ArchResult<&[f32]> {
+                Ok(&[])
+            }
+            fn get_values(&self, _: usize) -> ArchResult<&[f32]> {
+                Ok(&[])
+            }
+            fn advance(&mut self) {}
+        }
+
+        let mut kv = NullKv;
+        let result = model.embed(&[], &mut kv);
+        assert!(result.is_err(), "embed with empty token sequence must return an error");
+    }
+
+    // ── GGUF loader tests ─────────────────────────────────────────────────────
+
+    /// Load the minimal V2 DeepSeek GGUF (all-dense layout) without error.
+    ///
+    /// The V2 fixture sets `block_count=1` with `leading_dense_block_count`
+    /// defaulting to 1, so the single layer uses a dense SwiGLU FFN.
+    #[test]
+    fn deepseek_loader_round_trip_dense() {
+        let bytes = oxillama_gguf::test_utils::build_minimal_deepseek_gguf();
+        let gguf = oxillama_gguf::GgufModel::from_bytes(bytes)
+            .expect("synthetic DeepSeek V2 GGUF must parse");
+
+        let model = load_deepseek_from_gguf(&gguf)
+            .expect("load_deepseek_from_gguf must succeed for V2 dense fixture");
+
+        assert_eq!(model.config.num_layers, 1, "1-layer model");
+        assert_eq!(model.layers.len(), 1, "one DeepSeekLayer loaded");
+        assert!(
+            matches!(model.layers[0].ffn, FfnKind::Dense(_)),
+            "layer 0 must be Dense (first_k_dense_replace defaults to 1)"
+        );
+        assert_eq!(model.config.vocab_size, 32);
+        assert_eq!(model.config.hidden_size, 32);
+    }
+
+    /// Load the minimal V3 DeepSeek GGUF (all-MoE layout) without error.
+    ///
+    /// The V3 fixture sets `leading_dense_block_count=0`, so the single layer
+    /// uses the sparse MoE FFN with `SigmoidWithBias` routing (exp_probs_b present).
+    #[test]
+    fn deepseek_loader_round_trip_moe() {
+        let bytes = oxillama_gguf::test_utils::build_minimal_deepseek_v3_gguf();
+        let gguf = oxillama_gguf::GgufModel::from_bytes(bytes)
+            .expect("synthetic DeepSeek V3 GGUF must parse");
+
+        let model = load_deepseek_from_gguf(&gguf)
+            .expect("load_deepseek_from_gguf must succeed for V3 MoE fixture");
+
+        assert_eq!(model.config.num_layers, 1, "1-layer model");
+        assert_eq!(model.layers.len(), 1, "one DeepSeekLayer loaded");
+
+        match &model.layers[0].ffn {
+            FfnKind::Moe { weights, config } => {
+                assert_eq!(
+                    config.n_routed_experts, 2,
+                    "n_routed_experts must match fixture"
+                );
+                assert_eq!(
+                    config.n_shared_experts, 1,
+                    "n_shared_experts must match fixture"
+                );
+                assert!(
+                    weights.expert_bias.is_some(),
+                    "V3 layer must have expert_bias (SigmoidWithBias mode)"
+                );
+                assert_eq!(
+                    config.scoring_mode,
+                    crate::deepseek::moe::ScoringMode::SigmoidWithBias,
+                    "V3 layer must use SigmoidWithBias scoring"
+                );
+            }
+            FfnKind::Dense(_) => panic!("layer 0 must be MoE for V3 fixture"),
+        }
+    }
+
+    /// Forward pass on a GGUF-loaded model produces finite logits.
+    ///
+    /// Uses the V2 (dense) fixture for simplicity; the V3 MoE path is covered
+    /// separately in `deepseek_loader_round_trip_moe`.
+    #[test]
+    fn deepseek_loader_forward_no_nan() {
+        struct NullKvL;
+        impl KvCacheAccess for NullKvL {
+            fn seq_len(&self) -> usize {
+                0
+            }
+            fn store_kv(&mut self, _: usize, _: &[f32], _: &[f32]) -> ArchResult<()> {
+                Ok(())
+            }
+            fn get_keys(&self, _: usize) -> ArchResult<&[f32]> {
+                Ok(&[])
+            }
+            fn get_values(&self, _: usize) -> ArchResult<&[f32]> {
+                Ok(&[])
+            }
+            fn advance(&mut self) {}
+        }
+
+        let bytes = oxillama_gguf::test_utils::build_minimal_deepseek_gguf();
+        let gguf = oxillama_gguf::GgufModel::from_bytes(bytes)
+            .expect("synthetic DeepSeek V2 GGUF must parse");
+
+        let mut model = load_deepseek_from_gguf(&gguf)
+            .expect("load_deepseek_from_gguf must succeed");
+
+        let mut kv = NullKvL;
+        let logits = model
+            .forward(&[1u32, 2, 3], &mut kv)
+            .expect("forward must succeed on GGUF-loaded model");
+
+        assert_eq!(
+            logits.len(),
+            model.config.vocab_size,
+            "logits length must equal vocab_size"
+        );
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "all logits must be finite (no NaN or Inf)"
+        );
     }
 }

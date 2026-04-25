@@ -234,6 +234,7 @@ mod deepseek_tests {
             top_k_routed: TOP_K,
             shared_expert_intermediate_size: MOE_INTER,
             routed_scaling_factor: 1.0,
+            first_k_dense_replace: 1,
         };
 
         let model_config = ModelConfig {

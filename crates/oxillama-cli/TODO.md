@@ -105,7 +105,7 @@ With `chat`, `completions`, `generate-manpage`, and `version --verbose` now ship
 
 - [x] Conversation save/resume — `session.rs` module with `/save <path>` and `/load <path>` slash-commands wired into the chat REPL. Snapshots are written atomically (tempfile+rename) using oxicode-serde binary serialisation. Schema version guard (rejects future formats), SHA-256 KV-cache sidecar integrity check, and model-ID mismatch detection. 5 unit tests.
 - [x] `oxillama hub pull/list/rm` — HuggingFace Hub subcommand group (`feature = "hub"`). Pure Rust transport via `hf-hub 0.5.0 + ureq + rustls`. `hub list` enumerates `**/*.gguf` under the platform cache dir. `hub rm` removes a cached repo directory. `hub pull` downloads via `hf-hub` with optional SHA-256 verification and auto-selects the first `.gguf` from the repo manifest. Cache dir: `~/Library/Caches/oxillama/models` (macOS) / `~/.cache/oxillama/models` (Linux) via `directories` crate. 5 unit tests (no live network needed).
-- [x] TUI chat mode — `feature = "tui"` gated `crates/oxillama-cli/src/tui/` module tree using `ratatui 0.30` + `crossterm 0.29`. Full-screen layout: conversation pane (scrollable), stats sidebar (tokens/s, KV usage), status bar, and multi-line input box. Slash commands: `/save <path>`, `/load <path>`, `/clear`, `/quit`, `/help`. Activated with `oxillama chat --tui`. 6 unit tests via `ratatui::TestBackend` (no real TTY). Note: generation in TUI mode is currently stubbed with a placeholder message — full async engine hand-off is deferred; use `oxillama chat` (without `--tui`) for actual inference.
+- [x] TUI chat mode — `feature = "tui"` gated `crates/oxillama-cli/src/tui/` module tree using `ratatui 0.30` + `crossterm 0.29`. Full-screen layout: conversation pane (scrollable), stats sidebar (tokens/s, KV usage), status bar, and multi-line input box. Slash commands: `/save <path>`, `/load <path>`, `/clear`, `/quit`, `/help`. Activated with `oxillama chat --tui`. 6 unit tests via `ratatui::TestBackend` (no real TTY). Full async engine hand-off implemented: `tokio::task::spawn_blocking` + `std::sync::mpsc` worker in `tui/app.rs`; `Token(String)` / `GenerationDone` / `GenerationError(String)` event variants in `events.rs`; partial-assistant accumulation; live tokens/sec stats; 6 new unit tests.
 
 ## 8. v2.0+ Vision
 
@@ -117,4 +117,4 @@ With `chat`, `completions`, `generate-manpage`, and `version --verbose` now ship
 - `oxillama convert` — GGUF from safetensors / HF snapshot, reusing `oxillama-gguf` writer + `oxillama-quant` kernels.
 - Self-contained `scirs2-core` / `oxiblas` / `oxifft` feature-flag banner surfaced via `oxillama --about` so end users can see their sovereignty posture at a glance.
 
-*Last updated: 2026-04-24 (v0.1.2 — conversation save/resume, hub pull/list/rm)*
+*Last updated: 2026-04-25 (v0.1.2 — conversation save/resume, hub pull/list/rm, TUI async generation)*

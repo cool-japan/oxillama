@@ -55,6 +55,140 @@ pub trait ModelArchitecture: Send + Sync {
     }
 }
 
+/// A single request's slot within the shared KV pool.
+///
+/// Each in-flight request receives one `KvSlot` that identifies which
+/// position in the KV pool belongs to it.  The slot is released back to the
+/// pool when the request finishes (EOS or max-token limit reached).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvSlot {
+    /// Unique identifier of the request that owns this slot.
+    pub request_id: u64,
+    /// Index into the shared KV cache pool (e.g. the row within a paged KV
+    /// cache or the sequence slot index in a flat pool).
+    pub kv_cache_idx: usize,
+    /// Current sequence position (number of tokens committed so far).
+    pub position: usize,
+}
+
+impl KvSlot {
+    /// Construct a new `KvSlot`.
+    pub fn new(request_id: u64, kv_cache_idx: usize, position: usize) -> Self {
+        Self {
+            request_id,
+            kv_cache_idx,
+            position,
+        }
+    }
+}
+
+/// A view over the KV caches of multiple concurrent requests for batched
+/// decode attention.
+///
+/// During the decode phase each request has already accumulated keys and
+/// values from the prefill + prior decode steps.  `BatchedKvView` provides
+/// the batched-attention kernel with access to per-request KV slices without
+/// requiring the caller to lay out memory in any particular way.
+///
+/// Implementors typically wrap a pool of KV cache buffers indexed by [`KvSlot`].
+pub trait BatchedKvView: Sync {
+    /// Number of concurrent request slots in this batch.
+    fn slot_count(&self) -> usize;
+
+    /// Return the flattened key and value slices for slot `slot`.
+    ///
+    /// Both slices have length `position(slot) * kv_dim`, laid out as
+    /// `[seq_len, kv_dim]` in row-major order.
+    ///
+    /// # Panics
+    ///
+    /// Implementations are permitted to panic if `slot >= slot_count()`.
+    fn kv_for_slot(&self, slot: usize) -> (&[f32], &[f32]);
+
+    /// Number of KV tokens already committed for slot `slot`
+    /// (= the sequence position the next token will be written to).
+    fn position(&self, slot: usize) -> usize;
+}
+
+/// Minimal KV cache interface used by forward pass implementations.
+///
+/// This trait is defined in `oxillama-arch` to avoid a circular dependency
+/// with `oxillama-runtime` where the full KV cache lives.
+pub trait KvCacheAccess: Send + Sync {
+    /// Get the current sequence length (number of cached tokens).
+    fn seq_len(&self) -> usize;
+
+    /// Store key and value tensors for a layer at the current position.
+    fn store_kv(&mut self, layer: usize, key: &[f32], value: &[f32]) -> ArchResult<()>;
+
+    /// Retrieve all cached keys for a layer up to the current sequence length.
+    fn get_keys(&self, layer: usize) -> ArchResult<&[f32]>;
+
+    /// Retrieve all cached values for a layer up to the current sequence length.
+    fn get_values(&self, layer: usize) -> ArchResult<&[f32]>;
+
+    /// Advance the cache position by one token.
+    ///
+    /// Called after all layers have stored their K/V for the current token.
+    fn advance(&mut self);
+
+    /// KV dimension per token (num_kv_heads * head_dim).
+    ///
+    /// Returns `0` by default, which signals that per-token iteration is not
+    /// available via the default [`for_each_key`](Self::for_each_key) /
+    /// [`for_each_value`](Self::for_each_value) helpers.  Implementations that
+    /// know their KV dimension should override this.
+    fn kv_dim(&self) -> usize {
+        0
+    }
+
+    /// Iterate over every cached key token for `layer`, calling `f(pos, key_data)`.
+    ///
+    /// The default implementation chunks `get_keys()` using [`kv_dim()`](Self::kv_dim).
+    /// Paged implementations override this to avoid assembling a contiguous slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArchError::NotSupported`] if `kv_dim()` returns `0`.
+    /// Propagates any error from [`get_keys()`](Self::get_keys).
+    fn for_each_key(&self, layer: usize, f: &mut dyn FnMut(usize, &[f32])) -> ArchResult<()> {
+        let dim = self.kv_dim();
+        if dim == 0 {
+            return Err(ArchError::NotSupported {
+                detail: "kv_dim() not implemented; cannot iterate per-token keys".to_string(),
+            });
+        }
+        let keys = self.get_keys(layer)?;
+        for (pos, slice) in keys.chunks_exact(dim).enumerate() {
+            f(pos, slice);
+        }
+        Ok(())
+    }
+
+    /// Iterate over every cached value token for `layer`, calling `f(pos, value_data)`.
+    ///
+    /// The default implementation chunks `get_values()` using [`kv_dim()`](Self::kv_dim).
+    /// Paged implementations override this to avoid assembling a contiguous slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArchError::NotSupported`] if `kv_dim()` returns `0`.
+    /// Propagates any error from [`get_values()`](Self::get_values).
+    fn for_each_value(&self, layer: usize, f: &mut dyn FnMut(usize, &[f32])) -> ArchResult<()> {
+        let dim = self.kv_dim();
+        if dim == 0 {
+            return Err(ArchError::NotSupported {
+                detail: "kv_dim() not implemented; cannot iterate per-token values".to_string(),
+            });
+        }
+        let values = self.get_values(layer)?;
+        for (pos, slice) in values.chunks_exact(dim).enumerate() {
+            f(pos, slice);
+        }
+        Ok(())
+    }
+}
+
 /// Trait for running forward passes through a loaded model.
 ///
 /// Implementations own the model weights and maintain any mutable state
@@ -159,27 +293,141 @@ pub trait ForwardPass: Send + Sync {
     fn allocate_sequence_state(&self, max_context_length: usize) -> Box<dyn SequenceState> {
         Box::new(AttentionSequenceState::new(max_context_length))
     }
+
+    /// Run a batched decode-phase forward pass across multiple concurrent requests.
+    ///
+    /// Each slot in `kv_view` corresponds to one batch element.  `q_batch` is
+    /// laid out as `[batch_size, num_heads, head_dim]` in row-major order.
+    ///
+    /// The default implementation returns [`ArchError::NotSupported`].
+    /// Architectures that support continuous batching override this.
+    ///
+    /// # Arguments
+    ///
+    /// * `q_batch`    - Query tensor, shape `[batch_size, num_heads, head_dim]`.
+    /// * `kv_view`    - Per-slot KV cache view.
+    /// * `num_heads`  - Number of query attention heads.
+    /// * `head_dim`   - Per-head dimension.
+    /// * `scale`      - Softmax scale factor (typically `1 / sqrt(head_dim)`).
+    ///
+    /// # Returns
+    ///
+    /// Output tensor with layout `[batch_size, num_heads, head_dim]`.
+    fn forward_batched(
+        &mut self,
+        q_batch: &[f32],
+        kv_view: &dyn BatchedKvView,
+        num_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> ArchResult<Vec<f32>> {
+        let _ = (q_batch, kv_view, num_heads, head_dim, scale);
+        Err(ArchError::NotSupported {
+            detail: "forward_batched() not implemented for this architecture".to_string(),
+        })
+    }
 }
 
-/// Minimal KV cache interface used by forward pass implementations.
-///
-/// This trait is defined in `oxillama-arch` to avoid a circular dependency
-/// with `oxillama-runtime` where the full KV cache lives.
-pub trait KvCacheAccess: Send + Sync {
-    /// Get the current sequence length (number of cached tokens).
-    fn seq_len(&self) -> usize;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ArchError;
 
-    /// Store key and value tensors for a layer at the current position.
-    fn store_kv(&mut self, layer: usize, key: &[f32], value: &[f32]) -> ArchResult<()>;
+    /// A minimal stub implementing ForwardPass to test the default
+    /// `forward_batched` returns NotSupported.
+    struct StubModel;
 
-    /// Retrieve all cached keys for a layer up to the current sequence length.
-    fn get_keys(&self, layer: usize) -> ArchResult<&[f32]>;
+    impl ForwardPass for StubModel {
+        fn forward(
+            &mut self,
+            _tokens: &[u32],
+            _kv_cache: &mut dyn KvCacheAccess,
+        ) -> ArchResult<Vec<f32>> {
+            Ok(vec![])
+        }
 
-    /// Retrieve all cached values for a layer up to the current sequence length.
-    fn get_values(&self, layer: usize) -> ArchResult<&[f32]>;
+        fn vocab_size(&self) -> usize {
+            1
+        }
 
-    /// Advance the cache position by one token.
-    ///
-    /// Called after all layers have stored their K/V for the current token.
-    fn advance(&mut self);
+        fn max_context_length(&self) -> usize {
+            1
+        }
+
+        fn hidden_size(&self) -> usize {
+            1
+        }
+    }
+
+    /// A minimal BatchedKvView for testing.
+    struct EmptyKvView;
+    impl BatchedKvView for EmptyKvView {
+        fn slot_count(&self) -> usize {
+            0
+        }
+
+        fn kv_for_slot(&self, _slot: usize) -> (&[f32], &[f32]) {
+            (&[], &[])
+        }
+
+        fn position(&self, _slot: usize) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn forward_batched_default_returns_not_supported() {
+        let mut model = StubModel;
+        let view = EmptyKvView;
+        let result = model.forward_batched(&[], &view, 2, 4, 0.5);
+        match result {
+            Err(ArchError::NotSupported { detail }) => {
+                assert!(
+                    detail.contains("forward_batched"),
+                    "error detail should mention forward_batched, got: {detail}"
+                );
+            }
+            other => panic!("expected NotSupported, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_batched_empty_batch_via_default_is_not_supported() {
+        // The default implementation always returns NotSupported regardless of
+        // batch size — it cannot know the correct answer without weights.
+        let mut model = StubModel;
+        let view = EmptyKvView;
+        let result = model.forward_batched(&[], &view, 1, 8, 1.0);
+        assert!(result.is_err(), "default must return Err");
+    }
+
+    #[test]
+    fn kv_slot_construction() {
+        let slot = KvSlot::new(42, 7, 100);
+        assert_eq!(slot.request_id, 42);
+        assert_eq!(slot.kv_cache_idx, 7);
+        assert_eq!(slot.position, 100);
+    }
+
+    #[test]
+    fn kv_cache_access_default_kv_dim_is_zero() {
+        /// Minimal KvCacheAccess impl that does not override kv_dim().
+        struct MinimalCache;
+        impl KvCacheAccess for MinimalCache {
+            fn seq_len(&self) -> usize { 0 }
+            fn store_kv(&mut self, _layer: usize, _key: &[f32], _value: &[f32]) -> ArchResult<()> { Ok(()) }
+            fn get_keys(&self, _layer: usize) -> ArchResult<&[f32]> { Ok(&[]) }
+            fn get_values(&self, _layer: usize) -> ArchResult<&[f32]> { Ok(&[]) }
+            fn advance(&mut self) {}
+        }
+
+        let cache = MinimalCache;
+        assert_eq!(cache.kv_dim(), 0, "default kv_dim must be 0");
+
+        // for_each_key must return NotSupported when kv_dim == 0
+        let mut called = false;
+        let result = cache.for_each_key(0, &mut |_, _| { called = true; });
+        assert!(result.is_err(), "must return Err when kv_dim() == 0");
+        assert!(!called, "callback must not be invoked");
+    }
 }

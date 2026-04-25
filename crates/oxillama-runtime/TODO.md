@@ -172,7 +172,7 @@ Cached vocabulary
   serialized rather than truly continuous.~~
   **A2 — Per-request KV slot continuous batching** ✅ **Done (2026-04-20)**
   - **Shipped:** `BatchedKvView` trait + `KvSlot` struct + `VecBatchedKvView` impl in `kv_cache/mod.rs`; `batched_flash_attention<V: BatchedKvView>` in new `batched_attention.rs` (~351 LoC); `slot_id: Option<usize>` field on `Sequence` in `scheduler.rs`.
-  - **Note:** Full end-to-end batched forward pass requires `ForwardPass::forward_batched` in `oxillama-arch` (out of runtime scope). The primitives are wired and tested; the arch integration is a TODO comment in `batched_attention.rs`.
+  - **Note:** `ForwardPass::forward_batched` is now implemented in `oxillama-arch/src/traits.rs` (default returns `NotSupported`; LLaMA overrides with a real per-slot attention impl). `BatchedKvView` + `KvSlot` moved to `oxillama-arch/src/traits.rs` and re-exported from runtime. `kv_dim()`, `for_each_key()`, `for_each_value()` added to `KvCacheAccess` with defaults (contiguous path) and `PagedKvCache` overrides (multi-page path). `batched_attention.rs` wires through `forward_batched`.
   - **Tests (2 new):** `batched_kv_view_basic` (trait correctness), `batched_flash_decode_matches_serial` (batched output == two serial calls, tol 1e-5).
 - Single `LoadedLora` per engine — no multi-LoRA hot-swap / per-request
   ✅ **Done**: `LoraStack` integrated into `InferenceEngine`; `push_lora`, `pop_lora`, `clear_loras`, `apply_lora_stack` support hot-swap without restart

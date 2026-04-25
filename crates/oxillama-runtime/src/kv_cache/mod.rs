@@ -15,6 +15,7 @@ use oxicode::{Decode, Encode};
 use oxillama_arch::traits::KvCacheAccess;
 use oxillama_arch::ArchResult;
 
+pub use oxillama_arch::traits::{BatchedKvView, KvSlot};
 pub use paged::PagedKvCache;
 pub use prefix::{PrefixCacheConfig, PrefixKvCache};
 
@@ -34,61 +35,6 @@ pub struct KvCacheSnapshot {
     pub seq_len: usize,
 }
 
-/// A single request's slot within the shared KV pool.
-///
-/// Each in-flight request receives one `KvSlot` that identifies which
-/// position in the KV pool belongs to it.  The slot is released back to the
-/// pool when the request finishes (EOS or max-token limit reached).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KvSlot {
-    /// Unique identifier of the request that owns this slot.
-    pub request_id: u64,
-    /// Index into the shared KV cache pool (e.g. the row within a paged KV
-    /// cache or the sequence slot index in a flat pool).
-    pub kv_cache_idx: usize,
-    /// Current sequence position (number of tokens committed so far).
-    pub position: usize,
-}
-
-impl KvSlot {
-    /// Construct a new `KvSlot`.
-    pub fn new(request_id: u64, kv_cache_idx: usize, position: usize) -> Self {
-        Self {
-            request_id,
-            kv_cache_idx,
-            position,
-        }
-    }
-}
-
-/// A view over the KV caches of multiple concurrent requests for batched
-/// decode attention.
-///
-/// During the decode phase each request has already accumulated keys and
-/// values from the prefill + prior decode steps.  `BatchedKvView` provides
-/// the batched-attention kernel with access to per-request KV slices without
-/// requiring the caller to lay out memory in any particular way.
-///
-/// Implementors typically wrap a pool of [`KvCache`] buffers indexed by
-/// [`KvSlot`].
-pub trait BatchedKvView: Sync {
-    /// Number of concurrent request slots in this batch.
-    fn slot_count(&self) -> usize;
-
-    /// Return the flattened key and value slices for slot `slot`.
-    ///
-    /// Both slices have length `position(slot) * kv_dim`, laid out as
-    /// `[seq_len, kv_dim]` in row-major order.
-    ///
-    /// # Panics
-    ///
-    /// Implementations are permitted to panic if `slot >= slot_count()`.
-    fn kv_for_slot(&self, slot: usize) -> (&[f32], &[f32]);
-
-    /// Number of KV tokens already committed for slot `slot`
-    /// (= the sequence position the next token will be written to).
-    fn position(&self, slot: usize) -> usize;
-}
 
 /// Simple contiguous `BatchedKvView` backed by a `Vec<KvSlot>` paired with
 /// a pool of flat key/value buffers.
@@ -415,6 +361,10 @@ impl KvCacheAccess for KvCache {
             }
         }
     }
+
+    fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
 }
 
 #[cfg(test)]
@@ -621,5 +571,72 @@ mod tests {
         for &v in stored1 {
             assert!((v - 2.0).abs() < 1e-7, "layer 1 key should be 2.0");
         }
+    }
+
+    // ── for_each_key / for_each_value iteration ─────────────────────────────
+
+    #[test]
+    fn kv_cache_for_each_key_contiguous() {
+        use oxillama_arch::traits::KvCacheAccess;
+
+        let kv_dim = 4usize;
+        let mut cache = KvCache::new(1, 16, kv_dim);
+
+        // Store 4 tokens in layer 0.
+        for t in 0..4u32 {
+            let key: Vec<f32> = (0..kv_dim).map(|d| t as f32 * 10.0 + d as f32).collect();
+            let val: Vec<f32> = (0..kv_dim).map(|d| t as f32 * 100.0 + d as f32).collect();
+            cache.store_kv(0, &key, &val).expect("store_kv");
+            cache.advance();
+        }
+
+        // Collect callbacks via for_each_key.
+        let mut positions_seen: Vec<usize> = Vec::new();
+        let mut keys_seen: Vec<Vec<f32>> = Vec::new();
+        cache
+            .for_each_key(0, &mut |pos, slice| {
+                positions_seen.push(pos);
+                keys_seen.push(slice.to_vec());
+            })
+            .expect("for_each_key must succeed");
+
+        assert_eq!(positions_seen.len(), 4, "must visit all 4 positions");
+        assert_eq!(positions_seen, vec![0, 1, 2, 3], "positions must be in order");
+
+        // Check key data for each position.
+        for (t, key_row) in keys_seen.iter().enumerate() {
+            assert_eq!(key_row.len(), kv_dim, "key row must have kv_dim elements");
+            for (d, &v) in key_row.iter().enumerate() {
+                let expected = t as f32 * 10.0 + d as f32;
+                assert!(
+                    (v - expected).abs() < 1e-6,
+                    "token {t} dim {d}: expected {expected}, got {v}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kv_cache_for_each_value_contiguous() {
+        use oxillama_arch::traits::KvCacheAccess;
+
+        let kv_dim = 3usize;
+        let mut cache = KvCache::new(1, 8, kv_dim);
+
+        for t in 0..3u32 {
+            let key = vec![0.0f32; kv_dim];
+            let val: Vec<f32> = (0..kv_dim).map(|d| t as f32 + d as f32 * 0.1).collect();
+            cache.store_kv(0, &key, &val).expect("store_kv");
+            cache.advance();
+        }
+
+        let mut count = 0usize;
+        cache
+            .for_each_value(0, &mut |_pos, slice| {
+                assert_eq!(slice.len(), kv_dim);
+                count += 1;
+            })
+            .expect("for_each_value must succeed");
+        assert_eq!(count, 3, "must visit 3 value rows");
     }
 }
