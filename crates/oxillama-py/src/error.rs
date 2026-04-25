@@ -97,6 +97,19 @@ pub fn runtime_to_py(err: RuntimeError) -> PyErr {
         } => LoadError::new_err(format!(
             "Model fingerprint mismatch — expected {expected}, found {found}: {detail}"
         )),
+        RuntimeError::OffloadEof {
+            offset,
+            needed,
+            available,
+        } => LoadError::new_err(format!(
+            "Offload I/O error: unexpected EOF at offset {offset}, needed {needed} bytes, {available} available"
+        )),
+        RuntimeError::TensorNotFound(name) => {
+            LoadError::new_err(format!("Tensor not found in weight map: '{name}'"))
+        }
+        RuntimeError::LockPoisoned => {
+            GenerateError::new_err("Internal error: lock poisoned")
+        }
     }
 }
 
@@ -211,6 +224,13 @@ mod tests {
             }),
             RuntimeError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "test")),
             RuntimeError::Grammar(GrammarError::Stuck),
+            RuntimeError::OffloadEof {
+                offset: 0,
+                needed: 4,
+                available: 2,
+            },
+            RuntimeError::TensorNotFound("blk.0.attn_q.weight".to_string()),
+            RuntimeError::LockPoisoned,
         ];
 
         for variant in variants {

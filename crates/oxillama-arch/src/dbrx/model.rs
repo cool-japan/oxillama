@@ -329,6 +329,95 @@ impl ForwardPass for DbrxModel {
         Ok(logits)
     }
 
+    /// Extract the post-output-norm hidden state for embedding.
+    ///
+    /// Runs all transformer layers (token embedding → N×(attn norm → MHA → residual
+    /// → FFN norm → MoE → residual)) and the final `output_norm`, then returns the
+    /// normalised last-token hidden state *without* projecting through the LM head.
+    ///
+    /// The returned vector has length `hidden_size`, not `vocab_size`.
+    fn embed(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
+        let hidden = self.config.hidden_size;
+        let seq_len = tokens.len();
+
+        if seq_len == 0 {
+            return Err(ArchError::InvalidConfig {
+                detail: "embed: empty token sequence".to_string(),
+            });
+        }
+
+        // ── Token embedding lookup ──────────────────────────────────────────────
+        let mut hidden_states = vec![0.0f32; seq_len * hidden];
+        for (t, &tok_id) in tokens.iter().enumerate() {
+            let tok = tok_id as usize;
+            if tok >= self.config.vocab_size {
+                return Err(ArchError::InvalidConfig {
+                    detail: format!(
+                        "token id {tok} out of range (vocab_size={})",
+                        self.config.vocab_size
+                    ),
+                });
+            }
+            let off = tok * hidden;
+            hidden_states[t * hidden..(t + 1) * hidden]
+                .copy_from_slice(&self.token_embd[off..off + hidden]);
+        }
+
+        // ── Transformer layers ──────────────────────────────────────────────────
+        let n_layers = self.layers.len();
+        for layer_idx in 0..n_layers {
+            for t in 0..seq_len {
+                let pos = self.current_pos + t;
+
+                // ─ Pre-attention norm ──────────────────────────────────────────
+                let mut normed: Vec<f32> = hidden_states[t * hidden..(t + 1) * hidden].to_vec();
+                self.layers[layer_idx].attn_norm.forward(&mut normed);
+
+                // ─ MHA ────────────────────────────────────────────────────────
+                let attn_out = self.attention_single_token(layer_idx, &normed, pos, kv_cache)?;
+
+                // ─ Residual ────────────────────────────────────────────────────
+                for (h, a) in hidden_states[t * hidden..(t + 1) * hidden]
+                    .iter_mut()
+                    .zip(attn_out.iter())
+                {
+                    *h += a;
+                }
+
+                // ─ Pre-FFN norm ────────────────────────────────────────────────
+                let mut ffn_normed: Vec<f32> = hidden_states[t * hidden..(t + 1) * hidden].to_vec();
+                self.layers[layer_idx].ffn_norm.forward(&mut ffn_normed);
+
+                // ─ MoE FFN ────────────────────────────────────────────────────
+                let ffn_out = {
+                    let layer = &self.layers[layer_idx];
+                    moe_forward(&ffn_normed, &layer.moe_weights, &layer.moe_config).map_err(
+                        |e| ArchError::ForwardPassError {
+                            layer: layer_idx,
+                            message: format!("MoE: {e}"),
+                        },
+                    )?
+                };
+
+                // ─ Residual after FFN ──────────────────────────────────────────
+                for (h, f) in hidden_states[t * hidden..(t + 1) * hidden]
+                    .iter_mut()
+                    .zip(ffn_out.iter())
+                {
+                    *h += f;
+                }
+            }
+        }
+
+        // ── Final norm on last token (stop before LM head) ──────────────────────
+        let last = &mut hidden_states[(seq_len - 1) * hidden..seq_len * hidden];
+        self.output_norm.forward(last);
+
+        self.current_pos += seq_len;
+
+        Ok(last.to_vec())
+    }
+
     fn vocab_size(&self) -> usize {
         self.config.vocab_size
     }
@@ -416,15 +505,286 @@ pub fn build_dbrx_model(
     DbrxModel::new(config, dbrx_config, token_embd, layers, output_norm, output)
 }
 
-// ─── GGUF loader stub ─────────────────────────────────────────────────────────
+// ─── GGUF loader helpers (local copies; do NOT extract to common) ─────────────
 
-/// Load a DBRX model from a parsed GGUF file (stub — use `build_dbrx_model` for testing).
-pub fn load_dbrx_from_gguf(_model: &oxillama_gguf::GgufModel) -> ArchResult<DbrxModel> {
-    Err(ArchError::MissingTensor {
-        name: "load_dbrx_from_gguf: full loader not yet implemented; \
-               use build_dbrx_model() directly"
-            .to_string(),
-    })
+/// Dequantize raw tensor bytes to a `Vec<f32>`.
+fn dequant_to_f32_local(
+    info: &oxillama_gguf::TensorInfo,
+    data: &[u8],
+    dispatcher: &oxillama_quant::KernelDispatcher,
+) -> ArchResult<Vec<f32>> {
+    use oxillama_gguf::GgufTensorType;
+
+    let n_elements = info.n_elements() as usize;
+    let tensor_type = info.tensor_type;
+
+    if tensor_type == GgufTensorType::F32 {
+        let mut out = vec![0.0f32; n_elements];
+        for (i, chunk) in data.chunks_exact(4).enumerate().take(n_elements) {
+            out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        return Ok(out);
+    }
+
+    if tensor_type == GgufTensorType::F16 {
+        let mut out = vec![0.0f32; n_elements];
+        for (i, chunk) in data.chunks_exact(2).enumerate().take(n_elements) {
+            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            out[i] = half::f16::from_bits(bits).to_f32();
+        }
+        return Ok(out);
+    }
+
+    let kernel = dispatcher.get_kernel(tensor_type)?;
+    let block_size = tensor_type.block_size();
+    let block_bytes = tensor_type.block_bytes();
+    let n_blocks = n_elements.div_ceil(block_size);
+
+    let mut out = vec![0.0f32; n_elements];
+    for blk in 0..n_blocks {
+        let data_offset = blk * block_bytes;
+        let out_offset = blk * block_size;
+        let block_data = &data[data_offset..data_offset + block_bytes];
+        let out_slice = &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
+        kernel.dequant_block(block_data, out_slice)?;
+    }
+
+    Ok(out)
+}
+
+/// Load and dequantize a named tensor to `Vec<f32>`.
+fn load_dequant_tensor_local(
+    model: &oxillama_gguf::GgufModel,
+    dispatcher: &oxillama_quant::KernelDispatcher,
+    name: &str,
+) -> ArchResult<Vec<f32>> {
+    let info = model
+        .file
+        .tensors
+        .get(name)
+        .map_err(|_| ArchError::MissingTensor {
+            name: name.to_string(),
+        })?;
+    let data = model.tensor_data(name)?;
+    dequant_to_f32_local(info, data, dispatcher)
+}
+
+/// Load a named tensor as a `QuantLinear` (keeps data quantized).
+fn load_quant_linear_local(
+    model: &oxillama_gguf::GgufModel,
+    name: &str,
+) -> ArchResult<QuantLinear> {
+    let info = model
+        .file
+        .tensors
+        .get(name)
+        .map_err(|_| ArchError::MissingTensor {
+            name: name.to_string(),
+        })?;
+    let data = model.tensor_data(name)?;
+    let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+    let tensor = QuantTensor::new(data.to_vec(), shape, info.tensor_type);
+    Ok(QuantLinear::new(tensor, None))
+}
+
+/// Load and dequantize a 1-D RMSNorm weight tensor.
+fn load_rms_norm_weight_local(
+    model: &oxillama_gguf::GgufModel,
+    name: &str,
+) -> ArchResult<Vec<f32>> {
+    let info = model
+        .file
+        .tensors
+        .get(name)
+        .map_err(|_| ArchError::MissingTensor {
+            name: name.to_string(),
+        })?;
+    let data = model.tensor_data(name)?;
+    let dispatcher = oxillama_quant::KernelDispatcher::new();
+    dequant_to_f32_local(info, data, &dispatcher)
+}
+
+// ─── GGUF loader ─────────────────────────────────────────────────────────────
+
+/// Load a DBRX model from a parsed GGUF file.
+///
+/// DBRX GGUF tensor naming convention:
+/// - `token_embd.weight` — embedding table `[vocab_size, hidden_size]`
+/// - `blk.{i}.attn_norm.weight` — pre-attention RMSNorm
+/// - `blk.{i}.attn_q.weight` — query projection
+/// - `blk.{i}.attn_k.weight` — key projection
+/// - `blk.{i}.attn_v.weight` — value projection
+/// - `blk.{i}.attn_output.weight` — output projection
+/// - `blk.{i}.ffn_norm.weight` — pre-FFN RMSNorm
+/// - `blk.{i}.ffn_gate_inp.weight` — MoE router `[n_experts, hidden_size]`
+/// - `blk.{i}.ffn_gate_exps.weight` — stacked gate `[n_experts, ffn_hidden, hidden]`
+/// - `blk.{i}.ffn_up_exps.weight` — stacked up `[n_experts, ffn_hidden, hidden]`
+/// - `blk.{i}.ffn_down_exps.weight` — stacked down `[n_experts, hidden, ffn_hidden]`
+/// - `output_norm.weight` — final RMSNorm
+/// - `output.weight` — LM head `[vocab_size, hidden_size]` (falls back to tied embd)
+pub fn load_dbrx_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<DbrxModel> {
+    let metadata = &model.file.metadata;
+    let dispatcher = oxillama_quant::KernelDispatcher::new();
+
+    // ── Parse configuration ────────────────────────────────────────────────────
+    let model_config = crate::config::ModelConfig::from_metadata(metadata)?;
+    let dbrx_config = crate::dbrx::config::DbrxConfig::from_metadata(metadata);
+
+    let hidden = dbrx_config.hidden_size;
+    let n_layers = dbrx_config.num_layers;
+    let n_experts = dbrx_config.expert_count;
+    let top_k = dbrx_config.expert_used_count;
+    let ffn_hidden = dbrx_config.ffn_hidden_size;
+    let rms_eps = dbrx_config.rms_norm_eps;
+
+    // ── Token embedding ────────────────────────────────────────────────────────
+    let embd_info =
+        model
+            .file
+            .tensors
+            .get("token_embd.weight")
+            .map_err(|_| ArchError::MissingTensor {
+                name: "token_embd.weight".to_string(),
+            })?;
+    let embd_data = model.tensor_data("token_embd.weight")?;
+    let token_embd = dequant_to_f32_local(embd_info, embd_data, &dispatcher)?;
+
+    // ── Transformer layers ─────────────────────────────────────────────────────
+    let mut layers = Vec::with_capacity(n_layers);
+
+    for i in 0..n_layers {
+        let prefix = format!("blk.{i}");
+
+        // Attention norms and projections
+        let attn_norm_weights =
+            load_rms_norm_weight_local(model, &format!("{prefix}.attn_norm.weight"))?;
+        let attn_norm = RmsNorm::new(attn_norm_weights, rms_eps);
+
+        let attn_q = load_quant_linear_local(model, &format!("{prefix}.attn_q.weight"))?;
+        let attn_k = load_quant_linear_local(model, &format!("{prefix}.attn_k.weight"))?;
+        let attn_v = load_quant_linear_local(model, &format!("{prefix}.attn_v.weight"))?;
+        let attn_output = load_quant_linear_local(model, &format!("{prefix}.attn_output.weight"))?;
+
+        // FFN norm
+        let ffn_norm_weights =
+            load_rms_norm_weight_local(model, &format!("{prefix}.ffn_norm.weight"))?;
+        let ffn_norm = RmsNorm::new(ffn_norm_weights, rms_eps);
+
+        // MoE router: [n_experts, hidden_size]
+        let router_name = format!("{prefix}.ffn_gate_inp.weight");
+        let router = load_dequant_tensor_local(model, &dispatcher, &router_name)?;
+
+        let expected_router = n_experts * hidden;
+        if router.len() != expected_router {
+            return Err(ArchError::TensorShapeMismatch {
+                tensor: router_name,
+                expected: vec![n_experts, hidden],
+                got: vec![router.len()],
+            });
+        }
+
+        // Stacked expert tensors:
+        // ffn_gate_exps: [n_experts, ffn_hidden, hidden]
+        // ffn_up_exps:   [n_experts, ffn_hidden, hidden]
+        // ffn_down_exps: [n_experts, hidden, ffn_hidden]
+        let gate_name = format!("{prefix}.ffn_gate_exps.weight");
+        let up_name = format!("{prefix}.ffn_up_exps.weight");
+        let down_name = format!("{prefix}.ffn_down_exps.weight");
+
+        let gate_stacked = load_dequant_tensor_local(model, &dispatcher, &gate_name)?;
+        let up_stacked = load_dequant_tensor_local(model, &dispatcher, &up_name)?;
+        let down_stacked = load_dequant_tensor_local(model, &dispatcher, &down_name)?;
+
+        let gate_up_stride = ffn_hidden * hidden;
+        let down_stride = hidden * ffn_hidden;
+
+        let expected_gate_up = n_experts * gate_up_stride;
+        let expected_down = n_experts * down_stride;
+
+        if gate_stacked.len() != expected_gate_up {
+            return Err(ArchError::TensorShapeMismatch {
+                tensor: gate_name,
+                expected: vec![n_experts, ffn_hidden, hidden],
+                got: vec![gate_stacked.len()],
+            });
+        }
+        if up_stacked.len() != expected_gate_up {
+            return Err(ArchError::TensorShapeMismatch {
+                tensor: up_name,
+                expected: vec![n_experts, ffn_hidden, hidden],
+                got: vec![up_stacked.len()],
+            });
+        }
+        if down_stacked.len() != expected_down {
+            return Err(ArchError::TensorShapeMismatch {
+                tensor: down_name,
+                expected: vec![n_experts, hidden, ffn_hidden],
+                got: vec![down_stacked.len()],
+            });
+        }
+
+        // Slice stacked tensors into per-expert weights
+        let routed_experts: Vec<crate::deepseek::moe::DeepSeekExpert> = (0..n_experts)
+            .map(|e| {
+                let gate_start = e * gate_up_stride;
+                let up_start = e * gate_up_stride;
+                let down_start = e * down_stride;
+                crate::deepseek::moe::DeepSeekExpert {
+                    gate: gate_stacked[gate_start..gate_start + gate_up_stride].to_vec(),
+                    up: up_stacked[up_start..up_start + gate_up_stride].to_vec(),
+                    down: down_stacked[down_start..down_start + down_stride].to_vec(),
+                    hidden_size: hidden,
+                    intermediate_size: ffn_hidden,
+                }
+            })
+            .collect();
+
+        let moe_weights = MoeWeights {
+            router,
+            routed_experts,
+            shared_experts: vec![],
+            expert_bias: None,
+        };
+
+        let moe_config = MoeConfig {
+            hidden_size: hidden,
+            expert_intermediate_size: ffn_hidden,
+            n_shared_experts: 0,
+            n_routed_experts: n_experts,
+            top_k,
+            routed_scaling_factor: 1.0,
+            scoring_mode: ScoringMode::Softmax,
+            shared_expert_intermediate_size: ffn_hidden,
+        };
+
+        layers.push(DbrxLayer {
+            attn_norm,
+            attn_q,
+            attn_k,
+            attn_v,
+            attn_output,
+            ffn_norm,
+            moe_weights,
+            moe_config,
+        });
+    }
+
+    // ── Final norm and LM head ─────────────────────────────────────────────────
+    let output_norm_weights = load_rms_norm_weight_local(model, "output_norm.weight")?;
+    let output_norm = RmsNorm::new(output_norm_weights, rms_eps);
+
+    // Try explicit output.weight; fall back to tied token_embd.weight
+    let output = load_quant_linear_local(model, "output.weight")
+        .or_else(|_| load_quant_linear_local(model, "token_embd.weight"))?;
+
+    Ok(DbrxModel::new(
+        model_config,
+        dbrx_config,
+        token_embd,
+        layers,
+        output_norm,
+        output,
+    ))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -549,5 +909,100 @@ mod tests {
         let mut kv = NullKv;
         let result = model.forward(&[], &mut kv);
         assert!(result.is_err(), "empty token sequence must return an error");
+    }
+
+    #[test]
+    fn embed_returns_hidden_size() {
+        let mut model = build_tiny_model();
+        let mut kv = NullKv;
+        let embedding = model.embed(&[1u32], &mut kv).expect("embed must succeed");
+        assert_eq!(
+            embedding.len(),
+            16,
+            "embed output must have hidden_size=16 elements, got {}",
+            embedding.len()
+        );
+    }
+
+    #[test]
+    fn embed_all_finite() {
+        let mut model = build_tiny_model();
+        let mut kv = NullKv;
+        let embedding = model.embed(&[0u32], &mut kv).expect("embed must succeed");
+        assert!(
+            embedding.iter().all(|v| v.is_finite()),
+            "all embedding values must be finite"
+        );
+    }
+
+    #[test]
+    fn embed_empty_tokens_returns_error() {
+        let mut model = build_tiny_model();
+        let mut kv = NullKv;
+        let result = model.embed(&[], &mut kv);
+        assert!(
+            result.is_err(),
+            "embed with empty token sequence must return an error"
+        );
+    }
+
+    // ─── GGUF round-trip loader tests ─────────────────────────────────────────
+
+    #[test]
+    fn dbrx_loader_round_trip() {
+        // Build a minimal valid DBRX GGUF binary (2 layers, 4 experts, hidden=32,
+        // vocab=32, context=128) and verify that load_dbrx_from_gguf() succeeds
+        // and that the resulting model has the expected structural properties.
+        let bytes = oxillama_gguf::test_utils::build_minimal_dbrx_gguf();
+        let gguf_model =
+            oxillama_gguf::GgufModel::from_bytes(bytes).expect("GGUF parse must succeed");
+
+        let model = load_dbrx_from_gguf(&gguf_model).expect("load_dbrx_from_gguf must succeed");
+
+        // The fixture encodes: vocab_size=32, hidden_size=32, context_length=128.
+        assert_eq!(model.config.vocab_size, 32, "vocab_size from GGUF fixture");
+        assert_eq!(
+            model.config.hidden_size, 32,
+            "hidden_size from GGUF fixture"
+        );
+        assert_eq!(
+            model.config.max_context_length, 128,
+            "max_context_length from GGUF fixture"
+        );
+        // 2-layer fixture.
+        assert_eq!(model.layers.len(), 2, "num_layers from GGUF fixture");
+        // 4 experts per layer.
+        assert_eq!(
+            model.dbrx_config.expert_count, 4,
+            "expert_count from GGUF fixture"
+        );
+        // top-2 from 4.
+        assert_eq!(
+            model.dbrx_config.expert_used_count, 2,
+            "expert_used_count from GGUF fixture"
+        );
+    }
+
+    #[test]
+    fn dbrx_loader_forward_no_nan() {
+        // Load from the synthetic GGUF and run one forward pass.
+        // The weights are all-zero F32, so logits will be exactly 0.0,
+        // which satisfies the "no NaN" requirement.
+        let bytes = oxillama_gguf::test_utils::build_minimal_dbrx_gguf();
+        let gguf_model =
+            oxillama_gguf::GgufModel::from_bytes(bytes).expect("GGUF parse must succeed");
+
+        let mut model = load_dbrx_from_gguf(&gguf_model).expect("load_dbrx_from_gguf must succeed");
+
+        let mut kv = NullKv;
+        let logits = model.forward(&[0u32], &mut kv).expect("forward after load");
+
+        // vocab_size = 32 tokens.
+        assert_eq!(logits.len(), 32, "logit count must equal vocab_size=32");
+
+        assert!(
+            logits.iter().all(|v| !v.is_nan()),
+            "forward pass after GGUF load must produce no NaN logits"
+        );
     }
 }

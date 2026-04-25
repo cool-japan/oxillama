@@ -12,10 +12,12 @@ categories = ["parser-implementations", "encoding", "data-structures"]
 readme = "README.md"
 
 [features]
-default = ["mmap"]
-mmap = ["dep:memmap2"]
-test-utils = []
-integrity = []
+default = ["std", "mmap"]
+std = []
+alloc = []
+mmap = ["dep:memmap2", "std"]
+test-utils = ["std"]
+integrity = ["std"]
 validate = ["integrity"]
 
 [dependencies]

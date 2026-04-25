@@ -67,7 +67,7 @@ No submodules, no helpers, no binaries — intentionally thin. Any public surfac
 
 - `examples/` directory with runnable end-to-end samples:
   - ~~`openai_server.rs` — spin up the OpenAI-compatible server.~~ ✅ Shipped in `crates/oxillama/examples/openai_server.rs`.
-  - `wasm_browser/` — browser demo using `oxillama-wasm` through the facade.
+  - ~~`wasm_browser/` — browser demo using `oxillama-wasm` through the facade.~~ ✅ Shipped in `crates/oxillama/examples/wasm_browser/` (M1).
   - ~~`python_bridge/` — parity sample mirroring `oxillama-py` usage.~~ ✅ Shipped in `crates/oxillama/examples/python_bridge.rs`.
   - ~~`gpu_enabled.rs` — `gpu` feature on, Q4_0 GEMV dispatched via wgpu.~~ ✅ Shipped in `crates/oxillama/examples/gpu_enabled.rs`.
 - [x] Facade examples (`load_and_generate`, `lora_apply`, `speculative`) + `RECIPES.md` cookbook — mdBook deferred to next `/ultra` round (planned 2026-04-24)

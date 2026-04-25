@@ -20,8 +20,8 @@ serde = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
-sysinfo = "0.38.4"
-tabled = "0.20.0"
+sysinfo = { workspace = true }
+tabled = { workspace = true }
 
 [[bench]]
 name = "cross_simd"

@@ -23,12 +23,14 @@ bench = ["dep:oxillama-bench"]
 simd-avx2 = ["oxillama-quant/simd-avx2"]
 simd-avx512 = ["oxillama-quant/simd-avx512"]
 simd-neon = ["oxillama-quant/simd-neon"]
+hub = ["dep:hf-hub"]
+tui = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies]
 oxillama-gguf = { workspace = true, features = ["mmap"] }
 oxillama-quant = { workspace = true, features = ["parallel"] }
 oxillama-arch.workspace = true
-oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi"] }
+oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi", "parallel", "native-async", "mmap"] }
 oxillama-server = { workspace = true, optional = true }
 oxillama-bench = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
@@ -46,6 +48,14 @@ anyhow.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+oxicode.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+directories.workspace = true
+thiserror.workspace = true
+hf-hub = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

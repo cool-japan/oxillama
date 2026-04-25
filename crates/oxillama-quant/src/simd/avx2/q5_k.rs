@@ -161,6 +161,240 @@ impl QuantKernel for Q5_KAvx2 {
     fn name(&self) -> &'static str {
         "Q5_K"
     }
+
+    /// Fused Q5_K weight × Q8_0 activation GEMV.
+    ///
+    /// Each Q5_K super-block (256 weights, 176 bytes) maps to 8 Q8_0 activation blocks.
+    /// Sub-block `is` (0..8) of weight block `blk` uses Q8_0 at index `blk*8 + is`.
+    /// Accumulates into `out` (ACCUMULATE semantics).
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let q8_blocks_per_row = blocks_per_row * 8;
+        let acts_needed = q8_blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for row in 0..n_rows {
+            let row_start = row * row_bytes;
+            // SAFETY: bounds checked above; CPU avx2+fma guaranteed by KernelDispatcher.
+            let row_sum = unsafe {
+                fused_q5_k_q8_0_row_avx2(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            out[row] += row_sum;
+        }
+
+        Ok(())
+    }
+}
+
+/// Q8_0 block bytes for fused GEMV.
+const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Fused Q5_K weight × Q8_0 activation dot product for one row using AVX2+FMA.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES`
+/// - CPU must support `avx2` and `fma`
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fused_q5_k_q8_0_row_avx2(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    let mut row_sum = 0.0f32;
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        // SAFETY: row_data.len() == blocks_per_row * BLOCK_BYTES; blk < blocks_per_row.
+        let block = &row_data[bo..bo + BLOCK_BYTES];
+
+        let d = f16_to_f32(block);
+        let dmin = f16_to_f32(&block[2..]);
+        let (sc, mn) = decode_scales_mins(&block[4..16]);
+        let qh = &block[16..48]; // 32 high-bit bytes
+        let qs = &block[48..176]; // 128 nibble bytes
+
+        let input_offset = blk * BLOCK_SIZE;
+        let cols_in_block = (n_cols - input_offset).min(BLOCK_SIZE);
+
+        let mut is = 0usize;
+        let mut qs_off = 0usize;
+        let mut w_off = 0usize;
+
+        for group in 0..4 {
+            // Sub-block `is` (lo nibbles) — Q8_0 act block index `blk*8 + is`.
+            let a_idx_lo = blk * 8 + is;
+            let a_start_lo = a_idx_lo * Q8_0_BLOCK_BYTES;
+            // SAFETY: acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES.
+            let a_block_lo = &acts_q8[a_start_lo..a_start_lo + Q8_0_BLOCK_BYTES];
+            let d_a_lo = f16_to_f32(a_block_lo);
+            let q8_lo = &a_block_lo[2..]; // 32 i8 values
+
+            let da_lo = d * sc[is] as f32;
+            let m_lo = dmin * mn[is] as f32;
+
+            // Sub-block `is+1` (hi nibbles) — Q8_0 act block index `blk*8 + is + 1`.
+            let a_idx_hi = blk * 8 + is + 1;
+            let a_start_hi = a_idx_hi * Q8_0_BLOCK_BYTES;
+            // SAFETY: same guarantee as above.
+            let a_block_hi = &acts_q8[a_start_hi..a_start_hi + Q8_0_BLOCK_BYTES];
+            let d_a_hi = f16_to_f32(a_block_hi);
+            let q8_hi = &a_block_hi[2..]; // 32 i8 values
+
+            let da_hi = d * sc[is + 1] as f32;
+            let m_hi = dmin * mn[is + 1] as f32;
+
+            // Vectorised inner loops: compute Σ(q5_lo * q8_lo) and Σ(q8_lo) in 4-wide chunks.
+            // Using i32 accumulators for the integer dot products.
+            let mut dot_lo_i32 = _mm256_setzero_si256();
+            let mut sum_a_lo_i32 = _mm256_setzero_si256();
+            let mut dot_hi_i32 = _mm256_setzero_si256();
+            let mut sum_a_hi_i32 = _mm256_setzero_si256();
+
+            // Process groups of 8 within the sub-block.
+            let valid_lo = cols_in_block.saturating_sub(w_off).min(32);
+            let valid_hi = cols_in_block.saturating_sub(w_off + 32).min(32);
+
+            // Lo sub-block (weights w_off..w_off+32).
+            if valid_lo >= 8 {
+                let full_iters_lo = valid_lo / 8;
+                for chunk in 0..full_iters_lo {
+                    let l = chunk * 8;
+                    let q5_ptr = qs_off + l;
+
+                    // Extract 8 lo nibbles from qs bytes (two bytes each cover 2 weights).
+                    // Byte qs_off + l/2 has lo = weight 2*(l/2), hi = weight 2*(l/2)+1
+                    // But we process in the nibble-interleaved order stored by Q5_K.
+                    // For a clean SIMD approach: expand 4 bytes into 8 nibbles.
+                    // Actually Q5_K lo nibbles: for l in 0..32, qs[qs_off+l] & 0x0F.
+                    // We have 8 consecutive positions here.
+                    let mut nib_buf = [0i8; 8];
+                    let mut q8_buf = [0i8; 8];
+                    for j in 0..8 {
+                        let qh_bit = (qh[l + j] >> group) & 1;
+                        nib_buf[j] = ((qs[q5_ptr + j] & 0x0F) | (qh_bit << 4)) as i8;
+                        q8_buf[j] = q8_lo[l + j] as i8;
+                    }
+
+                    // SAFETY: nib_buf and q8_buf are stack arrays; loads are valid.
+                    let vw =
+                        _mm256_cvtepi8_epi32(_mm_loadl_epi64(nib_buf.as_ptr() as *const __m128i));
+                    let va =
+                        _mm256_cvtepi8_epi32(_mm_loadl_epi64(q8_buf.as_ptr() as *const __m128i));
+                    dot_lo_i32 = _mm256_add_epi32(dot_lo_i32, _mm256_mullo_epi32(vw, va));
+                    sum_a_lo_i32 = _mm256_add_epi32(sum_a_lo_i32, va);
+                }
+            }
+            // Scalar tail for lo sub-block.
+            let mut dot_lo_scalar = 0.0f32;
+            let mut sum_a_lo_scalar = 0.0f32;
+            let lo_simd_done = (valid_lo / 8) * 8;
+            for l in lo_simd_done..valid_lo {
+                let qh_bit = (qh[l] >> group) & 1;
+                let q_w = ((qs[qs_off + l] & 0x0F) | (qh_bit << 4)) as f32;
+                let q_a = q8_lo[l] as i8 as f32;
+                dot_lo_scalar += q_w * q_a;
+                sum_a_lo_scalar += q_a;
+            }
+            // Combine SIMD and scalar results for lo sub-block.
+            let dot_lo_total = hsum_i32_avx2(dot_lo_i32) as f32 + dot_lo_scalar;
+            let sum_a_lo_total = hsum_i32_avx2(sum_a_lo_i32) as f32 + sum_a_lo_scalar;
+            row_sum += (da_lo * dot_lo_total - m_lo * sum_a_lo_total) * d_a_lo;
+
+            // Hi sub-block (weights w_off+32..w_off+64).
+            if valid_hi >= 8 {
+                let full_iters_hi = valid_hi / 8;
+                for chunk in 0..full_iters_hi {
+                    let l = chunk * 8;
+                    let q5_ptr = qs_off + l;
+
+                    let mut nib_buf = [0i8; 8];
+                    let mut q8_buf = [0i8; 8];
+                    for j in 0..8 {
+                        let qh_bit = (qh[l + j] >> (group + 4)) & 1;
+                        nib_buf[j] = (((qs[q5_ptr + j] >> 4) & 0x0F) | (qh_bit << 4)) as i8;
+                        q8_buf[j] = q8_hi[l + j] as i8;
+                    }
+
+                    let vw =
+                        _mm256_cvtepi8_epi32(_mm_loadl_epi64(nib_buf.as_ptr() as *const __m128i));
+                    let va =
+                        _mm256_cvtepi8_epi32(_mm_loadl_epi64(q8_buf.as_ptr() as *const __m128i));
+                    dot_hi_i32 = _mm256_add_epi32(dot_hi_i32, _mm256_mullo_epi32(vw, va));
+                    sum_a_hi_i32 = _mm256_add_epi32(sum_a_hi_i32, va);
+                }
+            }
+            let mut dot_hi_scalar = 0.0f32;
+            let mut sum_a_hi_scalar = 0.0f32;
+            let hi_simd_done = (valid_hi / 8) * 8;
+            for l in hi_simd_done..valid_hi {
+                let qh_bit = (qh[l] >> (group + 4)) & 1;
+                let q_w = (((qs[qs_off + l] >> 4) & 0x0F) | (qh_bit << 4)) as f32;
+                let q_a = q8_hi[l] as i8 as f32;
+                dot_hi_scalar += q_w * q_a;
+                sum_a_hi_scalar += q_a;
+            }
+            let dot_hi_total = hsum_i32_avx2(dot_hi_i32) as f32 + dot_hi_scalar;
+            let sum_a_hi_total = hsum_i32_avx2(sum_a_hi_i32) as f32 + sum_a_hi_scalar;
+            row_sum += (da_hi * dot_hi_total - m_hi * sum_a_hi_total) * d_a_hi;
+
+            is += 2;
+            qs_off += 32;
+            w_off += 64;
+        }
+    }
+
+    row_sum
+}
+
+/// Horizontal sum of a 256-bit i32 register.
+///
+/// # Safety
+/// Requires `avx2`.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_i32_avx2(v: __m256i) -> i32 {
+    let hi = _mm256_extracti128_si256(v, 1);
+    let lo = _mm256_castsi256_si128(v);
+    let s = _mm_add_epi32(hi, lo);
+    let shuf = _mm_shuffle_epi32(s, 0b10_11_00_01);
+    let s2 = _mm_add_epi32(s, shuf);
+    let shuf2 = _mm_shuffle_epi32(s2, 0b00_00_10_10);
+    let s3 = _mm_add_epi32(s2, shuf2);
+    _mm_cvtsi128_si32(s3)
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +954,159 @@ mod tests {
             "varied gemv mismatch: avx2={}, ref={}",
             out_avx2[0],
             out_ref[0]
+        );
+    }
+
+    // ── matvec_q8_fused ───────────────────────────────────────────────────
+
+    /// Build a minimal valid Q8_0 activation block (34 bytes: 2-byte f16 scale + 32 i8).
+    fn make_q8_0_block(scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(34);
+        block.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+        for &v in values {
+            block.push(v as u8);
+        }
+        block
+    }
+
+    /// Build `n_q8_blocks` identical Q8_0 blocks.
+    fn make_q8_acts(n_q8_blocks: usize, scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        let single = make_q8_0_block(scale, values);
+        single.repeat(n_q8_blocks)
+    }
+
+    #[test]
+    fn test_q5k_avx2_fused_matches_reference_single_block() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // One Q5_K super-block (256 weights) needs 8 Q8_0 activation blocks.
+        let mut scales = [0u8; 12];
+        for (i, s) in scales.iter_mut().enumerate() {
+            *s = ((i * 7 + 5) & 0x3F) as u8;
+        }
+        let mut qh = [0u8; 32];
+        for (i, h) in qh.iter_mut().enumerate() {
+            *h = ((i * 13 + 3) & 0xFF) as u8;
+        }
+        let mut qs = [0u8; 128];
+        for (i, q) in qs.iter_mut().enumerate() {
+            *q = ((i * 5 + 11) & 0xFF) as u8;
+        }
+
+        let w_block = make_q5k_block(0.5, 0.25, &scales, &qh, &qs);
+        // 8 Q8_0 activation blocks for one Q5_K super-block.
+        let act_vals = [
+            2i8, -3, 5, -7, 1, -1, 4, -4, 6, -6, 3, -3, 2, -2, 1, -1, 8, -8, 7, -7, 6, -6, 5, -5,
+            4, -4, 3, -3, 2, -2, 1, -1,
+        ];
+        let acts = make_q8_acts(8, 0.1, &act_vals);
+
+        let mut out_avx2 = vec![0.0f32; 1];
+        let mut out_ref = vec![0.0f32; 1];
+
+        Q5_KAvx2
+            .matvec_q8_fused(&w_block, &acts, &mut out_avx2, 1, 256)
+            .expect("avx2 fused single block");
+        Q5KRef
+            .matvec_q8_fused(&w_block, &acts, &mut out_ref, 1, 256)
+            .expect("ref fused single block");
+
+        let err = (out_avx2[0] - out_ref[0]).abs();
+        assert!(
+            err < 1e-3,
+            "fused single-block mismatch: avx2={} ref={} err={}",
+            out_avx2[0],
+            out_ref[0],
+            err
+        );
+    }
+
+    #[test]
+    fn test_q5k_avx2_fused_multi_row() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // 3 rows × 512 cols = 2 Q5_K super-blocks per row → 16 Q8_0 act blocks per row.
+        let n_rows = 3usize;
+        let n_cols = 512usize;
+        let blocks_per_row = 2usize;
+        let q8_blocks_per_row = blocks_per_row * 8; // = 16
+
+        let mut all_weights = Vec::new();
+        for r in 0..n_rows {
+            for b in 0..blocks_per_row {
+                let mut scales = [0u8; 12];
+                for (i, s) in scales.iter_mut().enumerate() {
+                    *s = ((r * 17 + b * 11 + i * 7 + 5) & 0x3F) as u8;
+                }
+                let mut qh = [0u8; 32];
+                for (i, h) in qh.iter_mut().enumerate() {
+                    *h = ((r * 13 + b * 19 + i * 3) & 0xFF) as u8;
+                }
+                let mut qs = [0u8; 128];
+                for (i, q) in qs.iter_mut().enumerate() {
+                    *q = ((r * 5 + b * 23 + i * 11) & 0xFF) as u8;
+                }
+                all_weights.extend(make_q5k_block(
+                    0.5 + r as f32 * 0.1,
+                    0.1 + b as f32 * 0.05,
+                    &scales,
+                    &qh,
+                    &qs,
+                ));
+            }
+        }
+
+        let act_vals: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 0, 1, -1, 2, -2, 3, -3,
+            4, -4, 5, -5, 6, -6, 7, -7, 8,
+        ];
+        let acts = make_q8_acts(q8_blocks_per_row, 0.05, &act_vals);
+
+        let mut out_avx2 = vec![0.0f32; n_rows];
+        let mut out_ref = vec![0.0f32; n_rows];
+
+        Q5_KAvx2
+            .matvec_q8_fused(&all_weights, &acts, &mut out_avx2, n_rows, n_cols)
+            .expect("avx2 fused multi-row");
+        Q5KRef
+            .matvec_q8_fused(&all_weights, &acts, &mut out_ref, n_rows, n_cols)
+            .expect("ref fused multi-row");
+
+        for i in 0..n_rows {
+            let err = (out_avx2[i] - out_ref[i]).abs();
+            assert!(
+                err < 1e-3,
+                "fused multi-row row {i}: avx2={} ref={} err={}",
+                out_avx2[i],
+                out_ref[i],
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_q5k_avx2_fused_accumulate_semantics() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // d=0 → all zero contribution; pre-existing out value must be preserved.
+        let mut scales = [0u8; 12];
+        scales[..4].fill(1);
+        scales[8..12].fill(1);
+        let w_block = make_q5k_block(0.0, 0.0, &scales, &[0u8; 32], &[0u8; 128]);
+        let acts = make_q8_acts(8, 0.0, &[0i8; 32]);
+
+        let mut out = vec![99.0f32; 1];
+        Q5_KAvx2
+            .matvec_q8_fused(&w_block, &acts, &mut out, 1, 256)
+            .expect("avx2 fused accumulate");
+
+        assert!(
+            (out[0] - 99.0).abs() < 1e-5,
+            "accumulate semantics broken: expected 99.0, got {}",
+            out[0]
         );
     }
 }

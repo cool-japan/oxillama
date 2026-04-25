@@ -18,14 +18,15 @@ production paths.
 
 ## 2. Status Snapshot
 
-- Version: **0.1.1** (workspace inherited).
-- Completion: **98%**.
+- Version: **0.1.2** (workspace inherited).
+- Completion: **99%**.
 - Source files: **~45** under `src/**/*.rs`.
-- Supported architectures: **18** (16 feature-gated + Yi and InternLM3 compiled unconditionally).
-- Default features (16): `llama`, `qwen3`, `mistral`, `gemma`, `phi`,
+- Supported architectures: **20** (18 feature-gated + Yi and InternLM3 compiled unconditionally).
+- Default features (17): `llama`, `qwen3`, `mistral`, `gemma`, `phi`,
   `command-r`, `starcoder`, `llava`, `falcon`, `minicpm`, `olmo2`,
-  `granite`, `deepseek`, `dbrx`, `grok`, `mamba2` (`llava` implies `llama`).
-- Tests: **334 passing**.
+  `granite`, `deepseek`, `dbrx`, `grok`, `mamba2`, `jamba`
+  (`llava` implies `llama`; `jamba` implies `mamba2`).
+- Tests: **397 passing**.
 - Upstream dependencies: `oxillama-gguf`, `oxillama-quant`, `half`,
   `thiserror`, `tracing` — all workspace-pinned.
 - Policy compliance: no `unwrap()` in production paths, all files
@@ -48,9 +49,9 @@ production paths.
 | OLMo2 | ✓ | Reordered post-norms (after attention + after FFN) |
 | Granite 3.x | ✓ | Dense decoder-only; IBM open LLM family |
 | DeepSeek-V2 / V3 | ✓ | MLA (compressed latent KV) + shared/routed MoE |
-| DBRX | ✓ | Fine-grained 16-expert MoE, top-4 routing — **new in v0.1.1** |
-| Grok-1 | ✓ | 8-expert MoE, top-2, RoPE θ=1e6 — **new in v0.1.1** |
-| Mamba-2 | ✓ | Selective-scan SSM with learned Δ — **new in v0.1.1** |
+| DBRX | ✓ | Fine-grained 16-expert MoE, top-4 routing — new in v0.1.1; GGUF loaders completed in v0.1.2 |
+| Grok-1 | ✓ | 8-expert MoE, top-2, RoPE θ=1e6 — new in v0.1.1; GGUF loaders completed in v0.1.2 |
+| Mamba-2 | ✓ | Selective-scan SSM with learned Δ — new in v0.1.1; GGUF loaders completed in v0.1.2 |
 | Yi | ✓ | 01.AI Yi; LLaMA topology, GGUF arch `"yi"` |
 | InternLM3 | ✓ | Shanghai AI Lab InternLM3 |
 
@@ -396,4 +397,4 @@ depends on `llama` for its language-model backbone and enables the
   - Tests: (a) `ssm_scan_matches_reference` — 32-token sequence, tol 1e-5; (b) `conv1d_depthwise_matches_reference`; (c) `mamba2_forward_shape_and_finite` via `build_minimal_mamba2_gguf()`; (d) `sequence_state_reset_roundtrip`.
   - Risk: A stored as log(A) — MUST use `exp(-Δ * exp(log_A))`. ssm.rs should stay under 1000 LoC; split into scan.rs + state.rs if needed.
 
-*Last updated: 2026-04-24 (v0.1.1 shipped — D1 DBRX, D2 Grok-1, D3 DeepSeek-V3 sigmoid MoE, E1 SequenceState, E2 Mamba-2 all [x]; 18 architectures, 334 tests; cross-arch fuzz harness shipped at tests/arch_fuzz.rs)*
+*Last updated: 2026-04-25 (v0.1.2 — DBRX/Grok-1/Mamba-2 GGUF loaders completed; KvCacheAccess gained `kv_dim`/`for_each_key`/`for_each_value`; `BatchedKvView`+`KvSlot` moved to `traits.rs`; `ForwardPass::forward_batched` added (NotSupported default + LLaMA impl); 20 architectures, 397 tests, 1 skipped)*

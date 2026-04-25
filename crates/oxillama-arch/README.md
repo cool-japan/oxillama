@@ -6,7 +6,7 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 
 ## Status
 
-**Version:** 0.1.1 — **Tests:** 367 passing — **Architectures:** 20 — **Status:** Alpha
+**Version:** 0.1.2 — **Tests:** 397 passing — **Architectures:** 20 — **Status:** Alpha
 
 ## Supported Architectures
 
@@ -25,9 +25,9 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 | OLMo2 | `olmo2` (default) | Allen AI OLMo2 (reordered post-norms) |
 | Granite | `granite` (default) | IBM Granite 3.x dense decoder |
 | DeepSeek-V2 / V3 | `deepseek` (default) | MLA + MoE; sigmoid-with-bias scoring for V3 |
-| DBRX | `dbrx` (default) | Databricks DBRX (16-expert MoE, top-4) — **new in v0.1.1** |
-| Grok-1 | `grok` (default) | xAI Grok-1 (8-expert MoE, top-2, RoPE θ=1e6) — **new in v0.1.1** |
-| Mamba-2 | `mamba2` (default) | Selective-scan SSM — **new in v0.1.1** |
+| DBRX | `dbrx` (default) | Databricks DBRX (16-expert MoE, top-4) — new in v0.1.1; GGUF loaders completed in v0.1.2 |
+| Grok-1 | `grok` (default) | xAI Grok-1 (8-expert MoE, top-2, RoPE θ=1e6) — new in v0.1.1; GGUF loaders completed in v0.1.2 |
+| Mamba-2 | `mamba2` (default) | Selective-scan SSM — new in v0.1.1; GGUF loaders completed in v0.1.2 |
 | Jamba | `jamba` (default) | Hybrid attention+SSM (AI21 Labs) — interleaves transformer attention with Mamba-2 SSM layers (requires `mamba2`) — **new in v0.1.1** |
 | Yi | always-on | 01.AI Yi (LLaMA topology, compiled unconditionally) |
 | InternLM3 | always-on | Shanghai AI Lab InternLM3 (compiled unconditionally) |
@@ -39,8 +39,9 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 |------|-------------|
 | `ModelArchitecture` | Enum variant per supported architecture |
 | `LlamaModel` | Weight tensors + config for LLaMA-family models |
-| `ForwardPass` | Trait: `forward(&self, tokens, cache) -> logits` |
+| `ForwardPass` | Trait: `forward(&self, tokens, cache) -> logits`; `forward_batched` added in v0.1.2 (NotSupported default + LLaMA impl) |
 | `SequenceState` | Trait: generalises `KvCacheAccess` for SSMs — **new in v0.1.1** |
+| `BatchedKvView` | View over a batch slice of the KV cache; `KvSlot` per sequence — moved to `traits.rs` in v0.1.2 |
 | `ArchError` | Unified error type wrapping `GgufError` and `QuantError` |
 
 ## Usage

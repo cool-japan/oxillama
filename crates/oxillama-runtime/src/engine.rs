@@ -22,6 +22,7 @@ use oxillama_gguf::GgufModel;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::kv_cache::{KvCache, KvCacheSnapshot};
 use crate::metrics::{EngineMetrics, MetricsSnapshot};
+use crate::offload::{LayerPager, OffloadPolicy};
 use crate::sampling::{Sampler, SamplerConfig};
 use crate::tokenizer_bridge::TokenizerBridge;
 use std::sync::Arc;
@@ -47,6 +48,15 @@ pub struct EngineConfig {
     /// of slightly higher overhead from multiple forward calls.
     /// Default: 512.
     pub prefill_chunk_size: usize,
+
+    /// CPU/disk offload policy.
+    ///
+    /// Controls which model weights are kept resident in RAM and which are
+    /// evicted to disk and reloaded on demand.
+    ///
+    /// Default: [`OffloadPolicy::None`] — all weights remain in RAM, matching
+    /// classic llama.cpp behaviour.
+    pub offload_policy: OffloadPolicy,
 }
 
 impl Default for EngineConfig {
@@ -58,7 +68,17 @@ impl Default for EngineConfig {
             num_threads: 4,
             sampler: SamplerConfig::default(),
             prefill_chunk_size: 512,
+            offload_policy: OffloadPolicy::None,
         }
+    }
+}
+
+impl EngineConfig {
+    /// Set the CPU/disk offload policy, consuming self and returning the
+    /// updated config (builder pattern).
+    pub fn with_offload(mut self, policy: OffloadPolicy) -> Self {
+        self.offload_policy = policy;
+        self
     }
 }
 
@@ -84,6 +104,18 @@ pub struct InferenceEngine {
     metrics: Arc<EngineMetrics>,
     /// Stack of active LoRA adapters (in insertion order).
     lora_stack: oxillama_arch::LoraStack,
+    /// Optional CPU/disk layer pager (None when offload_policy is None).
+    ///
+    /// When present, linear-layer forward passes can call
+    /// `layer_pager.acquire(&tensor_id)` to get (or load from disk) the
+    /// raw quantized bytes for a given weight tensor.  This is the
+    /// graceful-fallback path: if `layer_pager` is `None`, existing in-RAM
+    /// weight references are used unchanged.
+    ///
+    /// Full integration with the arch-layer forward kernels (wiring through
+    /// `acquire` at each GEMM site) requires changes in `oxillama-arch` and
+    /// is deferred to a follow-up subtask (R1-arch integration).
+    layer_pager: Option<Arc<LayerPager>>,
 }
 
 impl InferenceEngine {
@@ -99,7 +131,28 @@ impl InferenceEngine {
             eos_token_id: None,
             metrics: EngineMetrics::new(),
             lora_stack: oxillama_arch::LoraStack::new(),
+            layer_pager: None,
         }
+    }
+
+    /// Return a reference to the active layer pager, if offloading is enabled.
+    ///
+    /// This is the inspection / integration hook that arch-layer code (or
+    /// higher-level callers) can use to acquire tensors on demand.  When
+    /// the pager is `None`, the engine is running in the default fully-in-RAM
+    /// mode.
+    pub fn layer_pager(&self) -> Option<&Arc<LayerPager>> {
+        self.layer_pager.as_ref()
+    }
+
+    /// Attach a pre-built [`LayerPager`] to this engine.
+    ///
+    /// This is the integration point for callers that construct their own
+    /// pager (e.g. from a custom [`PagerSource`][crate::offload::PagerSource])
+    /// and want to inject it rather than relying on the engine to build one
+    /// automatically from the GGUF file.
+    pub fn set_layer_pager(&mut self, pager: Arc<LayerPager>) {
+        self.layer_pager = Some(pager);
     }
 
     /// Load the model from an in-memory GGUF byte buffer.

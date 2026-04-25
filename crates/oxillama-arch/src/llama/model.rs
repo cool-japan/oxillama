@@ -14,7 +14,7 @@ use crate::common::swiglu::swiglu_inplace;
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::lora::LoadedLora;
-use crate::traits::{ForwardPass, KvCacheAccess};
+use crate::traits::{BatchedKvView, ForwardPass, KvCacheAccess};
 use oxillama_quant::{KernelDispatcher, QuantTensor};
 
 /// Weights for a dense SwiGLU FFN layer.
@@ -468,6 +468,112 @@ impl ForwardPass for LlamaModel {
             // MoE expert LoRA is not supported in this implementation.
         }
         Ok(())
+    }
+
+    fn forward_batched(
+        &mut self,
+        q_batch: &[f32],
+        kv_view: &dyn BatchedKvView,
+        num_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> ArchResult<Vec<f32>> {
+        // Proof-of-concept: iterate per-slot, run scaled-dot-product attention for each.
+        let head_stride = num_heads * head_dim;
+        if head_stride == 0 {
+            return Err(ArchError::ForwardPassError {
+                layer: 0,
+                message: "num_heads and head_dim must be > 0".to_string(),
+            });
+        }
+
+        let batch_size = q_batch.len() / head_stride;
+        if batch_size == 0 {
+            return Ok(vec![]);
+        }
+
+        let slot_count = kv_view.slot_count();
+        if slot_count != batch_size {
+            return Err(ArchError::ForwardPassError {
+                layer: 0,
+                message: format!("batch_size {batch_size} != kv_view slot_count {slot_count}"),
+            });
+        }
+
+        let mut out = vec![0.0f32; batch_size * head_stride];
+
+        // Process each slot independently (single-slot scaled-dot-product attention).
+        for slot_idx in 0..slot_count {
+            let q_slot = &q_batch[slot_idx * head_stride..(slot_idx + 1) * head_stride];
+            let (keys, values) = kv_view.kv_for_slot(slot_idx);
+            let pos = kv_view.position(slot_idx);
+
+            if pos == 0 || keys.is_empty() {
+                // No KV cache — output zeros (will be projected by the caller).
+                continue;
+            }
+
+            // kv_dim = num_heads * head_dim (full KV, not GQA for simplicity).
+            let kv_head_dim = if keys.len() % (pos * num_heads) == 0 {
+                keys.len() / (pos * num_heads)
+            } else {
+                head_dim // fallback
+            };
+
+            // Per-head scaled dot-product attention.
+            for h in 0..num_heads {
+                let q_head = &q_slot[h * head_dim..(h + 1) * head_dim];
+
+                // Compute attention scores: q @ K^T
+                let kv_h = h.min(
+                    keys.len()
+                        .checked_div(pos.saturating_mul(kv_head_dim))
+                        .unwrap_or(0)
+                        .saturating_sub(1),
+                );
+                let mut scores = vec![0.0f32; pos];
+                for (p, score) in scores.iter_mut().enumerate() {
+                    let k_base = p * num_heads * kv_head_dim + kv_h * kv_head_dim;
+                    let k_end = (k_base + kv_head_dim).min(keys.len());
+                    if k_base >= keys.len() {
+                        break;
+                    }
+                    let k_pos = &keys[k_base..k_end];
+                    *score = q_head
+                        .iter()
+                        .zip(k_pos.iter())
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        * scale;
+                }
+
+                // Softmax over scores.
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = scores.iter().map(|s| (s - max_s).exp()).sum();
+                let inv_sum = 1.0 / sum.max(1e-10);
+                for s in &mut scores {
+                    *s = (*s - max_s).exp() * inv_sum;
+                }
+
+                // Weighted sum of values.
+                let out_start = slot_idx * head_stride + h * head_dim;
+                let out_end = slot_idx * head_stride + (h + 1) * head_dim;
+                let out_head = &mut out[out_start..out_end];
+                for (p, &attn_weight) in scores.iter().enumerate() {
+                    let v_start =
+                        (p * num_heads * kv_head_dim + kv_h * kv_head_dim).min(values.len());
+                    let v_end = (v_start + head_dim).min(values.len());
+                    if v_start >= values.len() {
+                        break;
+                    }
+                    for (o, &v) in out_head.iter_mut().zip(values[v_start..v_end].iter()) {
+                        *o += attn_weight * v;
+                    }
+                }
+            }
+        }
+
+        Ok(out)
     }
 }
 

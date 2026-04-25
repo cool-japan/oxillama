@@ -456,6 +456,7 @@ impl InferenceEngine {
             num_threads: snap.num_threads,
             sampler: sampler_config,
             prefill_chunk_size: snap.prefill_chunk_size,
+            offload_policy: crate::offload::OffloadPolicy::None,
         };
 
         let mut engine = Self::new(config);

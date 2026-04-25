@@ -31,6 +31,11 @@ pub struct DeepSeekConfig {
     pub shared_expert_intermediate_size: usize,
     /// Scaling factor for the routing score normalisation (if sigmoid mode).
     pub routed_scaling_factor: f32,
+    /// Number of leading dense layers before MoE layers begin.
+    ///
+    /// Layers `0..first_k_dense_replace` use a standard dense SwiGLU FFN;
+    /// layers `first_k_dense_replace..num_layers` use the DeepSeek sparse MoE FFN.
+    pub first_k_dense_replace: usize,
 }
 
 impl DeepSeekConfig {
@@ -91,6 +96,11 @@ impl DeepSeekConfig {
             .get_f32("deepseek2.expert_weights_scale")
             .unwrap_or(1.0);
 
+        let first_k_dense_replace = metadata
+            .get_u32("deepseek2.leading_dense_block_count")
+            .map(|v| v as usize)
+            .unwrap_or(1);
+
         Self {
             q_lora_rank,
             kv_lora_rank,
@@ -102,6 +112,7 @@ impl DeepSeekConfig {
             top_k_routed,
             shared_expert_intermediate_size,
             routed_scaling_factor,
+            first_k_dense_replace,
         }
     }
 }

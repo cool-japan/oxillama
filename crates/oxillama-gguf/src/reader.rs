@@ -3,6 +3,9 @@
 //! Provides bounds-checked reading of primitive types from a byte slice,
 //! tracking the current read position automatically.
 
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
+
 use crate::error::{GgufError, GgufResult};
 
 /// A cursor-based reader over a byte slice with bounds checking.

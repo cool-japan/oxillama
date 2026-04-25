@@ -101,6 +101,7 @@ impl PyEngineConfig {
             num_threads: self.num_threads,
             sampler: self.sampler.to_rust(),
             prefill_chunk_size: 512,
+            offload_policy: oxillama_runtime::OffloadPolicy::None,
         }
     }
 }
@@ -521,6 +522,7 @@ impl PyEngine {
     /// Raises:
     ///     IOError:      if the download or GGUF file fails.
     ///     RuntimeError: if no ``.gguf`` file is found in the repository.
+    #[cfg(feature = "hub")]
     #[classmethod]
     #[pyo3(signature = (
         repo_id,

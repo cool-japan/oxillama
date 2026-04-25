@@ -30,6 +30,8 @@ pub mod batch_spool;
 pub mod body_limit;
 pub mod config;
 pub mod error;
+#[cfg(feature = "jwt")]
+pub mod jwt_auth;
 pub mod metrics;
 pub mod queue;
 pub mod rate_limit;

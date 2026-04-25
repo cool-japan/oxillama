@@ -3,6 +3,9 @@
 //! Parses the entire GGUF binary format: header, metadata KV pairs,
 //! tensor info entries, and computes the data section offset.
 
+#[cfg(not(feature = "std"))]
+use alloc::{format, string::ToString, vec::Vec};
+
 use crate::error::{GgufError, GgufResult};
 use crate::header::GgufHeader;
 use crate::metadata::{MetadataStore, MetadataValue};

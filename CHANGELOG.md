@@ -7,6 +7,33 @@ OxiLLaMa uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-04-25
+
+### Added
+
+#### Session Persistence (`oxillama-runtime`)
+- **Conversation save/resume** (`session.rs`): `Session::save()` and `Session::load()` serialize the full conversation history via `oxicode` (COOLJAPAN Pure Rust codec); SHA-256 KV sidecar validates integrity on load; schema version guard rejects incompatible session files
+- **`/save` and `/load` slash commands**: interactive CLI commands to persist and restore conversation sessions across process restarts
+
+#### HuggingFace Hub Integration (`oxillama-cli`)
+- **`oxillama hub pull/list/rm` subcommands**: download models directly from HuggingFace Hub (`hf-hub 0.5`), list cached models, and remove cached entries; uses `ureq` with `rustls` for Pure Rust TLS and the `directories` crate for platform-appropriate cache paths
+
+#### TUI Chat Mode (`oxillama-cli`)
+- **Full-screen TUI chat** (`ratatui 0.30` + `crossterm 0.29`): scrollable chat history, input line, live streaming via `spawn_blocking` + `mpsc` channel for async token delivery without blocking the TUI event loop; 6 unit tests covering layout, input handling, and message rendering
+
+#### New Architecture Loaders (`oxillama-arch`)
+- **DBRX GGUF loader**: support for Databricks DBRX mixture-of-experts architecture
+- **Grok-1 GGUF loader**: support for xAI Grok-1 architecture
+- **Mamba-2 GGUF loader**: support for state-space model architecture with `embed()` override for Mamba-2-specific token embedding logic
+
+#### KV Cache API Extensions (`oxillama-arch`)
+- **`KvCacheAccess` trait extensions**: new `kv_dim()`, `for_each_key()`, and `for_each_value()` methods on the `KvCacheAccess` trait; `PagedKvCache` fully implements multi-page support for all three methods
+- **`BatchedKvView` + `KvSlot`**: moved to `oxillama-arch/traits.rs` for cross-crate reuse
+- **`ForwardPass::forward_batched`**: default implementation added to the trait; LLaMA provides a concrete optimized implementation
+
+#### Quality
+- **2,020 tests passing**, up from 1,979 in v0.1.1
+
 ## [0.1.1] - 2026-04-24
 
 ### Added

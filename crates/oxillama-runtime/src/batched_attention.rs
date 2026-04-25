@@ -19,15 +19,11 @@
 //!   seq-major format with `seq_len_q = 1`).
 //! * Output: `[batch_size, num_heads, head_dim]`.
 //!
-//! # Note on ForwardPass integration
+//! # Integration with ForwardPass
 //!
-//! Full end-to-end continuous batching requires `ForwardPass::forward` in
-//! `oxillama-arch` to accept a batched query tensor and a `BatchedKvView`.
-//! That signature change is outside the scope of this crate.  The kernel
-//! here is the runtime primitive that the arch crate will delegate to once
-//! its interface is extended.
-//!
-//! TODO: requires `ForwardPass::forward_batched` in oxillama-arch.
+//! `ForwardPass::forward_batched` in `oxillama-arch` delegates to this
+//! kernel for LLaMA and other architectures that support continuous batching.
+//! Non-overriding architectures return `ArchError::NotSupported`.
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::flash_attention::flash_attention_forward;

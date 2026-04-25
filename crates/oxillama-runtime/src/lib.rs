@@ -13,11 +13,13 @@ pub mod kv_cache;
 pub mod kv_pool;
 pub mod lora_loader;
 pub mod metrics;
+pub mod offload;
 pub mod sampling;
 pub mod scheduler;
 pub mod sequence_pool;
 pub mod snapshot;
 pub mod speculative;
+#[cfg(feature = "native-async")]
 pub mod speculative_async;
 pub mod tokenizer_bridge;
 pub mod tool_dispatch;
@@ -33,6 +35,10 @@ pub use kv_cache::{BatchedKvView, KvCache, KvCacheSnapshot, KvSlot, VecBatchedKv
 pub use kv_pool::KvCachePool;
 pub use lora_loader::apply_lora;
 pub use metrics::{EngineMetrics, MetricsSnapshot};
+pub use offload::{
+    FilePagerSource, LayerPager, MemoryPressureProbe, OffloadPolicy, PagerSource, ResidentTensor,
+    TensorEntry, TensorId,
+};
 pub use oxillama_arch::LoraStack;
 pub use sampling::chain::{SamplerChain, SamplerStage};
 pub use sampling::grammar::{Grammar, GrammarError, GrammarState};
@@ -40,6 +46,7 @@ pub use sampling::{sample, Sampler, SamplerConfig};
 pub use scheduler::{Scheduler, SchedulerConfig, MAX_DECODE_WAIT_MS, PREFILL_CHUNK};
 pub use sequence_pool::{PoolError, PoolResult, SequencePool, SequenceSlot, SsmStatePool};
 pub use speculative::{SpeculativeConfig, SpeculativeDeltaSync, SpeculativeEngine};
+#[cfg(feature = "native-async")]
 pub use speculative_async::{
     AsyncSpecConfig, RewindError, Rewindable, SpecStats, SpeculativeDecoder,
 };

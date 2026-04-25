@@ -133,7 +133,23 @@ pub fn build_app_with_config(state: Arc<AppState>, config: &ServerConfig) -> Rou
             .layer(axum::Extension(limiter));
     }
 
-    // Auth layer
+    // Auth layer — JWT takes priority over static bearer keys.
+    #[cfg(feature = "jwt")]
+    if let Some(jwt_config) = config.jwt.clone() {
+        use crate::jwt_auth::{jwt_auth_middleware, JwtVerifier};
+        let verifier = Arc::new(JwtVerifier::new(jwt_config));
+        app = app.layer(axum::middleware::from_fn_with_state(
+            verifier,
+            jwt_auth_middleware,
+        ));
+    } else if !config.api_keys.is_empty() {
+        let keys = ApiKeys(Arc::new(config.api_keys.clone()));
+        app = app
+            .layer(axum::middleware::from_fn(auth_middleware))
+            .layer(axum::Extension(keys));
+    }
+
+    #[cfg(not(feature = "jwt"))]
     if !config.api_keys.is_empty() {
         let keys = ApiKeys(Arc::new(config.api_keys.clone()));
         app = app

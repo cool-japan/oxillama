@@ -33,7 +33,7 @@ jamba = ["mamba2"]
 reference-f32 = []
 
 [dependencies]
-oxillama-gguf.workspace = true
+oxillama-gguf = { workspace = true, features = ["std"] }
 oxillama-quant.workspace = true
 half.workspace = true
 thiserror.workspace = true

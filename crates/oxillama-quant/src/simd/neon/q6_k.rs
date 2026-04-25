@@ -541,6 +541,155 @@ impl QuantKernel for Q6_KNeon {
     fn name(&self) -> &'static str {
         "Q6_K_NEON"
     }
+
+    /// Fused Q6_K weight × Q8_0 activation GEMV using NEON.
+    ///
+    /// Each Q6_K super-block (256 weights) maps to 8 Q8_0 activation blocks.
+    /// Column `col` → Q8_0 block `blk*8 + col/32`, lane `col % 32`.
+    /// Accumulates into `out` (ACCUMULATE semantics).
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let q8_blocks_per_row = blocks_per_row * 8;
+        let acts_needed = q8_blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            // SAFETY: bounds checked above.
+            let row_sum = unsafe {
+                fused_q6_k_q8_0_row_neon(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            *out_val += row_sum;
+        }
+
+        Ok(())
+    }
+}
+
+/// Q8_0 activation block byte count.
+const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Convert two raw LE bytes to f32 via FP16.
+#[inline(always)]
+fn f16_bytes_to_f32_neon(bytes: [u8; 2]) -> f32 {
+    half::f16::from_le_bytes(bytes).to_f32()
+}
+
+/// Fused Q6_K weight × Q8_0 activation dot product for one row using NEON.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES`
+/// - Must run on AArch64 with NEON.
+unsafe fn fused_q6_k_q8_0_row_neon(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    let mut row_sum = 0.0f32;
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        // SAFETY: blk < blocks_per_row; row_data.len() == blocks_per_row * BLOCK_BYTES.
+        let block = &row_data[bo..bo + BLOCK_BYTES];
+
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let d = f16_bytes_to_f32_neon([block[208], block[209]]);
+
+        let input_offset = blk * BLOCK_SIZE;
+        let cols_in_block = (n_cols - input_offset).min(BLOCK_SIZE);
+
+        for group in 0..2 {
+            let ql_off = group * 64;
+            let qh_off = group * 32;
+            let sc_off = group * 8;
+            let in_off = group * 128;
+
+            for l in 0..32 {
+                let is = l / 16;
+
+                let q1 = ((ql[ql_off + l] & 0x0F) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
+                let q2 =
+                    ((ql[ql_off + l + 32] & 0x0F) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 =
+                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+
+                let s0 = d * scales[sc_off + is] as i8 as f32;
+                let s1 = d * scales[sc_off + is + 2] as i8 as f32;
+                let s2 = d * scales[sc_off + is + 4] as i8 as f32;
+                let s3 = d * scales[sc_off + is + 6] as i8 as f32;
+
+                let c0 = in_off + l;
+                let c1 = in_off + l + 32;
+                let c2 = in_off + l + 64;
+                let c3 = in_off + l + 96;
+
+                let sample_q8 = |col: usize| -> Option<f32> {
+                    if col >= cols_in_block {
+                        return None;
+                    }
+                    let q8_blk = blk * 8 + col / 32;
+                    let q8_lane = col % 32;
+                    // SAFETY: acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES.
+                    let ab = &acts_q8[q8_blk * Q8_0_BLOCK_BYTES..(q8_blk + 1) * Q8_0_BLOCK_BYTES];
+                    let d_a = f16_bytes_to_f32_neon([ab[0], ab[1]]);
+                    let q_a = ab[2 + q8_lane] as i8 as f32;
+                    Some(d_a * q_a)
+                };
+
+                if let Some(a0) = sample_q8(c0) {
+                    row_sum += s0 * q1 as f32 * a0;
+                }
+                if let Some(a1) = sample_q8(c1) {
+                    row_sum += s1 * q2 as f32 * a1;
+                }
+                if let Some(a2) = sample_q8(c2) {
+                    row_sum += s2 * q3 as f32 * a2;
+                }
+                if let Some(a3) = sample_q8(c3) {
+                    row_sum += s3 * q4 as f32 * a3;
+                }
+            }
+        }
+    }
+
+    row_sum
 }
 
 // ---------------------------------------------------------------------------
@@ -751,5 +900,128 @@ mod tests {
                 "gemm/gemv mismatch at row {i}: gemm={g}, gemv={v}"
             );
         }
+    }
+
+    // ── matvec_q8_fused ───────────────────────────────────────────────────
+
+    fn make_q8_0_block(scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(34);
+        block.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+        for &v in values {
+            block.push(v as u8);
+        }
+        block
+    }
+
+    fn make_q8_acts(n_q8_blocks: usize, scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        make_q8_0_block(scale, values).repeat(n_q8_blocks)
+    }
+
+    #[test]
+    fn test_q6k_neon_fused_matches_reference_single_block() {
+        let mut ql = [0u8; 128];
+        for (i, q) in ql.iter_mut().enumerate() {
+            *q = ((i * 5 + 11) & 0xFF) as u8;
+        }
+        let mut qh = [0u8; 64];
+        for (i, h) in qh.iter_mut().enumerate() {
+            *h = ((i * 13 + 7) & 0xFF) as u8;
+        }
+        let scales: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+
+        let w_block = make_q6k_block(0.01, &ql, &qh, &scales);
+        let act_vals: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 0, 1, -1, 2, -2, 3, -3,
+            4, -4, 5, -5, 6, -6, 7, -7, 8,
+        ];
+        let acts = make_q8_acts(8, 0.1, &act_vals);
+
+        let mut out_neon = vec![0.0f32; 1];
+        let mut out_ref = vec![0.0f32; 1];
+
+        Q6_KNeon
+            .matvec_q8_fused(&w_block, &acts, &mut out_neon, 1, 256)
+            .expect("neon fused single block");
+        Q6KRef
+            .matvec_q8_fused(&w_block, &acts, &mut out_ref, 1, 256)
+            .expect("ref fused single block");
+
+        let err = (out_neon[0] - out_ref[0]).abs();
+        assert!(
+            err < 1e-3,
+            "fused single-block mismatch: neon={} ref={} err={}",
+            out_neon[0],
+            out_ref[0],
+            err
+        );
+    }
+
+    #[test]
+    fn test_q6k_neon_fused_multi_row() {
+        let n_rows = 3usize;
+        let n_cols = 512usize;
+        let blocks_per_row = 2usize;
+        let q8_blocks_per_row = blocks_per_row * 8;
+
+        let mut all_weights = Vec::new();
+        for r in 0..n_rows {
+            for b in 0..blocks_per_row {
+                let mut ql = [0u8; 128];
+                for (i, q) in ql.iter_mut().enumerate() {
+                    *q = ((r * 17 + b * 11 + i * 5) & 0xFF) as u8;
+                }
+                let mut qh = [0u8; 64];
+                for (i, h) in qh.iter_mut().enumerate() {
+                    *h = ((r * 13 + b * 19 + i * 3) & 0xFF) as u8;
+                }
+                let scales: [u8; 16] =
+                    core::array::from_fn(|i| ((r * 7 + b * 11 + i * 13 + 5) & 0xFF) as u8);
+                all_weights.extend(make_q6k_block(0.01 + r as f32 * 0.005, &ql, &qh, &scales));
+            }
+        }
+
+        let act_vals: [i8; 32] = [
+            2, -3, 5, -7, 1, -1, 4, -4, 6, -6, 3, -3, 2, -2, 1, -1, 8, -8, 7, -7, 6, -6, 5, -5, 4,
+            -4, 3, -3, 2, -2, 1, -1,
+        ];
+        let acts = make_q8_acts(q8_blocks_per_row, 0.05, &act_vals);
+
+        let mut out_neon = vec![0.0f32; n_rows];
+        let mut out_ref = vec![0.0f32; n_rows];
+
+        Q6_KNeon
+            .matvec_q8_fused(&all_weights, &acts, &mut out_neon, n_rows, n_cols)
+            .expect("neon fused multi-row");
+        Q6KRef
+            .matvec_q8_fused(&all_weights, &acts, &mut out_ref, n_rows, n_cols)
+            .expect("ref fused multi-row");
+
+        for i in 0..n_rows {
+            let err = (out_neon[i] - out_ref[i]).abs();
+            assert!(
+                err < 1e-3,
+                "fused multi-row row {i}: neon={} ref={} err={}",
+                out_neon[i],
+                out_ref[i],
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_q6k_neon_fused_accumulate_semantics() {
+        let w_block = make_q6k_block(0.0, &[0u8; 128], &[0u8; 64], &[0u8; 16]);
+        let acts = make_q8_acts(8, 0.0, &[0i8; 32]);
+
+        let mut out = vec![77.0f32; 1];
+        Q6_KNeon
+            .matvec_q8_fused(&w_block, &acts, &mut out, 1, 256)
+            .expect("neon fused accumulate");
+
+        assert!(
+            (out[0] - 77.0).abs() < 1e-5,
+            "accumulate semantics broken: expected 77.0, got {}",
+            out[0]
+        );
     }
 }

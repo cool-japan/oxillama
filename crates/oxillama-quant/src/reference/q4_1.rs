@@ -87,17 +87,24 @@ impl QuantKernel for Q4_1Ref {
                 let d = f16_to_f32(u16::from_le_bytes([data[bo], data[bo + 1]]));
                 let m = f16_to_f32(u16::from_le_bytes([data[bo + 2], data[bo + 3]]));
                 let qs = &data[bo + 4..bo + 20];
-                let inp = &input[blk * Q4_1_BLOCK_SIZE..];
+                let input_offset = blk * Q4_1_BLOCK_SIZE;
+                let n_remaining = n_cols.saturating_sub(input_offset).min(Q4_1_BLOCK_SIZE);
+                let inp = &input[input_offset..input_offset + n_remaining];
 
-                // Inline dot product: extract nibbles on-the-fly
-                // Dequant layout: [lo0, hi0, lo1, hi1, ...] (interleaved)
                 let mut input_sum = 0.0f32;
                 for i in 0..16 {
                     let lo = (qs[i] & 0x0F) as f32;
                     let hi = (qs[i] >> 4) as f32;
-                    sum += d * lo * inp[i * 2];
-                    sum += d * hi * inp[i * 2 + 1];
-                    input_sum += inp[i * 2] + inp[i * 2 + 1];
+                    let j0 = i * 2;
+                    let j1 = i * 2 + 1;
+                    if j0 < n_remaining {
+                        sum += d * lo * inp[j0];
+                        input_sum += inp[j0];
+                    }
+                    if j1 < n_remaining {
+                        sum += d * hi * inp[j1];
+                        input_sum += inp[j1];
+                    }
                 }
                 sum += m * input_sum;
             }

@@ -220,7 +220,140 @@ impl QuantKernel for Q5KRef {
     fn name(&self) -> &'static str {
         "Q5_K"
     }
+
+    /// Override of `matvec_q8_fused` required because the trait default is wrong for Q5_K.
+    ///
+    /// # Why the default is broken
+    /// The trait default assumes one Q8_0 block per weight block.  For Q5_K (block_size=256),
+    /// each weight super-block spans 8 Q8_0 activation blocks (32 activations each).
+    ///
+    /// # Block mapping
+    /// 1 Q5_K weight block (176 bytes, 256 weights) ↔ 8 Q8_0 activation blocks.
+    /// Sub-block `s` (0..8) uses Q8_0 activation at index `blk * 8 + s`.
+    ///
+    /// # Formula per sub-block `s`
+    /// `contrib_s = d_a * (d * sc[s] * Σ(q5 * q_a) − dmin * mn[s] * Σ(q_a))`
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(crate::error::QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(Q5_K_BLOCK_SIZE);
+        let row_bytes = blocks_per_row * Q5_K_BLOCK_BYTES;
+        // Each Q5_K super-block maps to 8 Q8_0 activation blocks.
+        let q8_blocks_per_row = blocks_per_row * 8;
+        let acts_needed = q8_blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(crate::error::QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(crate::error::QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            let mut sum = 0.0f32;
+
+            for blk in 0..blocks_per_row {
+                let bo = row_start + blk * Q5_K_BLOCK_BYTES;
+                let block = &weights[bo..bo + Q5_K_BLOCK_BYTES];
+
+                let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+                let (sc, mn) = decode_scales_mins(&block[4..16]);
+                let qh = &block[16..48]; // 32 bytes: high bit per weight
+                let qs = &block[48..176]; // 128 bytes: lo 4-bit quants
+
+                let input_offset = blk * Q5_K_BLOCK_SIZE;
+                let cols_in_block = (n_cols - input_offset).min(Q5_K_BLOCK_SIZE);
+
+                let mut is = 0usize;
+                let mut qs_off = 0usize;
+                let mut w_off = 0usize;
+
+                for group in 0..4 {
+                    // Sub-block `is` (lo nibbles)
+                    let a_idx_lo = blk * 8 + is;
+                    let a_start_lo = a_idx_lo * Q8_0_BLOCK_BYTES;
+                    let a_block_lo = &acts_q8[a_start_lo..a_start_lo + Q8_0_BLOCK_BYTES];
+                    let d_a_lo = f16_to_f32(u16::from_le_bytes([a_block_lo[0], a_block_lo[1]]));
+                    let q8_lo = &a_block_lo[2..]; // 32 i8 values
+
+                    let da_lo = d * sc[is] as f32;
+                    let m_lo = dmin * mn[is] as f32;
+
+                    // Sub-block `is+1` (hi nibbles)
+                    let a_idx_hi = blk * 8 + is + 1;
+                    let a_start_hi = a_idx_hi * Q8_0_BLOCK_BYTES;
+                    let a_block_hi = &acts_q8[a_start_hi..a_start_hi + Q8_0_BLOCK_BYTES];
+                    let d_a_hi = f16_to_f32(u16::from_le_bytes([a_block_hi[0], a_block_hi[1]]));
+                    let q8_hi = &a_block_hi[2..]; // 32 i8 values
+
+                    let da_hi = d * sc[is + 1] as f32;
+                    let m_hi = dmin * mn[is + 1] as f32;
+
+                    // Lo nibbles → first 32 weights of this group
+                    let mut dot_lo = 0.0f32;
+                    let mut sum_a_lo = 0.0f32;
+                    for l in 0..32 {
+                        let col = w_off + l;
+                        if col < cols_in_block {
+                            let qh_bit = (qh[l] >> group) & 1;
+                            let q_w = ((qs[qs_off + l] & 0x0F) | (qh_bit << 4)) as f32;
+                            let q_a = q8_lo[l] as i8 as f32;
+                            dot_lo += q_w * q_a;
+                            sum_a_lo += q_a;
+                        }
+                    }
+                    sum += (da_lo * dot_lo - m_lo * sum_a_lo) * d_a_lo;
+
+                    // Hi nibbles → next 32 weights
+                    let mut dot_hi = 0.0f32;
+                    let mut sum_a_hi = 0.0f32;
+                    for l in 0..32 {
+                        let col = w_off + 32 + l;
+                        if col < cols_in_block {
+                            let qh_bit = (qh[l] >> (group + 4)) & 1;
+                            let q_w = (((qs[qs_off + l] >> 4) & 0x0F) | (qh_bit << 4)) as f32;
+                            let q_a = q8_hi[l] as i8 as f32;
+                            dot_hi += q_w * q_a;
+                            sum_a_hi += q_a;
+                        }
+                    }
+                    sum += (da_hi * dot_hi - m_hi * sum_a_hi) * d_a_hi;
+
+                    is += 2;
+                    qs_off += 32;
+                    w_off += 64;
+                }
+            }
+
+            *out_val += sum;
+        }
+
+        Ok(())
+    }
 }
+
+/// Q8_0 activation block byte count used in fused GEMV.
+const Q8_0_BLOCK_BYTES: usize = 34;
 
 fn f16_to_f32(bits: u16) -> f32 {
     half::f16::from_bits(bits).to_f32()

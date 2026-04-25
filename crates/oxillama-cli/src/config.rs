@@ -60,8 +60,15 @@ pub fn load_config(path: Option<PathBuf>) -> Result<OxillamaConfig> {
 
     // 2. Explicit CLI flag.
     if let Some(p) = path {
-        return read_config_toml(&p)
-            .with_context(|| format!("loading config from --config {}", p.display()));
+        if !p.exists() {
+            eprintln!(
+                "Warning: config file '{}' not found, using defaults",
+                p.display()
+            );
+        } else {
+            return read_config_toml(&p)
+                .with_context(|| format!("loading config from --config {}", p.display()));
+        }
     }
 
     // 3. Default location.
@@ -114,6 +121,27 @@ mod tests {
         let cfg = load_config(None).expect("load_config should not fail");
         assert!(cfg.default_model.is_none());
         assert!(cfg.default_ctx_size.is_none());
+    }
+
+    #[test]
+    fn test_load_config_missing_explicit_path_falls_back_to_defaults() {
+        // When --config points to a non-existent file, load_config must not
+        // error out — it should fall back to defaults (warning is emitted via
+        // eprintln, which we cannot capture here, but the Ok(defaults) is
+        // the observable outcome under test).
+        std::env::remove_var("OXILLAMA_CONFIG");
+        let nonexistent = std::env::temp_dir().join("oxillama_no_such_config_xyz.toml");
+        // Ensure the file really does not exist.
+        let _ = std::fs::remove_file(&nonexistent);
+        assert!(!nonexistent.exists(), "pre-condition: file must not exist");
+
+        let cfg = load_config(Some(nonexistent)).expect("should fall back to defaults, not error");
+        // All fields must be None (i.e. default).
+        assert!(cfg.default_model.is_none());
+        assert!(cfg.default_ctx_size.is_none());
+        assert!(cfg.default_threads.is_none());
+        assert!(cfg.default_temp.is_none());
+        assert!(cfg.log_level.is_none());
     }
 
     #[test]

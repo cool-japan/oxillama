@@ -144,10 +144,12 @@ impl KernelDispatcher {
         if simd::cached_capabilities().avx512f {
             match tensor_type {
                 GgufTensorType::Q4_0 => return Ok(Box::new(simd::avx512::Q4_0Avx512)),
+                GgufTensorType::Q4_1 => return Ok(Box::new(simd::avx512::Q4_1Avx512)),
                 GgufTensorType::Q8_0 => return Ok(Box::new(simd::avx512::Q8_0Avx512)),
                 GgufTensorType::Q4K => return Ok(Box::new(simd::avx512::Q4_KAvx512)),
                 GgufTensorType::Q1_0G128 => return Ok(Box::new(simd::avx512::Q1_0G128Avx512)),
                 GgufTensorType::Q5K => return Ok(Box::new(simd::avx512::Q5_KAvx512)),
+                GgufTensorType::Q5_1 => return Ok(Box::new(simd::avx512::Q5_1Avx512)),
                 GgufTensorType::Q6K => return Ok(Box::new(simd::avx512::Q6_KAvx512)),
                 GgufTensorType::Tq1_0 => return Ok(Box::new(simd::avx512::Tq1_0Avx512)),
                 GgufTensorType::Tq2_0 => return Ok(Box::new(simd::avx512::Tq2_0Avx512)),

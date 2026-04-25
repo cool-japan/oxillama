@@ -65,7 +65,7 @@ anyhow = { workspace = true }
 oxillama-gguf = { workspace = true, features = ["mmap"] }
 oxillama-quant = { workspace = true, features = ["parallel"] }
 oxillama-arch.workspace = true
-oxillama-runtime = { workspace = true, features = ["tokenizer-wasm"] }
+oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "parallel", "native-async", "mmap"] }
 oxillama-server = { workspace = true, optional = true }
 oxillama-bench = { workspace = true, optional = true }
 oxillama-gpu = { workspace = true, optional = true }

@@ -6,7 +6,7 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 
 ## Status
 
-**Version:** 0.1.1 — **Tests:** 343 passing — **Completion:** ~98% — **Status:** Alpha
+**Version:** 0.1.2 — **Tests:** 370 passing — **Completion:** ~98% — **Status:** Alpha
 
 ## What It Provides
 
@@ -30,8 +30,6 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 | `LoadedLora` | In-memory LoRA adapter ready to apply |
 | `Grammar` / `GrammarState` | GBNF grammar parser and logit-mask state machine |
 | `Scheduler` | Continuous-batching scheduler with prefill priority and chunked prefill |
-| `BatchedKvView` | Trait for per-request KV slot access (continuous batching) |
-| `KvSlot` | Per-request KV slot allocated from `VecBatchedKvView` |
 | `RuntimeError` | Unified error wrapping `ArchError`, `GgufError`, `QuantError` |
 | `EngineSnapshot` / `ModelFingerprint` | Session snapshot and resume via oxicode — **new in v0.1.1** |
 | `ToolDispatcher` / `ToolCallDetector` / `ToolCall` / `NoOpDispatcher` | Tool/function-calling trait and helpers — **new in v0.1.1** |
@@ -40,6 +38,9 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 | `KvCachePool` | Pooled KV cache allocator for multi-request reuse — **new in v0.1.1** |
 | `EngineMetrics` / `MetricsSnapshot` | Prometheus-compatible lock-free counters — **new in v0.1.1** |
 | `SequencePool` / `SsmStatePool` | Attention and SSM sequence state pools — **new in v0.1.1** |
+| `KvCacheAccess` | Trait extension: `kv_dim`, `for_each_key`, `for_each_value` with contiguous defaults and `PagedKvCache` multi-page overrides — **new in v0.1.2** |
+| `BatchedKvView` / `KvSlot` | Moved to `oxillama-arch/traits.rs`; re-exported from `oxillama-runtime` for backwards compatibility — **new in v0.1.2** |
+| `ForwardPass::forward_batched` | Default impl on `ForwardPass` trait; LLaMA proof-of-concept continuous-batch forward — **new in v0.1.2** |
 
 ## Usage
 
@@ -71,17 +72,12 @@ fn generate(model_path: &str, prompt: &str) -> RuntimeResult<String> {
 | `phi` | yes | Phi-3/4 architecture |
 | `command-r` | yes | Command-R architecture |
 | `starcoder` | yes | StarCoder 2 architecture |
-| `falcon` | yes | TII Falcon (passes through to `oxillama-arch`) |
-| `minicpm` | yes | MiniCPM scaled embedding (passes through to `oxillama-arch`) |
-| `olmo2` | yes | Allen AI OLMo2 (passes through to `oxillama-arch`) |
-| `granite` | yes | IBM Granite 3.x (passes through to `oxillama-arch`) |
-| `deepseek` | yes | DeepSeek-V2/V3 MLA+MoE (passes through to `oxillama-arch`) |
-| `dbrx` | yes | Databricks DBRX (passes through to `oxillama-arch`) |
-| `grok` | yes | xAI Grok-1 (passes through to `oxillama-arch`) |
-| `mamba2` | yes | Mamba-2 selective-scan SSM (passes through to `oxillama-arch`) |
-| `jamba` | yes | Hybrid attention+SSM (passes through to `oxillama-arch`, enables `mamba2`) |
 | `tokenizer-wasm` | yes | HF tokenizers with pure-Rust regex (required for WASM) |
 | `tokenizer-onig` | no | HF tokenizers with Oniguruma regex (native desktop alternative) |
+| `parallel` | no | Multi-threaded tensor ops via rayon |
+| `native-async` | no | Tokio-backed async engine API |
+| `mmap` | no | Memory-mapped model file loading |
+| `offload` | no | Tensor offload to secondary storage |
 
 ## License
 

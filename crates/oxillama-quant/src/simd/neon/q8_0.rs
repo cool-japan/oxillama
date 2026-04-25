@@ -263,6 +263,135 @@ impl QuantKernel for Q8_0Neon {
     fn name(&self) -> &'static str {
         "Q8_0_Neon"
     }
+
+    /// Fused Q8_0 weight × Q8_0 activation GEMV using NEON.
+    ///
+    /// Both blocks share the 34-byte format.  Accumulates into `out`.
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let acts_needed = blocks_per_row * BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            // SAFETY: bounds checked above.
+            let row_sum = unsafe {
+                fused_q8_0_q8_0_row_neon(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            *out_val += row_sum;
+        }
+
+        Ok(())
+    }
+}
+
+/// Fused Q8_0 weight × Q8_0 activation dot product for one row using NEON.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * BLOCK_BYTES`
+/// - Must run on AArch64 with NEON.
+unsafe fn fused_q8_0_q8_0_row_neon(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    let mut row_sum = 0.0f32;
+
+    for blk in 0..blocks_per_row {
+        let w_off = blk * BLOCK_BYTES;
+        // SAFETY: blk < blocks_per_row; row_data.len() == blocks_per_row * BLOCK_BYTES.
+        let w_block = &row_data[w_off..w_off + BLOCK_BYTES];
+        let d_w = f16_to_f32(u16::from_le_bytes([w_block[0], w_block[1]]));
+
+        let a_off = blk * BLOCK_BYTES;
+        // SAFETY: acts_q8.len() >= blocks_per_row * BLOCK_BYTES.
+        let a_block = &acts_q8[a_off..a_off + BLOCK_BYTES];
+        let d_a = f16_to_f32(u16::from_le_bytes([a_block[0], a_block[1]]));
+
+        let scale = d_w * d_a;
+
+        let input_offset = blk * BLOCK_SIZE;
+        let remaining = n_cols.saturating_sub(input_offset);
+
+        if remaining >= BLOCK_SIZE {
+            // Fast path: full 32-weight block using NEON i8 dot products.
+            // SAFETY: w_block[2..34] and a_block[2..34] are 32 valid i8 bytes.
+            let wptr = w_block.as_ptr().add(2) as *const i8;
+            let aptr = a_block.as_ptr().add(2) as *const i8;
+
+            // Load 4×8-lane i8 vectors.
+            let w0 = vld1_s8(wptr);
+            let w1 = vld1_s8(wptr.add(8));
+            let w2 = vld1_s8(wptr.add(16));
+            let w3 = vld1_s8(wptr.add(24));
+            let a0 = vld1_s8(aptr);
+            let a1 = vld1_s8(aptr.add(8));
+            let a2 = vld1_s8(aptr.add(16));
+            let a3 = vld1_s8(aptr.add(24));
+
+            // i8 → i16 multiply-add using vmull_s8 (8 lanes × 2 = 16-lane i16).
+            let prod0 = vmull_s8(w0, a0);
+            let prod1 = vmull_s8(w1, a1);
+            let prod2 = vmull_s8(w2, a2);
+            let prod3 = vmull_s8(w3, a3);
+
+            // Pair-sum to i32 (vpaddlq_s16: add adjacent pairs).
+            let acc0 = vpaddlq_s16(prod0);
+            let acc1 = vpaddlq_s16(prod1);
+            let acc2 = vpaddlq_s16(prod2);
+            let acc3 = vpaddlq_s16(prod3);
+
+            // Sum all four accumulators.
+            let total = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+            let dot_i32 = vaddvq_s32(total);
+            row_sum += scale * dot_i32 as f32;
+        } else if remaining > 0 {
+            // Scalar tail.
+            let q_w = &w_block[2..];
+            let q_a = &a_block[2..];
+            let mut partial = 0.0f32;
+            for i in 0..remaining {
+                partial += (q_w[i] as i8 as f32) * (q_a[i] as i8 as f32);
+            }
+            row_sum += scale * partial;
+        }
+    }
+
+    row_sum
 }
 
 #[cfg(all(test, feature = "simd-neon", target_arch = "aarch64"))]
@@ -517,6 +646,120 @@ mod tests {
             (output[0] - 6.0).abs() < 0.1,
             "expected 6.0, got {}",
             output[0]
+        );
+    }
+
+    // ── matvec_q8_fused ───────────────────────────────────────────────────
+
+    fn make_q8_0_block_fused(scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(BLOCK_BYTES);
+        let d_bits = half::f16::from_f32(scale).to_bits();
+        block.extend_from_slice(&d_bits.to_le_bytes());
+        for &v in values {
+            block.push(v as u8);
+        }
+        block
+    }
+
+    #[test]
+    fn test_q8_0_neon_fused_matches_reference_single_block() {
+        let w_vals: [i8; 32] = [
+            10, -20, 30, -40, 50, -60, 70, -80, 90, -100, 110, -120, 100, -90, 80, -70, 60, -50,
+            40, -30, 20, -10, 5, -15, 25, -35, 45, -55, 65, -75, 85, -95,
+        ];
+        let a_vals: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 0, 1, -1, 2, -2, 3, -3,
+            4, -4, 5, -5, 6, -6, 7, -7, 8,
+        ];
+        let w_block = make_q8_0_block_fused(0.5, &w_vals);
+        let a_block = make_q8_0_block_fused(0.1, &a_vals);
+
+        let mut out_neon = vec![0.0f32; 1];
+        let mut out_ref = vec![0.0f32; 1];
+
+        Q8_0Neon
+            .matvec_q8_fused(&w_block, &a_block, &mut out_neon, 1, 32)
+            .expect("neon fused single block");
+        Q8_0Ref
+            .matvec_q8_fused(&w_block, &a_block, &mut out_ref, 1, 32)
+            .expect("ref fused single block");
+
+        let err = (out_neon[0] - out_ref[0]).abs();
+        assert!(
+            err < 1e-3,
+            "fused single-block mismatch: neon={} ref={} err={}",
+            out_neon[0],
+            out_ref[0],
+            err
+        );
+    }
+
+    #[test]
+    fn test_q8_0_neon_fused_multi_row() {
+        let n_rows = 3usize;
+        let n_cols = 64usize;
+        let blocks_per_row = 2usize;
+
+        let w_vals_a: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, -1, 2, -3, 4, -5, 6, -7,
+            8, -9, 10, -11, 12, -13, 14, -15, 16,
+        ];
+        let w_vals_b: [i8; 32] = [
+            20, -30, 40, -50, 60, -70, 80, -90, 100, -110, 120, -127, 100, -90, 80, -70, 50, -40,
+            30, -20, 10, -5, 15, -25, 35, -45, 55, -65, 75, -85, 95, -100,
+        ];
+        let scales = [0.25f32, 0.5f32, 1.0f32];
+        let mut all_weights = Vec::new();
+        for &s in &scales {
+            all_weights.extend(make_q8_0_block_fused(s, &w_vals_a));
+            all_weights.extend(make_q8_0_block_fused(s * 0.5, &w_vals_b));
+        }
+
+        let a_vals: [i8; 32] = [
+            2, -3, 5, -7, 1, -1, 4, -4, 6, -6, 3, -3, 2, -2, 1, -1, 8, -8, 7, -7, 6, -6, 5, -5, 4,
+            -4, 3, -3, 2, -2, 1, -1,
+        ];
+        let mut acts = Vec::new();
+        for _ in 0..blocks_per_row {
+            acts.extend(make_q8_0_block_fused(0.05, &a_vals));
+        }
+
+        let mut out_neon = vec![0.0f32; n_rows];
+        let mut out_ref = vec![0.0f32; n_rows];
+
+        Q8_0Neon
+            .matvec_q8_fused(&all_weights, &acts, &mut out_neon, n_rows, n_cols)
+            .expect("neon fused multi-row");
+        Q8_0Ref
+            .matvec_q8_fused(&all_weights, &acts, &mut out_ref, n_rows, n_cols)
+            .expect("ref fused multi-row");
+
+        for i in 0..n_rows {
+            let err = (out_neon[i] - out_ref[i]).abs();
+            assert!(
+                err < 1e-3,
+                "fused multi-row row {i}: neon={} ref={} err={}",
+                out_neon[i],
+                out_ref[i],
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_q8_0_neon_fused_accumulate_semantics() {
+        let w_block = make_q8_0_block_fused(1.0, &[0i8; 32]);
+        let a_block = make_q8_0_block_fused(1.0, &[0i8; 32]);
+
+        let mut out = vec![55.0f32; 1];
+        Q8_0Neon
+            .matvec_q8_fused(&w_block, &a_block, &mut out, 1, 32)
+            .expect("neon fused accumulate");
+
+        assert!(
+            (out[0] - 55.0).abs() < 1e-5,
+            "accumulate semantics broken: expected 55.0, got {}",
+            out[0]
         );
     }
 }

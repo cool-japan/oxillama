@@ -5,6 +5,7 @@
 //! attention matrix, reducing memory from O(N²) to O(N·d).
 
 use crate::error::{RuntimeError, RuntimeResult};
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 /// Configuration for the flash attention kernel.
@@ -570,9 +571,31 @@ pub fn flash_attention_forward(
     let q_stride = seq_len_q * head_dim;
     let kv_stride = seq_len_kv * head_dim;
 
-    // Process each head in parallel.
+    // Process each head in parallel (when the `parallel` feature is active)
+    // or sequentially as a fallback (e.g. on wasm32-unknown-unknown).
+    #[cfg(feature = "parallel")]
     out_head
         .par_chunks_mut(q_stride)
+        .enumerate()
+        .try_for_each(|(h, out_slice)| {
+            let q_off = h * q_stride;
+            let kv_off = h * kv_stride;
+            flash_attention_forward_single_head(
+                &q_head[q_off..q_off + q_stride],
+                &k_head[kv_off..kv_off + kv_stride],
+                &v_head[kv_off..kv_off + kv_stride],
+                out_slice,
+                seq_len_q,
+                seq_len_kv,
+                head_dim,
+                softmax_scale,
+                causal_mask,
+            )
+        })?;
+
+    #[cfg(not(feature = "parallel"))]
+    out_head
+        .chunks_mut(q_stride)
         .enumerate()
         .try_for_each(|(h, out_slice)| {
             let q_off = h * q_stride;

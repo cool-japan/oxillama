@@ -628,6 +628,154 @@ impl QuantKernel for Q5_KNeon {
     fn name(&self) -> &'static str {
         "Q5_K_NEON"
     }
+
+    /// Fused Q5_K weight × Q8_0 activation GEMV using NEON.
+    ///
+    /// Each Q5_K super-block maps to 8 Q8_0 activation blocks.
+    /// Accumulates into `out` (ACCUMULATE semantics).
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let q8_blocks_per_row = blocks_per_row * 8;
+        let acts_needed = q8_blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            // SAFETY: bounds checked above.
+            let row_sum = unsafe {
+                fused_q5_k_q8_0_row_neon(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            *out_val += row_sum;
+        }
+
+        Ok(())
+    }
+}
+
+/// Q8_0 activation block byte count.
+const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Fused Q5_K weight × Q8_0 activation dot product for one row using NEON.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES`
+/// - Must run on AArch64 with NEON.
+unsafe fn fused_q5_k_q8_0_row_neon(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    let mut row_sum = 0.0f32;
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        // SAFETY: blk < blocks_per_row; row_data.len() == blocks_per_row * BLOCK_BYTES.
+        let block = &row_data[bo..bo + BLOCK_BYTES];
+
+        let d = f16_to_f32(block);
+        let dmin = f16_to_f32(&block[2..]);
+        let (sc, mn) = decode_scales_mins(&block[4..16]);
+        let qh = &block[16..48];
+        let qs = &block[48..176];
+
+        let input_offset = blk * BLOCK_SIZE;
+        let cols_in_block = (n_cols - input_offset).min(BLOCK_SIZE);
+
+        let mut is = 0usize;
+        let mut qs_off = 0usize;
+        let mut w_off = 0usize;
+
+        for group in 0..4_u32 {
+            // Sub-block `is` (lo nibbles).
+            let a_idx_lo = blk * 8 + is;
+            let a_start_lo = a_idx_lo * Q8_0_BLOCK_BYTES;
+            // SAFETY: acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES.
+            let a_block_lo = &acts_q8[a_start_lo..a_start_lo + Q8_0_BLOCK_BYTES];
+            let d_a_lo = f16_to_f32(a_block_lo);
+            let q8_lo = &a_block_lo[2..];
+
+            let da_lo = d * sc[is] as f32;
+            let m_lo = dmin * mn[is] as f32;
+
+            // Sub-block `is+1` (hi nibbles).
+            let a_idx_hi = blk * 8 + is + 1;
+            let a_start_hi = a_idx_hi * Q8_0_BLOCK_BYTES;
+            // SAFETY: same guarantee.
+            let a_block_hi = &acts_q8[a_start_hi..a_start_hi + Q8_0_BLOCK_BYTES];
+            let d_a_hi = f16_to_f32(a_block_hi);
+            let q8_hi = &a_block_hi[2..];
+
+            let da_hi = d * sc[is + 1] as f32;
+            let m_hi = dmin * mn[is + 1] as f32;
+
+            let valid_lo = cols_in_block.saturating_sub(w_off).min(32);
+            let valid_hi = cols_in_block.saturating_sub(w_off + 32).min(32);
+
+            // Process lo sub-block: Σ(q5_lo * q8_lo) and Σ(q8_lo).
+            let mut dot_lo = 0.0f32;
+            let mut sum_a_lo = 0.0f32;
+            for l in 0..valid_lo {
+                let qh_bit = (qh[l] >> group) & 1;
+                let q_w = ((qs[qs_off + l] & 0x0F) | (qh_bit << 4)) as f32;
+                let q_a = q8_lo[l] as i8 as f32;
+                dot_lo += q_w * q_a;
+                sum_a_lo += q_a;
+            }
+            row_sum += (da_lo * dot_lo - m_lo * sum_a_lo) * d_a_lo;
+
+            // Process hi sub-block.
+            let mut dot_hi = 0.0f32;
+            let mut sum_a_hi = 0.0f32;
+            for l in 0..valid_hi {
+                let qh_bit = (qh[l] >> (group + 4)) & 1;
+                let q_w = (((qs[qs_off + l] >> 4) & 0x0F) | (qh_bit << 4)) as f32;
+                let q_a = q8_hi[l] as i8 as f32;
+                dot_hi += q_w * q_a;
+                sum_a_hi += q_a;
+            }
+            row_sum += (da_hi * dot_hi - m_hi * sum_a_hi) * d_a_hi;
+
+            is += 2;
+            qs_off += 32;
+            w_off += 64;
+        }
+    }
+
+    row_sum
 }
 
 // ---------------------------------------------------------------------------
@@ -913,5 +1061,142 @@ mod tests {
                 err
             );
         }
+    }
+
+    // ── matvec_q8_fused ───────────────────────────────────────────────────
+
+    fn make_q8_0_block(scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(34);
+        block.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+        for &v in values {
+            block.push(v as u8);
+        }
+        block
+    }
+
+    fn make_q8_acts(n_q8_blocks: usize, scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        make_q8_0_block(scale, values).repeat(n_q8_blocks)
+    }
+
+    #[test]
+    fn test_q5k_neon_fused_matches_reference_single_block() {
+        let mut scales = [0u8; 12];
+        for (i, s) in scales.iter_mut().enumerate() {
+            *s = ((i * 7 + 5) & 0x3F) as u8;
+        }
+        let mut qh = [0u8; 32];
+        for (i, h) in qh.iter_mut().enumerate() {
+            *h = ((i * 13 + 3) & 0xFF) as u8;
+        }
+        let mut qs = [0u8; 128];
+        for (i, q) in qs.iter_mut().enumerate() {
+            *q = ((i * 5 + 11) & 0xFF) as u8;
+        }
+
+        let w_block = make_q5k_block(0.5, 0.25, &scales, &qh, &qs);
+        let act_vals: [i8; 32] = [
+            2, -3, 5, -7, 1, -1, 4, -4, 6, -6, 3, -3, 2, -2, 1, -1, 8, -8, 7, -7, 6, -6, 5, -5, 4,
+            -4, 3, -3, 2, -2, 1, -1,
+        ];
+        let acts = make_q8_acts(8, 0.1, &act_vals);
+
+        let mut out_neon = vec![0.0f32; 1];
+        let mut out_ref = vec![0.0f32; 1];
+
+        Q5_KNeon
+            .matvec_q8_fused(&w_block, &acts, &mut out_neon, 1, 256)
+            .expect("neon fused single block");
+        Q5KRef
+            .matvec_q8_fused(&w_block, &acts, &mut out_ref, 1, 256)
+            .expect("ref fused single block");
+
+        let err = (out_neon[0] - out_ref[0]).abs();
+        assert!(
+            err < 1e-3,
+            "fused single-block mismatch: neon={} ref={} err={}",
+            out_neon[0],
+            out_ref[0],
+            err
+        );
+    }
+
+    #[test]
+    fn test_q5k_neon_fused_multi_row() {
+        let n_rows = 3usize;
+        let n_cols = 512usize;
+        let blocks_per_row = 2usize;
+        let q8_blocks_per_row = blocks_per_row * 8;
+
+        let mut all_weights = Vec::new();
+        for r in 0..n_rows {
+            for b in 0..blocks_per_row {
+                let mut scales = [0u8; 12];
+                for (i, s) in scales.iter_mut().enumerate() {
+                    *s = ((r * 17 + b * 11 + i * 7 + 5) & 0x3F) as u8;
+                }
+                let mut qh = [0u8; 32];
+                for (i, h) in qh.iter_mut().enumerate() {
+                    *h = ((r * 13 + b * 19 + i * 3) & 0xFF) as u8;
+                }
+                let mut qs = [0u8; 128];
+                for (i, q) in qs.iter_mut().enumerate() {
+                    *q = ((r * 5 + b * 23 + i * 11) & 0xFF) as u8;
+                }
+                all_weights.extend(make_q5k_block(
+                    0.5 + r as f32 * 0.1,
+                    0.1 + b as f32 * 0.05,
+                    &scales,
+                    &qh,
+                    &qs,
+                ));
+            }
+        }
+
+        let act_vals: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 0, 1, -1, 2, -2, 3, -3,
+            4, -4, 5, -5, 6, -6, 7, -7, 8,
+        ];
+        let acts = make_q8_acts(q8_blocks_per_row, 0.05, &act_vals);
+
+        let mut out_neon = vec![0.0f32; n_rows];
+        let mut out_ref = vec![0.0f32; n_rows];
+
+        Q5_KNeon
+            .matvec_q8_fused(&all_weights, &acts, &mut out_neon, n_rows, n_cols)
+            .expect("neon fused multi-row");
+        Q5KRef
+            .matvec_q8_fused(&all_weights, &acts, &mut out_ref, n_rows, n_cols)
+            .expect("ref fused multi-row");
+
+        for i in 0..n_rows {
+            let err = (out_neon[i] - out_ref[i]).abs();
+            assert!(
+                err < 1e-3,
+                "fused multi-row row {i}: neon={} ref={} err={}",
+                out_neon[i],
+                out_ref[i],
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_q5k_neon_fused_accumulate_semantics() {
+        let mut scales = [0u8; 12];
+        scales[..4].fill(1);
+        scales[8..12].fill(1);
+        let w_block = make_q5k_block(0.0, 0.0, &scales, &[0u8; 32], &[0u8; 128]);
+        let acts = make_q8_acts(8, 0.0, &[0i8; 32]);
+
+        let mut out = vec![99.0f32; 1];
+        Q5_KNeon
+            .matvec_q8_fused(&w_block, &acts, &mut out, 1, 256)
+            .expect("neon fused accumulate");
+
+        assert!(
+            (out[0] - 99.0).abs() < 1e-5,
+            "accumulate semantics broken: expected 99.0, got {}",
+            out[0]
+        );
     }
 }

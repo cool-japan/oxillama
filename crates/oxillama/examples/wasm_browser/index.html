@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OxiLLaMa Browser Demo</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>OxiLLaMa Browser Demo</h1>
+    <p class="subtitle">Local LLM inference, 100% in your browser — no server required.</p>
+  </header>
+
+  <main>
+    <section id="load-section">
+      <h2>1. Load Model</h2>
+
+      <div class="file-row">
+        <div class="file-field">
+          <label for="model-file">GGUF model file:</label>
+          <input type="file" id="model-file" accept=".gguf" />
+        </div>
+        <div class="file-field">
+          <label for="tokenizer-file">tokenizer.json:</label>
+          <input type="file" id="tokenizer-file" accept=".json,application/json" />
+        </div>
+      </div>
+
+      <div id="model-info" class="model-info" hidden>
+        <span id="model-arch"></span>
+        <span id="model-ctx"></span>
+        <span id="model-tensors"></span>
+      </div>
+
+      <button id="load-btn" disabled>Load Model</button>
+
+      <div id="load-progress" class="progress-bar" hidden>
+        <div id="load-progress-inner"></div>
+      </div>
+      <p id="load-status" class="status"></p>
+    </section>
+
+    <section id="generate-section">
+      <h2>2. Generate</h2>
+      <label for="prompt-input">Prompt:</label>
+      <textarea id="prompt-input" rows="4" placeholder="Enter your prompt here…" disabled>Tell me a short story about a rust crab.</textarea>
+      <div class="controls">
+        <label for="max-tokens">Max tokens:</label>
+        <input type="number" id="max-tokens" value="200" min="1" max="2048" disabled />
+        <button id="generate-btn" disabled>Generate</button>
+        <button id="stop-btn" disabled>Stop</button>
+      </div>
+      <h3>Output:</h3>
+      <pre id="output" class="output"></pre>
+      <p id="stats" class="stats"></p>
+    </section>
+  </main>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
