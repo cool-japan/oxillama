@@ -4,6 +4,14 @@ Quantization kernels for all GGUF quantization types used in LLM inference.
 
 Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a Pure Rust LLM inference engine.
 
+## Status
+
+**Version:** 0.1.2 — **Tests:** 382 passing
+
+## What's New in v0.1.2
+
+- IQ3_S and IQ3_XXS codebook tables added in v0.1.2
+
 ## What It Provides
 
 - **25 quantization types**: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K_S/M/L, Q4_K_S/M, Q5_K_S/M, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ2_M, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, Q1_0_G128

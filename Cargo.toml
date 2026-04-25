@@ -84,7 +84,7 @@ toml = "1.1.2"
 # ── Binary / memory / numerics ──
 memmap2 = "0.9.10"
 half = { version = "2.7.1", features = ["serde"] }
-blake3 = "1.8.4"
+blake3 = "1.8.5"
 
 # ── Parallelism ──
 rayon = "1.12.0"
@@ -110,12 +110,12 @@ serde-wasm-bindgen = "0.6.5"
 wasm-streams = "0.5.0"
 
 # ── Temp files / atomic writes ──
-tempfile = "3.20.0"
+tempfile = "3.27.0"
 
 # ── Crypto ──
 sha2 = { version = "0.10.9", default-features = false, features = ["std"] }
 hmac = "0.12.1"
-rsa = { version = "0.9.6", default-features = false, features = ["std", "pem", "sha2"] }
+rsa = { version = "0.9.10", default-features = false, features = ["std", "pem", "sha2"] }
 base64 = "0.22.1"
 rand = "0.8.6"
 

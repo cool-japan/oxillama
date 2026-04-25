@@ -16,7 +16,7 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 
 ## Status
 
-**Version:** 0.1.1 — **Tests:** 151 passing — **Status:** Alpha (optional feature)
+**Version:** 0.1.2 — **Tests:** 151 passing — **Status:** Alpha (optional feature)
 
 **Total GPU kernels:** Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q8_K, Q1_0_G128, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, tiled GEMM, fused attention
 

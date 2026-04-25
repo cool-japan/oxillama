@@ -19,6 +19,10 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 - Wheels built with [maturin](https://www.maturin.rs/) (ABI3, Python 3.8+)
 - Optional numpy interop (`embed_numpy()`, `embed_batch_numpy()`, `forward_logits_numpy()`) via `numpy` feature
 
+## Status
+
+**Version:** 0.1.2 — **Tests:** 81 passing
+
 ## Installation
 
 ```bash

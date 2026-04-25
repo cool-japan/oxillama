@@ -83,7 +83,7 @@ OxiLLaMa is a Pure Rust reimplementation of [llama.cpp](https://github.com/ggml-
 | [`oxillama-wasm`](crates/oxillama-wasm) | WebAssembly bindings | ~150 |
 | [`oxillama-cli`](crates/oxillama-cli) | CLI binary (`cargo install oxillama-cli`) | ~430 |
 
-**Total: ~87,400 lines of Pure Rust across 11 crates** (as of v0.1.1, 1,898 tests passing)
+**Total: ~107,000 lines of Pure Rust across 11 crates** (v0.1.2 — 2,020 tests passing)
 
 ---
 
@@ -162,17 +162,15 @@ oxillama info --model path/to/model.gguf
 
 ---
 
-## What's New in v0.1.1 (2026-04-24)
+## What's New in v0.1.2 (2026-04-25)
 
-- **FlashAttention tiled CPU kernel** — BQ=BK=64 blocking, online softmax, rayon per-head parallelism; removes the full N×N attention matrix allocation.
-- **True continuous batching** — per-request KV slot allocation, `BatchedKvView` trait; enables heterogeneous request lengths with zero padding waste.
-- **Fused dequant+GEMM** — Q4_0 and Q4_K AVX2 + NEON paths skip the scratch buffer entirely; measured ~12% throughput gain on Q4_K_M decode.
-- **oxiblas float GEMM fallback** — F16/BF16/F32 tensor paths now route through OxiBLAS GEMM rather than naive loops.
-- **Tiled GEMM WGSL shader** — TILE_M/N=32, TILE_K=16, shared memory cooperative load; replaces naive GPU matmul for prefill workloads.
-- **Fused attention WGSL kernel** — QK + softmax + AV in a single GPU dispatch, eliminating intermediate buffer round-trips.
-- **4 new GPU GEMV kernels** — IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S quant GEMV on wgpu; GPU now covers 10 quantization types.
-- **5 new architectures** — DBRX (16-expert MoE, top-4), Grok-1 (8-expert MoE, top-2), DeepSeek-V3 sigmoid-with-bias MoE scoring, Mamba-2 (selective scan, learned Δ), plus OLMo2, Yi, Granite, MiniCPM, InternLM3.
-- **SequenceState trait** — arch-internal SSM abstraction that generalises the KV cache slot interface to state-space models.
+- **Conversation save/resume** — `/save` and `/load` slash commands in the chat REPL; state serialized via oxicode; SHA-256 KV sidecar for integrity verification.
+- **`oxillama hub` subcommand** — `hub pull`, `hub list`, `hub rm` for HuggingFace Hub model management; built on hf-hub 0.5 with pure Rust transport, no Python required.
+- **TUI chat mode** — `oxillama chat --tui` launches a full terminal UI (ratatui 0.30) with async token streaming via `spawn_blocking` + mpsc channels.
+- **DBRX, Grok-1, Mamba-2 real weight loading** — previously stub loaders now perform full weight loading from GGUF; all three architectures pass end-to-end forward pass tests.
+- **`KvCacheAccess` trait extensions** — new `kv_dim`, `for_each_key`, `for_each_value` methods; `BatchedKvView` and `KvSlot` promoted to `oxillama-arch`; `ForwardPass::forward_batched` ships a default impl plus a fully tested LLaMA specialisation.
+- **IQ3_S and IQ3_XXS codebook tables** — complete codebook data added to `oxillama-quant`; both formats now dequantize correctly in all kernel paths.
+- **Test suite: 1,898 → 2,020 tests** — per-crate breakdown: gguf=278, quant=382, arch=397, runtime=370, server=165, cli=38, bench=88, gpu=151, wasm=51, py=81.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full diff.
 
@@ -236,4 +234,4 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for detai
 
 ---
 
-*Copyright 2026 COOLJAPAN OU (Team KitaSan). All rights reserved. — OxiLLaMa v0.1.1 (2026-04-24)*
+*Copyright 2026 COOLJAPAN OU (Team KitaSan). All rights reserved. — OxiLLaMa v0.1.2 (2026-04-25)*

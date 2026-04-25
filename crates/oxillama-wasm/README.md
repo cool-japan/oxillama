@@ -18,6 +18,10 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 - Pure-Rust tokenizer backend (`fancy-regex`, no Oniguruma C library) — safe for `wasm32-unknown-unknown`
 - No SIMD rayon threads — single-threaded, browser-compatible; SIMD128 proposal enabled at compile time
 
+## Status
+
+**Version:** 0.1.2 — **Tests:** 51 passing
+
 ## Feature Flags
 
 | Feature | Default | Description |
