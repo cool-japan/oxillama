@@ -4,7 +4,7 @@
 ///
 /// Each `u32` encodes 4 unsigned weight magnitudes (one byte each, little-endian).
 /// The value `IQ3XXS_GRID[idx].to_le_bytes()[j]` gives the unsigned magnitude of
-/// weight `j` within the group.  Signs are applied separately via [`KSIGNS_IQ2XS`].
+/// weight `j` within the group.  Signs are applied separately via [`KSIGNS_IQ2XS`][super::signs::KSIGNS_IQ2XS].
 pub const IQ3XXS_GRID: [u32; 256] = [
     0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
     0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,

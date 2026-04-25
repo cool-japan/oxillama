@@ -35,7 +35,6 @@ pub struct KvCacheSnapshot {
     pub seq_len: usize,
 }
 
-
 /// Simple contiguous `BatchedKvView` backed by a `Vec<KvSlot>` paired with
 /// a pool of flat key/value buffers.
 ///
@@ -601,7 +600,11 @@ mod tests {
             .expect("for_each_key must succeed");
 
         assert_eq!(positions_seen.len(), 4, "must visit all 4 positions");
-        assert_eq!(positions_seen, vec![0, 1, 2, 3], "positions must be in order");
+        assert_eq!(
+            positions_seen,
+            vec![0, 1, 2, 3],
+            "positions must be in order"
+        );
 
         // Check key data for each position.
         for (t, key_row) in keys_seen.iter().enumerate() {

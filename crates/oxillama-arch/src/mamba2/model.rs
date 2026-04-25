@@ -384,11 +384,7 @@ impl ForwardPass for Mamba2Model {
     /// The returned vector has `d_model` elements — the hidden dimension, **not**
     /// `vocab_size`. This is used by embedding extraction pipelines (e.g. RAG,
     /// similarity search) that need the model's internal representation.
-    fn embed(
-        &mut self,
-        tokens: &[u32],
-        _kv_cache: &mut dyn KvCacheAccess,
-    ) -> ArchResult<Vec<f32>> {
+    fn embed(&mut self, tokens: &[u32], _kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
         let d_model = self.config.d_model;
         let vocab = self.config.vocab_size;
         let seq_len = tokens.len();
@@ -552,8 +548,7 @@ fn dequant_to_f32(
         let data_off = blk * block_bytes;
         let out_off = blk * block_size;
         let block_data = &data[data_off..data_off + block_bytes];
-        let out_slice =
-            &mut out[out_off..out_off.saturating_add(block_size).min(n_elements)];
+        let out_slice = &mut out[out_off..out_off.saturating_add(block_size).min(n_elements)];
         kernel
             .dequant_block(block_data, out_slice)
             .map_err(|e| ArchError::InvalidConfig {
@@ -722,7 +717,13 @@ pub fn load_mamba2_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<Mam
         });
     }
 
-    Ok(build_mamba2_model(cfg, token_embd, layers, output_norm, lm_head))
+    Ok(build_mamba2_model(
+        cfg,
+        token_embd,
+        layers,
+        output_norm,
+        lm_head,
+    ))
 }
 
 // We keep QuantTensor in scope for the API; suppress the unused-import warning.
@@ -836,9 +837,7 @@ mod tests {
     fn mamba2_embed_returns_correct_size() {
         let mut model = build_tiny_model();
         let mut kv = NullKv;
-        let embedding = model
-            .embed(&[1u32], &mut kv)
-            .expect("embed must succeed");
+        let embedding = model.embed(&[1u32], &mut kv).expect("embed must succeed");
         assert_eq!(
             embedding.len(),
             model.config.d_model,
@@ -865,7 +864,10 @@ mod tests {
         let mut model = build_tiny_model();
         let mut kv = NullKv;
         let result = model.embed(&[], &mut kv);
-        assert!(result.is_err(), "embed with empty tokens must return an error");
+        assert!(
+            result.is_err(),
+            "embed with empty tokens must return an error"
+        );
     }
 
     #[test]

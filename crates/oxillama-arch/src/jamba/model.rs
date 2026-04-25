@@ -477,11 +477,7 @@ impl ForwardPass for JambaModel {
     /// as a `Vec<f32>` of length `hidden_size` rather than `vocab_size`.
     ///
     /// SSM state is throwaway (same semantics as `forward()` in the stateless path).
-    fn embed(
-        &mut self,
-        tokens: &[u32],
-        kv_cache: &mut dyn KvCacheAccess,
-    ) -> ArchResult<Vec<f32>> {
+    fn embed(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
         let hidden_size = self.config.hidden_size;
         let vocab = self.config.vocab_size;
         let seq_len = tokens.len();
@@ -504,8 +500,7 @@ impl ForwardPass for JambaModel {
 
             // Embedding lookup.
             let emb_off = tok * hidden_size;
-            let mut hidden: Vec<f32> =
-                self.token_embd[emb_off..emb_off + hidden_size].to_vec();
+            let mut hidden: Vec<f32> = self.token_embd[emb_off..emb_off + hidden_size].to_vec();
 
             // Throwaway SSM states — same pattern as forward().
             let mut temp_ssm_states: Vec<SsmLayerState> = self
@@ -532,10 +527,12 @@ impl ForwardPass for JambaModel {
                     }
                     JambaLayerWeights::Ssm(w) => {
                         let ssm_state = &mut temp_ssm_states[layer_idx];
-                        hidden = Self::ssm_forward(&hidden, w, ssm_state, hidden_size)
-                            .map_err(|e| ArchError::ForwardPassError {
-                                layer: layer_idx,
-                                message: format!("embed SSM block: {e}"),
+                        hidden =
+                            Self::ssm_forward(&hidden, w, ssm_state, hidden_size).map_err(|e| {
+                                ArchError::ForwardPassError {
+                                    layer: layer_idx,
+                                    message: format!("embed SSM block: {e}"),
+                                }
                             })?;
                     }
                 }
@@ -746,8 +743,7 @@ fn dequant_to_f32(model: &oxillama_gguf::GgufModel, name: &str) -> ArchResult<Ve
         let data_offset: usize = blk * block_bytes;
         let out_offset: usize = blk * block_size;
         let block_data = &data[data_offset..data_offset + block_bytes];
-        let out_slice =
-            &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
+        let out_slice = &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
         kernel.dequant_block(block_data, out_slice)?;
     }
 
@@ -808,14 +804,12 @@ pub fn load_jamba_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<Jamb
             LayerKind::Attention => {
                 let prefix = format!("blk.{i}");
 
-                let attn_norm =
-                    load_rms_norm(model, &format!("{prefix}.attn_norm.weight"), eps)?;
+                let attn_norm = load_rms_norm(model, &format!("{prefix}.attn_norm.weight"), eps)?;
                 let w_q = dequant_to_f32(model, &format!("{prefix}.attn_q.weight"))?;
                 let w_k = dequant_to_f32(model, &format!("{prefix}.attn_k.weight"))?;
                 let w_v = dequant_to_f32(model, &format!("{prefix}.attn_v.weight"))?;
                 let w_o = dequant_to_f32(model, &format!("{prefix}.attn_output.weight"))?;
-                let ffn_norm =
-                    load_rms_norm(model, &format!("{prefix}.ffn_norm.weight"), eps)?;
+                let ffn_norm = load_rms_norm(model, &format!("{prefix}.ffn_norm.weight"), eps)?;
                 let w_gate = dequant_to_f32(model, &format!("{prefix}.ffn_gate.weight"))?;
                 let w_up = dequant_to_f32(model, &format!("{prefix}.ffn_up.weight"))?;
                 let w_down = dequant_to_f32(model, &format!("{prefix}.ffn_down.weight"))?;
@@ -835,8 +829,7 @@ pub fn load_jamba_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<Jamb
             LayerKind::Ssm => {
                 let prefix = format!("blk.{i}");
 
-                let ssm_norm =
-                    load_rms_norm(model, &format!("{prefix}.ssm_norm.weight"), eps)?;
+                let ssm_norm = load_rms_norm(model, &format!("{prefix}.ssm_norm.weight"), eps)?;
 
                 // Combined gate+input projection: [2*d_inner, hidden].
                 let w_in_z = dequant_to_f32(model, &format!("{prefix}.ssm_in.weight"))?;
@@ -861,15 +854,12 @@ pub fn load_jamba_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<Jamb
                 let w_c = vec![0.0f32; config.d_state * config.d_inner];
 
                 // Δ projection: [d_inner, d_inner].
-                let w_delta =
-                    dequant_to_f32(model, &format!("{prefix}.ssm_dt.weight"))
-                        .unwrap_or_else(|_| vec![0.0f32; config.d_inner * config.d_inner]);
+                let w_delta = dequant_to_f32(model, &format!("{prefix}.ssm_dt.weight"))
+                    .unwrap_or_else(|_| vec![0.0f32; config.d_inner * config.d_inner]);
 
                 // Δ bias is optional; default to zeros.
-                let b_delta =
-                    dequant_to_f32(model, &format!("{prefix}.ssm_dt.bias")).unwrap_or_else(|_| {
-                        vec![0.0f32; config.d_inner]
-                    });
+                let b_delta = dequant_to_f32(model, &format!("{prefix}.ssm_dt.bias"))
+                    .unwrap_or_else(|_| vec![0.0f32; config.d_inner]);
 
                 // Log-A: [d_state, d_inner].
                 let log_a = dequant_to_f32(model, &format!("{prefix}.ssm_A"))
@@ -900,7 +890,13 @@ pub fn load_jamba_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<Jamb
         layers.push(layer_weights);
     }
 
-    Ok(JambaModel::new(config, token_embd, layers, output_norm, lm_head))
+    Ok(JambaModel::new(
+        config,
+        token_embd,
+        layers,
+        output_norm,
+        lm_head,
+    ))
 }
 
 // ─── Math helpers ─────────────────────────────────────────────────────────────
@@ -1160,9 +1156,7 @@ mod tests {
         let cfg = tiny_config();
         let mut model = build_zero_jamba_model(cfg);
         let mut kv = NullKv;
-        let embedding = model
-            .embed(&[0u32], &mut kv)
-            .expect("embed must succeed");
+        let embedding = model.embed(&[0u32], &mut kv).expect("embed must succeed");
         assert!(
             embedding.iter().all(|v| v.is_finite()),
             "embed() output must contain only finite values, got: {embedding:?}"

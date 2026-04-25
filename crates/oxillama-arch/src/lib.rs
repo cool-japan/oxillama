@@ -65,4 +65,6 @@ pub use config::ModelConfig;
 pub use error::{ArchError, ArchResult};
 pub use lora::{LoadedLora, LoraAdapterTrait, LoraDelta, LoraStack, TargetModule};
 pub use registry::ArchitectureRegistry;
-pub use traits::{BatchedKvView, ForwardPass, KvCacheAccess, KvSlot, ModelArchitecture, TensorNamePattern};
+pub use traits::{
+    BatchedKvView, ForwardPass, KvCacheAccess, KvSlot, ModelArchitecture, TensorNamePattern,
+};

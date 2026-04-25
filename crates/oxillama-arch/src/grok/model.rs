@@ -545,8 +545,7 @@ fn dequant_to_f32(
         let data_offset = blk * block_bytes;
         let out_offset = blk * block_size;
         let block_data = &data[data_offset..data_offset + block_bytes];
-        let out_slice =
-            &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
+        let out_slice = &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
         kernel.dequant_block(block_data, out_slice)?;
     }
 
@@ -944,9 +943,7 @@ mod tests {
     fn embed_returns_hidden_size() {
         let mut model = build_tiny_model();
         let mut kv = NullKv;
-        let embedding = model
-            .embed(&[1u32], &mut kv)
-            .expect("embed must succeed");
+        let embedding = model.embed(&[1u32], &mut kv).expect("embed must succeed");
         assert_eq!(
             embedding.len(),
             16,
@@ -959,9 +956,7 @@ mod tests {
     fn embed_all_finite() {
         let mut model = build_tiny_model();
         let mut kv = NullKv;
-        let embedding = model
-            .embed(&[0u32], &mut kv)
-            .expect("embed must succeed");
+        let embedding = model.embed(&[0u32], &mut kv).expect("embed must succeed");
         assert!(
             embedding.iter().all(|v| v.is_finite()),
             "all embedding values must be finite"
@@ -973,7 +968,10 @@ mod tests {
         let mut model = build_tiny_model();
         let mut kv = NullKv;
         let result = model.embed(&[], &mut kv);
-        assert!(result.is_err(), "embed with empty token sequence must return an error");
+        assert!(
+            result.is_err(),
+            "embed with empty token sequence must return an error"
+        );
     }
 
     #[test]
@@ -1004,18 +1002,14 @@ mod tests {
     #[test]
     fn grok_loader_round_trip() {
         let bytes = oxillama_gguf::test_utils::build_minimal_grok_gguf();
-        let gguf =
-            oxillama_gguf::GgufModel::from_bytes(bytes).expect("GGUF parse must succeed");
+        let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("GGUF parse must succeed");
         let model = load_grok_from_gguf(&gguf).expect("load_grok_from_gguf must succeed");
 
         // Config sanity: hidden=32, vocab=32, 2 layers, 2 experts.
         assert_eq!(model.config.hidden_size, 32, "hidden_size must be 32");
         assert_eq!(model.config.vocab_size, 32, "vocab_size must be 32");
         assert_eq!(model.layers.len(), 2, "must have 2 layers");
-        assert_eq!(
-            model.config.num_experts, 2,
-            "must have 2 MoE experts"
-        );
+        assert_eq!(model.config.num_experts, 2, "must have 2 MoE experts");
     }
 
     /// Build a model directly with `num_kv_heads=1` (MQA) and verify forward pass.
@@ -1065,16 +1059,29 @@ mod tests {
         };
 
         let layers = (0..N_LAYERS)
-            .map(|_| make_grok_layer(H, N_HEADS, N_KV_HEADS, HEAD_DIM, N_EXPERTS, TOP_K, EXPERT_INTER))
+            .map(|_| {
+                make_grok_layer(
+                    H,
+                    N_HEADS,
+                    N_KV_HEADS,
+                    HEAD_DIM,
+                    N_EXPERTS,
+                    TOP_K,
+                    EXPERT_INTER,
+                )
+            })
             .collect();
         let token_embd = vec![0.0f32; VOCAB * H];
         let output_norm = RmsNorm::new(vec![1.0f32; H], 1e-5);
         let output = make_f32_ql(VOCAB, H);
 
-        let mut model = build_grok_model(model_cfg, grok_cfg, token_embd, layers, output_norm, output);
+        let mut model =
+            build_grok_model(model_cfg, grok_cfg, token_embd, layers, output_norm, output);
         let mut kv = NullKv;
 
-        let logits = model.forward(&[0u32], &mut kv).expect("MQA forward must succeed");
+        let logits = model
+            .forward(&[0u32], &mut kv)
+            .expect("MQA forward must succeed");
         assert_eq!(logits.len(), VOCAB, "logits must have vocab_size elements");
         assert!(
             logits.iter().all(|v| v.is_finite()),
@@ -1086,12 +1093,13 @@ mod tests {
     #[test]
     fn grok_loader_forward_no_nan() {
         let bytes = oxillama_gguf::test_utils::build_minimal_grok_gguf();
-        let gguf =
-            oxillama_gguf::GgufModel::from_bytes(bytes).expect("GGUF parse must succeed");
+        let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("GGUF parse must succeed");
         let mut model = load_grok_from_gguf(&gguf).expect("load_grok_from_gguf must succeed");
         let mut kv = NullKv;
 
-        let logits = model.forward(&[0u32], &mut kv).expect("forward must succeed");
+        let logits = model
+            .forward(&[0u32], &mut kv)
+            .expect("forward must succeed");
         assert_eq!(
             logits.len(),
             model.config.vocab_size,

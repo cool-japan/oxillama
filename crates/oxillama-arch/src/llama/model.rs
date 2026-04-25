@@ -548,10 +548,7 @@ impl ForwardPass for LlamaModel {
                 }
 
                 // Softmax over scores.
-                let max_s = scores
-                    .iter()
-                    .cloned()
-                    .fold(f32::NEG_INFINITY, f32::max);
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = scores.iter().map(|s| (s - max_s).exp()).sum();
                 let inv_sum = 1.0 / sum.max(1e-10);
                 for s in &mut scores {

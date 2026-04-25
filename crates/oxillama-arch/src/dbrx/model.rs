@@ -638,13 +638,14 @@ pub fn load_dbrx_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<DbrxM
     let rms_eps = dbrx_config.rms_norm_eps;
 
     // ── Token embedding ────────────────────────────────────────────────────────
-    let embd_info = model
-        .file
-        .tensors
-        .get("token_embd.weight")
-        .map_err(|_| ArchError::MissingTensor {
-            name: "token_embd.weight".to_string(),
-        })?;
+    let embd_info =
+        model
+            .file
+            .tensors
+            .get("token_embd.weight")
+            .map_err(|_| ArchError::MissingTensor {
+                name: "token_embd.weight".to_string(),
+            })?;
     let embd_data = model.tensor_data("token_embd.weight")?;
     let token_embd = dequant_to_f32_local(embd_info, embd_data, &dispatcher)?;
 
@@ -662,8 +663,7 @@ pub fn load_dbrx_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<DbrxM
         let attn_q = load_quant_linear_local(model, &format!("{prefix}.attn_q.weight"))?;
         let attn_k = load_quant_linear_local(model, &format!("{prefix}.attn_k.weight"))?;
         let attn_v = load_quant_linear_local(model, &format!("{prefix}.attn_v.weight"))?;
-        let attn_output =
-            load_quant_linear_local(model, &format!("{prefix}.attn_output.weight"))?;
+        let attn_output = load_quant_linear_local(model, &format!("{prefix}.attn_output.weight"))?;
 
         // FFN norm
         let ffn_norm_weights =
@@ -915,9 +915,7 @@ mod tests {
     fn embed_returns_hidden_size() {
         let mut model = build_tiny_model();
         let mut kv = NullKv;
-        let embedding = model
-            .embed(&[1u32], &mut kv)
-            .expect("embed must succeed");
+        let embedding = model.embed(&[1u32], &mut kv).expect("embed must succeed");
         assert_eq!(
             embedding.len(),
             16,
@@ -930,9 +928,7 @@ mod tests {
     fn embed_all_finite() {
         let mut model = build_tiny_model();
         let mut kv = NullKv;
-        let embedding = model
-            .embed(&[0u32], &mut kv)
-            .expect("embed must succeed");
+        let embedding = model.embed(&[0u32], &mut kv).expect("embed must succeed");
         assert!(
             embedding.iter().all(|v| v.is_finite()),
             "all embedding values must be finite"
@@ -944,7 +940,10 @@ mod tests {
         let mut model = build_tiny_model();
         let mut kv = NullKv;
         let result = model.embed(&[], &mut kv);
-        assert!(result.is_err(), "embed with empty token sequence must return an error");
+        assert!(
+            result.is_err(),
+            "embed with empty token sequence must return an error"
+        );
     }
 
     // ─── GGUF round-trip loader tests ─────────────────────────────────────────
@@ -962,7 +961,10 @@ mod tests {
 
         // The fixture encodes: vocab_size=32, hidden_size=32, context_length=128.
         assert_eq!(model.config.vocab_size, 32, "vocab_size from GGUF fixture");
-        assert_eq!(model.config.hidden_size, 32, "hidden_size from GGUF fixture");
+        assert_eq!(
+            model.config.hidden_size, 32,
+            "hidden_size from GGUF fixture"
+        );
         assert_eq!(
             model.config.max_context_length, 128,
             "max_context_length from GGUF fixture"
@@ -990,8 +992,7 @@ mod tests {
         let gguf_model =
             oxillama_gguf::GgufModel::from_bytes(bytes).expect("GGUF parse must succeed");
 
-        let mut model =
-            load_dbrx_from_gguf(&gguf_model).expect("load_dbrx_from_gguf must succeed");
+        let mut model = load_dbrx_from_gguf(&gguf_model).expect("load_dbrx_from_gguf must succeed");
 
         let mut kv = NullKv;
         let logits = model.forward(&[0u32], &mut kv).expect("forward after load");

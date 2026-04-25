@@ -4,7 +4,7 @@
 ///
 /// Each `u64` encodes 8 unsigned weight magnitudes (one byte each, little-endian).
 /// Grid index is a 9-bit value (lower 9 bits of a u16 from the block's `qs` field).
-/// The upper 7 bits of the same u16 select a sign mask via [`KSIGNS_IQ2XS`].
+/// The upper 7 bits of the same u16 select a sign mask via [`KSIGNS_IQ2XS`][super::signs::KSIGNS_IQ2XS].
 pub const IQ2XS_GRID: [u64; 512] = [
     0x0808080808080808,
     0x080808080808082b,

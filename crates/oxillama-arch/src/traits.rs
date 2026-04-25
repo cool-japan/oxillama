@@ -414,10 +414,18 @@ mod tests {
         /// Minimal KvCacheAccess impl that does not override kv_dim().
         struct MinimalCache;
         impl KvCacheAccess for MinimalCache {
-            fn seq_len(&self) -> usize { 0 }
-            fn store_kv(&mut self, _layer: usize, _key: &[f32], _value: &[f32]) -> ArchResult<()> { Ok(()) }
-            fn get_keys(&self, _layer: usize) -> ArchResult<&[f32]> { Ok(&[]) }
-            fn get_values(&self, _layer: usize) -> ArchResult<&[f32]> { Ok(&[]) }
+            fn seq_len(&self) -> usize {
+                0
+            }
+            fn store_kv(&mut self, _layer: usize, _key: &[f32], _value: &[f32]) -> ArchResult<()> {
+                Ok(())
+            }
+            fn get_keys(&self, _layer: usize) -> ArchResult<&[f32]> {
+                Ok(&[])
+            }
+            fn get_values(&self, _layer: usize) -> ArchResult<&[f32]> {
+                Ok(&[])
+            }
             fn advance(&mut self) {}
         }
 
@@ -426,7 +434,9 @@ mod tests {
 
         // for_each_key must return NotSupported when kv_dim == 0
         let mut called = false;
-        let result = cache.for_each_key(0, &mut |_, _| { called = true; });
+        let result = cache.for_each_key(0, &mut |_, _| {
+            called = true;
+        });
         assert!(result.is_err(), "must return Err when kv_dim() == 0");
         assert!(!called, "callback must not be invoked");
     }

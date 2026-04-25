@@ -736,13 +736,7 @@ async fn run() -> Result<()> {
                 use std::sync::{Arc, Mutex};
                 let model_id = chat_model_id_pre;
                 let engine_arc = Arc::new(Mutex::new(engine));
-                return crate::tui::run_tui(
-                    model_path_buf,
-                    model_id,
-                    engine_arc,
-                    sampler,
-                    512,
-                );
+                return crate::tui::run_tui(model_path_buf, model_id, engine_arc, sampler, 512);
             }
 
             // Set up history file directory.

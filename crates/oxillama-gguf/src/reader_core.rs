@@ -3,7 +3,7 @@
 //! This module provides the `parse_gguf` function family which can be driven
 //! from any byte source implementing the [`Source`] trait — both in `std`
 //! environments (via [`ReadSource`][crate::source::ReadSource] or
-//! [`SliceSource`]) and in `no_std + alloc` environments (via
+//! [`SliceSource`][crate::source::SliceSource]) and in `no_std + alloc` environments (via
 //! [`SliceSource`][crate::source::SliceSource]).
 //!
 //! All parse helpers in this module use `alloc` types (`String`, `Vec`) and

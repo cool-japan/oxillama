@@ -289,11 +289,7 @@ impl ForwardPass for DeepSeekModel {
     /// Identical to `forward()` through to and including `output_norm.forward(last)`.
     /// Does NOT call the LM-head projection (`self.output.forward`). Returns a
     /// `hidden_size`-dimensional vector suitable for semantic embedding use.
-    fn embed(
-        &mut self,
-        tokens: &[u32],
-        _kv_cache: &mut dyn KvCacheAccess,
-    ) -> ArchResult<Vec<f32>> {
+    fn embed(&mut self, tokens: &[u32], _kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
         let hidden = self.config.hidden_size;
         let seq_len = tokens.len();
 
@@ -508,8 +504,7 @@ fn dequant_to_f32(
         let data_offset = blk * block_bytes;
         let out_offset = blk * block_size;
         let block_data = &data[data_offset..data_offset + block_bytes];
-        let out_slice =
-            &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
+        let out_slice = &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
         kernel.dequant_block(block_data, out_slice)?;
     }
 
@@ -538,10 +533,7 @@ fn load_dequant_tensor(
 }
 
 /// Load a quantized linear layer from GGUF by tensor name.
-fn load_quant_linear(
-    model: &oxillama_gguf::GgufModel,
-    name: &str,
-) -> ArchResult<QuantLinear> {
+fn load_quant_linear(model: &oxillama_gguf::GgufModel, name: &str) -> ArchResult<QuantLinear> {
     let info = model
         .file
         .tensors
@@ -561,10 +553,7 @@ fn load_quant_linear(
 }
 
 /// Load an RMSNorm weight vector from GGUF (always dequantized to F32).
-fn load_rms_norm_weight(
-    model: &oxillama_gguf::GgufModel,
-    name: &str,
-) -> ArchResult<Vec<f32>> {
+fn load_rms_norm_weight(model: &oxillama_gguf::GgufModel, name: &str) -> ArchResult<Vec<f32>> {
     let dispatcher = KernelDispatcher::new();
     load_dequant_tensor(model, &dispatcher, name)
 }
@@ -674,21 +663,9 @@ fn load_expert(
     hidden_size: usize,
     intermediate_size: usize,
 ) -> ArchResult<crate::deepseek::moe::DeepSeekExpert> {
-    let gate = load_dequant_tensor(
-        model,
-        dispatcher,
-        &format!("{name_prefix}.ffn_gate.weight"),
-    )?;
-    let up = load_dequant_tensor(
-        model,
-        dispatcher,
-        &format!("{name_prefix}.ffn_up.weight"),
-    )?;
-    let down = load_dequant_tensor(
-        model,
-        dispatcher,
-        &format!("{name_prefix}.ffn_down.weight"),
-    )?;
+    let gate = load_dequant_tensor(model, dispatcher, &format!("{name_prefix}.ffn_gate.weight"))?;
+    let up = load_dequant_tensor(model, dispatcher, &format!("{name_prefix}.ffn_up.weight"))?;
+    let down = load_dequant_tensor(model, dispatcher, &format!("{name_prefix}.ffn_down.weight"))?;
 
     Ok(crate::deepseek::moe::DeepSeekExpert {
         gate,
@@ -700,10 +677,7 @@ fn load_expert(
 }
 
 /// Load dense FFN weights for one layer from GGUF.
-fn load_dense_ffn(
-    model: &oxillama_gguf::GgufModel,
-    layer_idx: usize,
-) -> ArchResult<DenseFfn> {
+fn load_dense_ffn(model: &oxillama_gguf::GgufModel, layer_idx: usize) -> ArchResult<DenseFfn> {
     let p = format!("blk.{layer_idx}");
     Ok(DenseFfn {
         gate: load_quant_linear(model, &format!("{p}.ffn_gate.weight"))?,
@@ -730,15 +704,10 @@ fn load_moe_ffn(
     let p = format!("blk.{layer_idx}");
 
     // Router: [n_routed_experts, hidden_size]
-    let router = load_dequant_tensor(
-        model,
-        dispatcher,
-        &format!("{p}.ffn_gate_inp.weight"),
-    )?;
+    let router = load_dequant_tensor(model, dispatcher, &format!("{p}.ffn_gate_inp.weight"))?;
 
     // Routed experts
-    let routed_experts: Vec<crate::deepseek::moe::DeepSeekExpert> = (0
-        ..ds_cfg.n_routed_experts)
+    let routed_experts: Vec<crate::deepseek::moe::DeepSeekExpert> = (0..ds_cfg.n_routed_experts)
         .map(|e| {
             load_expert(
                 model,
@@ -751,8 +720,7 @@ fn load_moe_ffn(
         .collect::<ArchResult<Vec<_>>>()?;
 
     // Shared experts
-    let shared_experts: Vec<crate::deepseek::moe::DeepSeekExpert> = (0
-        ..ds_cfg.n_shared_experts)
+    let shared_experts: Vec<crate::deepseek::moe::DeepSeekExpert> = (0..ds_cfg.n_shared_experts)
         .map(|e| {
             load_expert(
                 model,
@@ -821,8 +789,7 @@ fn load_moe_ffn(
 pub fn load_deepseek_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<DeepSeekModel> {
     // ── Parse model configuration ─────────────────────────────────────────────
     let config = ModelConfig::from_metadata(&model.file.metadata)?;
-    let ds_config =
-        DeepSeekConfig::from_metadata(&model.file.metadata, config.hidden_size);
+    let ds_config = DeepSeekConfig::from_metadata(&model.file.metadata, config.hidden_size);
 
     let hidden_size = config.hidden_size;
     let intermediate_size = config.intermediate_size;
@@ -861,8 +828,7 @@ pub fn load_deepseek_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<D
             let ffn_norm_w = load_rms_norm_weight(model, &format!("{p}.ffn_norm.weight"))?;
             let ffn_norm = RmsNorm::new(ffn_norm_w, config.rms_norm_eps);
 
-            let mla_weights =
-                load_mla_weights(model, &mla_cfg, layer_idx, max_seq)?;
+            let mla_weights = load_mla_weights(model, &mla_cfg, layer_idx, max_seq)?;
             let mla_cache = crate::common::mla::MlaLatentCache::new(max_seq, &mla_cfg);
 
             let ffn = if layer_idx < first_k_dense {
@@ -1267,9 +1233,7 @@ mod tests {
         }
 
         let mut kv = NullKv;
-        let embedding = model
-            .embed(&[1u32], &mut kv)
-            .expect("embed must succeed");
+        let embedding = model.embed(&[1u32], &mut kv).expect("embed must succeed");
         assert_eq!(
             embedding.len(),
             16,
@@ -1302,9 +1266,7 @@ mod tests {
         }
 
         let mut kv = NullKv;
-        let embedding = model
-            .embed(&[0u32], &mut kv)
-            .expect("embed must succeed");
+        let embedding = model.embed(&[0u32], &mut kv).expect("embed must succeed");
         assert!(
             embedding.iter().all(|v| v.is_finite()),
             "all embedding values must be finite"
@@ -1336,7 +1298,10 @@ mod tests {
 
         let mut kv = NullKv;
         let result = model.embed(&[], &mut kv);
-        assert!(result.is_err(), "embed with empty token sequence must return an error");
+        assert!(
+            result.is_err(),
+            "embed with empty token sequence must return an error"
+        );
     }
 
     // ── GGUF loader tests ─────────────────────────────────────────────────────
@@ -1431,8 +1396,8 @@ mod tests {
         let gguf = oxillama_gguf::GgufModel::from_bytes(bytes)
             .expect("synthetic DeepSeek V2 GGUF must parse");
 
-        let mut model = load_deepseek_from_gguf(&gguf)
-            .expect("load_deepseek_from_gguf must succeed");
+        let mut model =
+            load_deepseek_from_gguf(&gguf).expect("load_deepseek_from_gguf must succeed");
 
         let mut kv = NullKvL;
         let logits = model

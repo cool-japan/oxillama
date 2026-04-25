@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::session::{ChatMessage, SessionSnapshot};
 use super::events::TuiEvent;
+use crate::session::{ChatMessage, SessionSnapshot};
 
 /// The lifecycle state of the TUI application.
 pub enum AppState {
@@ -77,21 +77,14 @@ impl TuiApp {
         tokio::task::spawn_blocking(move || {
             while let Ok(prompt) = request_rx.recv() {
                 let result = {
-                    let mut eng = engine_clone
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut eng = engine_clone.lock().unwrap_or_else(|e| e.into_inner());
                     // Reset KV cache between turns so the full conversation
                     // is prefilled fresh each time (avoids double-prefill).
                     eng.reset();
-                    eng.generate_with_config(
-                        &prompt,
-                        max_tokens,
-                        sampler.clone(),
-                        |tok| {
-                            // Ignore send errors (TUI might have quit).
-                            let _ = event_tx_clone.send(TuiEvent::Token(tok.to_string()));
-                        },
-                    )
+                    eng.generate_with_config(&prompt, max_tokens, sampler.clone(), |tok| {
+                        // Ignore send errors (TUI might have quit).
+                        let _ = event_tx_clone.send(TuiEvent::Token(tok.to_string()));
+                    })
                 };
 
                 match result {
@@ -99,8 +92,7 @@ impl TuiApp {
                         let _ = event_tx_clone.send(TuiEvent::GenerationDone);
                     }
                     Err(e) => {
-                        let _ = event_tx_clone
-                            .send(TuiEvent::GenerationError(e.to_string()));
+                        let _ = event_tx_clone.send(TuiEvent::GenerationError(e.to_string()));
                     }
                 }
             }
@@ -164,9 +156,7 @@ impl TuiApp {
         // submit_prompt's try_send does not fail with Disconnected in UI tests.
         // The thread exits cleanly when request_tx is dropped (i.e., when the
         // TuiApp is dropped).
-        std::thread::spawn(move || {
-            while request_rx.recv().is_ok() {}
-        });
+        std::thread::spawn(move || while request_rx.recv().is_ok() {});
 
         Self {
             session: SessionSnapshot::new(model_id.as_str()),
@@ -242,10 +232,7 @@ impl TuiApp {
                     // Patch the last (placeholder) assistant message in-place.
                     if let Some(last) = self.session.messages.last_mut() {
                         if last.role == "assistant" {
-                            last.content = self
-                                .partial_assistant
-                                .clone()
-                                .unwrap_or_default();
+                            last.content = self.partial_assistant.clone().unwrap_or_default();
                         }
                     }
                 }
@@ -351,9 +338,8 @@ impl TuiApp {
 
         // Block new submissions while the worker is busy.
         if matches!(self.state, AppState::Generating) {
-            self.status_msg = Some(
-                "Already generating. Wait for response to complete.".to_string(),
-            );
+            self.status_msg =
+                Some("Already generating. Wait for response to complete.".to_string());
             return Ok(());
         }
 
@@ -484,7 +470,11 @@ mod tests {
     use crate::tui::events::TuiEvent;
 
     /// Helper: create a TuiApp with owned channels so tests can drive events.
-    fn make_test_app() -> (TuiApp, std::sync::mpsc::Sender<TuiEvent>, std::sync::mpsc::Receiver<String>) {
+    fn make_test_app() -> (
+        TuiApp,
+        std::sync::mpsc::Sender<TuiEvent>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
         let (event_tx, event_rx) = std::sync::mpsc::channel::<TuiEvent>();
         let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<String>(4);
         let app = TuiApp::new_for_testing(event_rx, request_tx);
@@ -505,7 +495,9 @@ mod tests {
         });
 
         event_tx.send(TuiEvent::Token("Hello".to_string())).unwrap();
-        event_tx.send(TuiEvent::Token(" world".to_string())).unwrap();
+        event_tx
+            .send(TuiEvent::Token(" world".to_string()))
+            .unwrap();
 
         app.drain_worker_events();
 
