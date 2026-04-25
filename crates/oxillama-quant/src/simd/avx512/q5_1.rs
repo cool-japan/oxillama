@@ -219,6 +219,7 @@ unsafe fn gemv_row_avx512(
 ) -> f32 {
     let mut acc_wd = _mm512_setzero_ps(); // accumulates (q5 * d) * input
     let mut acc_m = _mm512_setzero_ps(); // accumulates m * input
+    let mut acc_scalar = 0.0f32; // scalar accumulator for partial tail blocks
 
     for blk in 0..blocks_per_row {
         let bo = blk * BLOCK_BYTES;
@@ -282,17 +283,15 @@ unsafe fn gemv_row_avx512(
                 _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(q5_hi)), vd, vm),
             );
 
-            let mut scalar_sum = 0.0f32;
             for j in 0..remaining {
-                scalar_sum += partial[j] * input[input_offset + j];
+                acc_scalar += partial[j] * input[input_offset + j];
             }
-            acc_wd = _mm512_add_ps(acc_wd, _mm512_set1_ps(scalar_sum));
         }
         // remaining == 0: fully out of bounds, skip.
     }
 
-    // Total = Σ (q5 * d * input) + Σ (m * input)
-    hsum_f32_avx512(acc_wd) + hsum_f32_avx512(acc_m)
+    // Total = Σ (q5 * d * input) + Σ (m * input) + scalar tail
+    hsum_f32_avx512(acc_wd) + hsum_f32_avx512(acc_m) + acc_scalar
 }
 
 // ---------------------------------------------------------------------------

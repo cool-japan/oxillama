@@ -98,9 +98,10 @@ impl QuantKernel for Q5_1Ref {
                 let qh =
                     u32::from_le_bytes([data[bo + 4], data[bo + 5], data[bo + 6], data[bo + 7]]);
                 let qs = &data[bo + 8..bo + 24];
-                let inp = &input[blk * Q5_1_BLOCK_SIZE..];
+                let input_offset = blk * Q5_1_BLOCK_SIZE;
+                let n_remaining = n_cols.saturating_sub(input_offset).min(Q5_1_BLOCK_SIZE);
+                let inp = &input[input_offset..input_offset + n_remaining];
 
-                // Inline dot product: 5-bit asymmetric
                 let mut input_sum = 0.0f32;
                 for i in 0..16 {
                     let lo_nibble = qs[i] & 0x0F;
@@ -111,9 +112,14 @@ impl QuantKernel for Q5_1Ref {
                     let q0 = (lo_nibble | (hi_bit_0 << 4)) as f32;
                     let q1 = (hi_nibble | (hi_bit_1 << 4)) as f32;
 
-                    sum += d * q0 * inp[i];
-                    sum += d * q1 * inp[i + 16];
-                    input_sum += inp[i] + inp[i + 16];
+                    if i < n_remaining {
+                        sum += d * q0 * inp[i];
+                        input_sum += inp[i];
+                    }
+                    if i + 16 < n_remaining {
+                        sum += d * q1 * inp[i + 16];
+                        input_sum += inp[i + 16];
+                    }
                 }
                 sum += m * input_sum;
             }
