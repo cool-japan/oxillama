@@ -166,6 +166,27 @@ mod tests {
         assert!(matches!(err, GgufError::UnsupportedVersion { version: 0 }));
     }
 
+    /// Regression test for issue #1: a header whose magic bytes are the
+    /// literal ASCII string `"GGUF"` (i.e. exactly what every real GGUF file
+    /// starts with) must be accepted. Previously the constant carried a
+    /// transposed-nibble typo and rejected valid files such as
+    /// `Qwen3-1.7B-Q8_0.gguf` from lmstudio-community.
+    #[test]
+    fn test_issue_1_accepts_real_gguf_magic_bytes() {
+        let mut data = Vec::new();
+        // Magic: the literal ASCII bytes of "GGUF" — same as any real file.
+        data.extend_from_slice(b"GGUF");
+        // Version: 3
+        data.extend_from_slice(&3u32.to_le_bytes());
+        // Tensor count: 0
+        data.extend_from_slice(&0u64.to_le_bytes());
+        // KV count: 0
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let (header, _) = GgufHeader::parse(&data, 0).expect("real b\"GGUF\" magic must parse");
+        assert_eq!(header.version, 3);
+    }
+
     #[test]
     fn test_reject_version_99() {
         let mut data = Vec::new();

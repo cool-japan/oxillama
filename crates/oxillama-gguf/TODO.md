@@ -42,7 +42,7 @@ workspace assumes this layer is correct and zero-copy where possible.
 ## 4. Shipped in v0.1.0
 
 ### Format parsing
-- Full GGUF v3 header: magic (`0x46475547`) check, version, tensor count,
+- Full GGUF v3 header: magic (`0x46554747`) check, version, tensor count,
   KV-pair count.
 - All 13 GGUF metadata value types: `UINT8`/`INT8`/`UINT16`/`INT16`/
   `UINT32`/`INT32`/`UINT64`/`INT64`/`FLOAT32`/`FLOAT64`/`BOOL`/`STRING`

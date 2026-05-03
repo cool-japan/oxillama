@@ -229,7 +229,7 @@ const TENSORS: &[TensorDesc] = &[
 /// | `context_len`   | 128   |
 #[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub fn build_minimal_llama_gguf() -> Vec<u8> {
-    const GGUF_MAGIC: u32 = 0x4755_4746; // b"GGUF" little-endian
+    const GGUF_MAGIC: u32 = 0x4655_4747; // b"GGUF" little-endian
     const TENSOR_COUNT: u64 = 12;
     const KV_COUNT: u64 = 10;
     const F32_TYPE: u32 = 0; // GgufTensorType::F32
@@ -296,7 +296,7 @@ enum KvEntry {
 /// All tensors are F32, zero-filled.  `kv` must be in the order the loaders
 /// expect; the count is derived automatically.
 fn build_gguf_v3(kv: &[KvEntry], tensors: &[TensorDesc]) -> Vec<u8> {
-    const GGUF_MAGIC: u32 = 0x4755_4746;
+    const GGUF_MAGIC: u32 = 0x4655_4747;
     const F32_TYPE: u32 = 0;
     const ALIGN: usize = 32;
 

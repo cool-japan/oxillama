@@ -14,7 +14,7 @@ pub type GgufResult<T> = Result<T, GgufError>;
 #[derive(Error, Debug)]
 pub enum GgufError {
     /// Invalid GGUF magic number in file header.
-    #[error("invalid GGUF magic number: expected 0x46475547, got 0x{magic:08X}")]
+    #[error("invalid GGUF magic number: expected 0x46554747, got 0x{magic:08X}")]
     InvalidMagic {
         /// The magic number found in the file.
         magic: u32,
