@@ -209,6 +209,21 @@ impl PySpeculativeEngine {
         result
     }
 
+    /// Pickle refusal — `SpeculativeEngine` cannot be snapshotted in v0.1.3.
+    ///
+    /// See proposed follow-up R2 in `crates/oxillama-py/TODO.md`.
+    fn __reduce__(&self) -> PyResult<()> {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "SpeculativeEngine cannot be pickled or snapshotted in v0.1.3 \
+             — see proposed follow-up R2 in crates/oxillama-py/TODO.md.",
+        ))
+    }
+
+    /// Pickle refusal (protocol-aware variant).
+    fn __reduce_ex__(&self, _protocol: i32) -> PyResult<()> {
+        self.__reduce__()
+    }
+
     /// Generate text from `prompt`, invoking `callback` with each accepted
     /// token as it is produced.
     ///

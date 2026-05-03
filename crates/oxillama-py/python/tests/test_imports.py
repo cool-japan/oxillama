@@ -92,3 +92,26 @@ def test_native_exceptions_importable():
         pytest.skip("Native extension not built")
     for name in ("OxiLlamaError", "LoadError", "GenerateError", "TokenizerError"):
         assert hasattr(mod, name), f"Missing exception class: {name}"
+
+
+def test_snapshot_info_importable_from_oxillama_py():
+    """SnapshotInfo must be importable from oxillama_py (when native ext is built)."""
+    mod, ok = _try_import()
+    if not ok:
+        import pytest
+        pytest.skip("Native extension not built")
+    assert hasattr(mod, "SnapshotInfo"), "SnapshotInfo must be exported from native extension"
+
+
+def test_snapshot_error_importable():
+    """SnapshotError must be importable from oxillama_py or oxillama_py.snapshot."""
+    import oxillama_py.snapshot as snap_mod
+    assert hasattr(snap_mod, "SnapshotError"), "SnapshotError must be exported from oxillama_py.snapshot"
+    import oxillama_py
+    assert hasattr(oxillama_py, "SnapshotError"), "SnapshotError must be re-exported from oxillama_py"
+
+
+def test_snapshot_dump_callable():
+    """oxillama_py.snapshot.dump must be callable."""
+    import oxillama_py.snapshot as snap_mod
+    assert callable(snap_mod.dump), "oxillama_py.snapshot.dump must be callable"

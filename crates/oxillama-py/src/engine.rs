@@ -7,6 +7,7 @@
 //! blocked during inference.  Streaming callbacks re-acquire the GIL
 //! for each call via `Python::attach(...)`.
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -724,6 +725,111 @@ impl PyEngine {
         let inner = &mut engine.inner;
         py.detach(|| inner.load_model()).map_err(runtime_to_py)?;
         Ok(engine)
+    }
+
+    /// Save the engine state to `path` atomically.
+    ///
+    /// The snapshot format is `OXISNAP1` — a portable byte blob containing
+    /// the KV cache, sampler config, and a Blake3 fingerprint of the model
+    /// file.  Model weights are **not** stored.
+    ///
+    /// Raises:
+    ///     GenerateError: if no model is loaded.
+    ///     OSError: if the file cannot be written.
+    pub fn snapshot(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        let bytes = py.detach(|| self.inner.snapshot()).map_err(runtime_to_py)?;
+        py.detach(|| crate::snapshot::write_snapshot_atomic(&path, &bytes))
+            .map_err(crate::snapshot::io_to_py)
+    }
+
+    /// Return the engine state as a `bytes` object.
+    ///
+    /// Equivalent to `snapshot(path)` but returns the raw bytes in-memory
+    /// instead of writing them to disk.  Useful for streaming over a network
+    /// or storing in a database.
+    ///
+    /// Raises:
+    ///     GenerateError: if no model is loaded.
+    pub fn snapshot_bytes(&self, py: Python<'_>) -> PyResult<Vec<u8>> {
+        py.detach(|| self.inner.snapshot()).map_err(runtime_to_py)
+    }
+
+    /// Return metadata from the snapshot at `path` without loading the model.
+    ///
+    /// Returns a :class:`SnapshotInfo` with fields `arch_id`, `model_path`,
+    /// `tokenizer_path`, `max_context_length`, `num_threads`, `version`,
+    /// `magic`, and `tokens_count`.
+    ///
+    /// Raises:
+    ///     OSError: if the file cannot be read.
+    ///     GenerateError: if the snapshot format is invalid.
+    #[classmethod]
+    pub fn snapshot_info(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        path: PathBuf,
+    ) -> PyResult<crate::snapshot::PySnapshotInfo> {
+        py.detach(|| crate::snapshot::snapshot_info_from_path(&path))
+    }
+
+    /// Reconstruct an `Engine` from a snapshot at `path`.
+    ///
+    /// If `model_path` is `None` (default), the model path embedded in the
+    /// snapshot is used.  Pass an explicit `model_path` to override, which is
+    /// useful when moving a snapshot between machines where the GGUF lives at
+    /// a different absolute path.
+    ///
+    /// NOTE: When `model_path=None`, the snapshot bytes are deserialized twice
+    /// (once to peek the embedded path, once in `resume`) — acceptable overhead
+    /// for v0.1.3.
+    ///
+    /// The GGUF model is re-loaded from disk on every restore.
+    ///
+    /// Raises:
+    ///     GenerateError: if the snapshot is corrupted or incompatible.
+    ///     LoadError: if the model fingerprint does not match.
+    ///     OSError: if the snapshot file cannot be read.
+    #[classmethod]
+    #[pyo3(signature = (path, *, model_path = None))]
+    pub fn restore(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        path: PathBuf,
+        model_path: Option<PathBuf>,
+    ) -> PyResult<Self> {
+        // Read snapshot bytes with GIL released.
+        let bytes =
+            py.detach(|| std::fs::read(&path)).map_err(crate::snapshot::io_to_py)?;
+
+        // Resolve model path: use embedded path if not overridden.
+        let resolved_model_path: PathBuf = match model_path {
+            Some(p) => p,
+            None => {
+                let snap = oxillama_runtime::snapshot::EngineSnapshot::deserialize(&bytes)
+                    .map_err(runtime_to_py)?;
+                PathBuf::from(&snap.model_path)
+            }
+        };
+
+        // Load model and restore state with GIL released (may take seconds).
+        py.detach(|| {
+            oxillama_runtime::InferenceEngine::resume(&bytes, &resolved_model_path)
+        })
+        .map_err(runtime_to_py)
+        .map(|inner| Self { inner })
+    }
+
+    /// Pickle refusal — Engine state must be persisted via `Engine.snapshot(path)`.
+    fn __reduce__(&self) -> PyResult<()> {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "Engine cannot be pickled; use Engine.snapshot(path) and Engine.restore(path) \
+             instead — see oxillama_py.snapshot docs.",
+        ))
+    }
+
+    /// Pickle refusal (protocol-aware variant).
+    fn __reduce_ex__(&self, _protocol: i32) -> PyResult<()> {
+        self.__reduce__()
     }
 }
 

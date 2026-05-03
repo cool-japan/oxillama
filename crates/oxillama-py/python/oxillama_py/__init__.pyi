@@ -3,6 +3,7 @@
 Generated for PyO3 bindings exposed by OxiLLaMa.
 """
 
+import os
 from typing import Any, Callable, Optional, Sequence, Union
 
 try:
@@ -72,6 +73,24 @@ class StreamingCallback(Protocol):
 
 #: Convenience alias for a bare callable matching the streaming callback signature.
 TokenCallback = Callable[[str, int, bool], None]
+
+# ---------------------------------------------------------------------------
+# SnapshotInfo
+# ---------------------------------------------------------------------------
+
+class SnapshotInfo:
+    """Metadata extracted from a snapshot file without loading the model."""
+
+    arch_id: str
+    model_path: str
+    tokenizer_path: Optional[str]
+    max_context_length: int
+    num_threads: int
+    version: int
+    magic: bytes
+    tokens_count: int
+
+    def __repr__(self) -> str: ...
 
 # ---------------------------------------------------------------------------
 # Exception hierarchy
@@ -234,6 +253,19 @@ class Engine:
         token: Optional[str] = None,
         config: Optional[EngineConfig] = None,
     ) -> Engine: ...
+    def snapshot(self, path: Union[str, os.PathLike[str]]) -> None: ...
+    def snapshot_bytes(self) -> bytes: ...
+    @classmethod
+    def snapshot_info(cls, path: Union[str, os.PathLike[str]]) -> SnapshotInfo: ...
+    @classmethod
+    def restore(
+        cls,
+        path: Union[str, os.PathLike[str]],
+        *,
+        model_path: Optional[Union[str, os.PathLike[str]]] = None,
+    ) -> Engine: ...
+    def __reduce__(self) -> None: ...
+    def __reduce_ex__(self, protocol: int) -> None: ...
 
 # ---------------------------------------------------------------------------
 # SpeculativeConfig
@@ -288,6 +320,8 @@ class SpeculativeEngine:
         progress_capture_text: bool = False,
         strict_progress: bool = False,
     ) -> str: ...
+    def __reduce__(self) -> None: ...
+    def __reduce_ex__(self, protocol: int) -> None: ...
 
 # ---------------------------------------------------------------------------
 # Tokenizer
@@ -387,4 +421,8 @@ class AsyncEngine:
         progress_capture_text: bool = False,
         strict_progress: bool = False,
     ) -> Any: ...
+    async def snapshot(self, path: Union[str, os.PathLike[str]]) -> None: ...
+    async def snapshot_bytes(self) -> bytes: ...
+    def __reduce__(self) -> None: ...
+    def __reduce_ex__(self, protocol: int) -> None: ...
     def __repr__(self) -> str: ...

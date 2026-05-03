@@ -330,6 +330,48 @@ impl PyAsyncEngine {
         let loaded = self.inner.bind(py).borrow().is_loaded();
         format!("AsyncEngine(loaded={loaded})")
     }
+
+    /// Save the engine state to `path` asynchronously.
+    ///
+    /// Returns a coroutine that resolves when the file has been written.
+    fn snapshot<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let locals = PyDict::new(py);
+        locals.set_item("asyncio", py.import("asyncio")?)?;
+        locals.set_item("engine", &self.inner)?;
+        locals.set_item("path", &path)?;
+        py.eval(
+            c"asyncio.to_thread(engine.snapshot, path)",
+            None,
+            Some(&locals),
+        )
+    }
+
+    /// Return the engine state as `bytes` asynchronously.
+    ///
+    /// Returns a coroutine that resolves to a :class:`bytes` object.
+    fn snapshot_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let locals = PyDict::new(py);
+        locals.set_item("asyncio", py.import("asyncio")?)?;
+        locals.set_item("engine", &self.inner)?;
+        py.eval(
+            c"asyncio.to_thread(engine.snapshot_bytes)",
+            None,
+            Some(&locals),
+        )
+    }
+
+    /// Pickle refusal — use `engine.engine.snapshot(path)` / `Engine.restore(path)` instead.
+    fn __reduce__(&self) -> PyResult<()> {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "AsyncEngine cannot be pickled; use engine.engine.snapshot(path) and \
+             Engine.restore(path) instead — see oxillama_py.snapshot docs.",
+        ))
+    }
+
+    /// Pickle refusal (protocol-aware variant).
+    fn __reduce_ex__(&self, _protocol: i32) -> PyResult<()> {
+        self.__reduce__()
+    }
 }
 
 // -----------------------------------------------------------------------

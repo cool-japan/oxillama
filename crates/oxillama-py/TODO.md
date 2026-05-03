@@ -122,7 +122,7 @@ This is the 75% gap — the polish work the 25% number represents.
   manually; no `Engine.from_hub("meta-llama/...")` convenience.~~ ✅
   `Engine.from_hub()` shipped (`hub.rs`); `oxillama_py.hub.load_from_hub()`
   convenience function added; GIL released during download.
-- [~] **`Engine.snapshot(path)` / `Engine.restore(path)` Pure-Rust persistence** (planned 2026-05-03, supersedes "No pickle / checkpoint support" gap)
+- [x] **`Engine.snapshot(path)` / `Engine.restore(path)` Pure-Rust persistence** (planned 2026-05-03, supersedes "No pickle / checkpoint support" gap)
   - **Goal:** First-class persistence on `Engine` (and `AsyncEngine`) without exposing pickle. Three methods on `PyEngine`:
     1. `engine.snapshot(path)` — atomic write of the live engine state (model fingerprint, KV cache, sampler config, grammar source, tokenizer path, context size, num_threads) to a Pure-Rust `OXISNAP1` file via the existing `InferenceEngine::snapshot()` API.
     2. `engine.snapshot_bytes() -> bytes` — same payload returned in-memory for callers that want to manage I/O themselves (multiprocessing, network transport, etc.).
@@ -131,6 +131,7 @@ This is the 75% gap — the polish work the 25% number represents.
   - **Files:** `src/snapshot.rs` (NEW), `src/engine.rs`, `src/async_support.rs`, `src/speculative.rs`, `src/lib.rs`, `Cargo.toml`, `python/oxillama_py/snapshot.py` (NEW), `python/oxillama_py/__init__.py`, `python/oxillama_py/__init__.pyi`, `python/tests/test_engine_snapshot.py` (NEW), `python/tests/test_imports.py`, `docs/snapshot.rst` (NEW), `docs/index.rst`.
   - **Prerequisites:** None. Runtime `InferenceEngine::snapshot()` / `::resume()` already exist at `oxillama_runtime/src/snapshot.rs`. `tempfile` already a workspace dep.
   - **Tests:** 6 Rust unit tests + 6 pure-Python + 8 model-gated (`OXILLAMA_TEST_MODEL`).
+  - done 2026-05-03 — `PySnapshotInfo`, `write_snapshot_atomic`, `read_and_peek_snapshot` shipped in `snapshot.rs`; `snapshot`, `snapshot_bytes`, `snapshot_info`, `restore`, `__reduce__`, `__reduce_ex__` landed on `PyEngine`; async wrappers (`snapshot`, `snapshot_bytes`) on `PyAsyncEngine`; pickle-refusal hooks on `PySpeculativeEngine`; `oxillama_py.snapshot` Python module (`SnapshotError`, `dump`, `dumps`, `load`, `loads`, `snapshot_info`) shipped; `__init__.py` + `.pyi` updated; tests added; docs/snapshot.rst shipped; clippy clean; Rust unit tests pass (4/4); Python tests pass (8/8 non-gated); workspace tests 2031/2031 pass.
 - [x] **Polymorphic progress-bar hook with rich `ProgressEvent` contract** (planned 2026-05-03)
   - **Goal:** First-class `progress=` kwarg on `Engine.generate{,_streaming}`, `SpeculativeEngine.generate{,_streaming}`, and `AsyncEngine.generate{,_stream}` that accepts (a) any `tqdm`/`tqdm.notebook.tqdm`, (b) any `ipywidgets.IntProgress`, (c) any `Callable[[ProgressEvent], None]`, or (d) `None`. Rust-side throttling caps callback invocations at ~50 ms or 4 tokens (whichever first), always firing on the first and final token. RAII finaliser ensures the widget is closed / set to 100 % even on Python exception, cancellation, or EOS. Existing `callback=` kwarg is left untouched (additive, fully backwards-compatible). The v0.1.1 `TqdmProgress` shim is kept as a compat alias but documented as deprecated.
   - **Design:**

@@ -29,6 +29,7 @@ try:
         OxiLlamaError,
         QuantError,
         SamplerConfig,
+        SnapshotInfo,
         SpeculativeConfig,
         SpeculativeEngine,
         Tokenizer,
@@ -45,10 +46,14 @@ except ImportError:
     OxiLlamaError = None  # type: ignore[assignment,misc]
     QuantError = None  # type: ignore[assignment,misc]
     SamplerConfig = None  # type: ignore[assignment,misc]
+    SnapshotInfo = None  # type: ignore[assignment,misc]
     SpeculativeConfig = None  # type: ignore[assignment,misc]
     SpeculativeEngine = None  # type: ignore[assignment,misc]
     Tokenizer = None  # type: ignore[assignment,misc]
     TokenizerError = None  # type: ignore[assignment,misc]
+
+from oxillama_py import snapshot
+from oxillama_py.snapshot import SnapshotError
 
 __version__ = "0.1.0"
 
@@ -97,6 +102,9 @@ __all__ = [
     "SpeculativeEngine",
     "Lora",
     "Tokenizer",
+    # Snapshot API (v0.1.3)
+    "SnapshotInfo",
+    "snapshot",
     # Exceptions
     "OxiLlamaError",
     "LoadError",
@@ -104,6 +112,7 @@ __all__ = [
     "TokenizerError",
     "GrammarError",
     "QuantError",
+    "SnapshotError",
     # Callback protocol
     "StreamingCallback",
     "TokenCallback",

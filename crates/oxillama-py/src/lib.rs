@@ -48,6 +48,7 @@ pub mod error;
 pub mod hub;
 pub mod lora;
 pub mod sampler;
+pub mod snapshot;
 pub mod speculative;
 pub mod tokenizer;
 
@@ -67,6 +68,7 @@ fn oxillama_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<lora::PyLora>()?;
     m.add_class::<tokenizer::PyTokenizer>()?;
     m.add_class::<cancel::PyCancellationToken>()?;
+    m.add_class::<snapshot::PySnapshotInfo>()?;
     error::register_exceptions(m)?;
     Ok(())
 }
