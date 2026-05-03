@@ -41,9 +41,9 @@ oxillama = { path = "crates/oxillama", version = "0.1.2", default-features = fal
 oxillama-cli = { path = "crates/oxillama-cli", version = "0.1.2" }
 
 # ── COOLJAPAN Ecosystem (Pure Rust Policy) ──
-scirs2-core = { version = "0.4.2", default-features = false }
-scirs2-linalg = { version = "0.4.2", default-features = false }
-scirs2-neural = { version = "0.4.2", default-features = false }
+scirs2-core = { version = "0.4.3", default-features = false }
+scirs2-linalg = { version = "0.4.3", default-features = false }
+scirs2-neural = { version = "0.4.3", default-features = false }
 oxiblas = "0.2.1"
 oxifft = "0.3"
 

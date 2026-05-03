@@ -122,8 +122,15 @@ This is the 75% gap — the polish work the 25% number represents.
   manually; no `Engine.from_hub("meta-llama/...")` convenience.~~ ✅
   `Engine.from_hub()` shipped (`hub.rs`); `oxillama_py.hub.load_from_hub()`
   convenience function added; GIL released during download.
-- **No pickle / checkpoint support.** An `Engine` cannot round-trip
-  through `pickle.dumps` / `pickle.loads`.
+- [~] **`Engine.snapshot(path)` / `Engine.restore(path)` Pure-Rust persistence** (planned 2026-05-03, supersedes "No pickle / checkpoint support" gap)
+  - **Goal:** First-class persistence on `Engine` (and `AsyncEngine`) without exposing pickle. Three methods on `PyEngine`:
+    1. `engine.snapshot(path)` — atomic write of the live engine state (model fingerprint, KV cache, sampler config, grammar source, tokenizer path, context size, num_threads) to a Pure-Rust `OXISNAP1` file via the existing `InferenceEngine::snapshot()` API.
+    2. `engine.snapshot_bytes() -> bytes` — same payload returned in-memory for callers that want to manage I/O themselves (multiprocessing, network transport, etc.).
+    3. `Engine.restore(snapshot_path, *, model_path=None)` — classmethod that reads the file, peeks the embedded `model_path` (when no override is given), and reconstructs a fully loaded engine via `InferenceEngine::resume()`.
+    Plus `Engine.snapshot_info(path) -> SnapshotInfo` metadata peek, `__reduce__`/`__reduce_ex__` pickle-refusal hooks on all three engine types.
+  - **Files:** `src/snapshot.rs` (NEW), `src/engine.rs`, `src/async_support.rs`, `src/speculative.rs`, `src/lib.rs`, `Cargo.toml`, `python/oxillama_py/snapshot.py` (NEW), `python/oxillama_py/__init__.py`, `python/oxillama_py/__init__.pyi`, `python/tests/test_engine_snapshot.py` (NEW), `python/tests/test_imports.py`, `docs/snapshot.rst` (NEW), `docs/index.rst`.
+  - **Prerequisites:** None. Runtime `InferenceEngine::snapshot()` / `::resume()` already exist at `oxillama_runtime/src/snapshot.rs`. `tempfile` already a workspace dep.
+  - **Tests:** 6 Rust unit tests + 6 pure-Python + 8 model-gated (`OXILLAMA_TEST_MODEL`).
 - [x] **Polymorphic progress-bar hook with rich `ProgressEvent` contract** (planned 2026-05-03)
   - **Goal:** First-class `progress=` kwarg on `Engine.generate{,_streaming}`, `SpeculativeEngine.generate{,_streaming}`, and `AsyncEngine.generate{,_stream}` that accepts (a) any `tqdm`/`tqdm.notebook.tqdm`, (b) any `ipywidgets.IntProgress`, (c) any `Callable[[ProgressEvent], None]`, or (d) `None`. Rust-side throttling caps callback invocations at ~50 ms or 4 tokens (whichever first), always firing on the first and final token. RAII finaliser ensures the widget is closed / set to 100 % even on Python exception, cancellation, or EOS. Existing `callback=` kwarg is left untouched (additive, fully backwards-compatible). The v0.1.1 `TqdmProgress` shim is kept as a compat alias but documented as deprecated.
   - **Design:**
@@ -266,17 +273,23 @@ This is the 75% gap — the polish work the 25% number represents.
 
 ## Proposed follow-ups
 
-- **R1 — `pickle_checkpoint_support` scope clarification (proposed 2026-05-03)**
+- **R1 — `pickle_checkpoint_support` scope clarification (proposed 2026-05-03)** ✅ Resolved: user chose "Snapshot/restore API (no pickle)" direction; implemented as plan block above (planned 2026-05-03).
 
-  The pending gap "No pickle / checkpoint support" is too underspecified to plan responsibly. Concrete questions for the user before we can design:
+- **R2 — `SpeculativeEngine.snapshot/restore` (proposed 2026-05-03)**
 
-  1. **Which Engine state needs to round-trip?** Options range from cheap to expensive:
-     - **Just config** (model path, sampling params, LoRA stack identifier) — cheap, ~1 KB pickle, requires reload from disk on `loads`.
-     - **Config + KV cache** — mid-conversation snapshot; ~50–500 MB; needs `oxillama-runtime` snapshot/restore (which already exists for CLI session save/resume).
-     - **Config + KV + sampler RNG** — full reproducibility for scientific use.
-     - **Everything including model weights** — multi-GB pickles, almost certainly the wrong design.
-  2. **What's the use case?** Notebook checkpointing, multi-process serving, job-queue resumption, or testing/reproducibility?
-  3. **Storage format:** Native pickle (slow, large, opaque), or a `__reduce__` stub that delegates to a fast Pure Rust serialization (oxicode)?
-  4. **Alternative API:** Should we provide explicit `Engine.snapshot(path)` / `Engine.restore(path)` (already what the CLI does) and let users pickle a *handle* to that snapshot, rather than forcing the whole state through pickle?
+  `oxillama-runtime` does not currently provide snapshot/resume for `SpeculativeEngine` — the `EngineSnapshot` type is single-engine. Implementing this requires:
 
-  **Recommended next step:** before any implementation, the user picks one of (1)/(2)/(3)/(4) — or we leave the gap open and ship without it for v0.1.3.
+  1. A new `SpeculativeEngineSnapshot` type in `oxillama-runtime/src/snapshot.rs` containing `target_snapshot: EngineSnapshot`, `draft_snapshot: EngineSnapshot`, `num_speculative: usize`, `seed: Option<u64>`, plus speculation-loop state.
+  2. Methods on `oxillama_runtime::SpeculativeEngine`: `snapshot()` and `resume(bytes, target_path, draft_path)`.
+  3. Python wrapper mirroring the `PyEngine` snapshot API on `PySpeculativeEngine`.
+
+  Until this ships, `SpeculativeEngine.__reduce__`/`__reduce_ex__` raise a `TypeError` pointing at this R2.
+
+- **R3 — Hub-aware snapshots (proposed 2026-05-03)**
+
+  `Engine.from_hub("repo")` resolves to a local HF cache path and discards `repo_id`/`filename`/`revision`. Snapshots therefore record only the local path; restoring on a different machine fails unless the GGUF is also transferred out-of-band. Options:
+
+  1. Add `pub(crate) hub_origin: Option<HubOrigin>` to `PyEngine`; serialize in a Python-side envelope (`OXSN-PY1`) or push into `EngineSnapshot` v2.
+  2. On `restore`, if `hub_origin.is_some()` and the local path is missing, re-download via `hub::download_model_from_hub`.
+
+  Defer until user feedback indicates cross-machine portability is needed.
