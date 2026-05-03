@@ -15,6 +15,9 @@ use pyo3::types::PyAny;
 
 use oxillama_runtime::{EngineConfig as RustEngineConfig, InferenceEngine, SamplerConfig};
 
+use crate::callback::{
+    make_progress_bridge, ProgressBridge, DEFAULT_THROTTLE_MS, DEFAULT_THROTTLE_TOKENS,
+};
 use crate::cancel::PyCancellationToken;
 
 use crate::error::runtime_to_py;
@@ -208,13 +211,50 @@ impl PyEngine {
     ///     top_p:       Override nucleus sampling threshold (keyword-only).
     ///     top_k:       Override top-k limit (keyword-only).
     ///     seed:        Override random seed (keyword-only).
+    ///     cancel_token: Cooperative cancellation handle (keyword-only).
+    ///     progress:    A ``tqdm`` pbar, ``ipywidgets.IntProgress`` widget, a
+    ///                  ``Callable[[ProgressEvent], None]``, or ``None``.
+    ///                  See :mod:`oxillama_py.progress` for the contract.
+    ///     progress_throttle_ms: Minimum milliseconds between throttled
+    ///                  progress callbacks (default 50).
+    ///     progress_throttle_tokens: Minimum tokens between throttled
+    ///                  progress callbacks (default 4).
+    ///     progress_capture_text: When ``True``, populate
+    ///                  ``ProgressEvent.text_so_far``.  Off by default to
+    ///                  avoid the O(n) string copy on every fired tick.
+    ///     strict_progress: When ``True``, re-raise the first Python exception
+    ///                  raised from the progress callback after generation
+    ///                  completes; otherwise the exception is silently
+    ///                  swallowed.
     ///
     /// Returns:
     ///     str: The generated text (not including the prompt).
     ///
     /// Raises:
     ///     RuntimeError: if no model is loaded.
-    #[pyo3(signature = (prompt, max_tokens = 128, *, temperature = None, top_p = None, top_k = None, seed = None, cancel_token = None))]
+    ///
+    /// # Jupyter example
+    ///
+    /// ```python
+    /// from tqdm.auto import tqdm
+    /// with tqdm(desc="Generating", unit="tok") as bar:
+    ///     text = engine.generate("Hello", max_tokens=128, progress=bar)
+    /// ```
+    #[pyo3(signature = (
+        prompt,
+        max_tokens = 128,
+        *,
+        temperature = None,
+        top_p = None,
+        top_k = None,
+        seed = None,
+        cancel_token = None,
+        progress = None,
+        progress_throttle_ms = None,
+        progress_throttle_tokens = None,
+        progress_capture_text = false,
+        strict_progress = false,
+    ))]
     pub fn generate(
         &mut self,
         py: Python<'_>,
@@ -225,16 +265,42 @@ impl PyEngine {
         top_k: Option<usize>,
         seed: Option<u64>,
         cancel_token: Option<Py<PyCancellationToken>>,
+        progress: Option<Py<PyAny>>,
+        progress_throttle_ms: Option<u64>,
+        progress_throttle_tokens: Option<usize>,
+        progress_capture_text: bool,
+        strict_progress: bool,
     ) -> PyResult<String> {
         let inner = &mut self.inner;
         let cancelled = cancel_token
             .as_ref()
             .map(|ct| Python::attach(|py| ct.borrow(py).cancelled.clone()));
+        let bridge = make_progress_bridge(
+            py,
+            progress.as_ref(),
+            max_tokens,
+            progress_throttle_ms.unwrap_or(DEFAULT_THROTTLE_MS),
+            progress_throttle_tokens.unwrap_or(DEFAULT_THROTTLE_TOKENS),
+            progress_capture_text,
+        )?;
+        let bridge_arc: Option<Arc<Mutex<ProgressBridge>>> =
+            bridge.map(|b| Arc::new(Mutex::new(b)));
         let make_cb = || {
             let cancelled = cancelled.clone();
-            move |_tok: &str| {
+            let bridge_inner = bridge_arc.clone();
+            move |tok: &str| {
                 if let Some(ref flag) = cancelled {
                     flag.load(Ordering::Relaxed);
+                }
+                if let Some(ref bridge) = bridge_inner {
+                    Python::attach(|py| {
+                        if let Ok(mut b) = bridge.lock() {
+                            // strict=false here — the post-call epilogue
+                            // raises the stashed error if `strict_progress`
+                            // was set.
+                            let _ = b.note_token(py, tok, false, false);
+                        }
+                    });
                 }
             }
         };
@@ -247,15 +313,36 @@ impl PyEngine {
                 py.detach(|| inner.generate(prompt, max_tokens, make_cb()))
                     .map_err(runtime_to_py)
             };
-        // Check if cancelled after generation finished
-        if let Some(ref flag) = cancelled {
-            if flag.load(Ordering::Relaxed) {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "generation cancelled",
-                ));
+        let was_cancelled = cancelled
+            .as_ref()
+            .map(|f| f.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        let final_result = if was_cancelled {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "generation cancelled",
+            ))
+        } else {
+            result
+        };
+        // Synthesise a final-tick callback (only on success) before the
+        // cleanup finaliser runs.  Then run the explicit finaliser (and
+        // propagate any stashed Python error if strict_progress was
+        // requested) before the bridge is dropped so the finaliser sees the
+        // actual error context.
+        if let Some(bridge) = bridge_arc.as_ref() {
+            if let Ok(mut b) = bridge.lock() {
+                if final_result.is_ok() {
+                    b.fire_final(py);
+                }
+                b.finalise(py, final_result.as_ref().err());
+                if strict_progress {
+                    if let Some(err) = b.take_stashed_error() {
+                        return Err(err);
+                    }
+                }
             }
         }
-        result
+        final_result
     }
 
     /// Generate text from `prompt`, invoking `callback` with each token as it
@@ -274,13 +361,38 @@ impl PyEngine {
     ///     top_p:       Override nucleus sampling threshold (keyword-only).
     ///     top_k:       Override top-k limit (keyword-only).
     ///     seed:        Override random seed (keyword-only).
+    ///     cancel_token: Cooperative cancellation handle (keyword-only).
+    ///     strict_callback: When ``True`` re-raise the first Python exception
+    ///                  raised inside ``callback`` after generation completes.
+    ///     progress:    See :meth:`generate` (same contract as the non-streaming
+    ///                  variant).  Compose freely with ``callback``.
+    ///     progress_throttle_ms: see :meth:`generate`.
+    ///     progress_throttle_tokens: see :meth:`generate`.
+    ///     progress_capture_text: see :meth:`generate`.
+    ///     strict_progress: see :meth:`generate`.
     ///
     /// Returns:
     ///     str: The full generated text (concatenation of all callback inputs).
     ///
     /// Raises:
     ///     RuntimeError: if no model is loaded.
-    #[pyo3(signature = (prompt, max_tokens = 128, callback = None, *, temperature = None, top_p = None, top_k = None, seed = None, cancel_token = None, strict_callback = false))]
+    #[pyo3(signature = (
+        prompt,
+        max_tokens = 128,
+        callback = None,
+        *,
+        temperature = None,
+        top_p = None,
+        top_k = None,
+        seed = None,
+        cancel_token = None,
+        strict_callback = false,
+        progress = None,
+        progress_throttle_ms = None,
+        progress_throttle_tokens = None,
+        progress_capture_text = false,
+        strict_progress = false,
+    ))]
     pub fn generate_streaming(
         &mut self,
         py: Python<'_>,
@@ -293,6 +405,11 @@ impl PyEngine {
         seed: Option<u64>,
         cancel_token: Option<Py<PyCancellationToken>>,
         strict_callback: bool,
+        progress: Option<Py<PyAny>>,
+        progress_throttle_ms: Option<u64>,
+        progress_throttle_tokens: Option<usize>,
+        progress_capture_text: bool,
+        strict_progress: bool,
     ) -> PyResult<String> {
         let inner = &mut self.inner;
         let cancelled = cancel_token
@@ -305,9 +422,23 @@ impl PyEngine {
         let error_slot: Arc<Mutex<Option<pyo3::PyErr>>> = Arc::new(Mutex::new(None));
         let error_slot_inner = error_slot.clone();
 
+        // Build the optional progress bridge before releasing the GIL so the
+        // helper-module import happens with the GIL we already hold.
+        let bridge = make_progress_bridge(
+            py,
+            progress.as_ref(),
+            max_tokens,
+            progress_throttle_ms.unwrap_or(DEFAULT_THROTTLE_MS),
+            progress_throttle_tokens.unwrap_or(DEFAULT_THROTTLE_TOKENS),
+            progress_capture_text,
+        )?;
+        let bridge_arc: Option<Arc<Mutex<ProgressBridge>>> =
+            bridge.map(|b| Arc::new(Mutex::new(b)));
+
         let result = py
             .detach(|| {
                 let cancelled_inner = cancelled.clone();
+                let bridge_inner = bridge_arc.clone();
                 let cb = move |tok: &str| {
                     // Check cancellation before invoking user callback.
                     if let Some(ref flag) = cancelled_inner {
@@ -329,6 +460,13 @@ impl PyEngine {
                             // else: swallow the error (legacy behaviour)
                         }
                     }
+                    if let Some(ref bridge) = bridge_inner {
+                        Python::attach(|py| {
+                            if let Ok(mut b) = bridge.lock() {
+                                let _ = b.note_token(py, tok, false, false);
+                            }
+                        });
+                    }
                 };
                 if has_overrides {
                     let config = build_override_config(inner, temperature, top_p, top_k, seed);
@@ -343,18 +481,44 @@ impl PyEngine {
         if strict_callback {
             if let Ok(mut slot) = error_slot.lock() {
                 if let Some(py_err) = slot.take() {
+                    // Drive the finaliser with the error so the widget renders
+                    // the failure state before we propagate.
+                    if let Some(bridge) = bridge_arc.as_ref() {
+                        if let Ok(mut b) = bridge.lock() {
+                            b.finalise(py, Some(&py_err));
+                        }
+                    }
                     return Err(py_err);
                 }
             }
         }
-        if let Some(ref flag) = cancelled {
-            if flag.load(Ordering::Relaxed) {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "generation cancelled",
-                ));
+
+        let was_cancelled = cancelled
+            .as_ref()
+            .map(|f| f.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        let final_result = if was_cancelled {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "generation cancelled",
+            ))
+        } else {
+            result
+        };
+
+        if let Some(bridge) = bridge_arc.as_ref() {
+            if let Ok(mut b) = bridge.lock() {
+                if final_result.is_ok() {
+                    b.fire_final(py);
+                }
+                b.finalise(py, final_result.as_ref().err());
+                if strict_progress {
+                    if let Some(err) = b.take_stashed_error() {
+                        return Err(err);
+                    }
+                }
             }
         }
-        result
+        final_result
     }
 
     /// Compute a semantic embedding vector for `text`.

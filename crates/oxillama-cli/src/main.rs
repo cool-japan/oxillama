@@ -706,6 +706,7 @@ async fn run() -> Result<()> {
                 .unwrap_or("model")
                 .to_string();
 
+            #[cfg(feature = "tui")]
             let model_path_buf = std::path::PathBuf::from(&model);
 
             let config = oxillama_runtime::EngineConfig {

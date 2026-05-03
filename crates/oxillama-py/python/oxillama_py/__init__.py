@@ -1,4 +1,4 @@
-"""OxiLLaMa — Pure Rust LLM inference engine, Python bindings.
+"""OxiLLaMa - Pure Rust LLM inference engine, Python bindings.
 
 >>> import oxillama_py
 >>> config = oxillama_py.EngineConfig(model_path="model.gguf")
@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 from oxillama_py.callback import StreamingCallback, TokenCallback
-from oxillama_py.tqdm_helper import CollectTokens, TqdmProgress
+from oxillama_py.progress import ProgressEvent, make_progress_adapter
 from oxillama_py.utils import decode_from_logits
 
 # Re-export everything from the native extension module produced by PyO3.
@@ -50,6 +52,42 @@ except ImportError:
 
 __version__ = "0.1.0"
 
+# Names that should still be importable for back-compat but trigger a
+# DeprecationWarning on first access.  The lazy ``__getattr__`` hook below
+# keeps the original ``from oxillama_py import TqdmProgress`` form working.
+_DEPRECATED_NAMES = ("TqdmProgress", "CollectTokens")
+
+
+def __getattr__(name: str) -> Any:
+    """Module-level attribute hook for deprecated symbols.
+
+    Importing ``TqdmProgress``/``CollectTokens`` from this package emits a
+    :class:`DeprecationWarning` and forwards to the legacy
+    :mod:`oxillama_py.tqdm_helper` shim.  Both names are still listed in
+    ``__all__`` so wildcard imports continue to work.
+    """
+    if name in _DEPRECATED_NAMES:
+        import warnings
+
+        warnings.warn(
+            f"oxillama_py.{name} is deprecated; pass progress= to generate*() "
+            "instead.  See oxillama_py.progress.make_progress_adapter for the "
+            "new API.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from oxillama_py.tqdm_helper import CollectTokens, TqdmProgress
+
+        return {"TqdmProgress": TqdmProgress, "CollectTokens": CollectTokens}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+if TYPE_CHECKING:
+    # Static type-checkers (mypy/pyright) cannot follow the ``__getattr__``
+    # hook, so re-export the legacy names under ``TYPE_CHECKING`` guards.
+    from oxillama_py.tqdm_helper import CollectTokens, TqdmProgress  # noqa: F401
+
+
 __all__ = [
     # Core classes
     "EngineConfig",
@@ -69,4 +107,10 @@ __all__ = [
     # Callback protocol
     "StreamingCallback",
     "TokenCallback",
+    # Progress hook (v0.1.3)
+    "ProgressEvent",
+    "make_progress_adapter",
+    # Deprecated v0.1.1 shims (kept for back-compat)
+    "TqdmProgress",
+    "CollectTokens",
 ]

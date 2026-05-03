@@ -156,7 +156,21 @@ impl PyAsyncEngine {
     /// Generate text asynchronously.
     ///
     /// Returns a coroutine that resolves to the generated string.
-    #[pyo3(signature = (prompt, *, max_tokens=128, temperature=None, top_p=None, top_k=None, seed=None))]
+    #[pyo3(signature = (
+        prompt,
+        *,
+        max_tokens = 128,
+        temperature = None,
+        top_p = None,
+        top_k = None,
+        seed = None,
+        progress = None,
+        progress_throttle_ms = None,
+        progress_throttle_tokens = None,
+        progress_capture_text = false,
+        strict_progress = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn generate<'py>(
         &self,
         py: Python<'py>,
@@ -166,6 +180,11 @@ impl PyAsyncEngine {
         top_p: Option<f32>,
         top_k: Option<usize>,
         seed: Option<u64>,
+        progress: Option<Py<PyAny>>,
+        progress_throttle_ms: Option<u64>,
+        progress_throttle_tokens: Option<usize>,
+        progress_capture_text: bool,
+        strict_progress: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let locals = PyDict::new(py);
         locals.set_item("asyncio", py.import("asyncio")?)?;
@@ -177,8 +196,13 @@ impl PyAsyncEngine {
         locals.set_item("top_p", top_p)?;
         locals.set_item("top_k", top_k)?;
         locals.set_item("seed", seed)?;
+        locals.set_item("progress", progress)?;
+        locals.set_item("progress_throttle_ms", progress_throttle_ms)?;
+        locals.set_item("progress_throttle_tokens", progress_throttle_tokens)?;
+        locals.set_item("progress_capture_text", progress_capture_text)?;
+        locals.set_item("strict_progress", strict_progress)?;
         py.eval(
-            c"asyncio.to_thread(functools.partial(engine.generate, prompt, max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, seed=seed))",
+            c"asyncio.to_thread(functools.partial(engine.generate, prompt, max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, seed=seed, progress=progress, progress_throttle_ms=progress_throttle_ms, progress_throttle_tokens=progress_throttle_tokens, progress_capture_text=progress_capture_text, strict_progress=strict_progress))",
             None,
             Some(&locals),
         )
@@ -208,7 +232,21 @@ impl PyAsyncEngine {
     /// async for token in engine.generate_stream("Hello", max_tokens=128):
     ///     print(token, end="", flush=True)
     /// ```
-    #[pyo3(signature = (prompt, *, max_tokens=128, temperature=None, top_p=None, top_k=None, seed=None))]
+    #[pyo3(signature = (
+        prompt,
+        *,
+        max_tokens = 128,
+        temperature = None,
+        top_p = None,
+        top_k = None,
+        seed = None,
+        progress = None,
+        progress_throttle_ms = None,
+        progress_throttle_tokens = None,
+        progress_capture_text = false,
+        strict_progress = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn generate_stream<'py>(
         &self,
         py: Python<'py>,
@@ -218,6 +256,11 @@ impl PyAsyncEngine {
         top_p: Option<f32>,
         top_k: Option<usize>,
         seed: Option<u64>,
+        progress: Option<Py<PyAny>>,
+        progress_throttle_ms: Option<u64>,
+        progress_throttle_tokens: Option<usize>,
+        progress_capture_text: bool,
+        strict_progress: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let helper = get_token_stream_helper(py)?;
         let stream = helper.getattr("_TokenStream")?.call0()?;
@@ -233,6 +276,11 @@ impl PyAsyncEngine {
                     kwargs.set_item("top_p", top_p)?;
                     kwargs.set_item("top_k", top_k)?;
                     kwargs.set_item("seed", seed)?;
+                    kwargs.set_item("progress", &progress)?;
+                    kwargs.set_item("progress_throttle_ms", progress_throttle_ms)?;
+                    kwargs.set_item("progress_throttle_tokens", progress_throttle_tokens)?;
+                    kwargs.set_item("progress_capture_text", progress_capture_text)?;
+                    kwargs.set_item("strict_progress", strict_progress)?;
 
                     let cb_locals = PyDict::new(py);
                     cb_locals.set_item("_s", stream_handle.bind(py))?;

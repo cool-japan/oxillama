@@ -10,11 +10,16 @@
 //! `py.detach(...)` so Python threads remain unblocked during the
 //! Rust inference loop.  Streaming callbacks re-acquire the GIL per-token.
 
+use std::sync::{Arc, Mutex};
+
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
 use oxillama_runtime::{SpeculativeConfig as RustSpeculativeConfig, SpeculativeEngine};
 
+use crate::callback::{
+    make_progress_bridge, ProgressBridge, DEFAULT_THROTTLE_MS, DEFAULT_THROTTLE_TOKENS,
+};
 use crate::engine::PyEngineConfig;
 use crate::error::runtime_to_py;
 
@@ -133,19 +138,75 @@ impl PySpeculativeEngine {
     /// Args:
     ///     prompt:     Input text.
     ///     max_tokens: Maximum number of new tokens (default 128).
+    ///     progress:   See :class:`oxillama_py.Engine.generate` (same contract).
+    ///     progress_throttle_ms: see :class:`oxillama_py.Engine.generate`.
+    ///     progress_throttle_tokens: see :class:`oxillama_py.Engine.generate`.
+    ///     progress_capture_text: see :class:`oxillama_py.Engine.generate`.
+    ///     strict_progress: see :class:`oxillama_py.Engine.generate`.
     ///
     /// Returns:
     ///     str: Generated text.
-    #[pyo3(signature = (prompt, max_tokens = 128))]
+    #[pyo3(signature = (
+        prompt,
+        max_tokens = 128,
+        *,
+        progress = None,
+        progress_throttle_ms = None,
+        progress_throttle_tokens = None,
+        progress_capture_text = false,
+        strict_progress = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &mut self,
         py: Python<'_>,
         prompt: &str,
         max_tokens: usize,
+        progress: Option<Py<PyAny>>,
+        progress_throttle_ms: Option<u64>,
+        progress_throttle_tokens: Option<usize>,
+        progress_capture_text: bool,
+        strict_progress: bool,
     ) -> PyResult<String> {
         let inner = &mut self.inner;
-        py.detach(|| inner.generate(prompt, max_tokens, |_| {}))
-            .map_err(runtime_to_py)
+        let bridge = make_progress_bridge(
+            py,
+            progress.as_ref(),
+            max_tokens,
+            progress_throttle_ms.unwrap_or(DEFAULT_THROTTLE_MS),
+            progress_throttle_tokens.unwrap_or(DEFAULT_THROTTLE_TOKENS),
+            progress_capture_text,
+        )?;
+        let bridge_arc: Option<Arc<Mutex<ProgressBridge>>> =
+            bridge.map(|b| Arc::new(Mutex::new(b)));
+        let result = py
+            .detach(|| {
+                let bridge_inner = bridge_arc.clone();
+                inner.generate(prompt, max_tokens, move |tok| {
+                    if let Some(ref bridge) = bridge_inner {
+                        Python::attach(|py| {
+                            if let Ok(mut b) = bridge.lock() {
+                                let _ = b.note_token(py, tok, false, false);
+                            }
+                        });
+                    }
+                })
+            })
+            .map_err(runtime_to_py);
+        if let Some(bridge) = bridge_arc.as_ref() {
+            if let Ok(mut b) = bridge.lock() {
+                if result.is_ok() {
+                    b.fire_final(py);
+                }
+                b.finalise(py, result.as_ref().err());
+                if strict_progress {
+                    if let Some(err) = b.take_stashed_error() {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// Generate text from `prompt`, invoking `callback` with each accepted
@@ -158,28 +219,82 @@ impl PySpeculativeEngine {
     ///     prompt:     Input text.
     ///     max_tokens: Maximum number of new tokens.
     ///     callback:   Python callable invoked with each decoded token string.
+    ///     progress:   See :class:`oxillama_py.Engine.generate` (same contract).
+    ///     progress_throttle_ms: see :class:`oxillama_py.Engine.generate`.
+    ///     progress_throttle_tokens: see :class:`oxillama_py.Engine.generate`.
+    ///     progress_capture_text: see :class:`oxillama_py.Engine.generate`.
+    ///     strict_progress: see :class:`oxillama_py.Engine.generate`.
     ///
     /// Returns:
     ///     str: The full generated text.
-    #[pyo3(signature = (prompt, max_tokens = 128, callback = None))]
+    #[pyo3(signature = (
+        prompt,
+        max_tokens = 128,
+        callback = None,
+        *,
+        progress = None,
+        progress_throttle_ms = None,
+        progress_throttle_tokens = None,
+        progress_capture_text = false,
+        strict_progress = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_streaming(
         &mut self,
         py: Python<'_>,
         prompt: &str,
         max_tokens: usize,
         callback: Option<Py<PyAny>>,
+        progress: Option<Py<PyAny>>,
+        progress_throttle_ms: Option<u64>,
+        progress_throttle_tokens: Option<usize>,
+        progress_capture_text: bool,
+        strict_progress: bool,
     ) -> PyResult<String> {
         let inner = &mut self.inner;
-        py.detach(|| {
-            inner.generate(prompt, max_tokens, |tok| {
-                if let Some(ref cb) = callback {
-                    Python::attach(|py| {
-                        let _ = cb.call1(py, (tok,));
-                    });
-                }
+        let bridge = make_progress_bridge(
+            py,
+            progress.as_ref(),
+            max_tokens,
+            progress_throttle_ms.unwrap_or(DEFAULT_THROTTLE_MS),
+            progress_throttle_tokens.unwrap_or(DEFAULT_THROTTLE_TOKENS),
+            progress_capture_text,
+        )?;
+        let bridge_arc: Option<Arc<Mutex<ProgressBridge>>> =
+            bridge.map(|b| Arc::new(Mutex::new(b)));
+        let result = py
+            .detach(|| {
+                let bridge_inner = bridge_arc.clone();
+                inner.generate(prompt, max_tokens, |tok| {
+                    if let Some(ref cb) = callback {
+                        Python::attach(|py| {
+                            let _ = cb.call1(py, (tok,));
+                        });
+                    }
+                    if let Some(ref bridge) = bridge_inner {
+                        Python::attach(|py| {
+                            if let Ok(mut b) = bridge.lock() {
+                                let _ = b.note_token(py, tok, false, false);
+                            }
+                        });
+                    }
+                })
             })
-        })
-        .map_err(runtime_to_py)
+            .map_err(runtime_to_py);
+        if let Some(bridge) = bridge_arc.as_ref() {
+            if let Ok(mut b) = bridge.lock() {
+                if result.is_ok() {
+                    b.fire_final(py);
+                }
+                b.finalise(py, result.as_ref().err());
+                if strict_progress {
+                    if let Some(err) = b.take_stashed_error() {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        result
     }
 }
 

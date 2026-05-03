@@ -3,8 +3,10 @@
 //! Verbatim copies of the grid constants from `oxillama-quant/src/reference/iq_grids.rs`.
 //! `oxillama-quant` is NOT a dependency of `oxillama-gpu`; we inline the tables here.
 
+#[cfg(any(feature = "gpu", test))]
 pub(super) const KMASK_IQ2XS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
+#[cfg(any(feature = "gpu", test))]
 pub(super) const KSIGNS_IQ2XS: [u8; 128] = [
     0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15, 144, 17, 18, 147, 20, 149,
     150, 23, 24, 153, 154, 27, 156, 29, 30, 159, 160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170,
@@ -15,6 +17,7 @@ pub(super) const KSIGNS_IQ2XS: [u8; 128] = [
     252, 125, 126, 255,
 ];
 
+#[cfg(any(feature = "gpu", test))]
 pub(super) const IQ2XXS_GRID: [u64; 256] = [
     0x0808080808080808,
     0x080808080808082b,
@@ -274,6 +277,7 @@ pub(super) const IQ2XXS_GRID: [u64; 256] = [
     0x2b2b2b1908081908,
 ];
 
+#[cfg(any(feature = "gpu", test))]
 pub(super) const IQ2S_GRID: [u64; 1024] = [
     0x0808080808080808,
     0x080808080808082b,
@@ -1301,6 +1305,7 @@ pub(super) const IQ2S_GRID: [u64; 1024] = [
     0x2b2b2b2b2b2b2b2b,
 ];
 
+#[cfg(any(feature = "gpu", test))]
 pub(super) const IQ3XXS_GRID: [u32; 256] = [
     0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
     0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
@@ -1336,6 +1341,7 @@ pub(super) const IQ3XXS_GRID: [u32; 256] = [
     0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
 ];
 
+#[cfg(any(feature = "gpu", test))]
 pub(super) const IQ3S_GRID: [u32; 512] = [
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
     0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,

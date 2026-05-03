@@ -3,7 +3,7 @@
 Generated for PyO3 bindings exposed by OxiLLaMa.
 """
 
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence, Union
 
 try:
     from typing import Protocol, runtime_checkable
@@ -20,6 +20,45 @@ except ImportError:
 __version__: str
 
 __all__: list[str]
+
+# ---------------------------------------------------------------------------
+# ProgressEvent and progress hook
+# ---------------------------------------------------------------------------
+
+class ProgressEvent:
+    """A single progress update emitted from the Rust generation loop."""
+
+    tokens_generated: int
+    tokens_total: Optional[int]
+    elapsed_secs: float
+    tokens_per_sec: float
+    eta_secs: Optional[float]
+    is_final: bool
+    text_so_far: str
+
+    def __init__(
+        self,
+        tokens_generated: int,
+        tokens_total: Optional[int],
+        elapsed_secs: float,
+        tokens_per_sec: float,
+        eta_secs: Optional[float],
+        is_final: bool,
+        text_so_far: str,
+    ) -> None: ...
+
+#: Convenience alias for the user-facing progress callable signature.
+ProgressCallback = Callable[[ProgressEvent], None]
+
+#: Anything ``progress=`` will accept on the ``generate*`` methods.
+ProgressLike = Union[Any, ProgressCallback, None]
+
+def make_progress_adapter(
+    obj: ProgressLike, max_tokens: int
+) -> tuple[
+    Optional[Callable[[ProgressEvent], None]],
+    Optional[Callable[[Optional[BaseException]], None]],
+]: ...
 
 # ---------------------------------------------------------------------------
 # StreamingCallback Protocol
@@ -156,6 +195,12 @@ class Engine:
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         seed: Optional[int] = None,
+        cancel_token: Optional["CancellationToken"] = None,
+        progress: ProgressLike = None,
+        progress_throttle_ms: Optional[int] = None,
+        progress_throttle_tokens: Optional[int] = None,
+        progress_capture_text: bool = False,
+        strict_progress: bool = False,
     ) -> str: ...
     def generate_streaming(
         self,
@@ -167,7 +212,13 @@ class Engine:
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         seed: Optional[int] = None,
+        cancel_token: Optional["CancellationToken"] = None,
         strict_callback: bool = False,
+        progress: ProgressLike = None,
+        progress_throttle_ms: Optional[int] = None,
+        progress_throttle_tokens: Optional[int] = None,
+        progress_capture_text: bool = False,
+        strict_progress: bool = False,
     ) -> str: ...
     def embed(self, text: str) -> list[float]: ...
     def embed_numpy(self, text: str) -> "np.ndarray[tuple[int], np.dtype[np.float32]]": ...
@@ -214,12 +265,28 @@ class SpeculativeEngine:
     """Speculative decoding engine using a draft + target model pair."""
 
     def __init__(self, config: SpeculativeConfig) -> None: ...
-    def generate(self, prompt: str, max_tokens: int = 128) -> str: ...
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 128,
+        *,
+        progress: ProgressLike = None,
+        progress_throttle_ms: Optional[int] = None,
+        progress_throttle_tokens: Optional[int] = None,
+        progress_capture_text: bool = False,
+        strict_progress: bool = False,
+    ) -> str: ...
     def generate_streaming(
         self,
         prompt: str,
         max_tokens: int = 128,
         callback: Optional[Callable[[str], None]] = None,
+        *,
+        progress: ProgressLike = None,
+        progress_throttle_ms: Optional[int] = None,
+        progress_throttle_tokens: Optional[int] = None,
+        progress_capture_text: bool = False,
+        strict_progress: bool = False,
     ) -> str: ...
 
 # ---------------------------------------------------------------------------
@@ -261,4 +328,63 @@ class Lora:
     @property
     def alpha(self) -> float: ...
     def num_adapters(self) -> int: ...
+    def __repr__(self) -> str: ...
+
+# ---------------------------------------------------------------------------
+# CancellationToken
+# ---------------------------------------------------------------------------
+
+class CancellationToken:
+    """A thread-safe cancellation token."""
+
+    def __init__(self) -> None: ...
+    def cancel(self) -> None: ...
+    def is_cancelled(self) -> bool: ...
+    def reset(self) -> None: ...
+    def __repr__(self) -> str: ...
+
+# ---------------------------------------------------------------------------
+# AsyncEngine
+# ---------------------------------------------------------------------------
+
+class AsyncEngine:
+    """Asyncio-friendly wrapper around :class:`Engine`."""
+
+    def __init__(self, config: EngineConfig) -> None: ...
+    @property
+    def engine(self) -> Engine: ...
+    def is_loaded(self) -> bool: ...
+    def reset(self) -> None: ...
+    async def load_model(self) -> None: ...
+    async def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 128,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        seed: Optional[int] = None,
+        progress: ProgressLike = None,
+        progress_throttle_ms: Optional[int] = None,
+        progress_throttle_tokens: Optional[int] = None,
+        progress_capture_text: bool = False,
+        strict_progress: bool = False,
+    ) -> str: ...
+    async def embed(self, text: str) -> list[float]: ...
+    def generate_stream(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 128,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        seed: Optional[int] = None,
+        progress: ProgressLike = None,
+        progress_throttle_ms: Optional[int] = None,
+        progress_throttle_tokens: Optional[int] = None,
+        progress_capture_text: bool = False,
+        strict_progress: bool = False,
+    ) -> Any: ...
     def __repr__(self) -> str: ...

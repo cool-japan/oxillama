@@ -332,6 +332,7 @@ pub(crate) fn cpu_attention(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "gpu")]
     fn make_random(len: usize, seed: u64) -> Vec<f32> {
         let mut v = Vec::with_capacity(len);
         let mut x = seed;
