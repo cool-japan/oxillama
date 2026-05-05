@@ -10,7 +10,7 @@
 //! IQ4_NL block layout (18 bytes per 32 weights):
 //! - bytes  0-1: d (f16 little-endian scale)
 //! - bytes  2-17: 16 nibble-bytes encoding 32 four-bit weight indices
-//!   Low nibble  = weight[2i], High nibble = weight[2i+1]
+//!   Low nibble  = `weight[2i]`, High nibble = `weight[2i+1]`
 //!
 //! Dequantisation: `w = d * KVALUES_IQ4NL[nibble]`
 //!

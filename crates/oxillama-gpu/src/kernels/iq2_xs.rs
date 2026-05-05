@@ -12,7 +12,7 @@
 //! - bytes  2-65:  `qs[32]` — 32 × u16 little-endian.
 //!   Each u16: lower 9 bits = grid index into `IQ2XS_GRID[512]`,
 //!   upper 7 bits = sign selector index into `KSIGNS_IQ2XS[128]`.
-//! - bytes 66-73:  `scales[8]` — 8 bytes, low nibble → db[0], high nibble → db[1].
+//! - bytes 66-73:  `scales[8]` — 8 bytes, low nibble → `db[0]`, high nibble → `db[1]`.
 //!
 //! Scale formula:
 //!   `db[0] = d * (0.5 + (scales[ib32] & 0xf)) * 0.25`  (groups l=0,1)

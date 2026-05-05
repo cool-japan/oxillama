@@ -6,7 +6,13 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 
 ## Status
 
-**Version:** 0.1.2 — **Tests:** 382 passing
+**Version:** 0.1.3 — **Tests:** 389 passing
+
+## What's New in v0.1.3 (2026-05-05)
+
+- **AVX-512 IQ kernels** — IQ2_XXS, IQ2_XS, IQ3_S, IQ4_XS with AVX-512BW (`_mm512_permutexvar_epi8`); 2× throughput vs AVX2. Runtime-guarded via `is_x86_feature_detected!("avx512bw")`. 8 new tests.
+- **Fused `matvec_q8` for Q5_0 / Q5_1 / Q8_1** — single-pass dequant+dot in registers with no scratch allocation; AVX2 + NEON + scalar reference; 6 new tests (tol 1e-5 on 64×1024 GEMV).
+- Test count: 382 → **389 tests passing**.
 
 ## What's New in v0.1.2
 

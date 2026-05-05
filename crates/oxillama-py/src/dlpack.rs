@@ -2,8 +2,8 @@
 //!
 //! DLPack is the standard zero-copy tensor interchange protocol used by
 //! PyTorch, TensorFlow, JAX, CuPy, and every other major ML framework.
-//! This module implements the producer side (Vec<f32> → PyCapsule) and the
-//! consumer side (PyCapsule → Vec<f32>) for 1-D and N-D CPU tensors of dtype
+//! This module implements the producer side (`Vec<f32>` → PyCapsule) and the
+//! consumer side (PyCapsule → `Vec<f32>`) for 1-D and N-D CPU tensors of dtype
 //! float32.
 //!
 //! # Wire format

@@ -5,7 +5,7 @@
 //!    one feature vector per patch.
 //! 2. [`MmMerger`] — compresses 2×2 spatial patch blocks into a single LLM
 //!    token by reshaping `[N, hidden]` → `[N/4, 4*hidden]` then projecting.
-//! 3. [`Qwen2Backbone`] — Qwen-shaped decoder LLM with M-RoPE instead of
+//! 3. `Qwen2Backbone` — Qwen-shaped decoder LLM with M-RoPE instead of
 //!    standard 1-D RoPE.
 //!
 //! ## Forward flow

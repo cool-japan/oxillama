@@ -121,7 +121,7 @@ impl SpeculativeBenchTable {
     }
 
     /// Render the speedup as a 2-D grid with accept_threshold rows and
-    /// draft_size columns.  Identical to [`summary_table`] but exposes a
+    /// draft_size columns.  Identical to [`Self::summary_table`] but exposes a
     /// separate name for callers that distinguish the two concepts.
     pub fn speedup_grid(&self) -> String {
         self.summary_table()
@@ -473,17 +473,16 @@ mod tests {
         //         = 5·target_ns / (4·draft_ns + target_ns)
         //
         // For speedup > 1:  5·T > 4·d + T  ⟹  4T > 4d  ⟹  T > d
-        // So we need target_ns >> draft_ns.  Use target=20_000, draft=500.
+        // So we need target_ns >> draft_ns.  Use target=200_000, draft=5_000.
         let target_engine = StubSpecEngine {
             prefill_ns_per_tok: 100,
-            decode_ns: 20_000, // slow target
+            decode_ns: 200_000, // slow target (200 µs)
         };
         let draft_engine = StubSpecEngine {
             prefill_ns_per_tok: 50,
-            decode_ns: 500, // fast draft (40× faster)
+            decode_ns: 5_000, // fast draft (40× faster, 5 µs)
         };
-        let table =
-            run_acceptance_sweep(&target_engine, &draft_engine, &[4], &[1.0], 20, 2, "stub");
+        let table = run_acceptance_sweep(&target_engine, &draft_engine, &[4], &[1.0], 5, 3, "stub");
         let point = table.lookup(4, 1.0).expect("grid cell must exist");
         assert!(
             point.speedup > 1.0,

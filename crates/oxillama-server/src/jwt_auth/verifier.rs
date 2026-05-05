@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use thiserror::Error;
 
 // Use sha2 from the sha2 workspace dep for HS256 (digest 0.10 compatible with hmac 0.12).
@@ -653,7 +653,7 @@ mod tests {
         use rsa::signature::RandomizedSigner;
         use rsa::signature::SignatureEncoding;
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_core::OsRng;
         let private_key =
             rsa::RsaPrivateKey::new(&mut rng, 2048).expect("test fixture: RSA key generation");
         let public_key = rsa::RsaPublicKey::from(&private_key);

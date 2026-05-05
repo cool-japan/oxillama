@@ -668,8 +668,8 @@ impl InferenceEngine {
 
     /// Run the autoregressive decode loop starting from pre-computed logits.
     ///
-    /// Unlike [`generate_with_config`], this does **not** run prefill — the
-    /// caller must have already primed the KV cache (via [`prime_with_prefix`]
+    /// Unlike [`Self::generate_with_config`], this does **not** run prefill — the
+    /// caller must have already primed the KV cache (via [`Self::prime_with_prefix`]
     /// or a full prefill) and obtained the initial logits from that step.
     ///
     /// # Errors
@@ -974,7 +974,7 @@ impl InferenceEngine {
 
     /// Compute a semantic embedding vector for the given text using `PoolingMode::Last`.
     ///
-    /// This is a convenience wrapper around [`embed_with`]. Runs tokenization →
+    /// This is a convenience wrapper around [`Self::embed_with`]. Runs tokenization →
     /// full transformer layers → final RMSNorm, then L2-normalises the resulting
     /// `hidden_size`-dimensional vector. The KV cache is reset before the pass
     /// so that embeddings for different inputs are independent of each other.
@@ -1064,7 +1064,7 @@ impl InferenceEngine {
 
     /// Extract embedding vectors for multiple input texts using `PoolingMode::Last`.
     ///
-    /// This is a convenience wrapper around [`embed_batch_with`].
+    /// This is a convenience wrapper around [`Self::embed_batch_with`].
     /// Each text is processed independently with a fresh KV cache.
     pub fn embed_batch(&mut self, texts: &[String]) -> RuntimeResult<Vec<Vec<f32>>> {
         let str_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();

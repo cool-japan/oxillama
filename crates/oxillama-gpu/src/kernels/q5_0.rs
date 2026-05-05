@@ -478,7 +478,7 @@ mod tests {
         let cols = 32;
         let mut weight_bytes = Vec::new();
         for r in 0..rows {
-            let qh: u32 = ((r as u32 * 0x12345678).wrapping_add(0xABCD_EF01)) & 0xFFFF_FFFF;
+            let qh: u32 = (r as u32 * 0x12345678).wrapping_add(0xABCD_EF01);
             let mut qs = [0u8; 16];
             for (i, q) in qs.iter_mut().enumerate() {
                 *q = ((r * 7 + i * 11 + 3) & 0xFF) as u8;

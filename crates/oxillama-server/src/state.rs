@@ -8,7 +8,7 @@
 //! - Disk-backed batch store + queue sender (C3).
 //! - Multi-model LRU pool (C1), protected by a `Mutex` for admin mutations.
 //! - Prefix KV cache for system-prompt reuse across requests.
-//! - LoRA adapter registry (name → Arc<LoadedLora>).
+//! - LoRA adapter registry (name → `Arc<LoadedLora>`).
 //! - Persistent thread store + run queue (Assistants API).
 
 use std::collections::HashMap;

@@ -60,12 +60,12 @@ const SAFETENSORS_META_KEY: &str = "__metadata__";
 ///
 /// The resulting [`GgufModel`] carries:
 /// - A single metadata key: `general.architecture = "safetensors_import"`.
-/// - One [`TensorInfo`] per tensor found in the safetensors header.
+/// - One [`crate::tensor_info::TensorInfo`] per tensor found in the safetensors header.
 /// - All raw tensor bytes stored in-memory as `GgufData::Owned`.
 ///
 /// Because safetensors does not use GGUF's alignment-padded data section, the
 /// tensor data is stored contiguously in the order it appears in the file;
-/// tensor offsets in [`TensorInfo`] are absolute byte positions within that
+/// tensor offsets in [`crate::tensor_info::TensorInfo`] are absolute byte positions within that
 /// owned buffer.
 pub struct SafetensorsConverter;
 

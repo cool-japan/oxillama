@@ -1,4 +1,4 @@
-//! HTTP Range-request backed [`Source`] for remote GGUF loading.
+//! HTTP Range-request backed [`crate::source::Source`] for remote GGUF loading.
 //!
 //! [`HttpRangeSource`] issues HTTP `Range:` requests against a remote URL so
 //! that the GGUF parser can stream individual sections of a model file without

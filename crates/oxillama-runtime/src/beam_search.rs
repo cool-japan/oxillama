@@ -2,7 +2,7 @@
 //!
 //! Implements a full beam search decoder over an abstract forward-pass
 //! interface.  The engine's `forward()` call is abstracted behind
-//! [`BeamForwardPass`] so that both the real [`InferenceEngine`] and
+//! [`BeamForwardPass`] so that both the real [`crate::engine::InferenceEngine`] and
 //! test-only stubs can drive the algorithm.
 //!
 //! # Algorithm
@@ -93,13 +93,13 @@ impl BeamHypothesis {
 
 /// Abstraction over a forward pass that produces logits for a token sequence.
 ///
-/// The real implementation is backed by [`InferenceEngine`]; test stubs
+/// The real implementation is backed by [`crate::engine::InferenceEngine`]; test stubs
 /// can implement this trait with pre-computed logit sequences.
 pub trait BeamForwardPass {
     /// Run the forward pass on `tokens` and return raw logits.
     ///
     /// The implementation is free to maintain internal state (KV cache, etc.)
-    /// but must be resettable via [`reset`].
+    /// but must be resettable via [`Self::reset`].
     fn forward_tokens(&mut self, tokens: &[u32]) -> RuntimeResult<Vec<f32>>;
 
     /// Reset the internal state (e.g. clear the KV cache) so a fresh
@@ -109,7 +109,7 @@ pub trait BeamForwardPass {
 
 // ─── Engine adapter ───────────────────────────────────────────────────────────
 
-/// Adapter that wraps [`InferenceEngine`] to implement [`BeamForwardPass`].
+/// Adapter that wraps [`crate::engine::InferenceEngine`] to implement [`BeamForwardPass`].
 ///
 /// Each call to `forward_tokens` resets the KV cache, prefills the prompt
 /// tokens, and returns the logits for the last token.

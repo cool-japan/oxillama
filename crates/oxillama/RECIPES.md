@@ -74,7 +74,14 @@ fn main() -> anyhow::Result<()> {
     // 3. Spawn the background inference worker.
     //    Route handlers communicate with it via an mpsc channel.
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    spawn_inference_worker(engine, rx);
+    let prefix_cache = Arc::new(std::sync::Mutex::new(
+        oxillama::runtime::PrefixKvCache::new(oxillama::runtime::PrefixCacheConfig::default()),
+    ));
+    let loras: Arc<std::sync::RwLock<std::collections::HashMap<
+        String,
+        Arc<oxillama::arch::lora::LoadedLora>,
+    >>> = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    spawn_inference_worker(engine, rx, prefix_cache, loras);
 
     // 4. Build shared state + axum router.
     let state = Arc::new(AppState::new(

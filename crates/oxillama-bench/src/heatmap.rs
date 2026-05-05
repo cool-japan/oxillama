@@ -6,7 +6,7 @@
 //! [`summary_table`][BatchHeatmap::summary_table] renders a Markdown table
 //! suitable for CI output.
 //!
-//! The measurement discipline mirrors [`LongContextSweep`] (same warm-up /
+//! The measurement discipline mirrors [`crate::long_context::LongContextSweep`] (same warm-up /
 //! measure philosophy) but adds a second dimension — batch size — which exposes
 //! the crossover point where continuous batching stops paying off.
 //!
@@ -16,7 +16,7 @@
 //! 1. **Warm-up** — 3 rounds of: prefill `seq_len` tokens, decode `batch_size`
 //!    tokens, reset.  Primes caches and JIT paths so first-measurement noise is
 //!    excluded.
-//! 2. **Measurement** — [`MEASURE_ROUNDS`] rounds of the same loop; each
+//! 2. **Measurement** — `MEASURE_ROUNDS` rounds of the same loop; each
 //!    individual decode call is timed with [`std::time::Instant`] so we can
 //!    extract a per-call latency distribution.
 //! 3. **Aggregation** — derive `toks/s` from total tokens / total wall time;

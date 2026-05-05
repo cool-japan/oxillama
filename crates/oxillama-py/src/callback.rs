@@ -163,7 +163,7 @@ pub struct ProgressBridge {
 }
 
 impl ProgressBridge {
-    /// Number of tokens passed to [`note_token`] so far (across all calls).
+    /// Number of tokens passed to [`Self::note_token`] so far (across all calls).
     pub fn tokens_total(&self) -> usize {
         self.tokens_total.load(Ordering::Relaxed)
     }

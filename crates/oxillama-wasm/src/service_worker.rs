@@ -82,7 +82,7 @@ impl Default for ServiceWorkerOptions {
 /// Return the service-worker JavaScript source as a `String`.
 ///
 /// Deserializes `options_json` as [`ServiceWorkerOptions`], then calls
-/// [`generate_service_worker_script`] to produce a self-contained script.
+/// `generate_service_worker_script` to produce a self-contained script.
 ///
 /// The caller is responsible for hosting the script: either write it to a
 /// `.js` file served from the same origin, or encode it as a Blob URL:

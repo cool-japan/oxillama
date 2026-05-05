@@ -4,7 +4,7 @@ GGUF v3 file format parser and tensor loader for Rust.
 
 Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a Pure Rust LLM inference engine.
 
-**278 tests passing** (unit + integration, as of v0.1.2)
+**290 tests passing** (unit + integration, as of v0.1.3)
 
 ## What It Provides
 
@@ -26,6 +26,12 @@ The `tests/` directory contains integration tests covering the three new v0.1.2 
 | `tests/resume.rs` | `ResumeCheckpoint` round-trip, fingerprint mismatch detection |
 | `tests/sharded.rs` | Multi-shard load, architecture consistency checks, duplicate-tensor rejection |
 | `tests/quantize_on_load.rs` | F16→Q4_0, F16→Q8_0, F32→Q4_0, re-quantization rejection |
+
+## What's New in v0.1.3 (2026-05-05)
+
+- **BLOOM GGUF test fixture** — `build_minimal_bloom_gguf()` helper added to `test_utils.rs`; 1-layer, hidden=64, 8 heads; used by `oxillama-arch` BLOOM integration tests.
+- **Phi-3.5-MoE GGUF test fixture** — `build_minimal_phi_moe_gguf()` helper; 1-layer, 4 experts, top-2; used by Phi-3.5-MoE integration tests.
+- Test count: 278 → **290 tests passing**.
 
 ## What's New in v0.1.2
 
