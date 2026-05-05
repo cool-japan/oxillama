@@ -126,11 +126,9 @@ fn dequant_tq1_0_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuRes
             for &qs_byte in block.iter().take(TQ1_0_QS_BYTES) {
                 let vals = decode_qs_byte(qs_byte);
                 for &v in &vals {
-                    if out_idx < cols * (row + 1) {
-                        let col = out_idx - row * cols;
-                        if col < cols {
-                            f32_weights[row * cols + col] = d * v as f32;
-                        }
+                    let col = out_idx - weight_base;
+                    if col < cols {
+                        f32_weights[row * cols + col] = d * v as f32;
                     }
                     out_idx += 1;
                 }

@@ -945,7 +945,7 @@ mod tests {
                 "probs must still sum to 1, got {sum}"
             );
 
-            let cpu_ref = cpu_softmax(&[0.0f32, 0.0, 1.0], 1.0); // -inf → 0
+            let cpu_ref = cpu_softmax(&[f32::NEG_INFINITY, 0.0f32, 1.0], 1.0);
             assert!(
                 (probs[2] - cpu_ref[2]).abs() < 1e-3,
                 "probs[2] mismatch: gpu={}, cpu={}",

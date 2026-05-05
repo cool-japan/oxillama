@@ -184,7 +184,7 @@ fn scalar_gemv(
             let signs = &block[SIGNS_OFFSET..SIGNS_OFFSET + SIGNS_BYTES];
             let scales = &block[SCALES_OFFSET..BLOCK_BYTES];
             let mut ib32 = 0usize;
-            let mut col = blk * BLOCK_SIZE;
+            let col = blk * BLOCK_SIZE;
             while ib32 < N_SUPERBLOCKS {
                 let pair = ib32 / 2;
                 let scale_byte = scales[pair];
