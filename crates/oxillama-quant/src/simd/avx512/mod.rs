@@ -24,9 +24,17 @@
 //! | [`Tq2_0Avx512`]     | TQ2_0      | 256 | 66  | ~2× |
 //! | [`Q5_0Avx512`]      | Q5_0       | 32  | 22  | ~2× |
 //! | [`Q8_KAvx512`]      | Q8_K       | 256 | 292 | ~2× |
+//! | [`Iq2XxsAvx512`]    | IQ2_XXS    | 256 | 66  | ~2× |
+//! | [`Iq2XsAvx512`]     | IQ2_XS     | 256 | 74  | ~2× |
+//! | [`Iq3SAvx512`]      | IQ3_S      | 256 | 110 | ~2× |
+//! | [`Iq4XsAvx512`]     | IQ4_XS     | 256 | 136 | ~2× |
 
 #![cfg(all(feature = "simd-avx512", target_arch = "x86_64"))]
 
+pub mod iq2_xs;
+pub mod iq2_xxs;
+pub mod iq3_s;
+pub mod iq4_xs;
 pub mod q1_0_g128;
 pub mod q2_k;
 pub mod q3_k;
@@ -44,6 +52,10 @@ pub mod tq1_0;
 pub mod tq2_0;
 mod util;
 
+pub use iq2_xs::Iq2XsAvx512;
+pub use iq2_xxs::Iq2XxsAvx512;
+pub use iq3_s::Iq3SAvx512;
+pub use iq4_xs::Iq4XsAvx512;
 pub use q1_0_g128::Q1_0G128Avx512;
 pub use q2_k::Q2_KAvx512;
 pub use q3_k::Q3_KAvx512;

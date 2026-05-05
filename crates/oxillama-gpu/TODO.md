@@ -31,14 +31,14 @@ shader coverage, batching, and attention fusion.
 
 | Item              | Value                                        |
 |-------------------|----------------------------------------------|
-| Version           | 0.1.1 (workspace)                            |
-| Completion        | ~93 %                                        |
+| Version           | 0.1.3 (workspace)                            |
+| Completion        | ~95 %                                        |
 | Feature flag      | `gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]` (off by default) |
 | wgpu version      | 29.0.1                                       |
-| Source files      | 7 Rust files (`lib.rs`, `context.rs`, `buffer.rs`, `error.rs`, `kernels/mod.rs`, `kernels/q4_0.rs`, `kernels/q8_0.rs`) |
-| WGSL shaders      | 2 shader files (`shaders/gemv_f32.wgsl`, `shaders/batched_gemv_f32.wgsl`) with Q4_0 and Q8_0 entry points |
-| Tests             | 151 unit tests (smoke + error-display + gated end-to-end correctness) |
-| Quant coverage    | 24 / 25 quant types (Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q8_K, Q1_0_G128, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ1_S, IQ1_M, IQ2_XS, IQ4_NL, TQ1_0, TQ2_0, Q4_1, Q5_0, Q5_1, Q8_1; tiled GEMM + fused attention) |
+| Source files      | 7 Rust files (`lib.rs`, `context.rs`, `buffer.rs`, `error.rs`, `kernels/mod.rs`, `kernels/q4_0.rs`, `kernels/q8_0.rs`) + `kernels/sampling.rs` |
+| WGSL shaders      | 6 shader files (`gemv_f32.wgsl`, `batched_gemv_f32.wgsl`, `gemm_f32.wgsl`, `gemv_f16.wgsl`, `attention_fused_f32.wgsl`, `sampling.wgsl`) |
+| Tests             | 211 unit tests (smoke + error-display + gated end-to-end correctness + 13 sampling tests) |
+| Quant coverage    | 24 / 25 quant types (Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q8_K, Q1_0_G128, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ1_S, IQ1_M, IQ2_XS, IQ4_NL, TQ1_0, TQ2_0, Q4_1, Q5_0, Q5_1, Q8_1; tiled GEMM + fused attention + GPU sampling) |
 | Pure Rust         | Yes — wgpu is Rust-native                    |
 | Default behaviour | Graceful CPU fallback when no adapter found  |
 
@@ -66,12 +66,12 @@ shader coverage, batching, and attention fusion.
 | IQ4_XS                    | ✓         | CPU dequant + GPU f32 GEMV                        |
 | Tiled GEMM                | ✓         | TILE_M/N=32, TILE_K=16; `gemm_f32.wgsl` — **new in v0.1.1** |
 | Fused attention           | ✓         | Online softmax, QK+AV single dispatch — **new in v0.1.1** |
-| IQ1_S                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
-| IQ1_M                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
-| IQ2_XS                    | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
-| IQ4_NL                    | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
-| TQ1_0                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
-| TQ2_0                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
+| IQ1_S                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.3**    |
+| IQ1_M                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.3**    |
+| IQ2_XS                    | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.3**    |
+| IQ4_NL                    | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.3**    |
+| TQ1_0                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.3**    |
+| TQ2_0                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.3**    |
 
 ## 3. Module Map
 
@@ -232,7 +232,44 @@ These items make up the remaining ~18 % of the v0.1.0 completion figure.
   tuned for tile-based mobile GPUs, coordinated with the `oxillama-wasm`
   hookup so a browser build gets real acceleration, not just portability.
 
-*Last updated: 2026-05-05 (v0.1.5 shipped — IQ1_S/IQ1_M/IQ2_XS/IQ4_NL/TQ1_0/TQ2_0 GPU kernels; 24 quant types on GPU, ~95% HF coverage; 198 oxillama-gpu tests)*
+*Last updated: 2026-05-05 (v0.1.3 shipped — GPU sampling kernels: softmax, top-k, categorical; 211 oxillama-gpu tests; ~95% completion)*
+
+## Track E — GPU Sampling Kernels (v0.1.3 — Shipped 2026-05-05)
+
+### E1 — WGSL sampling shader (`sampling.wgsl`)
+
+- [x] Three WGSL entry points: `softmax_logits`, `topk_partition`, `sample_categorical` (done 2026-05-05)
+  - `softmax_logits`: two-pass workgroup reduction (find max → exp+sum → normalise); temperature=0 → argmax degenerate distribution; 256-thread workgroup with shared memory (2 KiB).
+  - `topk_partition`: 256-thread workgroup, each thread tracks best candidate; thread-0 selection sort for final top-k (supports k ≤ 256).
+  - `sample_categorical`: single-thread (1,1,1) workgroup; LCG RNG seeded from two u32 params; CDF walk to pick token.
+  - **Files:** `src/shaders/sampling.wgsl` (new, ~185 LoC WGSL).
+
+### E2 — Rust `SamplingKernel` (`kernels/sampling.rs`)
+
+- [x] `SamplingKernel` struct owning three compiled pipelines and bind-group layouts (done 2026-05-05)
+  - `softmax(logits, temperature) → Vec<f32>` — host-in, host-out convenience wrapper.
+  - `softmax_raw(logits, temperature) → wgpu::Buffer` — GPU-resident output for chaining.
+  - `top_k(probs, k) → (Vec<f32>, Vec<u32>)` — host-in, host-out.
+  - `top_k_raw(probs_buf, k) → (wgpu::Buffer, wgpu::Buffer)` — GPU-resident.
+  - `sample(probs, idxs, seed) → u32` — host-in, token-out.
+  - `sample_raw(probs_buf, idxs_buf, seed) → u32` — GPU-resident inputs.
+  - Stub constructor (`#[cfg(not(feature = "gpu"))]`) returns `Err(NoAdapter)`.
+  - u32 buffer helpers added to `buffer.rs` (`upload_u32`, `create_output_u32`, `download_u32`).
+  - **Files:** `src/kernels/sampling.rs` (new, ~480 LoC); `src/buffer.rs` (extended); `src/kernels/mod.rs` (added `pub mod sampling`); `src/lib.rs` (added `pub use kernels::sampling::SamplingKernel`).
+  - **Tests:** 13 tests (3 CPU-reference always-run + 10 GPU tests with `skip_if_no_gpu!` macro).
+    - `cpu_softmax_sums_to_one` — always runs
+    - `cpu_softmax_temperature_zero_argmax` — always runs
+    - `cpu_top_k_returns_correct_count` — always runs
+    - `gpu_softmax_matches_cpu` — GPU, tol 1e-4
+    - `gpu_softmax_temperature_zero_is_argmax` — GPU
+    - `gpu_topk_correctness_k40` — GPU, 1024-element dist
+    - `gpu_topk_partial_order_invariant` — GPU
+    - `gpu_sample_categorical_with_seed_deterministic` — GPU, same seed → same token
+    - `gpu_sample_temperature_zero_is_argmax` — GPU, point mass
+    - `gpu_sample_distribution_chi_squared_passes_at_5pct` — GPU, 1000 samples, χ² ≤ 20
+    - `gpu_sampling_no_adapter_falls_back_gracefully` — always runs
+    - `gpu_softmax_handles_neg_inf_logits` — GPU
+    - `gpu_topk_handles_k_eq_one` — GPU
 
 ## 8. Planned GPU Kernels (v2.0 — Scheduled 2026-04-19)
 
@@ -327,7 +364,7 @@ These items make up the remaining ~18 % of the v0.1.0 completion figure.
   - **Tests:** `test_gpu_gemv_iq3_s_matches_cpu` — 64×256 GEMV, tol 1e-3.
   - **Risk:** IQ3_S decode is the most byte-fiddly — cross-reference reference impl twice before coding.
 
-## 10. Track C — Remaining 6 GPU Kernels (v0.1.5 — Scheduled 2026-05-05)
+## 10. Track C — Remaining 6 GPU Kernels (v0.1.3 — Scheduled 2026-05-05)
 
 ### D1 — IQ1_S GPU GEMV kernel
 

@@ -11,7 +11,7 @@ use crate::batch;
 use crate::batch_spool;
 use crate::body_limit::body_limit_layer;
 use crate::config::ServerConfig;
-use crate::rate_limit::{rate_limit_middleware, RateLimiter};
+use crate::rate_limit::{per_key_rate_limit_middleware, rate_limit_middleware, RateLimiter};
 use crate::routes;
 use crate::state::AppState;
 use crate::threads;
@@ -96,6 +96,12 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             "/v1/threads/{thread_id}/runs/{run_id}/steps/{step_id}",
             get(threads::steps::get_step_handler),
         )
+        // ── Responses API ─────────────────────────────────────────────────
+        .route(
+            "/v1/responses",
+            post(routes::responses::create_response).get(routes::responses::list_responses),
+        )
+        .route("/v1/responses/{id}", get(routes::responses::get_response))
         // ── Admin API ─────────────────────────────────────────────────────
         .route("/admin/models/load", post(admin::admin_load_model))
         .route("/admin/models/unload", post(admin::admin_unload_model))
@@ -198,6 +204,12 @@ pub fn build_app_with_config(state: Arc<AppState>, config: &ServerConfig) -> Rou
             "/v1/threads/{thread_id}/runs/{run_id}/steps/{step_id}",
             get(threads::steps::get_step_handler),
         )
+        // ── Responses API ─────────────────────────────────────────────────
+        .route(
+            "/v1/responses",
+            post(routes::responses::create_response).get(routes::responses::list_responses),
+        )
+        .route("/v1/responses/{id}", get(routes::responses::get_response))
         // ── Admin API ─────────────────────────────────────────────────────
         .route("/admin/models/load", post(admin::admin_load_model))
         .route("/admin/models/unload", post(admin::admin_unload_model))
@@ -219,7 +231,7 @@ pub fn build_app_with_config(state: Arc<AppState>, config: &ServerConfig) -> Rou
         app = app.route("/metrics", get(routes::metrics::metrics));
     }
 
-    let mut app = app.with_state(state);
+    let mut app = app.with_state(Arc::clone(&state));
 
     // Admin auth extension.
     app = app.layer(axum::Extension(admin_auth));
@@ -234,7 +246,15 @@ pub fn build_app_with_config(state: Arc<AppState>, config: &ServerConfig) -> Rou
         app = app.layer(axum::middleware::from_fn(tracing_middleware));
     }
 
-    // Rate limiting layer
+    // Per-API-key rate limiter (applied after auth so the key is always in headers).
+    if let Some(per_key_limiter) = state.per_key_rate_limiter.as_ref().cloned() {
+        app = app.layer(axum::middleware::from_fn_with_state(
+            per_key_limiter,
+            per_key_rate_limit_middleware,
+        ));
+    }
+
+    // Global token-bucket rate limiting layer
     if config.rate_limit_capacity > 0.0 {
         let limiter = RateLimiter::new(config.rate_limit_capacity, config.rate_limit_rate);
         app = app

@@ -33,6 +33,7 @@ pub mod kernels;
 pub use context::GpuContext;
 pub use context::GpuDeviceInfo;
 pub use error::{GpuError, GpuResult};
+pub use kernels::sampling::SamplingKernel;
 pub use kernels::{
     batched_gemv_f32, supports_f16, BatchedGemvConfig, BatchedGpuKernel, F16AccumulatorConfig,
     FusedAttentionKernel, GpuKernel, Iq1MGpuKernel, Iq1SGpuKernel, Iq2SGpuKernel, Iq2XsGpuKernel,

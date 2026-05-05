@@ -7,6 +7,7 @@
 
 pub mod batched_attention;
 pub mod beam_search;
+pub mod embedding;
 pub mod engine;
 pub mod error;
 pub mod flash_attention;
@@ -29,6 +30,7 @@ pub use batched_attention::batched_flash_attention;
 pub use beam_search::{
     beam_generate, BeamForwardPass, BeamHypothesis, BeamSearchConfig, EngineBeamAdapter,
 };
+pub use embedding::PoolingMode;
 pub use engine::{EngineConfig, InferenceEngine, FLASH_ATTN_THRESHOLD};
 pub use error::{RuntimeError, RuntimeResult};
 pub use flash_attention::{
@@ -46,6 +48,7 @@ pub use offload::{
 };
 pub use oxillama_arch::lora::LoadedLora;
 pub use oxillama_arch::LoraStack;
+pub use sampling::advanced::{DryStage, EtaStage, TopAStage, TypicalPStage, XtcStage};
 pub use sampling::chain::{LogitBias, SamplerChain, SamplerStage};
 pub use sampling::grammar::{Grammar, GrammarError, GrammarState, JsonSchemaCompiler};
 pub use sampling::{sample, Sampler, SamplerConfig};

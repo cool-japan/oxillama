@@ -22,6 +22,8 @@ use crate::batch_spool::{BatchQueueSender, BatchStore as DiskBatchStore};
 use crate::files_store::FilesStore;
 use crate::metrics::Metrics;
 use crate::queue::{BatchRequest, VocabBytes};
+use crate::rate_limit::PerKeyRateLimiter;
+use crate::responses_store::ResponseStore;
 use crate::router::ModelPool;
 use crate::threads::stream::RunEventSender;
 use crate::threads::{RunQueueSender, ThreadStore};
@@ -109,6 +111,17 @@ pub struct AppState {
     ///
     /// `None` when SSE streaming is not enabled.
     pub run_event_tx_broadcast: Option<RunEventSender>,
+
+    /// In-memory store for Responses API objects.
+    ///
+    /// `None` when the Responses API has not been enabled.  Route handlers
+    /// return 503 (`ModelNotReady`) in this case.
+    pub responses_store: Option<Arc<ResponseStore>>,
+
+    /// Per-API-key token-bucket rate limiter.
+    ///
+    /// `None` when per-key rate limiting has not been configured.
+    pub per_key_rate_limiter: Option<Arc<PerKeyRateLimiter>>,
 }
 
 impl AppState {
@@ -155,6 +168,8 @@ impl AppState {
             run_queue_tx: None,
             files_store: None,
             run_event_tx_broadcast: None,
+            responses_store: None,
+            per_key_rate_limiter: None,
         }
     }
 
@@ -184,6 +199,23 @@ impl AppState {
     /// can subscribe to.
     pub fn with_run_event_sender(mut self, tx: RunEventSender) -> Self {
         self.run_event_tx_broadcast = Some(tx);
+        self
+    }
+
+    /// Attach a Responses API store to this `AppState`.
+    ///
+    /// When set, the `/v1/responses` routes are fully operational.
+    pub fn with_responses_store(mut self, store: Arc<ResponseStore>) -> Self {
+        self.responses_store = Some(store);
+        self
+    }
+
+    /// Attach a per-API-key rate limiter to this `AppState`.
+    ///
+    /// When set, the `per_key_rate_limit_middleware` is applied to all routes
+    /// in `build_app_with_config`.
+    pub fn with_per_key_rate_limiter(mut self, limiter: Arc<PerKeyRateLimiter>) -> Self {
+        self.per_key_rate_limiter = Some(limiter);
         self
     }
 
@@ -222,6 +254,8 @@ impl AppState {
             run_queue_tx: None,
             files_store: None,
             run_event_tx_broadcast: None,
+            responses_store: None,
+            per_key_rate_limiter: None,
         }
     }
 }

@@ -16,6 +16,8 @@
 //! | Gemma 2/3 | `gemma` | Planned |
 //! | Phi-3/4 | `phi` | Planned |
 
+#[cfg(feature = "bloom")]
+pub mod bloom;
 #[cfg(feature = "command-r")]
 pub mod command_r;
 pub mod common;
@@ -57,6 +59,8 @@ pub mod mixtral;
 pub mod olmo2;
 #[cfg(feature = "phi")]
 pub mod phi;
+#[cfg(feature = "phimoe")]
+pub mod phi_moe;
 #[cfg(feature = "qwen2-vl")]
 pub mod qwen2_vl;
 #[cfg(feature = "qwen3")]
@@ -70,6 +74,7 @@ pub mod starcoder;
 pub mod traits;
 pub mod yi;
 
+pub use common::alibi::AlibiBias;
 pub use common::rope::RopeScalingType;
 pub use config::{ModelConfig, VisionConfig};
 pub use error::{ArchError, ArchResult};

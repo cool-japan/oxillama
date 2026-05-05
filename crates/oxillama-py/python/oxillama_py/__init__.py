@@ -238,8 +238,13 @@ except ImportError:
 
 from oxillama_py import snapshot
 from oxillama_py.snapshot import SnapshotError
+from oxillama_py import torch_helper as _torch_helper
 
 __version__ = "0.1.0"
+
+# Patch torch interop helpers onto Engine (no-op if torch is not installed).
+import sys as _sys
+_torch_helper.try_patch(_sys.modules[__name__])
 
 # Names that should still be importable for back-compat but trigger a
 # DeprecationWarning on first access.  The lazy ``__getattr__`` hook below

@@ -107,11 +107,16 @@ impl SamplerChain {
     /// Build a chain from a `SamplerConfig`, replicating the standard pipeline.
     ///
     /// Pipeline order:
-    /// logit-bias → repetition penalty → temperature → top-K → min-P → top-P.
+    /// logit-bias → repetition penalty → DRY → XTC → TypicalP → TopA → Eta
+    ///   → temperature → top-K → min-P → top-P.
     ///
     /// Logit-bias must come first so that bans and boosts are visible to all
-    /// downstream filtering stages.
+    /// downstream filtering stages. The five advanced stages are inserted after
+    /// repetition penalty (they work on logit-scale values) but before temperature
+    /// scaling (so they see the pre-temperature distribution shape).
     pub fn from_config(config: &super::SamplerConfig) -> Self {
+        use super::advanced::{DryStage, EtaStage, TopAStage, TypicalPStage, XtcStage};
+
         let mut chain = Self::new();
 
         if let Some(seed) = config.seed {
@@ -132,6 +137,39 @@ impl SamplerChain {
                 config.repetition_penalty_window,
             ));
         }
+
+        // ── Advanced stages (Track B, v0.1.7) ────────────────────────────────
+        // Order: DRY → XTC → TypicalP → TopA → Eta
+        if config.dry_multiplier != 0.0 {
+            chain = chain.push(DryStage::new(
+                config.dry_multiplier,
+                config.dry_base,
+                config.dry_allowed_length,
+                Vec::new(), // sequence_breakers — not yet in SamplerConfig; extend later
+            ));
+        }
+
+        if config.xtc_threshold < 1.0 && config.xtc_probability > 0.0 {
+            let seed = config.seed.unwrap_or(0xDEAD_BEEF_CAFE_BABE);
+            chain = chain.push(XtcStage::new(
+                config.xtc_threshold,
+                config.xtc_probability,
+                seed,
+            ));
+        }
+
+        if config.typical_p < 1.0 {
+            chain = chain.push(TypicalPStage::new(config.typical_p));
+        }
+
+        if config.top_a != 0.0 {
+            chain = chain.push(TopAStage::new(config.top_a));
+        }
+
+        if config.eta_cutoff != 0.0 || config.epsilon_cutoff != 0.0 {
+            chain = chain.push(EtaStage::new(config.eta_cutoff, config.epsilon_cutoff));
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         if config.temperature <= 0.0 {
             // Greedy: just push the greedy selector

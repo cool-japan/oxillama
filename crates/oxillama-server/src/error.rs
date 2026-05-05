@@ -82,6 +82,14 @@ pub enum ServerError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
+
+    /// Response not found in the in-memory responses store.
+    #[error("response {0} not found")]
+    ResponseNotFound(String),
+
+    /// Previous response not found when chaining with `previous_response_id`.
+    #[error("previous response {0} not found")]
+    PreviousResponseNotFound(String),
 }
 
 impl IntoResponse for ServerError {
@@ -98,6 +106,8 @@ impl IntoResponse for ServerError {
             ServerError::FileTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::FileStoreError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::RunStepNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::ResponseNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::PreviousResponseNotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
@@ -113,6 +123,8 @@ impl IntoResponse for ServerError {
             ServerError::FileTooLarge(_) => "payload_too_large",
             ServerError::FileStoreError(_) => "internal_error",
             ServerError::RunStepNotFound(_) => "not_found_error",
+            ServerError::ResponseNotFound(_) => "not_found_error",
+            ServerError::PreviousResponseNotFound(_) => "not_found_error",
             _ => "internal_error",
         };
 

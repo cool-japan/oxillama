@@ -151,12 +151,12 @@ Priority order (highest first):
 
 ## 7. v2.0+ Vision
 
-- ~~**Remote GGUF streaming via HTTP range requests.**~~ ✅ Shipped (v0.1.5
+- ~~**Remote GGUF streaming via HTTP range requests.**~~ ✅ Shipped (v0.1.3
   Track B). `HttpRangeSource` issues HTTP `Range:` requests, caches the
   first 128 KiB eagerly, and exposes `GgufModel::from_url(url)`. Gated
   behind `http` feature (`dep:ureq`, `native-tls`). All network-dependent
   tests carry `#[ignore]`.
-- ~~**safetensors import bridge.**~~ ✅ Shipped (v0.1.5 Track B).
+- ~~**safetensors import bridge.**~~ ✅ Shipped (v0.1.3 Track B).
   `SafetensorsConverter::load(path)` / `from_bytes(bytes)` parses the
   8-byte LE header_size prefix + JSON tensor descriptors and produces an
   in-memory `GgufModel` with `general.architecture = "safetensors_import"`.

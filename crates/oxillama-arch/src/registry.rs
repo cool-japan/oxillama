@@ -98,6 +98,12 @@ impl ArchitectureRegistry {
         #[cfg(feature = "gptneox")]
         registry.register(Box::new(crate::gpt_neox::GptNeoxArchitecture::new()));
 
+        #[cfg(feature = "bloom")]
+        registry.register(Box::new(crate::bloom::BloomArchitecture::new()));
+
+        #[cfg(feature = "phimoe")]
+        registry.register(Box::new(crate::phi_moe::PhiMoeArchitecture::new()));
+
         registry
     }
 
@@ -153,8 +159,8 @@ mod tests {
     #[test]
     fn test_with_builtins_has_twelve_architectures() {
         let reg = ArchitectureRegistry::with_builtins();
-        // 21 previous + 3 new (mixtral, stablelm, gptneox) = 24
-        assert_eq!(reg.len(), 24, "expected 24 builtin architectures");
+        // 24 previous + 2 new (bloom, phimoe) = 26
+        assert_eq!(reg.len(), 26, "expected 26 builtin architectures");
         assert!(!reg.is_empty());
     }
 
@@ -245,6 +251,7 @@ mod tests {
         let mut listed = reg.list();
         listed.sort_unstable();
         let mut expected = vec![
+            "bloom",
             "command-r",
             "dbrx",
             "deepseek2",
@@ -264,6 +271,7 @@ mod tests {
             "mixtral",
             "olmo2",
             "phi3",
+            "phimoe",
             "qwen2vl",
             "qwen3",
             "stablelm",

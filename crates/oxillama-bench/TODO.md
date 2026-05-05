@@ -143,7 +143,7 @@ policy in benchmark harnesses either, even though they are not strictly
 
 ## 7. v2.0+ Vision
 
-- ~~**Power / watt benchmarks.**~~ ✅ Shipped (v0.1.6): `RaplReader` in
+- ~~**Power / watt benchmarks.**~~ ✅ Shipped (v0.1.3): `RaplReader` in
   `src/power.rs` reads `/sys/class/powercap/intel-rapl:*` energy counters on
   Linux; `measure_tokens_per_joule` wraps any closure; `compute_tokens_per_joule_from_delta`
   is exposed for unit-testable formula verification.  Criterion bench at
@@ -154,7 +154,7 @@ policy in benchmark harnesses either, even though they are not strictly
   and `memory_bytes` per cell; `summary_table` and `p99_table` render Markdown
   grids; Criterion bench at `benches/batch_heatmap.rs` with
   `OXILLAMA_BENCH_PRINT_HEATMAP=1` for optional table output.
-- ~~**CI regression gate.**~~ ✅ Shipped (v0.1.6): `RegressionGate` in
+- ~~**CI regression gate.**~~ ✅ Shipped (v0.1.3): `RegressionGate` in
   `src/regression_gate.rs` loads a JSON baseline (`from_file` / `save_baseline`),
   checks per-metric thresholds (throughput: higher is better; latency: lower is
   better), and returns structured `RegressionFailure` list.  `format_report`
@@ -173,4 +173,6 @@ policy in benchmark harnesses either, even though they are not strictly
 - **Regression history dashboard.** Persist criterion JSON to a small
   on-repo time-series and render a rolling-window plot per metric.
 
-*Last updated: 2026-04-20 (v0.1.1 — 79 tests; KV-cache scaling, cross-SIMD, memory profiler, tokenizer throughput, E2E stub bench all shipped)*
+- ~~**No speculative decoding benchmark.**~~ ✅ Shipped (v0.1.3): `run_acceptance_sweep`, `StubSpecEngine`, `SpeculativeBenchTable`, `SpeculativePoint`, `SpeculativeBenchConfig` in `src/speculative.rs`; Criterion bench at `benches/speculative.rs`; 8 unit tests; re-exported from `lib.rs`; `OXILLAMA_BENCH_PRINT_SPEC=1` enables Markdown table output.
+
+*Last updated: 2026-05-05 (v0.1.3 — speculative decoding acceptance sweep shipped; 8 new tests)*

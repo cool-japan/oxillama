@@ -246,4 +246,30 @@ Implementation highlights:
   - **Tests:** (a) `admin_load_unload_cycle`. (b) `admin_bearer_auth_rejects_missing_token`. (c) `admin_loopback_only_when_no_auth`. (d) `admin_stats_returns_metrics`.
   - **Risk:** Non-auth + public interface = full fleet control to anyone. Mitigate with hard startup error.
 
-*Last updated: 2026-05-03 (v0.1.3 — ~190 tests, prefix-KV + multi-LoRA server wiring shipped)*
+## 8. v0.1.3 — Responses API + Per-Key Rate Limiting (done 2026-05-05)
+
+- [x] **Responses API (`/v1/responses`)**
+  - `POST /v1/responses` — create a response (non-streaming or SSE when `stream: true`)
+  - `GET /v1/responses` — list all responses (descending `created_at`)
+  - `GET /v1/responses/:id` — retrieve one response
+  - `previous_response_id` chaining: prior input + output prepended to context
+  - SSE event names: `response.created`, `response.output_text.delta`, `response.completed`, `[DONE]`
+  - New module: `src/responses_store.rs` (`ResponseStore`, `ResponseRecord`, `ResponseStatus`)
+  - New module: `src/routes/responses.rs` (all three route handlers)
+  - `AppState::responses_store: Option<Arc<ResponseStore>>` + `with_responses_store()` builder
+  - `ServerError::ResponseNotFound` + `ServerError::PreviousResponseNotFound` → HTTP 404
+
+- [x] **Per-API-key rate limiting (`PerKeyRateLimiter`)**
+  - `PerKeyRateLimiter` with lazy-insert bucket map (`Arc<RwLock<HashMap<String, Mutex<TokenBucket>>>>`)
+  - `with_overrides(HashMap<String, (f64, f64)>)` builder for per-key capacity/rate
+  - `check_key(&str) -> bool` — fast read-lock path + slow write-lock insertion
+  - `per_key_rate_limit_middleware` reads `Authorization: Bearer` or `X-Api-Key`
+  - Anonymous requests (no key header) pass through
+  - `ServerConfig::per_key_rate_limits: Option<HashMap<String, (f64, f64)>>`
+  - `AppState::per_key_rate_limiter: Option<Arc<PerKeyRateLimiter>>` + `with_per_key_rate_limiter()` builder
+  - Layered in `build_app_with_config` when `state.per_key_rate_limiter.is_some()`
+  - Re-exported from `lib.rs`: `PerKeyRateLimiter`, `ResponseStore`
+  - 15 new tests (5 store unit + 5 route integration + 5 per-key unit)
+  - Total test count: 236 (all passing)
+
+*Last updated: 2026-05-05 (v0.1.3 — 236 tests, Responses API + per-key rate limiting shipped)*

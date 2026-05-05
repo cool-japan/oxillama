@@ -140,6 +140,7 @@ impl PySamplerConfig {
 
     /// Convert to the Rust [`SamplerConfig`].
     pub fn to_rust(&self) -> SamplerConfig {
+        let defaults = SamplerConfig::default();
         SamplerConfig {
             temperature: self.temperature,
             top_k: self.top_k,
@@ -155,6 +156,16 @@ impl PySamplerConfig {
             token_vocab: None,
             logit_bias: std::collections::HashMap::new(),
             banned_tokens: Vec::new(),
+            // Advanced sampler stages — not exposed in the Python API; use defaults.
+            dry_multiplier: defaults.dry_multiplier,
+            dry_base: defaults.dry_base,
+            dry_allowed_length: defaults.dry_allowed_length,
+            xtc_threshold: defaults.xtc_threshold,
+            xtc_probability: defaults.xtc_probability,
+            typical_p: defaults.typical_p,
+            top_a: defaults.top_a,
+            eta_cutoff: defaults.eta_cutoff,
+            epsilon_cutoff: defaults.epsilon_cutoff,
         }
     }
 
@@ -282,6 +293,8 @@ mod tests {
             token_vocab: None,
             logit_bias: std::collections::HashMap::new(),
             banned_tokens: Vec::new(),
+            // Advanced sampler stages — keep defaults for this round-trip test.
+            ..SamplerConfig::default()
         };
         let py_cfg = PySamplerConfig::from_rust(original.clone());
         let back = py_cfg.to_rust();

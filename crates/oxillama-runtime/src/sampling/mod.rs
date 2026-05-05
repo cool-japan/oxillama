@@ -3,6 +3,7 @@
 //! Supports greedy, top-k, top-p (nucleus), min-p, temperature scaling,
 //! repetition penalty, Mirostat v2, and GBNF grammar-constrained sampling.
 
+pub mod advanced;
 pub mod chain;
 pub mod grammar;
 
@@ -67,6 +68,72 @@ pub struct SamplerConfig {
     /// even if it is the only remaining candidate.
     #[serde(default)]
     pub banned_tokens: Vec<u32>,
+
+    // ── Advanced sampler stages (v0.1.7 Track B) ─────────────────────────────
+    /// DRY penalty multiplier (0.0 = disabled).
+    ///
+    /// Penalises tokens that would continue an n-gram already present in the
+    /// recent context. Higher values apply stronger penalties.
+    #[serde(default)]
+    pub dry_multiplier: f32,
+
+    /// DRY exponential base for match-length amplification (default = 1.75).
+    ///
+    /// Longer n-gram matches receive penalty `dry_multiplier * dry_base^(match_len - dry_allowed_length)`.
+    #[serde(default = "dry_base_default")]
+    pub dry_base: f32,
+
+    /// Minimum match length (in tokens) before DRY applies any penalty (default = 2).
+    #[serde(default = "dry_allowed_length_default")]
+    pub dry_allowed_length: usize,
+
+    /// XTC cumulative-probability threshold (0.0 = disabled; use ≥ 1.0 to disable).
+    ///
+    /// The "top set" is defined as the smallest set of tokens whose cumulative
+    /// probability exceeds this threshold.
+    #[serde(default)]
+    pub xtc_threshold: f32,
+
+    /// XTC exclusion probability — how often the top-set exclusion fires (default = 0.5).
+    #[serde(default = "xtc_probability_default")]
+    pub xtc_probability: f32,
+
+    /// Locally-typical sampling budget (1.0 = disabled / passthrough).
+    ///
+    /// Keeps only tokens whose information content is closest to the distribution
+    /// entropy until cumulative probability ≥ p.
+    #[serde(default = "typical_p_default")]
+    pub typical_p: f32,
+
+    /// Top-A adaptive threshold multiplier (0.0 = disabled).
+    ///
+    /// Keeps tokens with `prob >= top_a * max_prob²`.
+    #[serde(default)]
+    pub top_a: f32,
+
+    /// Eta-cutoff entropy-adaptive threshold (0.0 = disabled).
+    ///
+    /// Dynamic floor = `max(epsilon_cutoff, eta_cutoff / perplexity)`.
+    #[serde(default)]
+    pub eta_cutoff: f32,
+
+    /// Epsilon hard-floor probability used together with `eta_cutoff` (0.0 = no floor).
+    #[serde(default)]
+    pub epsilon_cutoff: f32,
+}
+
+// Default-value helpers for serde.
+fn dry_base_default() -> f32 {
+    1.75
+}
+fn dry_allowed_length_default() -> usize {
+    2
+}
+fn xtc_probability_default() -> f32 {
+    0.5
+}
+fn typical_p_default() -> f32 {
+    1.0
 }
 
 impl Default for SamplerConfig {
@@ -86,6 +153,16 @@ impl Default for SamplerConfig {
             token_vocab: None,
             logit_bias: std::collections::HashMap::new(),
             banned_tokens: Vec::new(),
+            // Advanced stages (disabled by default)
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            xtc_threshold: 0.0,
+            xtc_probability: 0.5,
+            typical_p: 1.0,
+            top_a: 0.0,
+            eta_cutoff: 0.0,
+            epsilon_cutoff: 0.0,
         }
     }
 }
@@ -108,6 +185,15 @@ impl SamplerConfig {
             token_vocab: None,
             logit_bias: std::collections::HashMap::new(),
             banned_tokens: Vec::new(),
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            xtc_threshold: 0.0,
+            xtc_probability: 0.5,
+            typical_p: 1.0,
+            top_a: 0.0,
+            eta_cutoff: 0.0,
+            epsilon_cutoff: 0.0,
         }
     }
 
@@ -128,6 +214,15 @@ impl SamplerConfig {
             token_vocab: None,
             logit_bias: std::collections::HashMap::new(),
             banned_tokens: Vec::new(),
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            xtc_threshold: 0.0,
+            xtc_probability: 0.5,
+            typical_p: 1.0,
+            top_a: 0.0,
+            eta_cutoff: 0.0,
+            epsilon_cutoff: 0.0,
         }
     }
 }

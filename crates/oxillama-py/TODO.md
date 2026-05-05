@@ -270,7 +270,9 @@ This is the 75% gap — the polish work the 25% number represents.
   `on_cache_evict` callback protocols for telemetry tooling.
 - Optional `ray` / `dask` integration for sharded inference.
 
-*Last updated: 2026-04-20 (v0.1.1 — 81 tests, 16 public API items, all v1.1 roadmap items shipped)*
+- ~~**`torch.Tensor` interop.**~~ ✅ Shipped (v0.1.3 Track F): `torch_helper.py` adds `Engine.logits_torch(text)` and `Engine.embeddings_torch(text)` via DLPack zero-copy; monkey-patched onto `Engine` at import time by `__init__.py`; lazy `torch` import so absence of PyTorch never prevents package import; `logits_torch` / `embeddings_torch` stubs added to `__init__.pyi`; `src/torch_interop.rs` placeholder for future Rust-side helpers; Python test suite in `tests/test_torch_interop.py` (17 tests).
+
+*Last updated: 2026-05-05 (v0.1.3 — torch interop shipped; 17 new Python tests)*
 
 ## Proposed follow-ups
 
@@ -278,7 +280,7 @@ This is the 75% gap — the polish work the 25% number represents.
 
 - ✅ **R2 — `SpeculativeEngine.snapshot/restore` (done 2026-05-05)**
 
-  Implemented Track E of OxiLLaMa v0.1.4. Shipped:
+  Implemented Track E of OxiLLaMa v0.1.3. Shipped:
 
   1. `SpeculativeEngineSnapshot` in `oxillama-runtime/src/snapshot.rs` with `encode()`/`decode()`/`fingerprint()`, magic header `b"OXISPEC1"`, LE wire format (no oxicode for the outer envelope so magic can be checked before allocation).
   2. `RuntimeError::SpecSnapshotIncompatible(String)` added to `error.rs`.
@@ -290,7 +292,7 @@ This is the 75% gap — the polish work the 25% number represents.
 
 - ✅ **R3 — Hub-aware snapshots (done 2026-05-05)**
 
-  Shipped as Track F of OxiLLaMa v0.1.6.
+  Shipped as Track F of OxiLLaMa v0.1.3.
 
   1. Added `HubOrigin { repo_id, filename, sha256 }` serde struct to `snapshot.rs`.
   2. Added `EngineSnapshotMeta { model_path, hub_origin: Option<HubOrigin> }` envelope with JSON sidecar (`path + ".meta.json"`).
@@ -303,7 +305,7 @@ This is the 75% gap — the polish work the 25% number represents.
 
 - ✅ **DLPack tensor interop (done 2026-05-05)**
 
-  Shipped as Track F of OxiLLaMa v0.1.6.
+  Shipped as Track F of OxiLLaMa v0.1.3.
 
   1. New `src/dlpack.rs` with DLPack v0.8 C structs (`DLDevice`, `DLDataType`, `DLTensor`, `DLManagedTensor`) and `vec_to_dlpack` / `dlpack_to_vec` public functions.
   2. `Engine.logits_dlpack(text)` — runs `forward_logits(text)` and returns the vocab-length f32 vector as a `"dltensor"` PyCapsule with shape `[vocab_size]`.

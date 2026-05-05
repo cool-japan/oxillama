@@ -116,6 +116,55 @@ impl QuantKernel for Q8_1Avx2 {
     fn name(&self) -> &'static str {
         "Q8_1"
     }
+
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        use crate::error::QuantError;
+
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let q8_block_bytes: usize = 34;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < blocks_per_row * q8_block_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: blocks_per_row * q8_block_bytes,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            let partial = unsafe {
+                fused_q8_1_q8_0_row_avx2(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            *out_val += partial;
+        }
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +294,123 @@ unsafe fn gemv_row_avx2(
 }
 
 // ---------------------------------------------------------------------------
+// Fused matvec: Q8_1 weights × Q8_0 activations
+// ---------------------------------------------------------------------------
+
+/// Fused dequant+dot for Q8_1 weights × Q8_0 activations.
+///
+/// Q8_1 layout: d (f16) at [0..2], s (f16, unused) at [2..4], qs (i8×32) at [4..36].
+/// Formula: `d_w * Σ(qs_weight_i * d_a * q8_0_act_i)`
+///
+/// # Safety
+/// - `weights_row.len() >= blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * 34`
+/// - CPU must support `avx2` and `fma`
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fused_q8_1_q8_0_row_avx2(
+    weights_row: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    const Q8_BLOCK_BYTES: usize = 34;
+    let mut acc = _mm256_setzero_ps();
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        let block = &weights_row[bo..bo + BLOCK_BYTES];
+        let col_start = blk * BLOCK_SIZE;
+
+        // Q8_1 weight: scale at [0..2], qs (int8) at [4..36], s at [2..4] unused
+        let d_w = f16_to_f32(block);
+        let vd_w = _mm256_set1_ps(d_w);
+
+        // Load 32 int8 weight quants from byte offset 4
+        let w_raw = _mm256_loadu_si256(block.as_ptr().add(4) as *const __m256i);
+        let w_lo128 = _mm256_castsi256_si128(w_raw);
+        let w_hi128 = _mm256_extracti128_si256(w_raw, 1);
+        let w_lo_i16 = _mm256_cvtepi8_epi16(w_lo128);
+        let w_hi_i16 = _mm256_cvtepi8_epi16(w_hi128);
+        let wq0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(w_lo_i16)));
+        let wq1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(w_lo_i16, 1)));
+        let wq2 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(w_hi_i16)));
+        let wq3 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(w_hi_i16, 1)));
+        // Scale by d_w
+        let wf0 = _mm256_mul_ps(wq0, vd_w);
+        let wf1 = _mm256_mul_ps(wq1, vd_w);
+        let wf2 = _mm256_mul_ps(wq2, vd_w);
+        let wf3 = _mm256_mul_ps(wq3, vd_w);
+
+        // Decode Q8_0 activation block (34 bytes: 2 f16 scale + 32 i8)
+        let ab = blk * Q8_BLOCK_BYTES;
+        let a_block = &acts_q8[ab..ab + Q8_BLOCK_BYTES];
+        let d_a = f16_to_f32(a_block);
+        let vd_a = _mm256_set1_ps(d_a);
+
+        let q8_raw = _mm256_loadu_si256(a_block.as_ptr().add(2) as *const __m256i);
+        let q8_lo128 = _mm256_castsi256_si128(q8_raw);
+        let q8_hi128 = _mm256_extracti128_si256(q8_raw, 1);
+        let q8_lo_i16 = _mm256_cvtepi8_epi16(q8_lo128);
+        let q8_hi_i16 = _mm256_cvtepi8_epi16(q8_hi128);
+        let qa0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(q8_lo_i16)));
+        let qa1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(
+            q8_lo_i16, 1,
+        )));
+        let qa2 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(q8_hi_i16)));
+        let qa3 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(
+            q8_hi_i16, 1,
+        )));
+        let act0 = _mm256_mul_ps(qa0, vd_a);
+        let act1 = _mm256_mul_ps(qa1, vd_a);
+        let act2 = _mm256_mul_ps(qa2, vd_a);
+        let act3 = _mm256_mul_ps(qa3, vd_a);
+
+        let col_end = (col_start + BLOCK_SIZE).min(n_cols);
+        let avail = col_end - col_start;
+
+        // Group A: weight[0..8] × act[0..8]
+        let n_a = avail.min(8);
+        let mut act_a = [0.0f32; 8];
+        _mm256_storeu_ps(act_a.as_mut_ptr(), act0);
+        let mut buf_a = [0.0f32; 8];
+        buf_a[..n_a].copy_from_slice(&act_a[..n_a]);
+        acc = _mm256_fmadd_ps(wf0, _mm256_loadu_ps(buf_a.as_ptr()), acc);
+
+        // Group B: weight[8..16] × act[8..16]
+        let n_b = avail.saturating_sub(8).min(8);
+        let mut act_b = [0.0f32; 8];
+        _mm256_storeu_ps(act_b.as_mut_ptr(), act1);
+        let mut buf_b = [0.0f32; 8];
+        if n_b > 0 {
+            buf_b[..n_b].copy_from_slice(&act_b[..n_b]);
+        }
+        acc = _mm256_fmadd_ps(wf1, _mm256_loadu_ps(buf_b.as_ptr()), acc);
+
+        // Group C: weight[16..24] × act[16..24]
+        let n_c = avail.saturating_sub(16).min(8);
+        let mut act_c = [0.0f32; 8];
+        _mm256_storeu_ps(act_c.as_mut_ptr(), act2);
+        let mut buf_c = [0.0f32; 8];
+        if n_c > 0 {
+            buf_c[..n_c].copy_from_slice(&act_c[..n_c]);
+        }
+        acc = _mm256_fmadd_ps(wf2, _mm256_loadu_ps(buf_c.as_ptr()), acc);
+
+        // Group D: weight[24..32] × act[24..32]
+        let n_d = avail.saturating_sub(24).min(8);
+        let mut act_d = [0.0f32; 8];
+        _mm256_storeu_ps(act_d.as_mut_ptr(), act3);
+        let mut buf_d = [0.0f32; 8];
+        if n_d > 0 {
+            buf_d[..n_d].copy_from_slice(&act_d[..n_d]);
+        }
+        acc = _mm256_fmadd_ps(wf3, _mm256_loadu_ps(buf_d.as_ptr()), acc);
+    }
+
+    hsum_f32_avx(acc)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -352,6 +518,68 @@ mod tests {
             "gemv: ref={} avx2={}",
             ref_out[0],
             avx2_out[0]
+        );
+    }
+
+    #[test]
+    fn fused_q8_1_avx2_matches_reference() {
+        if !avx2_available() {
+            return;
+        }
+
+        let mut qs_w = [0i8; 32];
+        for (i, q) in qs_w.iter_mut().enumerate() {
+            *q = ((i as i16 * 7 - 64).clamp(-128, 127)) as i8;
+        }
+        let weight_block = make_block(0.5, &qs_w);
+
+        // Build a Q8_0 activation block (34 bytes): 2-byte f16 scale + 32 i8 values
+        let d_a = 0.25f32;
+        let mut acts_raw = [0i8; 32];
+        for (i, v) in acts_raw.iter_mut().enumerate() {
+            *v = ((i as i16 * 5 - 40).clamp(-128, 127)) as i8;
+        }
+        let mut acts_block = Vec::with_capacity(34);
+        acts_block.extend_from_slice(&half::f16::from_f32(d_a).to_bits().to_le_bytes());
+        for &v in &acts_raw {
+            acts_block.push(v as u8);
+        }
+
+        // Reference: dequant weight then dot with scaled activations
+        let mut w_dequant = vec![0.0f32; BLOCK_SIZE];
+        Q8_1Avx2
+            .dequant_block(&weight_block, &mut w_dequant)
+            .expect("ref dequant w");
+        let acts_f32: Vec<f32> = acts_raw.iter().map(|&v| v as f32 * d_a).collect();
+        let expected: f32 = w_dequant
+            .iter()
+            .zip(acts_f32.iter())
+            .map(|(w, a)| w * a)
+            .sum();
+
+        // AVX2 fused (additive — start with 0)
+        let mut out_avx2 = vec![0.0f32; 1];
+        Q8_1Avx2
+            .matvec_q8_fused(&weight_block, &acts_block, &mut out_avx2, 1, BLOCK_SIZE)
+            .expect("avx2 fused");
+
+        assert!(
+            (out_avx2[0] - expected).abs() < 0.1,
+            "fused_q8_1_avx2: got={} expected={}",
+            out_avx2[0],
+            expected
+        );
+
+        // Also compare against reference Q8_1Ref::matvec_q8_fused
+        let mut out_ref = vec![0.0f32; 1];
+        Q8_1Ref
+            .matvec_q8_fused(&weight_block, &acts_block, &mut out_ref, 1, BLOCK_SIZE)
+            .expect("ref fused");
+        assert!(
+            (out_avx2[0] - out_ref[0]).abs() < 0.1,
+            "fused: avx2={} ref={}",
+            out_avx2[0],
+            out_ref[0]
         );
     }
 }

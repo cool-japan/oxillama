@@ -1,8 +1,9 @@
 //! Common layer implementations shared across model architectures.
 //!
-//! These building blocks (RMSNorm, LayerNorm, RoPE, SwiGLU, GELU, Linear) are used by
-//! multiple model families and are implemented once here.
+//! These building blocks (RMSNorm, LayerNorm, RoPE, SwiGLU, GELU, Linear,
+//! ALiBi) are used by multiple model families and are implemented once here.
 
+pub mod alibi;
 pub mod attention;
 pub mod gelu;
 pub mod layer_norm;

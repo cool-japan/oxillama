@@ -18,6 +18,12 @@ try:
 except ImportError:
     _HAS_NUMPY = False
 
+try:
+    import torch
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+
 __version__: str
 
 __all__: list[str]
@@ -303,6 +309,18 @@ class Engine:
     """Return the last hidden-state embedding for ``text`` as a DLPack capsule.
 
     Shape: ``[1, hidden_size]``, dtype float32, device CPU.
+    """
+    def logits_torch(self, text: str, **kwargs: Any) -> "torch.Tensor": ...
+    """Return the logit vector for ``text`` as a ``torch.Tensor``.
+
+    Zero-copy via DLPack.  Shape: ``[vocab_size]``, dtype float32, device CPU.
+    Requires ``torch`` to be installed (``pip install torch``).
+    """
+    def embeddings_torch(self, text: str, **kwargs: Any) -> "torch.Tensor": ...
+    """Return the embedding vector for ``text`` as a ``torch.Tensor``.
+
+    Zero-copy via DLPack.  Shape: ``[1, hidden_size]``, dtype float32, device CPU.
+    Requires ``torch`` to be installed (``pip install torch``).
     """
     def async_engine(self) -> "AsyncEngine": ...
     def __reduce__(self) -> None: ...

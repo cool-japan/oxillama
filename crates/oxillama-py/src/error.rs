@@ -113,6 +113,9 @@ pub fn runtime_to_py(err: RuntimeError) -> PyErr {
         RuntimeError::SpecSnapshotIncompatible(detail) => {
             GenerateError::new_err(format!("Speculative snapshot incompatible: {detail}"))
         }
+        RuntimeError::EmptySequence => {
+            GenerateError::new_err("Input tokenizes to an empty sequence — provide at least one token")
+        }
     }
 }
 
@@ -235,6 +238,7 @@ mod tests {
             RuntimeError::TensorNotFound("blk.0.attn_q.weight".to_string()),
             RuntimeError::LockPoisoned,
             RuntimeError::SpecSnapshotIncompatible("test detail".to_string()),
+            RuntimeError::EmptySequence,
         ];
 
         for variant in variants {

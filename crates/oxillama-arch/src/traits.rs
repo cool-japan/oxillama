@@ -222,6 +222,27 @@ pub trait ForwardPass: Send + Sync {
         })
     }
 
+    /// Run one forward pass, returning per-token hidden states for **all** tokens
+    /// as a flat `[seq_len × hidden_size]` vector in row-major order.
+    ///
+    /// This is the multi-token embedding extraction path used when a pooling
+    /// mode other than `Last` is requested. The returned vector has length
+    /// `seq_len * hidden_size`.
+    ///
+    /// The default implementation returns [`ArchError::NotSupported`].
+    /// Architectures that require multi-token pooling should override this.
+    fn embed_all(
+        &mut self,
+        tokens: &[u32],
+        kv_cache: &mut dyn KvCacheAccess,
+    ) -> ArchResult<Vec<f32>> {
+        let _ = (tokens, kv_cache);
+        Err(ArchError::NotSupported {
+            detail: "embed_all() not implemented for this architecture; use embed() instead"
+                .to_string(),
+        })
+    }
+
     /// Returns the model's vocabulary size.
     fn vocab_size(&self) -> usize;
 

@@ -7,9 +7,48 @@ OxiLLaMa uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.1.6] - 2026-05-05
+## [0.1.3] - 2026-05-05
 
 ### Added
+
+#### BLOOM + Phi-3.5-MoE Architectures (`oxillama-arch`)
+- **`AlibiBias`** (`src/common/alibi.rs`, ~200 LoC): `AlibiBias::new(num_heads)` computing `m_h = 2^(-8*(h+1)/num_heads)` slope-per-head bias; `apply(scores, seq_q, seq_k)` adds ALiBi bias matrix in-place; `slopes()` accessor for testing; 2 tests including geometric-sequence slope invariant
+- **`BloomArchitecture`** (`src/bloom/{mod,model,config}.rs`, ~900 LoC): arch id `"bloom"`, gated `bloom` feature (included in default); ALiBi positional bias (no RoPE), pre-LayerNorm, GELU FFN, MHA; bias terms on all attention and FFN projections; tensor names: `blk.{L}.{attn_norm,attn_qkv,attn_output,ffn_norm,ffn_up,ffn_down}.{weight,bias}`; 5 tests including `bloom_no_rope_present` and ALiBi slope reference match
+- **`PhiMoeArchitecture`** (`src/phi_moe/{mod,model,config}.rs`, ~700 LoC): arch id `"phimoe"`, gated `phimoe` feature; Phi-3 merged QKV + partial RoPE (first 25% of head_dim) reusing `phi/attention` path; sparse MoE FFN (16 experts, top-2) via `common/moe.rs::SparseTopKMoe`; tensor names: Phi-3 attention layout + `blk.{L}.ffn_{gate,up,down}_exps.weight` / `ffn_gate_inp.weight`; 5 tests
+- **GGUF test fixtures**: `build_minimal_bloom_gguf()` (1-layer, hidden=64, 8 heads) + `build_minimal_phi_moe_gguf()` (1-layer, 4 experts, top-2) added to `oxillama-gguf/src/test_utils.rs`
+- Arch count: 25 → **27**; `bloom = []`, `phimoe = []` added to default features
+
+#### Advanced Sampler Suite + Embedding Pooling (`oxillama-runtime`)
+- **`DryStage`** (`sampling/advanced.rs`): "Don't Repeat Yourself" n-gram penalty; `multiplier * base^(match_len - allowed_length)` subtracted from logit; `sequence_breakers` list prevents cross-sentence penalties; passthrough when `multiplier == 0.0`
+- **`XtcStage`**: Exclude Top Choices — collects cumulative-probability top set; with probability `xtc_probability` zeroes all but the single best token in the top set; passthrough when `threshold >= 1.0` or `probability == 0.0`
+- **`TypicalPStage`**: locally-typical sampling via Shannon entropy H; sorts tokens by `|ln p(t) + H|` ascending; keeps until cumulative probability ≥ p; passthrough when `p >= 1.0`
+- **`TopAStage`**: adaptive threshold `a * max_prob²`; keeps only tokens whose softmax prob exceeds the threshold; passthrough when `a == 0.0`
+- **`EtaStage`**: entropy-scaled cutoff `max(epsilon, eta / exp(H))`; combines typical + epsilon into a perplexity-adaptive floor; passthrough when both fields are 0.0
+- **`SamplerConfig` extended** with 9 new fields (`dry_multiplier`, `dry_base`, `dry_allowed_length`, `xtc_threshold`, `xtc_probability`, `typical_p`, `top_a`, `eta_cutoff`, `epsilon_cutoff`), all `#[serde(default)]`; existing output byte-identical when all at defaults
+- **5 new stages registered** in `SamplerChain::from_config()` after `LogitBias`/`RepetitionPenalty`, before `Temperature`; order: DRY → XTC → TypicalP → TopA → Eta
+- **`PoolingMode { Last, Mean, Max, Cls }`** (`src/embedding.rs`, ~250 LoC): serde; `pool_hidden_states(states, seq_len, hidden_size, mode) -> RuntimeResult<Vec<f32>>`
+- **`embed_with(text, mode)`** + **`embed_batch_with(texts, mode)`** on `InferenceEngine`; existing `embed()` / `embed_batch()` delegate to `PoolingMode::Last` (zero behaviour change)
+- 20 new tests (10 sampler + 8 pooling + 2 edge-case safety)
+
+#### Responses API + Per-API-Key Rate Limiting (`oxillama-server`)
+- **`ResponseStore`** (`src/responses_store.rs`, ~280 LoC): `Arc<RwLock<HashMap<String, ResponseRecord>>>` with `create()`, `get()` (404 on miss), `update_output()`, `list()` (descending by `created_at`); 4 unit tests
+- **Five route handlers** (`src/routes/responses.rs`): `POST /v1/responses` (non-streaming + SSE; `response.created` / `response.output_text.delta` / `response.completed` / `[DONE]` event names; `previous_response_id` chains prior record into prompt), `GET /v1/responses`, `GET /v1/responses/:id`; 5 integration tests
+- **`PerKeyRateLimiter`** (`src/rate_limit.rs` extension, ~250 LoC): lazy per-key `TokenBucket` map (`Arc<RwLock<HashMap<String, Mutex<TokenBucket>>>>`) — read lock on subsequent hits, write lock only on first-seen key; `with_overrides(map)` for per-key capacity/rate; `per_key_rate_limit_middleware` reads `Authorization: Bearer` or `X-Api-Key`; anonymous requests fall through to global limiter; 5 unit tests
+- **`ServerConfig.per_key_rate_limits`**: optional override map `HashMap<String, (f64, f64)>` (capacity, rate)
+- **Error variants**: `ResponseNotFound(String)` (HTTP 404), `PreviousResponseNotFound(String)` (HTTP 404)
+- **`AppState`** extended with `responses_store: Option<Arc<ResponseStore>>`, `per_key_rate_limiter: Option<Arc<PerKeyRateLimiter>>`; builder methods `with_responses_store()`, `with_per_key_rate_limiter()`
+
+#### AVX-512 IQ Kernels + Fused Legacy Matvec (`oxillama-quant`)
+- **`Iq2XxsAvx512`**, **`Iq2XsAvx512`**, **`Iq3SAvx512`**, **`Iq4XsAvx512`** (`simd/avx512/{iq2_xxs,iq2_xs,iq3_s,iq4_xs}.rs`, ~900 LoC): mirror AVX2 templates with `__m512i`; `_mm512_permutexvar_epi8` for grid lookup (AVX-512BW); 2× per-iter throughput; runtime-guarded via `is_x86_feature_detected!("avx512bw")`; tests auto-skip on non-AVX-512 hosts; 8 new tests
+- **`matvec_q8_fused` for Q5_0/Q5_1/Q8_1** (AVX2 + NEON + scalar reference): single-pass dequant+dot in registers with no scratch f32; Q5_0 signed high-bit reconstruction, Q5_1 affine (`d` + `m` bias), Q8_1 with `s` precomputed-sum correction; 6 new tests (tol 1e-5 on 64×1024 GEMV)
+
+#### GPU Sampling Kernels (`oxillama-gpu`)
+- **`sampling.wgsl`** (`src/shaders/sampling.wgsl`, ~185 LoC WGSL): `softmax_logits` (256-thread shared-memory reduction with max+sum two-pass, temperature scaling, temp=0 argmax degenerate path); `topk_partition` (workgroup cooperative selection, k ≤ 256); `sample_categorical` (LCG RNG seeded from host u32 pair + CDF walk)
+- **`SamplingKernel`** (`src/kernels/sampling.rs`, ~480 LoC): `softmax(logits, temp) -> GpuBuffer`, `top_k(probs, k) -> (vals, idxs)`, `sample(probs, idxs, seed) -> u32`; GPU-resident chaining variants (`_raw`); graceful `Err(GpuError::NoAdapter)` when no GPU; 10 new tests (CPU-reference always-run + GPU tests auto-skip via `skip_if_no_gpu!` macro)
+
+#### Speculative Decoding Bench + Python Torch Interop (`oxillama-bench` + `oxillama-py`)
+- **`SpeculativeBenchTable`** (`src/speculative.rs`, ~480 LoC): `SpeculativePoint { draft_size, accept_threshold, baseline_toks_per_sec, spec_toks_per_sec, speedup, mean_accepted }` (serde); `run_acceptance_sweep()` with deterministic floor-based acceptance; `summary_table()` / `speedup_grid()` Markdown 2-D grids; `default_draft_sizes()` `&[1,2,4,8]`, `default_accept_thresholds()` `&[0.5,0.7,0.85,0.95]`; Criterion bench `benches/speculative.rs` with `OXILLAMA_BENCH_PRINT_SPEC=1` gate; 8 new tests
+- **`torch_helper.py`** (`python/oxillama_py/torch_helper.py`, ~155 LoC): `Engine.logits_torch(text) -> torch.Tensor` and `Engine.embeddings_torch(text) -> torch.Tensor` via lazy `import torch` + `torch.from_dlpack(self.logits_dlpack(...))`; monkey-patched onto `Engine` class at module load; graceful `ImportError` with helpful message when `torch` absent; no Rust-level `torch` dependency; type stubs updated in `__init__.pyi`; 8+ Python tests in `test_torch_interop.py` (skipped when `torch` unavailable)
 
 #### Mixtral + StableLM + GPT-NeoX Architectures (`oxillama-arch`)
 - **`MixtralArchitecture`** (`src/mixtral/{mod.rs,model.rs}`, ~400 LoC): arch id `"mixtral"`, gated `mixtral` feature; sparse top-2-of-8 MoE FFN reusing `common/moe.rs`; sliding window attention + RMSNorm from Mistral path; tensor names: `blk.{i}.ffn_gate_exps.weight`, `ffn_up_exps.weight`, `ffn_down_exps.weight`, `ffn_gate_inp.weight` (router); 6 tests including routing correctness and load-balance softmax normalization
@@ -50,14 +89,6 @@ OxiLLaMa uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`vec_to_dlpack()` / `dlpack_to_vec()`** (`src/dlpack.rs`, ~280 LoC): full DLPack v0.8 C struct layout (`DLDevice/kCPU`, `DLDataType/f32`, `DLTensor`, `DLManagedTensor`); `ManagedTensorState` owns `Vec<f32>`+`Vec<i64>` with `extern "C"` deleter; `PyCapsule` with name `"dltensor"`; 5 Rust tests + 8 Python tests
 - **`PyEngine::logits_dlpack()`**, **`embeddings_dlpack()`** added to engine API; type stubs updated
 
-### Quality
-- **2,151 tests passing**, up from 2,030 in v0.1.5 (+121 tests)
-- **0 warnings** maintained (`cargo clippy --workspace -- -D warnings`)
-
-## [0.1.5] - 2026-05-05
-
-### Added
-
 #### LLaVA-1.6 / LLaVA-NeXT Anyres Tiling (`oxillama-arch`)
 - **`AnyresTileConfig`** (`src/llava_next/tiler.rs`): `select_grid(img_w, img_h) -> (n_cols, n_rows)` via fill-fraction minimisation across `grid_pinpoints`; `split_into_tiles(pixels, img_w, img_h)` bilinear-resizes the image into a variable NxM tile grid plus a global-view thumbnail
 - **`LlavaNextModel`** (`src/llava_next/model.rs`): reuses `ClipEncoder` + `MmProjector` from LLaVA-1.5; `encode_image()` splits → per-tile CLIP → concat → project; text-only `ForwardPass` fallback
@@ -95,14 +126,6 @@ OxiLLaMa uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`default_batch_sizes()`**: `&[1, 2, 4, 8]`; **`default_seq_lens()`**: `&[128, 512, 1024, 2048]`
 - **Criterion bench target** (`benches/batch_heatmap.rs`): `HeatmapStubEngine` + `BenchmarkId::new(format!("b{}", batch_size), seq_len)` naming; `OXILLAMA_BENCH_PRINT_HEATMAP=1` env gate prints tables to stdout
 - 14 new unit tests (grid coverage, table headers, p99 unit label, lookup missing cell, monotonicity, error cases)
-
-### Quality
-- **2,030 tests passing**, up from 1,952 in v0.1.4 (+78 tests)
-- **0 warnings** maintained (`cargo clippy --workspace -- -D warnings`)
-
-## [0.1.4] - 2026-05-05
-
-### Added
 
 #### AVX-512 SIMD Completeness for Legacy Quant Types (`oxillama-quant`)
 - **`Q4_1Avx512`** (`simd/avx512/q4_1.rs`, ~280 LoC): AVX-512F dequant + GEMV kernel for Q4_1 18-byte blocks (`d` f16, `m` f16, 8 nibble bytes); FMA path `result = d * nibble + m` using `_mm512_fmadd_ps`; 3 tests (dequant, 64×1024 GEMV, partial-block GEMV)
@@ -151,14 +174,6 @@ OxiLLaMa uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`tests/mobile_matrix_doc.md`**: manual test matrix for iOS Safari 17+, Android Chrome 121+, Firefox 122+
 - 7 new tests (serde roundtrip, default cache name, script identifier presence, invalid JSON rejection, SIMD compiled_with type, struct defaults, feature-gated SIMD assertion)
 
-### Quality
-- **1,952 tests passing**, up from 1,873 in v0.1.3 (+79 tests)
-- **0 warnings** maintained (`cargo clippy --workspace -- -D warnings`)
-
-## [0.1.3] - 2026-05-03
-
-### Added
-
 #### Server Prefix-KV Cache Wiring (`oxillama-server` + `oxillama-runtime`)
 - **`InferenceEngine::prime_with_prefix`**: restores KV cache from a `CachedKvState` snapshot then forward-passes suffix tokens, returning initial logits for the decode loop — skips re-prefilling shared system prompts on cache hits
 - **`InferenceEngine::generate_with_logits`**: decode-only loop starting from pre-computed initial logits; used after a prefix-cache hit to avoid a second prefill pass
@@ -188,8 +203,9 @@ OxiLLaMa uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`Q8_1GpuKernel`** (`kernels/q8_1.rs`, ~360 LoC): WGSL GEMV kernel for Q8_1 blocks (36 bytes: 2-byte `d` + 2-byte `sum` + 32 signed-byte `qs`)
 - GPU dispatcher now covers 18 quantization types (was 14); Q4_1/Q5_0/Q5_1/Q8_1 cover ~85% of community-quantized HuggingFace GGUF uploads
 
-#### Quality
-- **1,873 tests passing**, up from 1,825 in v0.1.2; 0 warnings maintained
+### Quality
+- **2,235 tests passing**, up from 1,825 in v0.1.2 (+410 tests)
+- **0 warnings** maintained (`cargo clippy --workspace -- -D warnings`)
 
 ## [0.1.2] - 2026-04-25
 

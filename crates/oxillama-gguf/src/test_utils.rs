@@ -1974,6 +1974,257 @@ pub fn build_minimal_qwen2vl_gguf() -> Vec<u8> {
     )
 }
 
+// ─── BLOOM builder ────────────────────────────────────────────────────────────
+
+/// Tensor catalogue for a minimal 1-layer BLOOM model.
+///
+/// BLOOM uses:
+/// - Biased LayerNorm instead of RMSNorm
+/// - Fused QKV: `[(num_heads * 3) * head_dim, hidden_size]` with bias
+/// - All linear layers have bias vectors
+/// - No RoPE (uses ALiBi bias instead)
+/// - Standard GELU FFN (not SwiGLU)
+///
+/// Dimensions: hidden=64, heads=8, head_dim=8, vocab=32, ffn=256 (4×hidden), layers=1
+const BLOOM_TENSORS: &[TensorDesc] = &[
+    // Token embedding: [vocab=32, hidden=64]
+    TensorDesc {
+        name: "token_embd.weight",
+        dims: &[64, 32],
+        n_elements: 2048,
+    },
+    // Final LayerNorm
+    TensorDesc {
+        name: "output_norm.weight",
+        dims: &[64],
+        n_elements: 64,
+    },
+    TensorDesc {
+        name: "output_norm.bias",
+        dims: &[64],
+        n_elements: 64,
+    },
+    // Layer 0: pre-attention LayerNorm
+    TensorDesc {
+        name: "blk.0.attn_norm.weight",
+        dims: &[64],
+        n_elements: 64,
+    },
+    TensorDesc {
+        name: "blk.0.attn_norm.bias",
+        dims: &[64],
+        n_elements: 64,
+    },
+    // Fused QKV: (num_heads * 3) * head_dim = 8*3*8 = 192 rows, hidden=64 cols
+    TensorDesc {
+        name: "blk.0.attn_qkv.weight",
+        dims: &[192, 64],
+        n_elements: 12288,
+    },
+    TensorDesc {
+        name: "blk.0.attn_qkv.bias",
+        dims: &[192],
+        n_elements: 192,
+    },
+    // Attention output projection: [hidden=64, num_heads*head_dim=64]
+    TensorDesc {
+        name: "blk.0.attn_output.weight",
+        dims: &[64, 64],
+        n_elements: 4096,
+    },
+    TensorDesc {
+        name: "blk.0.attn_output.bias",
+        dims: &[64],
+        n_elements: 64,
+    },
+    // Pre-FFN LayerNorm
+    TensorDesc {
+        name: "blk.0.ffn_norm.weight",
+        dims: &[64],
+        n_elements: 64,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_norm.bias",
+        dims: &[64],
+        n_elements: 64,
+    },
+    // FFN up (W1): [ffn=256, hidden=64]
+    TensorDesc {
+        name: "blk.0.ffn_up.weight",
+        dims: &[256, 64],
+        n_elements: 16384,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_up.bias",
+        dims: &[256],
+        n_elements: 256,
+    },
+    // FFN down (W2): [hidden=64, ffn=256]
+    TensorDesc {
+        name: "blk.0.ffn_down.weight",
+        dims: &[64, 256],
+        n_elements: 16384,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_down.bias",
+        dims: &[64],
+        n_elements: 64,
+    },
+];
+
+/// Build a valid GGUF v3 binary for a minimal 1-layer BLOOM model.
+///
+/// | Hyper-parameter | Value |
+/// |-----------------|-------|
+/// | `hidden_size`   | 64    |
+/// | `heads`         | 8     |
+/// | `head_dim`      | 8     |
+/// | `layers`        | 1     |
+/// | `vocab_size`    | 32    |
+/// | `ffn_size`      | 256   |
+/// | `context_len`   | 128   |
+///
+/// BLOOM uses standard LayerNorm (with bias) and ALiBi positional biases.
+/// No RoPE. No separate `output.weight` tensor (weight-tied to `token_embd`).
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
+pub fn build_minimal_bloom_gguf() -> Vec<u8> {
+    build_gguf_v3(
+        &[
+            KvEntry::Str("general.architecture", "bloom"),
+            KvEntry::Str("general.name", "test-bloom"),
+            KvEntry::U32("bloom.embedding_length", 64),
+            KvEntry::U32("bloom.feed_forward_length", 256),
+            KvEntry::U32("bloom.block_count", 1),
+            KvEntry::U32("bloom.attention.head_count", 8),
+            KvEntry::U32("bloom.attention.head_count_kv", 8),
+            KvEntry::U32("bloom.context_length", 128),
+            KvEntry::U32("bloom.vocab_size", 32),
+            KvEntry::F32("bloom.attention.layer_norm_rms_epsilon", 1e-5),
+            KvEntry::Str("tokenizer.ggml.model", "bloom"),
+        ],
+        BLOOM_TENSORS,
+    )
+}
+
+// ─── Phi-MoE builder ──────────────────────────────────────────────────────────
+
+/// Tensor catalogue for a minimal 1-layer Phi-3.5-MoE model.
+///
+/// Phi-MoE uses Phi-3 style attention (fused QKV, partial RoPE, GQA)
+/// combined with a sparse MoE FFN:
+/// - 4 experts (reduced from 16 for test speed), top-2 routing
+/// - RMSNorm (not LayerNorm)
+/// - No bias on attention projections (like Phi-3)
+///
+/// Dimensions: hidden=64, attn_heads=8, kv_heads=4, head_dim=8, vocab=32
+///             intermediate=64, num_experts=4, top-2 routing
+const PHI_MOE_TENSORS: &[TensorDesc] = &[
+    // Token embedding: [vocab=32, hidden=64]
+    TensorDesc {
+        name: "token_embd.weight",
+        dims: &[64, 32],
+        n_elements: 2048,
+    },
+    // Final RMSNorm
+    TensorDesc {
+        name: "output_norm.weight",
+        dims: &[64],
+        n_elements: 64,
+    },
+    // LM head
+    TensorDesc {
+        name: "output.weight",
+        dims: &[64, 32],
+        n_elements: 2048,
+    },
+    // Layer 0: pre-attention RMSNorm
+    TensorDesc {
+        name: "blk.0.attn_norm.weight",
+        dims: &[64],
+        n_elements: 64,
+    },
+    // Fused QKV: (num_heads + 2*kv_heads) * head_dim = (8+2*4)*8 = 128 rows
+    TensorDesc {
+        name: "blk.0.attn_qkv.weight",
+        dims: &[128, 64],
+        n_elements: 8192,
+    },
+    // Attention output projection: [hidden=64, num_heads*head_dim=64]
+    TensorDesc {
+        name: "blk.0.attn_output.weight",
+        dims: &[64, 64],
+        n_elements: 4096,
+    },
+    // Pre-FFN RMSNorm
+    TensorDesc {
+        name: "blk.0.ffn_norm.weight",
+        dims: &[64],
+        n_elements: 64,
+    },
+    // Router: [num_experts=4, hidden=64]
+    TensorDesc {
+        name: "blk.0.ffn_gate_inp.weight",
+        dims: &[64, 4],
+        n_elements: 256,
+    },
+    // Stacked gate exps: [num_experts=4, ffn=64, hidden=64]
+    TensorDesc {
+        name: "blk.0.ffn_gate_exps.weight",
+        dims: &[4, 64, 64],
+        n_elements: 16384,
+    },
+    // Stacked up exps: [num_experts=4, ffn=64, hidden=64]
+    TensorDesc {
+        name: "blk.0.ffn_up_exps.weight",
+        dims: &[4, 64, 64],
+        n_elements: 16384,
+    },
+    // Stacked down exps: [num_experts=4, hidden=64, ffn=64]
+    TensorDesc {
+        name: "blk.0.ffn_down_exps.weight",
+        dims: &[4, 64, 64],
+        n_elements: 16384,
+    },
+];
+
+/// Build a valid GGUF v3 binary for a minimal 1-layer Phi-3.5-MoE model.
+///
+/// | Hyper-parameter          | Value |
+/// |--------------------------|-------|
+/// | `hidden_size`            | 64    |
+/// | `attn_heads`             | 8     |
+/// | `kv_heads`               | 4     |
+/// | `head_dim`               | 8     |
+/// | `layers`                 | 1     |
+/// | `vocab_size`             | 32    |
+/// | `intermediate_size`      | 64    |
+/// | `num_experts`            | 4     |
+/// | `num_experts_per_tok`    | 2     |
+/// | `partial_rotary_factor`  | 0.5   |
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
+pub fn build_minimal_phi_moe_gguf() -> Vec<u8> {
+    build_gguf_v3(
+        &[
+            KvEntry::Str("general.architecture", "phimoe"),
+            KvEntry::Str("general.name", "test-phimoe"),
+            KvEntry::U32("phimoe.embedding_length", 64),
+            KvEntry::U32("phimoe.feed_forward_length", 64),
+            KvEntry::U32("phimoe.block_count", 1),
+            KvEntry::U32("phimoe.attention.head_count", 8),
+            KvEntry::U32("phimoe.attention.head_count_kv", 4),
+            KvEntry::U32("phimoe.context_length", 128),
+            KvEntry::U32("phimoe.vocab_size", 32),
+            KvEntry::F32("phimoe.rope.freq_base", 10000.0),
+            KvEntry::F32("phimoe.attention.layer_norm_rms_epsilon", 1e-5),
+            KvEntry::F32("phimoe.rope.partial_rotary_factor", 0.5),
+            KvEntry::U32("phimoe.expert_count", 4),
+            KvEntry::U32("phimoe.expert_used_count", 2),
+            KvEntry::Str("tokenizer.ggml.model", "phi"),
+        ],
+        PHI_MOE_TENSORS,
+    )
+}
+
 // ─── Self-tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

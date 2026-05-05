@@ -41,9 +41,9 @@ into `arch` unless they have a concrete reason.
 
 | Field | Value |
 |---|---|
-| Version | 0.1.1 |
-| Completion | ~93% |
-| Source files | 15 (`src/**/*.rs`) |
+| Version | 0.1.3 |
+| Completion | ~98% |
+| Source files | 17 (`src/**/*.rs`) |
 | Largest file | `src/engine.rs` (~1.4K lines, under 2000-line policy) |
 | Default tokenizer backend | `tokenizer-wasm` (pure Rust, wasm32-safe) |
 | Alternate backend | `tokenizer-onig` (C regex, native only) |
@@ -292,7 +292,7 @@ Cached vocabulary
   - **Files:** `src/snapshot.rs`, `src/engine.rs` (+80 LoC), `src/error.rs` (2 new variants), `src/kv_cache/mod.rs` (+100 LoC), `src/kv_cache/paged.rs`, `src/sampling/mod.rs` (Xorshift64 accessors), `src/sampling/grammar/machine.rs` (GrammarState::from_state_id), `crates/oxillama-arch/src/common/sequence_state.rs` (additive trait methods + Mamba2/Jamba overrides), `Cargo.toml` (oxicode dep), `tests/snapshot.rs`.
   - **Tests:** `snapshot_roundtrip_small`, `snapshot_rejects_wrong_model_fingerprint`, `snapshot_rejects_incompatible_version`, `snapshot_preserves_mirostat_mu`, `snapshot_preserves_grammar_state`, `snapshot_ssm_roundtrip`, `snapshot_paged_kv_roundtrip`, `snapshot_cross_process_determinism`.
 
-- [x] SpeculativeEngine snapshot/restore (Track E, v0.1.4) ✅ **Done (2026-05-05)**
+- [x] SpeculativeEngine snapshot/restore (Track E, v0.1.3) ✅ **Done (2026-05-05)**
   - `SpeculativeEngineSnapshot` (magic `b"OXISPEC1"`, version 1) in `src/snapshot.rs`: `encode()`, `decode()`, `fingerprint()`. LE binary envelope (not oxicode) so the magic check is O(1) before any allocation.
   - `RuntimeError::SpecSnapshotIncompatible(String)` added to `src/error.rs`.
   - `SpeculativeEngine::snapshot()`, `snapshot_to_file(path)`, `resume(bytes, target, draft)`, `resume_from_file(path, target, draft)` in `src/speculative.rs`.
@@ -324,4 +324,28 @@ Cached vocabulary
   - Exported from `lib.rs`: `beam_generate`, `BeamForwardPass`, `BeamHypothesis`, `BeamSearchConfig`, `EngineBeamAdapter`.
   - 8 tests: `test_score_formula`, `test_width_one_matches_greedy`, `test_beam_returns_beam_width_results`, `test_early_stopping_fires`, `test_log_softmax_correctness`, `test_beam_generate_errors_on_empty_prompt`, `test_unloaded_engine_errors`, `test_stub_engine_reset_called`.
 
-*Last updated: 2026-05-05 (v0.1.5 Track B)*
+- [x] Advanced sampler stages (Track B, v0.1.3) ✅ **Done (2026-05-05)**
+  - **Shipped:** `src/sampling/advanced.rs` (~560 LoC):
+    - `DryStage` — "Don't Repeat Yourself" n-gram penalty; exponential amplification for longer matches.
+    - `XtcStage` — Exclude Top Choices; forces diversity by removing top-set tokens with configurable probability.
+    - `TypicalPStage` — Locally-typical sampling; keeps tokens near the distribution entropy.
+    - `TopAStage` — Adaptive threshold `a * max_prob²`; auto-adapts to distribution peakiness.
+    - `EtaStage` — Entropy-scaled cutoff `max(epsilon, eta / perplexity)`.
+  - **New `SamplerConfig` fields:** `dry_multiplier`, `dry_base`, `dry_allowed_length`, `xtc_threshold`, `xtc_probability`, `typical_p`, `top_a`, `eta_cutoff`, `epsilon_cutoff` (all `#[serde(default)]`).
+  - **Chain integration:** 5 stages inserted in `SamplerChain::from_config()` after `RepetitionPenalty`, before `TemperatureScale`.
+  - **Tests (12):** 5 passthrough tests, 5 active tests, 2 edge-case safety tests.
+  - **Re-exported** from `lib.rs`: `DryStage`, `XtcStage`, `TypicalPStage`, `TopAStage`, `EtaStage`.
+
+- [x] Embedding pooling modes (Track B, v0.1.3) ✅ **Done (2026-05-05)**
+  - **Shipped:** `src/embedding.rs` (~250 LoC):
+    - `PoolingMode` enum: `Last` (default), `Mean`, `Max`, `Cls` — with `Serialize`/`Deserialize`/`Default`.
+    - `pool_hidden_states(states, seq_len, hidden_size, mode) -> RuntimeResult<Vec<f32>>` kernel.
+    - Per-mode kernels: `pool_last`, `pool_mean`, `pool_max`, `pool_cls`.
+  - **New engine methods:** `embed_with(text, mode)` and `embed_batch_with(texts, mode)`.
+  - **Delegating:** `embed()` → `embed_with(text, PoolingMode::Last)`, `embed_batch()` → `embed_batch_with(texts, PoolingMode::Last)`.
+  - **New error variant:** `RuntimeError::EmptySequence` (`#[error("cannot pool empty sequence")]`).
+  - **New `ForwardPass` method:** `embed_all()` default → `Err(NotSupported)` for future multi-token pooling.
+  - **Tests (8):** `pooling_last_matches_last_row`, `pooling_mean_is_arithmetic_mean`, `pooling_max_is_elementwise_max`, `pooling_cls_matches_first_row`, plus 4 edge-case tests.
+  - **Re-exported** from `lib.rs`: `PoolingMode`.
+
+*Last updated: 2026-05-05 (v0.1.3 Track B)*

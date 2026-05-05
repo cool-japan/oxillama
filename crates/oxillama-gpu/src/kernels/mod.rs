@@ -37,6 +37,7 @@ pub mod q6_k;
 pub mod q8_0;
 pub mod q8_1;
 pub mod q8_k;
+pub mod sampling;
 pub mod tiled_gemm;
 pub mod tq1_0;
 pub mod tq2_0;

@@ -60,3 +60,7 @@ harness = false
 name = "power"
 harness = false
 
+[[bench]]
+name = "speculative"
+harness = false
+

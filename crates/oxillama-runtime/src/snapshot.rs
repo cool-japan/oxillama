@@ -672,10 +672,19 @@ impl InferenceEngine {
             mirostat_eta: snap.sampler_state.mirostat_eta,
             grammar: None,
             token_vocab: None,
-            // Logit bias and banned tokens are not persisted in v1 snapshots;
-            // they default to empty.
+            // Logit bias, banned tokens, and advanced sampler stages are not
+            // persisted in v1 snapshots; they default to empty/disabled.
             logit_bias: std::collections::HashMap::new(),
             banned_tokens: Vec::new(),
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            xtc_threshold: 0.0,
+            xtc_probability: 0.5,
+            typical_p: 1.0,
+            top_a: 0.0,
+            eta_cutoff: 0.0,
+            epsilon_cutoff: 0.0,
         };
 
         // Re-parse grammar if present (state resets to initial — known limitation).

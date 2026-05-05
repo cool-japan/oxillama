@@ -12,7 +12,7 @@ categories = ["science", "algorithms"]
 readme = "README.md"
 
 [features]
-default = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "llava", "llava16", "falcon", "minicpm", "olmo2", "granite", "deepseek", "dbrx", "grok", "mamba2", "jamba", "qwen2-vl", "mixtral", "stablelm", "gptneox"]
+default = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "llava", "llava16", "falcon", "minicpm", "olmo2", "granite", "deepseek", "dbrx", "grok", "mamba2", "jamba", "qwen2-vl", "mixtral", "stablelm", "gptneox", "bloom", "phimoe"]
 llama = []
 qwen3 = []
 mistral = []
@@ -35,6 +35,8 @@ qwen2-vl = []
 mixtral = []
 stablelm = []
 gptneox = []
+bloom = []
+phimoe = []
 reference-f32 = []
 
 [dependencies]

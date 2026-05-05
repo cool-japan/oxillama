@@ -17,6 +17,7 @@ pub mod power;
 pub mod prefill_decode;
 pub mod regression_gate;
 pub mod simd_comparison;
+pub mod speculative;
 pub mod throughput;
 
 pub use arch_config::ArchBenchConfig;
@@ -44,6 +45,10 @@ pub use regression_gate::{BaselineEntry, RegressionFailure, RegressionGate};
 pub use simd_comparison::{
     format_comparison_table, run_dequant_comparison, run_gemv_comparison, KernelBenchResult,
     SimdComparisonConfig, SimdComparisonResult,
+};
+pub use speculative::{
+    default_accept_thresholds, default_draft_sizes, run_acceptance_sweep, SpeculativeBenchConfig,
+    SpeculativeBenchTable, SpeculativePoint, StubSpecEngine,
 };
 pub use throughput::{
     aggregate_throughput, bench_tokenizer_decode, bench_tokenizer_encode, compute_throughput,

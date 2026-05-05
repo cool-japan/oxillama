@@ -19,6 +19,7 @@ use oxillama_arch::config::ModelConfig;
 use oxillama_arch::traits::{ForwardPass, KvCacheAccess};
 use oxillama_gguf::GgufModel;
 
+use crate::embedding::{pool_hidden_states, PoolingMode};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::kv_cache::{KvCache, KvCacheSnapshot};
 use crate::metrics::{EngineMetrics, MetricsSnapshot};
@@ -971,15 +972,35 @@ impl InferenceEngine {
         self.model_config.as_ref().map(|c| c.hidden_size)
     }
 
-    /// Compute a semantic embedding vector for the given text.
+    /// Compute a semantic embedding vector for the given text using `PoolingMode::Last`.
     ///
-    /// Runs tokenization → full transformer layers → final RMSNorm, then
-    /// L2-normalises the resulting `hidden_size`-dimensional vector.
-    /// The KV cache is reset before the pass so that embeddings for
-    /// different inputs are independent of each other.
+    /// This is a convenience wrapper around [`embed_with`]. Runs tokenization →
+    /// full transformer layers → final RMSNorm, then L2-normalises the resulting
+    /// `hidden_size`-dimensional vector. The KV cache is reset before the pass
+    /// so that embeddings for different inputs are independent of each other.
     ///
     /// Returns `RuntimeError::ModelNotLoaded` if no model has been loaded.
     pub fn embed(&mut self, text: &str) -> RuntimeResult<Vec<f32>> {
+        self.embed_with(text, PoolingMode::Last)
+    }
+
+    /// Compute a semantic embedding vector for the given text using the specified
+    /// pooling strategy.
+    ///
+    /// Runs tokenization → full transformer layers → final RMSNorm → pooling,
+    /// then L2-normalises the resulting `hidden_size`-dimensional vector.
+    /// The KV cache is reset before the pass so that embeddings for different
+    /// inputs are independent of each other.
+    ///
+    /// # Pooling modes
+    ///
+    /// * [`PoolingMode::Last`] — last token hidden state (causal / decoder models).
+    /// * [`PoolingMode::Mean`] — mean across all token positions.
+    /// * [`PoolingMode::Max`]  — elementwise max across all token positions.
+    /// * [`PoolingMode::Cls`]  — first token hidden state (BERT / encoder models).
+    ///
+    /// Returns `RuntimeError::ModelNotLoaded` if no model has been loaded.
+    pub fn embed_with(&mut self, text: &str, mode: PoolingMode) -> RuntimeResult<Vec<f32>> {
         // Step 1: Reset the KV cache so this embedding is independent.
         // Must happen before we take any partial borrows below.
         self.reset();
@@ -1013,7 +1034,24 @@ impl InferenceEngine {
         }
 
         // Step 4: Run the embed forward pass (all layers + output_norm, no LM head).
-        let hidden = forward_pass.embed(&tokens, kv_cache)?;
+        // The forward pass returns the hidden states for all token positions as a
+        // flat [seq_len × hidden_size] vector (or just hidden_size for single-token
+        // models). We retrieve all-states where available; otherwise fall back to
+        // the last-state path for backward compatibility.
+        let seq_len = tokens.len();
+        let hidden_size = forward_pass.hidden_size();
+
+        let all_hidden = forward_pass.embed_all(&tokens, kv_cache);
+        let hidden = match all_hidden {
+            Ok(states) if states.len() == seq_len * hidden_size && seq_len > 0 => {
+                // embed_all is supported and returned a correctly-shaped matrix.
+                pool_hidden_states(&states, seq_len, hidden_size, mode)?
+            }
+            _ => {
+                // Fall back to embed() (last-token path).
+                forward_pass.embed(&tokens, kv_cache)?
+            }
+        };
 
         // Step 5: L2-normalise the hidden vector for cosine-similarity compatibility.
         let norm: f32 = hidden.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1024,49 +1062,44 @@ impl InferenceEngine {
         }
     }
 
-    /// Extract embedding vectors for multiple input texts (batch variant).
+    /// Extract embedding vectors for multiple input texts using `PoolingMode::Last`.
     ///
-    /// Runs the model forward pass and returns the final hidden state
-    /// (post-normalization, pre-LM-head) as the embedding vector.
+    /// This is a convenience wrapper around [`embed_batch_with`].
     /// Each text is processed independently with a fresh KV cache.
     pub fn embed_batch(&mut self, texts: &[String]) -> RuntimeResult<Vec<Vec<f32>>> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or(RuntimeError::ModelNotLoaded)?;
-        let forward_pass = self
-            .forward_pass
-            .as_mut()
-            .ok_or(RuntimeError::ModelNotLoaded)?;
-        let kv_cache = self.kv_cache.as_mut().ok_or(RuntimeError::ModelNotLoaded)?;
+        let str_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        self.embed_batch_with(&str_refs, PoolingMode::Last)
+    }
 
-        let hidden_size = forward_pass.hidden_size();
-        let mut embeddings = Vec::with_capacity(texts.len());
-
-        for text in texts {
-            // Reset cache for each text (embeddings are independent)
-            kv_cache.clear();
-
-            let tokens = tokenizer.encode(text)?;
-            if tokens.is_empty() {
-                embeddings.push(vec![0.0f32; hidden_size]);
-                continue;
-            }
-
-            // Process all tokens and get the final hidden state
-            let hidden_state = forward_pass.embed(&tokens, kv_cache)?;
-
-            // L2 normalize the embedding vector
-            let norm: f32 = hidden_state.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let embedding = if norm > 1e-12 {
-                hidden_state.iter().map(|x| x / norm).collect()
-            } else {
-                hidden_state
-            };
-
-            embeddings.push(embedding);
+    /// Extract embedding vectors for multiple input texts using the specified
+    /// pooling strategy.
+    ///
+    /// Each text is processed independently with a fresh KV cache.
+    /// The output order matches the input order.
+    ///
+    /// Returns `RuntimeError::ModelNotLoaded` if no model has been loaded.
+    pub fn embed_batch_with(
+        &mut self,
+        texts: &[&str],
+        mode: PoolingMode,
+    ) -> RuntimeResult<Vec<Vec<f32>>> {
+        // Validate that the engine is loaded by borrowing forward_pass and
+        // tokenizer — this also gives us the hidden_size for the zero-vector path.
+        {
+            let _fp = self
+                .forward_pass
+                .as_ref()
+                .ok_or(RuntimeError::ModelNotLoaded)?;
+            let _tok = self
+                .tokenizer
+                .as_ref()
+                .ok_or(RuntimeError::ModelNotLoaded)?;
         }
 
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for &text in texts {
+            embeddings.push(self.embed_with(text, mode)?);
+        }
         Ok(embeddings)
     }
 }

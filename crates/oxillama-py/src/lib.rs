@@ -52,6 +52,7 @@ pub mod sampler;
 pub mod snapshot;
 pub mod speculative;
 pub mod tokenizer;
+pub mod torch_interop;
 
 use pyo3::prelude::*;
 

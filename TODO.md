@@ -8,163 +8,30 @@ and an OpenAI-compatible API server without any C/C++/Fortran code.
 
 ---
 
-## v0.1.6 Shipped (2026-05-05)
+## v0.1.3 Shipped (2026-05-05)
 
-v0.1.6 theme: **Broadening model+inference surface**: three new architectures, three sampling/decoding primitives, OpenAI Assistants v2 file/step/stream parity, four CLI tools, power benchmarking, Python DLPack + hub-aware snapshots.
+v0.1.3 theme: **End-to-end feature completeness** across all crates: new architectures (BLOOM, Phi-3.5-MoE, Mixtral, StableLM, GPT-NeoX, LLaVA-1.6, Qwen2-VL), advanced sampler suite (DRY/XTC/TypicalP/TopA/Eta), `/v1/responses` + per-API-key rate limiting, AVX-512 IQ kernels + fused legacy matvec, GPU sampling kernels, speculative decoding bench + Python torch interop, server productionization (prefix-KV cache, multi-LoRA, Assistants API, Files store, Batch API, CLI tools, power benchmarks, DLPack interop).
 
-**Mixtral + StableLM + GPT-NeoX architectures** (`oxillama-arch`):
-`MixtralArchitecture` (`"mixtral"`) reusing `common/moe.rs` sparse top-2-of-8 routing +
-SWA + RMSNorm from mistral. `StablelmArchitecture` (`"stablelm"`) with parallel attn+FFN,
-partial RoPE on first 25% of head_dim, LayerNorm with bias. `GptNeoxArchitecture` (`"gptneox"`)
-with parallel residual sum, learned-bias LayerNorm, partial RoPE. 3 new Cargo feature flags;
-arch count: 22 → 25.
+**BLOOM + Phi-3.5-MoE architectures** (`oxillama-arch`):
+`AlibiBias` primitive (`common/alibi.rs`) with slope formula matching transformers/modeling_bloom.py.
+`BloomArchitecture` (`"bloom"`) with ALiBi positional bias (no RoPE), pre-LayerNorm, GELU FFN, MHA; bias terms on all projections. `PhiMoeArchitecture` (`"phimoe"`) reusing Phi-3 merged QKV + partial RoPE + `SparseTopKMoe` router (16 experts, top-2). Test fixtures `build_minimal_bloom_gguf` + `build_minimal_phi_moe_gguf`. Arch count: 25 → 27.
 
-**Logit-bias + JSON-Schema → GBNF + beam search** (`oxillama-runtime`):
-`SamplerConfig.logit_bias: HashMap<u32,f32>` + `banned_tokens: Vec<u32>` applied before
-top-k/top-p. `JsonSchemaCompiler::compile(schema_json) -> Grammar` supporting
-object/array/string/number/boolean/null/enum/required/pattern. `BeamSearchConfig` +
-`BeamHypothesis` + `InferenceEngine::beam_generate()` with length-penalty scoring,
-early-stopping, global top-k pruning per step.
+**Advanced sampler suite + embedding pooling** (`oxillama-runtime`):
+`DryStage` (n-gram DRY penalty, exponential growth), `XtcStage` (exclude top-choices with probability), `TypicalPStage` (locally-typical sampling via Shannon entropy), `TopAStage` (adaptive `a × max_prob²` threshold), `EtaStage` (entropy-scaled cutoff combining typical + epsilon). 9 new `SamplerConfig` fields, all `#[serde(default)]`, byte-identical defaults. `PoolingMode { Last, Mean, Max, Cls }` + `pool_hidden_states()` + `embed_with()` / `embed_batch_with()` API.
 
-**Files store + Run Steps + Run streaming** (`oxillama-server`):
-`POST/GET/DELETE /v1/files` with `FilesStore` atomic-write pattern + multipart upload.
-`RunStep` type (`MessageCreation`/`ToolCalls`) with `GET /v1/threads/:id/runs/:run_id/steps`.
-`RunEvent` SSE stream: `thread.run.created → in_progress → message.delta → completed → [DONE]`;
-broadcast via `tokio::sync::broadcast`.
+**`/v1/responses` + per-API-key rate limiting** (`oxillama-server`):
+`ResponseStore` (in-memory `Arc<RwLock<HashMap>>`) with atomic create/get/update/list. `POST /v1/responses` (non-streaming + SSE `response.created / output_text.delta / completed / [DONE]`), `GET /v1/responses`, `GET /v1/responses/:id`. `previous_response_id` chains prior response into context. `PerKeyRateLimiter` with lazy per-key `TokenBucket` insertion, override map, `per_key_rate_limit_middleware`.
 
-**CLI: quantize + convert + verify + tokenize** (`oxillama-cli`):
-`oxillama quantize` re-quantizes GGUF tensors (Q4_0/Q8_0).
-`oxillama convert` wraps `SafetensorsConverter` (safetensors → GGUF).
-`oxillama verify` checks magic, version, parse, optional SHA256, tensor bounds.
-`oxillama tokenize`/`detokenize` debug helpers via `TokenizerBridge`.
+**AVX-512 IQ kernels + fused legacy matvec** (`oxillama-quant`):
+`Iq2XxsAvx512`, `Iq2XsAvx512`, `Iq3SAvx512`, `Iq4XsAvx512` — `_mm512_permutexvar_epi8` grid lookup (AVX-512BW); 2× per-iter throughput over AVX2; runtime-guarded, auto-skip on non-AVX-512. `matvec_q8_fused` override for Q5_0/Q5_1/Q8_1 on both AVX2 and NEON paths; scalar parity oracles in reference tier.
 
-**Power/watt benchmarks + CI regression gate** (`oxillama-bench`):
-`RaplReader` scans `/sys/class/powercap/intel-rapl:*` for tokens/joule measurement;
-graceful `NoRapl` fallback on non-Linux. `RegressionGate` hard-fails on >threshold
-regression in `toks_per_sec`/`prefill_ms`/`decode_ms_p99` vs saved baseline JSON.
-Criterion bench `benches/power.rs`.
+**GPU sampling kernels** (`oxillama-gpu`):
+`sampling.wgsl` — `softmax_logits` (256-thread shared-memory reduction, temperature scaling, temp=0 argmax path), `topk_partition` (workgroup cooperative top-k ≤ 256), `sample_categorical` (LCG RNG + CDF walk). `SamplingKernel` struct with `softmax()`, `top_k()`, `sample()` Rust wrappers; graceful `NoAdapter` fallback.
 
-**Hub-aware snapshots + DLPack interop** (`oxillama-py`):
-`HubOrigin { repo_id, filename, sha256 }` field in `EngineSnapshotMeta`; `restore()` re-downloads
-from hub if model file missing. `vec_to_dlpack()` / `dlpack_to_vec()` producing DLPack v0.8
-`PyCapsule` for zero-copy logits/embeddings. `PyEngine::logits_dlpack()`,
-`embeddings_dlpack()`, `from_snapshot_with_hub()`.
+**Speculative decoding bench + Python torch interop** (`oxillama-bench` + `oxillama-py`):
+`SpeculativeBenchConfig`, `SpeculativePoint`, `SpeculativeBenchTable` + `run_acceptance_sweep()` with deterministic acceptance simulation; `summary_table()` / `speedup_grid()` Markdown output; Criterion bench `benches/speculative.rs`. `torch_helper.py` pure-Python bridge: `Engine.logits_torch()` / `embeddings_torch()` via lazy `torch.from_dlpack(capsule)` (no Rust torch dependency).
 
-2,151 tests, 0 warnings. See [CHANGELOG.md](CHANGELOG.md) for full details.
-
----
-
-## v0.1.5 Shipped (2026-05-05)
-
-v0.1.5 theme: **Multimodal tile-scale + remote GGUF + GPU quant breadth + async Python + fused GEMV + heatmap bench**.
-
-**LLaVA-1.6 / LLaVA-NeXT anyres tiling** (`oxillama-arch`):
-`AnyresTileConfig` with `select_grid` (fill-fraction minimisation) and `split_into_tiles`
-(bilinear resize to tile grid + thumbnail). `LlavaNextModel` reuses `ClipEncoder` and
-`MmProjector` from LLaVA-1.5; `encode_image()` runs per-tile CLIP → concat → project.
-Registered under arch id `"llava16"` behind `llava16` feature flag.
-
-**Remote GGUF HTTP range + safetensors bridge** (`oxillama-gguf`):
-`HttpRangeSource { url, content_length }` implementing `Source` with 128 KiB warm cache;
-`GgufModel::from_url(url)` entry point (gated `http` feature, `ureq 3.x`).
-`SafetensorsConverter::load(path)` + `from_bytes(bytes)` parses 8-byte LE header_size
-prefix + JSON + raw tensor data; dtype map: F32/F16/BF16/I8 → corresponding GGUF types.
-
-**IQ1_S / IQ1_M / IQ2_XS / IQ4_NL / TQ1_0 / TQ2_0 GPU kernels** (`oxillama-gpu`):
-6 new CPU-dequant + `gemv_f32.wgsl` dispatch kernel files; IQ1_S_GRID[2048] split across
-`iq1s_grid/{mod,data_a,data_b}.rs`. GPU quant coverage: 18 → 24 types (~95% of HF uploads).
-
-**Python native async engine via asyncio bridge** (`oxillama-py`):
-`AsyncEngine` class (pure Python, `ThreadPoolExecutor` + `asyncio.run_in_executor`):
-`async generate(prompt, ...) -> str` and `async stream(prompt, ...) -> AsyncIterator[str]`.
-`PyEngine::async_engine()` factory method. Type stubs updated.
-
-**Fused dequant+GEMV for Q2_K/Q3_K** (`oxillama-quant`):
-`matvec_q8_fused` overrides for `Q2_KAvx2`, `Q3_KAvx2` (AVX2) and `Q2_KNeon`, `Q3_KNeon`
-(ARM NEON); eliminates scratch buffer for 4 most-used K-quants. Reference scalar overrides
-corrected to match 256-weight super-block layout (8 Q8_0 blocks per super-block).
-
-**Latency-vs-batch-size heatmap bench** (`oxillama-bench`):
-`BatchHeatmap` / `HeatmapPoint { batch_size, seq_len, toks_per_sec, p99_latency_ms, memory_bytes }`;
-2-D sweep `batch_size ∈ {1,2,4,8}` × `seq_len ∈ {128,512,1024,2048}`; `summary_table()` +
-`p99_table()` Markdown output; Criterion bench `benches/batch_heatmap.rs`.
-
-2,030 tests, 0 warnings. See [CHANGELOG.md](CHANGELOG.md) for full details.
-
----
-
-## v0.1.4 Shipped (2026-05-05)
-
-v0.1.4 theme: **SIMD completeness + multimodal Qwen2-VL + Assistants API + snapshot parity**.
-
-**AVX-512 SIMD completeness for Q4_1/Q5_1/Q8_1** (`oxillama-quant`):
-Three new AVX-512 kernel files (`q4_1.rs`, `q5_1.rs`, `q8_1.rs`) completing the
-four-tier SIMD ladder for all legacy quantization types; Q4_1 FMA with per-block `m` offset,
-Q5_1 5-bit unsigned reconstruction, Q8_1 36-byte block stride. Dispatch updated.
-
-**Long-context KV-cache scaling bench** (`oxillama-bench`):
-`LongContextSweep` + `LongContextPoint` sweep `ctx ∈ {1024, 4096, 8192, 16384, 32768}`,
-emit Markdown summary table; Criterion bench target `long_context` with `StubEngine`;
-`OXILLAMA_BENCH_PRINT_TABLE=1` env gate.
-
-**OpenAI Assistants API subset** (`oxillama-server`):
-`POST/GET /v1/threads`, `POST/GET /v1/threads/:id/messages`,
-`POST/GET /v1/threads/:id/runs`, `POST /v1/threads/:id/runs/:run_id/cancel`.
-`ThreadStore` with atomic JSON writes + append-only JSONL message log (mirrors
-`batch_spool` pattern). Worker transitions `queued → in_progress → completed`.
-7 routes, 12 new tests. OpenAI Assistants v2 envelope shape.
-
-**Qwen2-VL multimodal architecture with M-RoPE** (`oxillama-arch`):
-`MRopeTable` (3-axis time/height/width head_dim split), native Qwen2 ViT vision
-encoder (patch size 14, dynamic resolution, window attention), `MmMerger` (2×2
-spatial block → 1 LLM token compression), `Qwen2VlModel` backbone with M-RoPE per
-layer. Registered under arch id `"qwen2vl"` behind `qwen2-vl` feature flag.
-`build_minimal_qwen2vl_gguf()` test fixture added.
-
-**SpeculativeEngine snapshot/restore** (`oxillama-runtime` + `oxillama-py`):
-`SpeculativeEngineSnapshot` (magic `OXISPEC1`, wraps two `EngineSnapshot`s + spec
-state), `SpeculativeEngine::snapshot()`/`resume()`. Python bindings:
-`snapshot(path)`, `snapshot_bytes()`, `restore()` classmethod, pickle-compatible
-`__reduce__`. Type stubs updated.
-
-**WASM SIMD128 check + service-worker model cache** (`oxillama-wasm`):
-`getSimd128Status()` diagnostic (compiled_with / runtime_detected / user_agent),
-`getServiceWorkerScript(opts)` emitting a cache-first JS service worker that
-intercepts `/models/*.gguf` fetches from IndexedDB across sessions,
-`registerServiceWorker(url)`. Demo HTML + mobile browser test matrix doc.
-
-1,952 tests, 0 warnings. See [CHANGELOG.md](CHANGELOG.md) for full details.
-
----
-
-## v0.1.3 Shipped (2026-05-03)
-
-v0.1.3 theme: **Server productionization + SIMD/GPU coverage tail**.
-
-**Server prefix-KV cache wiring** (`oxillama-runtime` + `oxillama-server`):
-`engine.prime_with_prefix` (restores KV → suffix prefill → returns initial logits),
-`engine.generate_with_logits` (decode-only loop from initial logits),
-`engine.store_kv_in_prefix_cache` (public boundary-safe KV store helper),
-`CachedKvState::new` (public constructor for Mutex-release-safe reconstruction),
-per-request `cache_prompt: bool` flag (default true), `AppState::prefix_cache`,
-worker hit/miss/store logic.
-
-**Server multi-LoRA registry + admin CRUD** (`oxillama-arch` + `oxillama-server`):
-`ForwardPass::unapply_all_loras` + LLaMA/LLaVA/Command-R overrides,
-`engine.unapply_all_loras` (clears QuantLinear.lora after generation),
-`AppState::loras: Arc<RwLock<HashMap<String, Arc<LoadedLora>>>>`,
-per-request `lora_selection: Vec<(String, f32)>` on `BatchRequest`,
-`POST/GET/DELETE /admin/loras` endpoints, `LoraSelection` re-export.
-
-**AVX-512 K-quant kernels** (`oxillama-quant`): `Q2_KAvx512` (~700 LoC) and
-`Q3_KAvx512` (~830 LoC) with `_mm512_*` intrinsics, 2× wider than AVX2 paths;
-AVX-512 coverage table now includes Q2_K and Q3_K.
-
-**GPU legacy quad kernels** (`oxillama-gpu`): `Q4_1GpuKernel`, `Q5_0GpuKernel`,
-`Q5_1GpuKernel`, `Q8_1GpuKernel` WGSL GEMV shaders (~1,570 total LoC);
-GPU dispatcher now covers 18 quant types (~85% of community HuggingFace uploads).
-
-1,873 tests, 0 warnings. See [CHANGELOG.md](CHANGELOG.md) for full details.
+2,235 tests, 0 warnings. See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ---
 
@@ -211,7 +78,7 @@ quant kernel, and 3 cargo-fuzz targets on the GGUF parser. 1,205 tests, 0 warnin
 | Total Lines | ~96,000 Rust / ~122,000 total |
 | Source Files | 356 Rust files / 420 total |
 | Crates | 11 |
-| Test Count | 1,952 |
+| Test Count | 2,235 |
 | Warnings | 0 |
 | Coverage | 87.09% region / 87.23% function / 85.42% line |
 | Last Updated | 2026-05-05 |
