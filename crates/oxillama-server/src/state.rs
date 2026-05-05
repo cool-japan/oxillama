@@ -7,8 +7,11 @@
 //! - In-memory batch store (legacy).
 //! - Disk-backed batch store + queue sender (C3).
 //! - Multi-model LRU pool (C1), protected by a `Mutex` for admin mutations.
+//! - Prefix KV cache for system-prompt reuse across requests.
+//! - LoRA adapter registry (name → Arc<LoadedLora>).
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use tokio::sync::mpsc;
@@ -20,6 +23,7 @@ use crate::queue::{BatchRequest, VocabBytes};
 use crate::router::ModelPool;
 
 use oxillama_runtime::sampling::SamplerConfig;
+use oxillama_runtime::{LoadedLora, PrefixCacheConfig, PrefixKvCache};
 
 /// Shared application state accessible by all route handlers.
 ///
@@ -67,6 +71,19 @@ pub struct AppState {
     /// inference worker. In the current single-worker design the worker also
     /// holds the pool; admin mutations use `try_lock` to avoid deadlocks.
     pub model_pool: Mutex<ModelPool>,
+
+    /// Prefix KV cache for system-prompt reuse across requests.
+    ///
+    /// When a new request shares a long prefix with a previously-cached
+    /// sequence (e.g. a fixed system prompt), the matching KV state is
+    /// restored and only the suffix tokens need a fresh prefill pass.
+    pub prefix_cache: Arc<Mutex<PrefixKvCache>>,
+
+    /// Loaded LoRA adapter registry: stable name → `Arc<LoadedLora>`.
+    ///
+    /// Populated via `POST /admin/loras`.  Request handlers look up adapters
+    /// by name and pass them to the worker via `BatchRequest::Generate`.
+    pub loras: Arc<RwLock<HashMap<String, Arc<LoadedLora>>>>,
 }
 
 impl AppState {
@@ -107,6 +124,10 @@ impl AppState {
             batch_disk_store,
             batch_queue_tx,
             model_pool: Mutex::new(ModelPool::new(4, 0)),
+            prefix_cache: Arc::new(Mutex::new(PrefixKvCache::new(
+                PrefixCacheConfig::default(),
+            ))),
+            loras: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -139,6 +160,10 @@ impl AppState {
             batch_disk_store,
             batch_queue_tx,
             model_pool: Mutex::new(ModelPool::new(4, 0)),
+            prefix_cache: Arc::new(Mutex::new(PrefixKvCache::new(
+                PrefixCacheConfig::default(),
+            ))),
+            loras: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }

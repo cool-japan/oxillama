@@ -280,6 +280,13 @@ pub trait ForwardPass: Send + Sync {
         Ok(())
     }
 
+    /// Remove all LoRA adapters from every `QuantLinear` in this model.
+    ///
+    /// The inverse of [`apply_lora_stack`]: sets `lora = None` on every linear
+    /// layer that was patched.  The default is a no-op; architectures that
+    /// override [`apply_lora`] must also override this.
+    fn unapply_all_loras(&mut self) {}
+
     /// Allocate a fresh per-sequence state object for this model.
     ///
     /// The runtime calls this once per pool slot at model load time.

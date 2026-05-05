@@ -547,7 +547,18 @@ async fn run() -> Result<()> {
             // Start the single inference worker that owns the engine.
             let (queue_tx, queue_rx) =
                 tokio::sync::mpsc::channel::<oxillama_server::BatchRequest>(64);
-            oxillama_server::spawn_inference_worker(engine, queue_rx);
+            let prefix_cache = std::sync::Arc::new(std::sync::Mutex::new(
+                oxillama_runtime::PrefixKvCache::new(oxillama_runtime::PrefixCacheConfig::default()),
+            ));
+            let loras = std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::<String, std::sync::Arc<oxillama_runtime::LoadedLora>>::new(),
+            ));
+            oxillama_server::spawn_inference_worker(
+                engine,
+                queue_rx,
+                std::sync::Arc::clone(&prefix_cache),
+                std::sync::Arc::clone(&loras),
+            );
 
             let state = std::sync::Arc::new(oxillama_server::AppState::new(
                 queue_tx,

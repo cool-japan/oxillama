@@ -237,7 +237,7 @@ fn encode_q8_0(weights: &[f32]) -> Vec<u8> {
 ///
 /// The blob must be even-length (2 bytes per f16 value).
 fn dequant_f16(blob: &[u8]) -> GgufResult<Vec<f32>> {
-    if blob.len() % 2 != 0 {
+    if !blob.len().is_multiple_of(2) {
         return Err(GgufError::InvalidMetadata {
             key: "<f16_blob>".to_string(),
             reason: format!("blob length {} is not a multiple of 2", blob.len()),
@@ -255,7 +255,7 @@ fn dequant_f16(blob: &[u8]) -> GgufResult<Vec<f32>> {
 
 /// Dequantize a raw F32 tensor blob to a `Vec<f32>`.
 fn dequant_f32(blob: &[u8]) -> GgufResult<Vec<f32>> {
-    if blob.len() % 4 != 0 {
+    if !blob.len().is_multiple_of(4) {
         return Err(GgufError::InvalidMetadata {
             key: "<f32_blob>".to_string(),
             reason: format!("blob length {} is not a multiple of 4", blob.len()),

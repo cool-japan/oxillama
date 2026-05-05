@@ -48,6 +48,10 @@ shader coverage, batching, and attention fusion.
 |---------------------------|:---------:|---------------------------------------------------|
 | Q4_0                      | ✓         | f32 accumulator, naive one-workgroup-per-row      |
 | Q8_0                      | ✓         | f32 accumulator, naive                            |
+| Q4_1                      | ✓         | f32 GEMV — **new in v0.1.3** (20-byte blocks, 4-bit + min)  |
+| Q5_0                      | ✓         | f32 GEMV — **new in v0.1.3** (22-byte blocks, 5-bit)        |
+| Q5_1                      | ✓         | f32 GEMV — **new in v0.1.3** (24-byte blocks, 5-bit + min)  |
+| Q8_1                      | ✓         | f32 GEMV — **new in v0.1.3** (36-byte blocks, 8-bit + sum)  |
 | Q2_K                      | ✓         | CPU dequant + GPU f32 GEMV                        |
 | Q3_K                      | ✓         | CPU dequant + GPU f32 GEMV                        |
 | Q4_K                      | ✓         | CPU dequant + GPU f32 GEMV                        |
@@ -62,7 +66,6 @@ shader coverage, batching, and attention fusion.
 | IQ4_XS                    | ✓         | CPU dequant + GPU f32 GEMV                        |
 | Tiled GEMM                | ✓         | TILE_M/N=32, TILE_K=16; `gemm_f32.wgsl` — **new in v0.1.1** |
 | Fused attention           | ✓         | Online softmax, QK+AV single dispatch — **new in v0.1.1** |
-| K-quants (Q2_K rest)      | —         | v2.0                                              |
 | I-quants (remaining)      | —         | v2.0                                              |
 | Ternary (TQ1_0, TQ2_0)    | —         | v2.0                                              |
 
@@ -225,7 +228,7 @@ These items make up the remaining ~18 % of the v0.1.0 completion figure.
   tuned for tile-based mobile GPUs, coordinated with the `oxillama-wasm`
   hookup so a browser build gets real acceleration, not just portability.
 
-*Last updated: 2026-04-20 (v0.1.1 shipped — tiled GEMM, fused attention, IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S GPU kernels; 151 tests)*
+*Last updated: 2026-05-03 (v0.1.3 shipped — Q4_1/Q5_0/Q5_1/Q8_1 GPU kernels; 18 quant types on GPU, ~85% HF coverage; 1873 workspace tests)*
 
 ## 8. Planned GPU Kernels (v2.0 — Scheduled 2026-04-19)
 

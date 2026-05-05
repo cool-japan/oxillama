@@ -366,7 +366,7 @@ pub fn flash_attention_gqa(
             message: "num_kv_heads must be > 0".to_string(),
         });
     }
-    if num_q_heads % num_kv_heads != 0 {
+    if !num_q_heads.is_multiple_of(num_kv_heads) {
         return Err(RuntimeError::AttentionError {
             message: format!(
                 "num_q_heads ({}) must be divisible by num_kv_heads ({})",
@@ -499,7 +499,7 @@ pub fn flash_attention_forward(
     let q_total = q.len();
     let kv_total = k.len();
 
-    if q_total % (num_heads * head_dim) != 0 {
+    if !q_total.is_multiple_of(num_heads * head_dim) {
         return Err(RuntimeError::AttentionError {
             message: format!(
                 "q length {} is not divisible by num_heads * head_dim = {}",
@@ -508,7 +508,7 @@ pub fn flash_attention_forward(
             ),
         });
     }
-    if kv_total % (num_heads * head_dim) != 0 {
+    if !kv_total.is_multiple_of(num_heads * head_dim) {
         return Err(RuntimeError::AttentionError {
             message: format!(
                 "k length {} is not divisible by num_heads * head_dim = {}",

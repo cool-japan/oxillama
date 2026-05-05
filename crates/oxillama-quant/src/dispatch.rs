@@ -146,6 +146,8 @@ impl KernelDispatcher {
                 GgufTensorType::Q4_0 => return Ok(Box::new(simd::avx512::Q4_0Avx512)),
                 GgufTensorType::Q4_1 => return Ok(Box::new(simd::avx512::Q4_1Avx512)),
                 GgufTensorType::Q8_0 => return Ok(Box::new(simd::avx512::Q8_0Avx512)),
+                GgufTensorType::Q2K => return Ok(Box::new(simd::avx512::Q2_KAvx512)),
+                GgufTensorType::Q3K => return Ok(Box::new(simd::avx512::Q3_KAvx512)),
                 GgufTensorType::Q4K => return Ok(Box::new(simd::avx512::Q4_KAvx512)),
                 GgufTensorType::Q1_0G128 => return Ok(Box::new(simd::avx512::Q1_0G128Avx512)),
                 GgufTensorType::Q5K => return Ok(Box::new(simd::avx512::Q5_KAvx512)),

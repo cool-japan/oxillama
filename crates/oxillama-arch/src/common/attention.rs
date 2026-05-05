@@ -12,7 +12,7 @@ pub fn effective_attention_span(config: &ModelConfig, layer_idx: usize) -> u32 {
     match config.swa_window {
         None => u32::MAX,
         Some(w) => {
-            if config.swa_interleaved && layer_idx % 2 == 0 {
+            if config.swa_interleaved && layer_idx.is_multiple_of(2) {
                 u32::MAX // global layer in Gemma interleaved pattern
             } else {
                 w

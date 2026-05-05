@@ -8,6 +8,37 @@ and an OpenAI-compatible API server without any C/C++/Fortran code.
 
 ---
 
+## v0.1.3 Shipped (2026-05-03)
+
+v0.1.3 theme: **Server productionization + SIMD/GPU coverage tail**.
+
+**Server prefix-KV cache wiring** (`oxillama-runtime` + `oxillama-server`):
+`engine.prime_with_prefix` (restores KV → suffix prefill → returns initial logits),
+`engine.generate_with_logits` (decode-only loop from initial logits),
+`engine.store_kv_in_prefix_cache` (public boundary-safe KV store helper),
+`CachedKvState::new` (public constructor for Mutex-release-safe reconstruction),
+per-request `cache_prompt: bool` flag (default true), `AppState::prefix_cache`,
+worker hit/miss/store logic.
+
+**Server multi-LoRA registry + admin CRUD** (`oxillama-arch` + `oxillama-server`):
+`ForwardPass::unapply_all_loras` + LLaMA/LLaVA/Command-R overrides,
+`engine.unapply_all_loras` (clears QuantLinear.lora after generation),
+`AppState::loras: Arc<RwLock<HashMap<String, Arc<LoadedLora>>>>`,
+per-request `lora_selection: Vec<(String, f32)>` on `BatchRequest`,
+`POST/GET/DELETE /admin/loras` endpoints, `LoraSelection` re-export.
+
+**AVX-512 K-quant kernels** (`oxillama-quant`): `Q2_KAvx512` (~700 LoC) and
+`Q3_KAvx512` (~830 LoC) with `_mm512_*` intrinsics, 2× wider than AVX2 paths;
+AVX-512 coverage table now includes Q2_K and Q3_K.
+
+**GPU legacy quad kernels** (`oxillama-gpu`): `Q4_1GpuKernel`, `Q5_0GpuKernel`,
+`Q5_1GpuKernel`, `Q8_1GpuKernel` WGSL GEMV shaders (~1,570 total LoC);
+GPU dispatcher now covers 18 quant types (~85% of community HuggingFace uploads).
+
+1,873 tests, 0 warnings. See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+---
+
 ## v0.1.1 Shipped (2026-04-24)
 
 v0.1.1 ships on top of v0.1.0's foundation: FlashAttention tiled CPU kernel
@@ -48,13 +79,13 @@ quant kernel, and 3 cargo-fuzz targets on the GGUF parser. 1,205 tests, 0 warnin
 
 | Metric | Value |
 |--------|-------|
-| Total Lines | ~87,444 Rust / ~110,634 total |
-| Source Files | 321 Rust files / 383 total |
+| Total Lines | ~91,500 Rust / ~116,000 total |
+| Source Files | 337 Rust files / 400 total |
 | Crates | 11 |
-| Test Count | 1,662 |
+| Test Count | 1,873 |
 | Warnings | 0 |
 | Coverage | 87.09% region / 87.23% function / 85.42% line |
-| Last Updated | 2026-04-24 |
+| Last Updated | 2026-05-03 |
 
 ---
 
@@ -133,14 +164,14 @@ bench, gpu}`, so downstream apps only depend on one crate.
 Themes that span multiple crates. Each theme references the primary subcrate
 TODO where detailed work items live.
 
-### Prefix KV caching (runtime + server) — SHIPPED
+### Prefix KV caching (runtime + server) — FULLY SHIPPED ✅ v0.1.3
 
 ~~Radix-tree-indexed shared-prefix reuse with copy-on-write on divergence so that
-shared system prompts are paid for once across concurrent requests.~~ ✅ Shipped
-in `oxillama-runtime`: `PrefixKvCache`, `RadixNode`, `CachedKvState`, LRU
-eviction, memory tracking, hit/miss counters, `KvCache::restore_from_snapshot()`.
-Server-side integration (opt-in per-request flag) remains a v1.1 item
-(see `oxillama-server/TODO.md` §6).
+shared system prompts are paid for once across concurrent requests.~~ ✅ Fully
+shipped: runtime `PrefixKvCache` (v0.1.2) + server-side wiring (v0.1.3):
+`engine.prime_with_prefix`, `generate_with_logits`, `store_kv_in_prefix_cache`,
+per-request `cache_prompt` flag, `AppState::prefix_cache` Arc, and worker-side
+hit/miss/store logic.
 
 ### Function / tool calling (server + runtime grammar)
 
@@ -153,8 +184,9 @@ and `oxillama-runtime/TODO.md` §6.
 ### SIMD breadth (quant)
 
 Close the gap where 18 of 25 quantization types remain scalar-only: AVX-512 +
-NEON kernels for Q5_K / Q6_K (LLaMA-3 dominant formats); AVX2 for Q2_K / Q3_K
-(phone / Pi deployments); ~~AVX2 for IQ2_XXS (the most common I-quant in HF GGUF
+NEON kernels for Q5_K / Q6_K (LLaMA-3 dominant formats); ~~AVX2 for Q2_K / Q3_K
+(phone / Pi deployments)~~ ✅ Shipped in v0.1.1; ~~AVX-512 for Q2_K / Q3_K~~ ✅
+Shipped in v0.1.3; ~~AVX2 for IQ2_XXS (the most common I-quant in HF GGUF
 uploads)~~ ✅ Shipped. Full matrix in `oxillama-quant/TODO.md` §2 + §6.
 
 ### More architectures (arch + runtime feature flags) — SHIPPED
@@ -172,9 +204,11 @@ Details in `oxillama-arch/TODO.md` §6.
 Extend `oxillama-gpu` from 6 quant shaders to cover remaining K-quants,
 ~~batched GEMV for prefill~~ ✅ Shipped (`BatchedGpuKernel`, Q4_0 batched impl),
 ~~IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S GPU GEMV kernels~~ ✅ Shipped in v0.1.1 (+4 kernels,
-now 10 quant types on GPU), ~~tiled GEMM WGSL shader (TILE_M/N=32, TILE_K=16,
+now 14 quant types on GPU), ~~tiled GEMM WGSL shader (TILE_M/N=32, TILE_K=16,
 shared memory cooperative)~~ ✅ Shipped in v0.1.1, ~~fused attention WGSL kernel
 (single-dispatch QK+softmax+AV)~~ ✅ Shipped in v0.1.1,
+~~Q4_1/Q5_0/Q5_1/Q8_1 legacy quad GPU kernels~~ ✅ Shipped in v0.1.3 (now 18
+quant types on GPU, covers ~85% of community HuggingFace uploads),
 f16 accumulator paths, and naga cross-compile validation (MSL for Metal + SPIR-V
 for Vulkan). See `oxillama-gpu/TODO.md` §6.
 

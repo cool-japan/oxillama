@@ -174,9 +174,8 @@ Cached vocabulary
   - **Shipped:** `BatchedKvView` trait + `KvSlot` struct + `VecBatchedKvView` impl in `kv_cache/mod.rs`; `batched_flash_attention<V: BatchedKvView>` in new `batched_attention.rs` (~351 LoC); `slot_id: Option<usize>` field on `Sequence` in `scheduler.rs`.
   - **Note:** `ForwardPass::forward_batched` is now implemented in `oxillama-arch/src/traits.rs` (default returns `NotSupported`; LLaMA overrides with a real per-slot attention impl). `BatchedKvView` + `KvSlot` moved to `oxillama-arch/src/traits.rs` and re-exported from runtime. `kv_dim()`, `for_each_key()`, `for_each_value()` added to `KvCacheAccess` with defaults (contiguous path) and `PagedKvCache` overrides (multi-page path). `batched_attention.rs` wires through `forward_batched`.
   - **Tests (2 new):** `batched_kv_view_basic` (trait correctness), `batched_flash_decode_matches_serial` (batched output == two serial calls, tol 1e-5).
-- Single `LoadedLora` per engine — no multi-LoRA hot-swap / per-request
-  ✅ **Done**: `LoraStack` integrated into `InferenceEngine`; `push_lora`, `pop_lora`, `clear_loras`, `apply_lora_stack` support hot-swap without restart
-  adapter selection.
+- ~~Single `LoadedLora` per engine — no multi-LoRA hot-swap / per-request
+  adapter selection.~~ ✅ **Done**: `LoraStack` integrated into `InferenceEngine`; `push_lora`, `pop_lora`, `clear_loras`, `apply_lora_stack` support hot-swap without restart. Server wiring shipped v0.1.3 (`AppState::loras` registry + per-request `lora_selection`, `engine.unapply_all_loras()` reverts `QuantLinear.lora` fields after generation).
 - No CPU offload / lazy paging — entire model must fit in RAM.
 - ~~Speculative decoding has no delta-sync optimisation; KV resync
   re-prefills the full accepted history each round.~~ ✅ Shipped:
@@ -192,9 +191,11 @@ Cached vocabulary
 
 - ~~Prefix KV caching: radix-tree-indexed shared-prefix reuse across
   requests, with copy-on-write on divergence. Integrates with the
-  scheduler so system prompts are paid for once.~~ ✅ Shipped:
+  scheduler so system prompts are paid for once.~~ ✅ Fully shipped:
   `PrefixKvCache`, `RadixNode`, `CachedKvState`, LRU eviction, memory
-  tracking, hit/miss counters, `KvCache::restore_from_snapshot()`.
+  tracking, hit/miss counters, `KvCache::restore_from_snapshot()`
+  (v0.1.2). Server wiring completed v0.1.3: `prime_with_prefix`,
+  `generate_with_logits`, `store_kv_in_prefix_cache`, `CachedKvState::new`.
 - ~~Delta KV resync for speculative decoding.~~ ✅ Shipped:
   `SpeculativeDeltaSync` with `checkpoint`/`restore`, wired into
   `SpeculativeEngine`; draft only re-runs corrected token on rejection.

@@ -4,7 +4,7 @@
 //! - bytes[0..2]   — FP16 super-block scale `d` (little-endian)
 //! - bytes[2..4]   — FP16 super-block minimum `dmin` (little-endian)
 //! - bytes[4..16]  — 12 bytes encoding 8 sub-block scales + 8 sub-block mins,
-//!                   6 bits each, packed (see `decode_scales_mins`)
+//!   6 bits each, packed (see `decode_scales_mins`)
 //! - bytes[16..144] — 128 packed nibble bytes (256 × 4-bit unsigned values)
 //!
 //! Block structure: 8 sub-blocks of 32 weights each (4 groups of 2 sub-blocks).

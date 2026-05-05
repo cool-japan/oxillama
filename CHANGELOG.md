@@ -7,6 +7,42 @@ OxiLLaMa uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-03
+
+### Added
+
+#### Server Prefix-KV Cache Wiring (`oxillama-server` + `oxillama-runtime`)
+- **`InferenceEngine::prime_with_prefix`**: restores KV cache from a `CachedKvState` snapshot then forward-passes suffix tokens, returning initial logits for the decode loop — skips re-prefilling shared system prompts on cache hits
+- **`InferenceEngine::generate_with_logits`**: decode-only loop starting from pre-computed initial logits; used after a prefix-cache hit to avoid a second prefill pass
+- **`InferenceEngine::store_kv_in_prefix_cache`**: public helper that snapshots current KV state into a `PrefixKvCache` without exposing the mutable KV reference across crate boundaries
+- **`CachedKvState::new`**: public constructor enabling reconstruction from cloned K/V buffers after the `Mutex` guard is released
+- **Server-side `PrefixKvCache` wiring**: `AppState` now holds `prefix_cache: Arc<Mutex<PrefixKvCache>>`; the worker thread looks up the longest matching token prefix, restores KV state on hit, generates via `generate_with_logits`, and stores the post-generation KV state; full-prefill fallback on miss
+- **Per-request `cache_prompt` flag**: new `cache_prompt: bool` field on `ChatCompletionRequest` (default `true`) and `BatchRequest::Generate` / `GenerateStream`; setting `false` disables caching for that request
+- **Type aliases for complex worker types**: `PrefixHitData` and `WorkerHandles` suppress clippy "very complex type" lint without losing information
+
+#### Server Multi-LoRA Registry + Per-Request Adapter Selection (`oxillama-server` + `oxillama-arch`)
+- **`InferenceEngine::unapply_all_loras`**: clears `lora_stack` and calls `ForwardPass::unapply_all_loras()` — properly reverts all `QuantLinear.lora` fields set by `apply_lora_stack()`, restoring the base model weights for the next request
+- **`ForwardPass::unapply_all_loras`**: new default no-op trait method; overridden in LLaMA, LLaVA, and Command-R model impls to iterate all linear layers and call `clear_lora()`
+- **`AppState::loras` registry**: `loras: Arc<RwLock<HashMap<String, Arc<LoadedLora>>>>` field on `AppState`; `spawn_inference_worker` accepts the registry Arc and resolves adapter names inside the worker
+- **Per-request LoRA selection**: new `lora_selection: Vec<(String, f32)>` on `BatchRequest::Generate` / `GenerateStream`; chat route parses `"lora": "name"` (string form with scale 1.0) or `"lora": [{"name": "...", "scale": 0.8}]` (array form), resolves names → 400 on unknown
+- **Admin LoRA CRUD endpoints**: `POST /admin/loras` (load GGUF + register), `DELETE /admin/loras/{name}` (unregister, 404 if not found), `GET /admin/loras` (list registered names); backed by `admin/loras.rs` (~220 LoC, 5 tests)
+- **`LoraSelection` public type alias**: re-exported from `oxillama_server` for use in downstream crates
+
+#### AVX-512 K-Quant Kernels (`oxillama-quant`)
+- **`Q2_KAvx512`** (`simd/avx512/q2_k.rs`, ~700 LoC): full AVX-512F dequant + GEMV kernel for Q2_K super-block format (84 bytes, 256 weights, 2-bit packed with scale-of-scales); 2× wider lanes vs the AVX2 path via `_mm512_*` intrinsics; registered in `dispatch.rs`
+- **`Q3_KAvx512`** (`simd/avx512/q3_k.rs`, ~830 LoC): full AVX-512F dequant + GEMV kernel for Q3_K (110 bytes, 3-bit packed from 32-byte `qs` + 8-byte `hmask`, 6-bit scale array); signed [-4..3] weight reconstruction; registered in `dispatch.rs`
+- AVX-512 coverage table now includes Q2_K and Q3_K (previously scalar + AVX2 only)
+
+#### GPU Legacy Quad Kernels (`oxillama-gpu`)
+- **`Q4_1GpuKernel`** (`kernels/q4_1.rs`, ~370 LoC): WGSL GEMV kernel for Q4_1 blocks (20 bytes: 2-byte `d` + 2-byte `m` + 16 nibble bytes); registered in `GpuDispatcher`
+- **`Q5_0GpuKernel`** (`kernels/q5_0.rs`, ~410 LoC): WGSL GEMV kernel for Q5_0 blocks (22 bytes: 2-byte `d` + 4-byte `qh` high bits + 16-byte `qs`); 5-bit unpacking with separate high-bit array
+- **`Q5_1GpuKernel`** (`kernels/q5_1.rs`, ~430 LoC): WGSL GEMV kernel for Q5_1 blocks (24 bytes: 2-byte `d` + 2-byte `m` + 4-byte `qh` + 16-byte `qs`)
+- **`Q8_1GpuKernel`** (`kernels/q8_1.rs`, ~360 LoC): WGSL GEMV kernel for Q8_1 blocks (36 bytes: 2-byte `d` + 2-byte `sum` + 32 signed-byte `qs`)
+- GPU dispatcher now covers 18 quantization types (was 14); Q4_1/Q5_0/Q5_1/Q8_1 cover ~85% of community-quantized HuggingFace GGUF uploads
+
+#### Quality
+- **1,873 tests passing**, up from 1,825 in v0.1.2; 0 warnings maintained
+
 ## [0.1.2] - 2026-04-25
 
 ### Added

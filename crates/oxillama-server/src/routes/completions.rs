@@ -79,6 +79,8 @@ pub async fn completions(
             prompt,
             max_tokens,
             config,
+            cache_prompt: true,
+            lora_selection: vec![],
             reply: reply_tx,
         })
         .await

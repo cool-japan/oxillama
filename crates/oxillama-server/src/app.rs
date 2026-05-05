@@ -56,6 +56,15 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/admin/models", get(admin::admin_list_models))
         .route("/admin/stats", get(admin::admin_stats))
         .route("/admin/health", get(admin::admin_health))
+        // ── LoRA registry ─────────────────────────────────────────────────
+        .route(
+            "/admin/loras",
+            post(admin::admin_register_lora).get(admin::admin_list_loras),
+        )
+        .route(
+            "/admin/loras/{name}",
+            axum::routing::delete(admin::admin_unregister_lora),
+        )
         .with_state(state)
 }
 
@@ -103,7 +112,16 @@ pub fn build_app_with_config(state: Arc<AppState>, config: &ServerConfig) -> Rou
         .route("/admin/models/unload", post(admin::admin_unload_model))
         .route("/admin/models", get(admin::admin_list_models))
         .route("/admin/stats", get(admin::admin_stats))
-        .route("/admin/health", get(admin::admin_health));
+        .route("/admin/health", get(admin::admin_health))
+        // ── LoRA registry ─────────────────────────────────────────────────
+        .route(
+            "/admin/loras",
+            post(admin::admin_register_lora).get(admin::admin_list_loras),
+        )
+        .route(
+            "/admin/loras/{name}",
+            axum::routing::delete(admin::admin_unregister_lora),
+        );
 
     // Metrics endpoint
     if config.metrics_enabled {

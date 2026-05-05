@@ -144,6 +144,21 @@ Implementation highlights:
   stream, `tool_calls` arrays in both streaming and non-streaming
   responses.
 
+- ~~**Server-side prefix-KV cache wiring.**~~ ✅ Shipped in v0.1.3.
+  `AppState::prefix_cache: Arc<Mutex<PrefixKvCache>>`, per-request
+  `cache_prompt: bool` flag (default `true`), worker-side hit/miss/store
+  logic calling `engine.prime_with_prefix` + `engine.generate_with_logits`
+  on cache hit; full-prefill fallback on miss; `store_kv_in_prefix_cache`
+  stores post-generation KV state.
+
+- ~~**Multi-LoRA per-request registry + admin CRUD.**~~ ✅ Shipped in v0.1.3.
+  `AppState::loras: Arc<RwLock<HashMap<String, Arc<LoadedLora>>>>`;
+  `lora_selection: Vec<(String, f32)>` on `BatchRequest`; chat route
+  parses `"lora": "name"` or `"lora": [{"name": "...", "scale": 0.8}]`,
+  resolves → 400 on unknown name; `POST /admin/loras` (load GGUF + register),
+  `DELETE /admin/loras/{name}`, `GET /admin/loras`; `engine.unapply_all_loras()`
+  restores base weights after generation.
+
 ## 7. v2.0+ Vision
 
 - [x] **Multi-model router (LRU warm-pool) (done 2026-04-20)**
@@ -227,4 +242,4 @@ Implementation highlights:
   - **Tests:** (a) `admin_load_unload_cycle`. (b) `admin_bearer_auth_rejects_missing_token`. (c) `admin_loopback_only_when_no_auth`. (d) `admin_stats_returns_metrics`.
   - **Risk:** Non-auth + public interface = full fleet control to anyone. Mitigate with hard startup error.
 
-*Last updated: 2026-04-24 (v0.1.2 — 165 tests, JWT auth with scopes shipped)*
+*Last updated: 2026-05-03 (v0.1.3 — ~190 tests, prefix-KV + multi-LoRA server wiring shipped)*

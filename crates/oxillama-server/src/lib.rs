@@ -21,6 +21,9 @@
 //! | GET | `/admin/models` | List model pool (admin) |
 //! | GET | `/admin/stats` | Server stats (admin) |
 //! | GET | `/admin/health` | Extended health (admin) |
+//! | POST | `/admin/loras` | Register a LoRA adapter (admin) |
+//! | DELETE | `/admin/loras/{name}` | Unregister a LoRA adapter (admin) |
+//! | GET | `/admin/loras` | List registered LoRA adapters (admin) |
 
 pub mod admin;
 pub mod app;
@@ -52,7 +55,7 @@ pub use auth::ApiKeys;
 pub use config::ServerConfig;
 pub use error::{ServerError, ServerResult};
 pub use metrics::Metrics;
-pub use queue::{BatchRequest, VocabBytes};
+pub use queue::{BatchRequest, LoraSelection, VocabBytes};
 pub use rate_limit::RateLimiter;
 pub use router::{ModelLoader, ModelPool, ModelSpec};
 pub use shutdown::{shutdown_signal, ShutdownSignal, ShutdownTrigger};

@@ -15,12 +15,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxillama"
 authors = ["COOLJAPAN OU (Team KitaSan)"]
-rust-version = "1.86"
+rust-version = "1.89"
 homepage = "https://github.com/cool-japan/oxillama"
 readme = "README.md"
 keywords = ["llm", "inference", "gguf", "llama", "pure-rust"]
@@ -28,17 +28,17 @@ categories = ["science", "algorithms", "command-line-utilities"]
 
 [workspace.dependencies]
 # ── Internal crates ──
-oxillama-gguf = { path = "crates/oxillama-gguf", version = "0.1.2", default-features = false }
-oxillama-quant = { path = "crates/oxillama-quant", version = "0.1.2", default-features = false }
-oxillama-arch = { path = "crates/oxillama-arch", version = "0.1.2" }
-oxillama-runtime = { path = "crates/oxillama-runtime", version = "0.1.2", default-features = false }
-oxillama-server = { path = "crates/oxillama-server", version = "0.1.2" }
-oxillama-bench = { path = "crates/oxillama-bench", version = "0.1.2" }
-oxillama-py = { path = "crates/oxillama-py", version = "0.1.2" }
-oxillama-wasm = { path = "crates/oxillama-wasm", version = "0.1.2" }
-oxillama-gpu = { path = "crates/oxillama-gpu", version = "0.1.2", default-features = false }
-oxillama = { path = "crates/oxillama", version = "0.1.2", default-features = false }
-oxillama-cli = { path = "crates/oxillama-cli", version = "0.1.2" }
+oxillama-gguf = { path = "crates/oxillama-gguf", version = "0.1.3", default-features = false }
+oxillama-quant = { path = "crates/oxillama-quant", version = "0.1.3", default-features = false }
+oxillama-arch = { path = "crates/oxillama-arch", version = "0.1.3" }
+oxillama-runtime = { path = "crates/oxillama-runtime", version = "0.1.3", default-features = false }
+oxillama-server = { path = "crates/oxillama-server", version = "0.1.3" }
+oxillama-bench = { path = "crates/oxillama-bench", version = "0.1.3" }
+oxillama-py = { path = "crates/oxillama-py", version = "0.1.3" }
+oxillama-wasm = { path = "crates/oxillama-wasm", version = "0.1.3" }
+oxillama-gpu = { path = "crates/oxillama-gpu", version = "0.1.3", default-features = false }
+oxillama = { path = "crates/oxillama", version = "0.1.3", default-features = false }
+oxillama-cli = { path = "crates/oxillama-cli", version = "0.1.3" }
 
 # ── COOLJAPAN Ecosystem (Pure Rust Policy) ──
 scirs2-core = { version = "0.4.3", default-features = false }
