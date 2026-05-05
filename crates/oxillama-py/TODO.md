@@ -276,21 +276,37 @@ This is the 75% gap — the polish work the 25% number represents.
 
 - **R1 — `pickle_checkpoint_support` scope clarification (proposed 2026-05-03)** ✅ Resolved: user chose "Snapshot/restore API (no pickle)" direction; implemented as plan block above (planned 2026-05-03).
 
-- **R2 — `SpeculativeEngine.snapshot/restore` (proposed 2026-05-03)**
+- ✅ **R2 — `SpeculativeEngine.snapshot/restore` (done 2026-05-05)**
 
-  `oxillama-runtime` does not currently provide snapshot/resume for `SpeculativeEngine` — the `EngineSnapshot` type is single-engine. Implementing this requires:
+  Implemented Track E of OxiLLaMa v0.1.4. Shipped:
 
-  1. A new `SpeculativeEngineSnapshot` type in `oxillama-runtime/src/snapshot.rs` containing `target_snapshot: EngineSnapshot`, `draft_snapshot: EngineSnapshot`, `num_speculative: usize`, `seed: Option<u64>`, plus speculation-loop state.
-  2. Methods on `oxillama_runtime::SpeculativeEngine`: `snapshot()` and `resume(bytes, target_path, draft_path)`.
-  3. Python wrapper mirroring the `PyEngine` snapshot API on `PySpeculativeEngine`.
+  1. `SpeculativeEngineSnapshot` in `oxillama-runtime/src/snapshot.rs` with `encode()`/`decode()`/`fingerprint()`, magic header `b"OXISPEC1"`, LE wire format (no oxicode for the outer envelope so magic can be checked before allocation).
+  2. `RuntimeError::SpecSnapshotIncompatible(String)` added to `error.rs`.
+  3. `SpeculativeEngine::snapshot()`, `snapshot_to_file()`, `resume()`, `resume_from_file()` in `speculative.rs`; `Xorshift64::raw_state()` / `from_raw_state()` accessors added.
+  4. Python `PySpeculativeEngine`: `snapshot(path)`, `snapshot_bytes() -> bytes`, `restore(cls, path, target_model, draft_model)`, `__reduce__` / `__reduce_ex__` (now real pickle support).
+  5. `.pyi` stubs updated for `SpeculativeEngine`.
+  6. 6 Rust unit tests in `snapshot.rs` + Python test file `test_speculative_snapshot.py` (13 pure-Python method-existence tests + 3 model-gated integration tests).
+  7. `oxillama-runtime::RuntimeError::SpecSnapshotIncompatible` wired into `error.rs` in `oxillama-py`.
 
-  Until this ships, `SpeculativeEngine.__reduce__`/`__reduce_ex__` raise a `TypeError` pointing at this R2.
+- ✅ **R3 — Hub-aware snapshots (done 2026-05-05)**
 
-- **R3 — Hub-aware snapshots (proposed 2026-05-03)**
+  Shipped as Track F of OxiLLaMa v0.1.6.
 
-  `Engine.from_hub("repo")` resolves to a local HF cache path and discards `repo_id`/`filename`/`revision`. Snapshots therefore record only the local path; restoring on a different machine fails unless the GGUF is also transferred out-of-band. Options:
+  1. Added `HubOrigin { repo_id, filename, sha256 }` serde struct to `snapshot.rs`.
+  2. Added `EngineSnapshotMeta { model_path, hub_origin: Option<HubOrigin> }` envelope with JSON sidecar (`path + ".meta.json"`).
+  3. Extended `Engine.snapshot(path, *, hub_origin=None)` — when `hub_origin` is provided, serialises the origin metadata to the sidecar file.
+  4. Updated `Engine.restore()` to read the sidecar on restore: if `hub_origin` is set and the local model path is missing, it re-downloads via `hub::download_model_from_hub` and verifies SHA-256.
+  5. Added `Engine.from_snapshot_with_hub(snapshot_path)` classmethod (convenience alias for `restore()` with hub-aware logic).
+  6. Added `HubOrigin` TypedDict to `__init__.pyi`; updated `Engine.snapshot`, `.restore`, `from_snapshot_with_hub` stubs.
+  7. Rust unit tests: `hub_origin_serde_roundtrip`, `snapshot_meta_with_hub_origin_roundtrip`, `snapshot_meta_without_hub_origin_roundtrip`, `sha256_hex_length_and_format`, `meta_path_for_appends_suffix`.
+  8. Python tests: `test_hub_snapshot.py` (12 tests) + `test_dlpack.py` (13 tests).
 
-  1. Add `pub(crate) hub_origin: Option<HubOrigin>` to `PyEngine`; serialize in a Python-side envelope (`OXSN-PY1`) or push into `EngineSnapshot` v2.
-  2. On `restore`, if `hub_origin.is_some()` and the local path is missing, re-download via `hub::download_model_from_hub`.
+- ✅ **DLPack tensor interop (done 2026-05-05)**
 
-  Defer until user feedback indicates cross-machine portability is needed.
+  Shipped as Track F of OxiLLaMa v0.1.6.
+
+  1. New `src/dlpack.rs` with DLPack v0.8 C structs (`DLDevice`, `DLDataType`, `DLTensor`, `DLManagedTensor`) and `vec_to_dlpack` / `dlpack_to_vec` public functions.
+  2. `Engine.logits_dlpack(text)` — runs `forward_logits(text)` and returns the vocab-length f32 vector as a `"dltensor"` PyCapsule with shape `[vocab_size]`.
+  3. `Engine.embeddings_dlpack(text)` — runs `embed(text)` and returns the hidden-state vector as a `"dltensor"` PyCapsule with shape `[1, hidden_size]`.
+  4. Capsule memory is owned by the `DLManagedTensor`; freed by CPython GC via `capsule_destructor` → `managed_tensor_deleter`.
+  5. Rust unit tests: `dlpack_shape_matches_input`, `dlpack_dtype_is_f32`, `dlpack_device_is_cpu`, `dlpack_capsule_name_is_dltensor`, `dlpack_deleter_null_is_safe`.

@@ -1832,6 +1832,148 @@ pub fn build_minimal_mamba2_gguf() -> Vec<u8> {
     )
 }
 
+// ─── Qwen2-VL builder ─────────────────────────────────────────────────────────
+
+/// Tensor catalogue for a minimal 1-layer Qwen2-VL model.
+///
+/// Dimensions:
+/// - LLM: hidden=32, heads=2, kv_heads=2, head_dim=16, ffn=64, vocab=32
+/// - Vision encoder: vis_hidden=8, patch_size=4, num_heads=2
+/// - MM merger: mm.0.weight [32, 4*8=32]
+/// - v.patch_embd.weight [8, 4*4*3=48]
+/// - v.post_ln.weight [8]
+const QWEN2VL_TENSORS: &[TensorDesc] = &[
+    // ── LLM backbone ─────────────────────────────────────────────────────────
+    TensorDesc {
+        name: "token_embd.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.attn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "blk.0.attn_q.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.attn_k.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.attn_v.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.attn_output.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_gate.weight",
+        dims: &[64, 32],
+        n_elements: 2048,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_up.weight",
+        dims: &[64, 32],
+        n_elements: 2048,
+    },
+    TensorDesc {
+        name: "blk.0.ffn_down.weight",
+        dims: &[32, 64],
+        n_elements: 2048,
+    },
+    TensorDesc {
+        name: "output_norm.weight",
+        dims: &[32],
+        n_elements: 32,
+    },
+    TensorDesc {
+        name: "output.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    // ── MM Merger ─────────────────────────────────────────────────────────────
+    // mm.0.weight: [llm_hidden=32, 4*vis_hidden=4*8=32]
+    TensorDesc {
+        name: "mm.0.weight",
+        dims: &[32, 32],
+        n_elements: 1024,
+    },
+    // ── Vision encoder ────────────────────────────────────────────────────────
+    // v.patch_embd.weight: [vis_hidden=8, patch_size²×3=4×4×3=48]
+    TensorDesc {
+        name: "v.patch_embd.weight",
+        dims: &[48, 8],
+        n_elements: 384,
+    },
+    // v.post_ln.weight: [vis_hidden=8]
+    TensorDesc {
+        name: "v.post_ln.weight",
+        dims: &[8],
+        n_elements: 8,
+    },
+];
+
+/// Build a valid GGUF v3 binary for a minimal 1-layer Qwen2-VL model.
+///
+/// Includes both LLM backbone tensors and vision encoder tensors (`v.*` prefix)
+/// plus the MM merger weight (`mm.0.weight`).
+///
+/// # Dimensions
+///
+/// | Component      | Hyper-parameter   | Value |
+/// |----------------|-------------------|-------|
+/// | LLM backbone   | `hidden_size`     | 32    |
+/// |                | `heads`           | 2     |
+/// |                | `kv_heads`        | 2     |
+/// |                | `head_dim`        | 16    |
+/// |                | `layers`          | 1     |
+/// |                | `vocab_size`      | 32    |
+/// |                | `ffn_size`        | 64    |
+/// |                | `context_len`     | 128   |
+/// | Vision encoder | `vis_hidden`      | 8     |
+/// |                | `patch_size`      | 4     |
+/// |                | `vis_num_heads`   | 2     |
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
+pub fn build_minimal_qwen2vl_gguf() -> Vec<u8> {
+    build_gguf_v3(
+        &[
+            KvEntry::Str("general.architecture", "qwen2vl"),
+            KvEntry::Str("general.name", "test-qwen2vl"),
+            KvEntry::U32("qwen2vl.embedding_length", 32),
+            KvEntry::U32("qwen2vl.feed_forward_length", 64),
+            KvEntry::U32("qwen2vl.block_count", 1),
+            KvEntry::U32("qwen2vl.attention.head_count", 2),
+            KvEntry::U32("qwen2vl.attention.head_count_kv", 2),
+            KvEntry::U32("qwen2vl.context_length", 128),
+            KvEntry::U32("qwen2vl.vocab_size", 32),
+            KvEntry::F32("qwen2vl.rope.freq_base", 10000.0),
+            KvEntry::F32("qwen2vl.attention.layer_norm_rms_epsilon", 1e-5),
+            // Vision encoder metadata
+            KvEntry::U32("clip.vision.image_size", 16),
+            KvEntry::U32("clip.vision.patch_size", 4),
+            KvEntry::U32("clip.vision.embedding_length", 8),
+            KvEntry::U32("clip.vision.attention.head_count", 2),
+            KvEntry::U32("clip.vision.n_layers", 0),
+            KvEntry::U32("clip.vision.attention.window_size", 8),
+            KvEntry::Str("tokenizer.ggml.model", "qwen"),
+        ],
+        QWEN2VL_TENSORS,
+    )
+}
+
 // ─── Self-tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

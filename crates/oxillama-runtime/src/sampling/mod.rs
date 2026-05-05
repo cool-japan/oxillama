@@ -48,6 +48,25 @@ pub struct SamplerConfig {
     #[serde(skip)]
     #[allow(clippy::type_complexity)]
     pub token_vocab: Option<Arc<Vec<(u32, Vec<u8>)>>>,
+
+    /// Per-token logit biases applied before top-k/top-p.
+    ///
+    /// Positive values increase a token's probability; negative values decrease it.
+    /// For example, `logit_bias[token_id] = 5.0` strongly encourages that token,
+    /// while `-100.0` effectively bans it (use `banned_tokens` for strict banning).
+    ///
+    /// Applied as: `logits[token_id] += bias` before the greedy / sampling steps.
+    #[serde(default)]
+    pub logit_bias: std::collections::HashMap<u32, f32>,
+
+    /// Tokens that must never be generated.
+    ///
+    /// Their logits are set to `f32::NEG_INFINITY` before any other sampling
+    /// step, including top-k/p filtering. This is a hard constraint — unlike
+    /// a large negative `logit_bias`, a banned token will never be selected
+    /// even if it is the only remaining candidate.
+    #[serde(default)]
+    pub banned_tokens: Vec<u32>,
 }
 
 impl Default for SamplerConfig {
@@ -65,6 +84,8 @@ impl Default for SamplerConfig {
             mirostat_eta: 0.1,
             grammar: None,
             token_vocab: None,
+            logit_bias: std::collections::HashMap::new(),
+            banned_tokens: Vec::new(),
         }
     }
 }
@@ -85,6 +106,8 @@ impl SamplerConfig {
             mirostat_eta: 0.1,
             grammar: None,
             token_vocab: None,
+            logit_bias: std::collections::HashMap::new(),
+            banned_tokens: Vec::new(),
         }
     }
 
@@ -103,6 +126,8 @@ impl SamplerConfig {
             seed: None,
             grammar: None,
             token_vocab: None,
+            logit_bias: std::collections::HashMap::new(),
+            banned_tokens: Vec::new(),
         }
     }
 }
@@ -192,6 +217,10 @@ impl Sampler {
         }
 
         let mut processed = logits.to_vec();
+
+        // Step 0: Apply logit bias and banned tokens — same order as
+        // sample_with_rng so both code paths behave identically.
+        apply_logit_bias_and_banned_tokens(&mut processed, &self.config);
 
         // Step 1: Apply repetition penalty
         apply_repetition_penalty(&mut processed, &self.config, recent_tokens);
@@ -344,6 +373,11 @@ fn sample_with_rng(
 
     let mut processed = logits.to_vec();
 
+    // Step 0: Apply logit bias and banned tokens FIRST — before any other
+    // transformation so that bans are absolute and biases influence all
+    // downstream filtering steps (top-k, top-p, grammar masking, etc.).
+    apply_logit_bias_and_banned_tokens(&mut processed, config);
+
     // Step 1: Apply repetition penalty
     apply_repetition_penalty(&mut processed, config, recent_tokens);
 
@@ -430,6 +464,37 @@ fn sample_with_rng(
 
     // Fallback: return last candidate (rounding issues)
     candidates.last().map(|&(idx, _)| idx).unwrap_or(0)
+}
+
+/// Apply logit bias and banned-token masking to logits in-place.
+///
+/// Processing order:
+/// 1. Banned tokens are set to `f32::NEG_INFINITY` unconditionally.
+/// 2. Logit biases are added to the surviving logits.
+///
+/// Both operations are applied before repetition penalty, grammar masking,
+/// and temperature / top-k / top-p filtering, so they influence all
+/// downstream steps.
+fn apply_logit_bias_and_banned_tokens(processed: &mut [f32], config: &SamplerConfig) {
+    // Step A: hard-ban tokens.
+    for &token in &config.banned_tokens {
+        let idx = token as usize;
+        if idx < processed.len() {
+            processed[idx] = f32::NEG_INFINITY;
+        }
+    }
+
+    // Step B: additive bias.
+    for (&token, &bias) in &config.logit_bias {
+        let idx = token as usize;
+        if idx < processed.len() {
+            // Do not modify already-banned tokens — a banned token must
+            // remain at -inf even if a positive bias is also specified.
+            if processed[idx].is_finite() {
+                processed[idx] += bias;
+            }
+        }
+    }
 }
 
 /// Apply repetition penalty to logits in-place.
@@ -789,6 +854,97 @@ mod tests {
         for &(_, p) in &candidates {
             assert!((p - 1.0 / 3.0).abs() < 0.01, "expected ~0.333, got {p}");
         }
+    }
+
+    // ── Logit-bias / banned-tokens tests ──────────────────────────────────────
+
+    #[test]
+    fn banned_tokens_never_sampled() {
+        // Only token 3 is allowed; all others are banned.
+        let vocab_size = 5usize;
+        let logits: Vec<f32> = (0..vocab_size).map(|i| i as f32).collect();
+
+        let mut banned = Vec::new();
+        for i in 0u32..vocab_size as u32 {
+            if i != 3 {
+                banned.push(i);
+            }
+        }
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            seed: Some(42),
+            banned_tokens: banned,
+            ..SamplerConfig::default()
+        };
+        let mut sampler = Sampler::new(config);
+        for _ in 0..50 {
+            let tok = sampler.sample(&logits, &[]);
+            assert_eq!(
+                tok, 3,
+                "only token 3 should ever be sampled when all others are banned"
+            );
+        }
+    }
+
+    #[test]
+    fn positive_bias_increases_token_probability() {
+        // Token 1 starts with a very low logit; add a large positive bias.
+        // After bias, token 1 should dominate and be selected nearly always.
+        let logits = vec![10.0f32, -20.0, -20.0, -20.0];
+        let mut bias = std::collections::HashMap::new();
+        bias.insert(1u32, 100.0f32); // huge positive bias on token 1
+
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            seed: Some(7),
+            logit_bias: bias,
+            ..SamplerConfig::default()
+        };
+        let mut sampler = Sampler::new(config);
+        // With a +100 bias, token 1's effective logit = 80, far above token 0's 10.
+        let tok = sampler.sample(&logits, &[]);
+        assert_eq!(tok, 1, "large positive bias should make token 1 dominate");
+    }
+
+    #[test]
+    fn negative_bias_decreases() {
+        // Token 0 has the highest raw logit; apply a strongly negative bias.
+        // Token 1 should win after bias.
+        let logits = vec![100.0f32, 1.0, 0.5, 0.1];
+        let mut bias = std::collections::HashMap::new();
+        bias.insert(0u32, -200.0f32); // strong negative on the top token
+
+        let config = SamplerConfig {
+            temperature: 0.0, // greedy — picks strictly by highest logit after bias
+            logit_bias: bias,
+            ..SamplerConfig::greedy()
+        };
+        let tok = sample(&logits, &config, &[]);
+        assert_eq!(
+            tok, 1,
+            "after large negative bias on token 0, token 1 should win"
+        );
+    }
+
+    #[test]
+    fn logit_bias_empty_config_no_op() {
+        // Empty logit_bias and empty banned_tokens must not change sampling behaviour.
+        let logits = vec![1.0f32, 2.0, 3.0, 0.5];
+        let config_empty = SamplerConfig {
+            temperature: 0.0,
+            logit_bias: std::collections::HashMap::new(),
+            banned_tokens: Vec::new(),
+            ..SamplerConfig::greedy()
+        };
+        let tok = sample(&logits, &config_empty, &[]);
+        // Greedy with no bias should still pick index 2 (value 3.0).
+        assert_eq!(tok, 2, "empty logit_bias / banned_tokens should be a no-op");
     }
 
     // ── Grammar-constrained sampling tests ────────────────────────────────────

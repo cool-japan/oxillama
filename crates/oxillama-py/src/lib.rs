@@ -42,6 +42,7 @@ pub mod async_support;
 pub mod callback;
 pub mod cancel;
 pub mod chat_template;
+pub mod dlpack;
 pub mod engine;
 pub mod error;
 #[cfg(feature = "hub")]

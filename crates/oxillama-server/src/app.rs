@@ -14,6 +14,7 @@ use crate::config::ServerConfig;
 use crate::rate_limit::{rate_limit_middleware, RateLimiter};
 use crate::routes;
 use crate::state::AppState;
+use crate::threads;
 use crate::tracing_layer::tracing_middleware;
 use crate::ws::ws_handler;
 
@@ -49,6 +50,51 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route(
             "/v1/batch_jobs/{id}/cancel",
             post(batch_spool::routes::cancel_batch),
+        )
+        // ── Files API ─────────────────────────────────────────────────────
+        .route(
+            "/v1/files",
+            post(routes::files::create_file_handler).get(routes::files::list_files_handler),
+        )
+        .route(
+            "/v1/files/{file_id}",
+            get(routes::files::get_file_handler).delete(routes::files::delete_file_handler),
+        )
+        .route(
+            "/v1/files/{file_id}/content",
+            get(routes::files::get_file_content_handler),
+        )
+        // ── Assistants API ────────────────────────────────────────────────
+        .route("/v1/threads", post(threads::routes::create_thread_handler))
+        .route(
+            "/v1/threads/{thread_id}",
+            get(threads::routes::get_thread_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/messages",
+            post(threads::routes::create_message_handler)
+                .get(threads::routes::list_messages_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs",
+            post(threads::routes::create_run_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}",
+            get(threads::routes::get_run_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/cancel",
+            post(threads::routes::cancel_run_handler),
+        )
+        // ── Run Steps subresource ─────────────────────────────────────────
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/steps",
+            get(threads::steps::list_steps_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/steps/{step_id}",
+            get(threads::steps::get_step_handler),
         )
         // ── Admin API ─────────────────────────────────────────────────────
         .route("/admin/models/load", post(admin::admin_load_model))
@@ -106,6 +152,51 @@ pub fn build_app_with_config(state: Arc<AppState>, config: &ServerConfig) -> Rou
         .route(
             "/v1/batch_jobs/{id}/cancel",
             post(batch_spool::routes::cancel_batch),
+        )
+        // ── Files API ─────────────────────────────────────────────────────
+        .route(
+            "/v1/files",
+            post(routes::files::create_file_handler).get(routes::files::list_files_handler),
+        )
+        .route(
+            "/v1/files/{file_id}",
+            get(routes::files::get_file_handler).delete(routes::files::delete_file_handler),
+        )
+        .route(
+            "/v1/files/{file_id}/content",
+            get(routes::files::get_file_content_handler),
+        )
+        // ── Assistants API ────────────────────────────────────────────────
+        .route("/v1/threads", post(threads::routes::create_thread_handler))
+        .route(
+            "/v1/threads/{thread_id}",
+            get(threads::routes::get_thread_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/messages",
+            post(threads::routes::create_message_handler)
+                .get(threads::routes::list_messages_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs",
+            post(threads::routes::create_run_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}",
+            get(threads::routes::get_run_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/cancel",
+            post(threads::routes::cancel_run_handler),
+        )
+        // ── Run Steps subresource ─────────────────────────────────────────
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/steps",
+            get(threads::steps::list_steps_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/steps/{step_id}",
+            get(threads::steps::get_step_handler),
         )
         // ── Admin API ─────────────────────────────────────────────────────
         .route("/admin/models/load", post(admin::admin_load_model))

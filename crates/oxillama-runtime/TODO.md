@@ -292,4 +292,36 @@ Cached vocabulary
   - **Files:** `src/snapshot.rs`, `src/engine.rs` (+80 LoC), `src/error.rs` (2 new variants), `src/kv_cache/mod.rs` (+100 LoC), `src/kv_cache/paged.rs`, `src/sampling/mod.rs` (Xorshift64 accessors), `src/sampling/grammar/machine.rs` (GrammarState::from_state_id), `crates/oxillama-arch/src/common/sequence_state.rs` (additive trait methods + Mamba2/Jamba overrides), `Cargo.toml` (oxicode dep), `tests/snapshot.rs`.
   - **Tests:** `snapshot_roundtrip_small`, `snapshot_rejects_wrong_model_fingerprint`, `snapshot_rejects_incompatible_version`, `snapshot_preserves_mirostat_mu`, `snapshot_preserves_grammar_state`, `snapshot_ssm_roundtrip`, `snapshot_paged_kv_roundtrip`, `snapshot_cross_process_determinism`.
 
-*Last updated: 2026-04-24 (v0.1.2)*
+- [x] SpeculativeEngine snapshot/restore (Track E, v0.1.4) ✅ **Done (2026-05-05)**
+  - `SpeculativeEngineSnapshot` (magic `b"OXISPEC1"`, version 1) in `src/snapshot.rs`: `encode()`, `decode()`, `fingerprint()`. LE binary envelope (not oxicode) so the magic check is O(1) before any allocation.
+  - `RuntimeError::SpecSnapshotIncompatible(String)` added to `src/error.rs`.
+  - `SpeculativeEngine::snapshot()`, `snapshot_to_file(path)`, `resume(bytes, target, draft)`, `resume_from_file(path, target, draft)` in `src/speculative.rs`.
+  - `Xorshift64::raw_state()` / `from_raw_state()` accessors for PRNG serialisation.
+  - `tempfile` moved from `[dev-dependencies]` to `[dependencies]` to support production atomic writes.
+  - 6 new Rust unit tests in `snapshot::tests`: roundtrip, wrong-magic rejection, truncated rejection, accepted-history preservation, None-seed roundtrip, fingerprint determinism.
+
+- [x] Logit-bias / banned-tokens API ✅ **Done (2026-05-05)**
+  - `SamplerConfig.logit_bias: HashMap<u32, f32>` and `SamplerConfig.banned_tokens: Vec<u32>` — applied as step 0 in both `sample_with_rng` (core path) and `sample_mirostat_v2`.
+  - `LogitBias` struct implementing `SamplerStage` — inserted as the first stage in `SamplerChain::from_config()` when either field is non-empty.
+  - Hard bans first (`NEG_INFINITY`), additive biases after; already-banned tokens are skipped in the bias pass.
+  - 4 new tests in `sampling::tests`: `banned_tokens_never_sampled`, `positive_bias_increases_token_probability`, `negative_bias_decreases`, `logit_bias_empty_config_no_op`.
+  - 5 new tests in `sampling::chain::tests`: coverage of `LogitBias` constructors and pipeline position.
+
+- [x] JSON-Schema → GBNF compiler ✅ **Done (2026-05-05)**
+  - `JsonSchemaCompiler::compile(schema_json: &str) -> GrammarResult<Grammar>` in `src/sampling/grammar/json_schema.rs`.
+  - Supports: `type` (string, number, integer, boolean, null, object, array), `properties` + `required`, `enum`, `items`, `minimum` / `maximum`, `minLength` / `maxLength`, `pattern` (literal-only; regex patterns return `GrammarError::ParseError`).
+  - Nested objects and arrays handled recursively; complex sub-schemas promoted to named helper rules.
+  - Exported from `lib.rs` as `JsonSchemaCompiler`.
+  - 15+ tests covering all type variants, enum, nested objects, pattern literals, error paths, and the empty-object fallback (`json-pair` helper rule).
+
+- [x] Beam search decoding ✅ **Done (2026-05-05)**
+  - `BeamSearchConfig { beam_width, max_new_tokens, length_penalty, early_stopping }` (defaults 4 / 256 / 1.0 / true).
+  - `BeamHypothesis { tokens, logprob_sum, finished }` with `score(length_penalty, prompt_len) -> f32`.
+  - `BeamForwardPass` trait: `forward_tokens(&mut self, tokens: &[u32]) -> RuntimeResult<Vec<f32>>`, `reset(&mut self)`.
+  - `EngineBeamAdapter<'a>` wraps `&'a mut InferenceEngine` for use with `beam_generate`.
+  - `beam_generate<F: BeamForwardPass>(config, prompt, forward, eos_id) -> RuntimeResult<Vec<BeamHypothesis>>` free function — log-softmax top-k expansion, per-step global sort, EOS detection, early stopping.
+  - `InferenceEngine::beam_generate()` convenience method (checks `is_loaded()`).
+  - Exported from `lib.rs`: `beam_generate`, `BeamForwardPass`, `BeamHypothesis`, `BeamSearchConfig`, `EngineBeamAdapter`.
+  - 8 tests: `test_score_formula`, `test_width_one_matches_greedy`, `test_beam_returns_beam_width_results`, `test_early_stopping_fires`, `test_log_softmax_correctness`, `test_beam_generate_errors_on_empty_prompt`, `test_unloaded_engine_errors`, `test_stub_engine_reset_called`.
+
+*Last updated: 2026-05-05 (v0.1.5 Track B)*

@@ -21,12 +21,12 @@ production paths.
 - Version: **0.1.2** (workspace inherited).
 - Completion: **99%**.
 - Source files: **~45** under `src/**/*.rs`.
-- Supported architectures: **20** (18 feature-gated + Yi and InternLM3 compiled unconditionally).
-- Default features (17): `llama`, `qwen3`, `mistral`, `gemma`, `phi`,
-  `command-r`, `starcoder`, `llava`, `falcon`, `minicpm`, `olmo2`,
+- Supported architectures: **21** (19 feature-gated + Yi and InternLM3 compiled unconditionally).
+- Default features (18): `llama`, `qwen3`, `mistral`, `gemma`, `phi`,
+  `command-r`, `starcoder`, `llava`, `llava16`, `falcon`, `minicpm`, `olmo2`,
   `granite`, `deepseek`, `dbrx`, `grok`, `mamba2`, `jamba`
-  (`llava` implies `llama`; `jamba` implies `mamba2`).
-- Tests: **397 passing**.
+  (`llava16` implies `llava`; `llava` implies `llama`; `jamba` implies `mamba2`).
+- Tests: **439 passing**.
 - Upstream dependencies: `oxillama-gguf`, `oxillama-quant`, `half`,
   `thiserror`, `tracing` — all workspace-pinned.
 - Policy compliance: no `unwrap()` in production paths, all files
@@ -187,8 +187,7 @@ depends on `llama` for its language-model backbone and enables the
 - **State-space models** — [x] Mamba-2 implemented (`crates/oxillama-arch/src/mamba2/`);
   `SequenceState` trait in `common/sequence_state.rs` generalises KvCacheAccess for SSMs. (v0.1.1)
   Jamba hybrid: see B1 below.
-- **Advanced multimodal**: Qwen2-VL, LLaVA-1.6, Molmo — not
-  covered. Only LLaVA-1.5 ships today.
+- **Advanced multimodal**: ~~LLaVA-1.6~~ ✅ Shipped (v0.1.5, anyres tiling in `src/llava_next/`; registered under arch id `"llava16"`). Qwen2-VL, Molmo — not yet covered.
 - [x] **B4 — `tensor_loader.rs` preventive split via splitrs (planned 2026-04-20)** — DROPPED: `tensor_loader.rs` does not exist in the tree. Largest arch file is `llava/model.rs` at 1,210 lines (well under the 2,000-line splitrs threshold). The split intent is subsumed by B3's lora submodule restructure.
   - **Goal:** `crates/oxillama-arch/src/tensor_loader.rs` is approaching the 2000-LoC limit. Split before B1's Jamba additions push it over.
   - **Design:** Run `rslines 50 crates/oxillama-arch/src/tensor_loader.rs` to confirm size and identify natural split boundaries. Run `splitrs crates/oxillama-arch/src/tensor_loader.rs` to refactor into `tensor_loader/{mod,llama,qwen,mamba2,...}.rs` along arch boundaries. Re-export the public API from `tensor_loader/mod.rs` so callers see no API change. Verify with `cargo check -p oxillama-arch --all-features` and `cargo nextest run -p oxillama-arch --all-features`.
@@ -278,8 +277,7 @@ depends on `llama` for its language-model backbone and enables the
   - **Risk:** Jamba's exact MoE config varies by checkpoint. Default to top-2 of 16 (published config); overridable via metadata.
 - **Qwen2-VL** — advanced multimodal (dynamic resolution,
   M-RoPE).
-- **LLaVA-1.6** — improved vision encoder and higher-res patch
-  handling.
+- ~~**LLaVA-1.6**~~ ✅ Shipped (v0.1.5) — anyres tiling: variable grid (1×2, 2×1, 2×2, 3×1, 1×3) + global thumbnail, each tile independently CLIP-encoded, features concatenated before MM projector. Registered under `"llava16"`. Feature `llava16` (depends on `llava`). Files: `src/llava_next/{mod,model,tiler}.rs`.
 - **Molmo** — next-gen multimodal stack.
 - ~~**InternLM3**~~ ✅ Shipped (`src/internlm3/`).
 - **Yi-VL** — 01.AI's multimodal line.

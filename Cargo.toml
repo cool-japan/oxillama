@@ -63,11 +63,12 @@ uuid = { version = "1", features = ["v4", "fast-rng", "macro-diagnostics"] }
 
 # ── Async runtime ──
 tokio = { version = "1.52.1", features = ["full"] }
-tokio-stream = "0.1.18"
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+futures-util = "0.3.31"
 tokio-util = { version = "0.7.18", features = ["full"] }
 
 # ── HTTP server ──
-axum = { version = "0.8.9", features = ["ws"] }
+axum = { version = "0.8.9", features = ["ws", "multipart"] }
 tower = "0.5.3"
 tower-http = { version = "0.6.8", features = ["cors", "limit", "trace"] }
 
@@ -91,6 +92,9 @@ rayon = "1.12.0"
 
 # ── Tokenizer ──
 tokenizers = { version = "0.22.2", default-features = false }
+
+# ── HTTP client (pure-Rust body, native-tls for TLS) ──
+ureq = { version = "3.3.0", features = ["native-tls"] }
 
 # ── HuggingFace Hub ──
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"] }

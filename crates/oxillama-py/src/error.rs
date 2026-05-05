@@ -110,6 +110,9 @@ pub fn runtime_to_py(err: RuntimeError) -> PyErr {
         RuntimeError::LockPoisoned => {
             GenerateError::new_err("Internal error: lock poisoned")
         }
+        RuntimeError::SpecSnapshotIncompatible(detail) => {
+            GenerateError::new_err(format!("Speculative snapshot incompatible: {detail}"))
+        }
     }
 }
 
@@ -231,6 +234,7 @@ mod tests {
             },
             RuntimeError::TensorNotFound("blk.0.attn_q.weight".to_string()),
             RuntimeError::LockPoisoned,
+            RuntimeError::SpecSnapshotIncompatible("test detail".to_string()),
         ];
 
         for variant in variants {

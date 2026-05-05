@@ -53,6 +53,9 @@ impl ArchitectureRegistry {
         #[cfg(feature = "llava")]
         registry.register(Box::new(crate::llava::LlavaArchitecture::new()));
 
+        #[cfg(feature = "llava16")]
+        registry.register(Box::new(crate::llava_next::LlavaNextArchitecture::new()));
+
         #[cfg(feature = "falcon")]
         registry.register(Box::new(crate::falcon::FalconArchitecture::new()));
 
@@ -82,6 +85,18 @@ impl ArchitectureRegistry {
 
         #[cfg(feature = "jamba")]
         registry.register(Box::new(crate::jamba::JambaArchitecture::new()));
+
+        #[cfg(feature = "qwen2-vl")]
+        registry.register(Box::new(crate::qwen2_vl::Qwen2VlArchitecture::new()));
+
+        #[cfg(feature = "mixtral")]
+        registry.register(Box::new(crate::mixtral::MixtralArchitecture::new()));
+
+        #[cfg(feature = "stablelm")]
+        registry.register(Box::new(crate::stablelm::StablelmArchitecture::new()));
+
+        #[cfg(feature = "gptneox")]
+        registry.register(Box::new(crate::gpt_neox::GptNeoxArchitecture::new()));
 
         registry
     }
@@ -138,8 +153,8 @@ mod tests {
     #[test]
     fn test_with_builtins_has_twelve_architectures() {
         let reg = ArchitectureRegistry::with_builtins();
-        // 18 previous + 1 new (jamba) = 19
-        assert_eq!(reg.len(), 19, "expected 19 builtin architectures");
+        // 21 previous + 3 new (mixtral, stablelm, gptneox) = 24
+        assert_eq!(reg.len(), 24, "expected 24 builtin architectures");
         assert!(!reg.is_empty());
     }
 
@@ -237,16 +252,21 @@ mod tests {
             "gemma",
             "granite",
             "grok",
+            "gptneox",
             "internlm3",
             "jamba",
             "llama",
             "llava",
+            "llava16",
             "mamba2",
             "minicpm",
             "mistral",
+            "mixtral",
             "olmo2",
             "phi3",
+            "qwen2vl",
             "qwen3",
+            "stablelm",
             "starcoder",
             "yi",
         ];

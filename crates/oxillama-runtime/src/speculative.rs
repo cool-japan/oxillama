@@ -28,9 +28,13 @@
 //! TODO: implement delta-KV-cache sync so the draft model only processes the
 //! newly accepted tokens rather than the full history on every round.
 
+use std::io::Write;
+use std::path::Path;
+
 use crate::engine::{EngineConfig, InferenceEngine};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::kv_cache::KvCacheSnapshot;
+use crate::snapshot::SpeculativeEngineSnapshot;
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -285,6 +289,133 @@ impl SpeculativeEngine {
 
         Ok(generated)
     }
+
+    // ── Snapshot / resume ────────────────────────────────────────────────────
+
+    /// Capture the full speculative-engine state as a portable byte blob.
+    ///
+    /// Snapshots both the target and draft [`InferenceEngine`]s individually,
+    /// then wraps them with the speculative-loop state (num_speculative, seed,
+    /// RNG state, accepted token history) into a [`SpeculativeEngineSnapshot`]
+    /// and encodes the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::ModelNotLoaded`] if either sub-engine has no
+    /// model loaded, or a serialisation error on encoding failure.
+    pub fn snapshot(&self) -> RuntimeResult<Vec<u8>> {
+        let target_bytes = self.target.snapshot()?;
+        let target_snap =
+            crate::snapshot::EngineSnapshot::deserialize(&target_bytes).map_err(|e| {
+                RuntimeError::SpecSnapshotIncompatible(format!(
+                    "target engine snapshot failed: {e}"
+                ))
+            })?;
+
+        let draft_bytes = self.draft.snapshot()?;
+        let draft_snap =
+            crate::snapshot::EngineSnapshot::deserialize(&draft_bytes).map_err(|e| {
+                RuntimeError::SpecSnapshotIncompatible(format!("draft engine snapshot failed: {e}"))
+            })?;
+
+        let spec_snap = SpeculativeEngineSnapshot {
+            target_snapshot: target_snap,
+            draft_snapshot: draft_snap,
+            num_speculative: self.num_speculative,
+            spec_seed: None,             // seed is already baked into rng_state
+            accepted_tokens: Vec::new(), // no persistent accepted history between calls
+            rng_state: self.rng.raw_state(),
+        };
+
+        spec_snap.encode()
+    }
+
+    /// Write a snapshot of this engine atomically to `path`.
+    ///
+    /// Uses a temp-file-then-rename strategy within the same directory so the
+    /// destination is never left in a partial state.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any [`RuntimeError`] from [`Self::snapshot`] or any I/O error
+    /// from the atomic write.
+    pub fn snapshot_to_file(&self, path: &Path) -> RuntimeResult<()> {
+        let bytes = self.snapshot()?;
+        atomic_write(path, &bytes)?;
+        Ok(())
+    }
+
+    /// Resume a speculative decoding session from a previously captured byte blob.
+    ///
+    /// 1. Decodes the [`SpeculativeEngineSnapshot`].
+    /// 2. Resumes the target engine from its embedded snapshot, validating the
+    ///    target model fingerprint against `target_model_path`.
+    /// 3. Resumes the draft engine similarly from `draft_model_path`.
+    /// 4. Reconstructs the `SpeculativeEngine` with the restored RNG state.
+    ///
+    /// # Errors
+    ///
+    /// - [`RuntimeError::SpecSnapshotIncompatible`] — bytes are not a valid
+    ///   speculative snapshot.
+    /// - [`RuntimeError::ModelFingerprintMismatch`] — either model file has
+    ///   changed since the snapshot was taken.
+    /// - Any error from loading either model.
+    pub fn resume(
+        bytes: &[u8],
+        target_model_path: &Path,
+        draft_model_path: &Path,
+    ) -> RuntimeResult<Self> {
+        let spec_snap = SpeculativeEngineSnapshot::decode(bytes)?;
+
+        // Re-encode the individual engine snapshots for InferenceEngine::resume.
+        let target_bytes = spec_snap.target_snapshot.serialize().map_err(|e| {
+            RuntimeError::SpecSnapshotIncompatible(format!(
+                "failed to re-encode target snapshot: {e}"
+            ))
+        })?;
+        let draft_bytes = spec_snap.draft_snapshot.serialize().map_err(|e| {
+            RuntimeError::SpecSnapshotIncompatible(format!(
+                "failed to re-encode draft snapshot: {e}"
+            ))
+        })?;
+
+        let target = InferenceEngine::resume(&target_bytes, target_model_path)?;
+        let draft = InferenceEngine::resume(&draft_bytes, draft_model_path)?;
+
+        Ok(Self {
+            target,
+            draft,
+            num_speculative: spec_snap.num_speculative,
+            rng: Xorshift64::from_raw_state(spec_snap.rng_state),
+            delta_sync: SpeculativeDeltaSync::new(),
+        })
+    }
+
+    /// Resume a speculative decoding session from a snapshot file.
+    ///
+    /// Reads the file, then delegates to [`Self::resume`].
+    pub fn resume_from_file(
+        path: &Path,
+        target_model_path: &Path,
+        draft_model_path: &Path,
+    ) -> RuntimeResult<Self> {
+        let bytes = std::fs::read(path)?;
+        Self::resume(&bytes, target_model_path, draft_model_path)
+    }
+}
+
+/// Write `bytes` to `path` atomically using a temp-file-then-rename strategy.
+fn atomic_write(path: &Path, bytes: &[u8]) -> RuntimeResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        RuntimeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "snapshot path has no parent directory",
+        ))
+    })?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.persist(path).map_err(|e| RuntimeError::Io(e.error))?;
+    Ok(())
 }
 
 // ─── KV cache re-sync ────────────────────────────────────────────────────────
@@ -502,6 +633,22 @@ impl Xorshift64 {
                 0x517cc1b727220a95u64
             } else {
                 seed
+            },
+        }
+    }
+
+    /// Return the raw internal state for snapshot serialisation.
+    fn raw_state(&self) -> u64 {
+        self.state
+    }
+
+    /// Reconstruct from a previously captured raw state.
+    fn from_raw_state(state: u64) -> Self {
+        Self {
+            state: if state == 0 {
+                0x517cc1b727220a95u64
+            } else {
+                state
             },
         }
     }

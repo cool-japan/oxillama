@@ -153,6 +153,8 @@ impl PySamplerConfig {
             mirostat_eta: self.mirostat_eta,
             grammar: None,
             token_vocab: None,
+            logit_bias: std::collections::HashMap::new(),
+            banned_tokens: Vec::new(),
         }
     }
 
@@ -278,6 +280,8 @@ mod tests {
             mirostat_eta: 0.08,
             grammar: None,
             token_vocab: None,
+            logit_bias: std::collections::HashMap::new(),
+            banned_tokens: Vec::new(),
         };
         let py_cfg = PySamplerConfig::from_rust(original.clone());
         let back = py_cfg.to_rust();

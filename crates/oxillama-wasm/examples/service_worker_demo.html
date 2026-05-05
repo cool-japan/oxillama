@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OxiLLaMa Service Worker Demo</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      max-width: 600px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      line-height: 1.6;
+      color: #222;
+    }
+    h1 { font-size: 1.6rem; margin-bottom: 0.5rem; }
+    .card {
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 1rem 1.25rem;
+      margin: 1rem 0;
+      background: #fafafa;
+    }
+    .card h2 { font-size: 1rem; margin: 0 0 0.4rem; text-transform: uppercase;
+                letter-spacing: 0.05em; color: #555; }
+    .value { font-family: monospace; font-size: 0.95rem; }
+    .ok   { color: #1a7a1a; }
+    .warn { color: #c07000; }
+    .err  { color: #b00000; }
+  </style>
+</head>
+<body>
+  <h1>OxiLLaMa Model Cache Demo</h1>
+  <p>
+    This page demonstrates SIMD128 status detection and service-worker
+    registration for client-side GGUF model caching.
+    Open DevTools → Application → Service Workers to verify registration.
+  </p>
+
+  <div class="card" id="card-simd">
+    <h2>SIMD128 Status</h2>
+    <div id="simd-status" class="value">Loading…</div>
+  </div>
+
+  <div class="card" id="card-sw">
+    <h2>Service Worker</h2>
+    <div id="sw-status" class="value">Loading…</div>
+  </div>
+
+  <div class="card" id="card-sw-support">
+    <h2>Browser Support</h2>
+    <div id="browser-support" class="value">Checking…</div>
+  </div>
+
+  <script type="module">
+    // ── Import the generated WASM JS glue ──────────────────────────────────────
+    // Adjust the path to match your wasm-pack output directory.
+    // e.g.  `wasm-pack build --target web --out-dir examples/pkg`
+    import init, {
+      getSimd128Status,
+      getServiceWorkerScript,
+      registerServiceWorker,
+    } from './pkg/oxillama_wasm.js';
+
+    // ── Helper: set element text with a CSS class ──────────────────────────────
+    function setText(id, text, cssClass) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = text;
+      if (cssClass) el.className = 'value ' + cssClass;
+    }
+
+    // ── Main ───────────────────────────────────────────────────────────────────
+    async function main() {
+      // 1. Initialise the WASM module.
+      await init();
+
+      // 2. SIMD128 status.
+      try {
+        const simd = getSimd128Status();
+        const compiled  = simd.compiled_with;
+        const detected  = simd.runtime_detected;
+        const ua        = simd.user_agent || navigator.userAgent.slice(0, 80);
+
+        setText(
+          'simd-status',
+          `compiled_with=${compiled}, runtime_detected=${detected}\n` +
+          `user_agent: ${ua}`,
+          compiled ? 'ok' : 'warn',
+        );
+      } catch (e) {
+        setText('simd-status', 'Error reading SIMD status: ' + e, 'err');
+      }
+
+      // 3. Browser support summary.
+      const swSupported  = 'serviceWorker' in navigator;
+      const idbSupported = typeof indexedDB !== 'undefined';
+      const wasmSupported = typeof WebAssembly !== 'undefined';
+      setText(
+        'browser-support',
+        `ServiceWorker=${swSupported ? 'yes' : 'NO'}, ` +
+        `IndexedDB=${idbSupported ? 'yes' : 'NO'}, ` +
+        `WebAssembly=${wasmSupported ? 'yes' : 'NO'}`,
+        swSupported && idbSupported ? 'ok' : 'warn',
+      );
+
+      // 4. Service-worker registration.
+      if (!swSupported) {
+        setText(
+          'sw-status',
+          'Service workers are not supported in this browser.',
+          'warn',
+        );
+        return;
+      }
+
+      try {
+        // Build options — override these to match your model hosting path.
+        const optsJson = JSON.stringify({
+          gguf_path_prefix: '/models/',
+          cache_name: 'oxillama-model-cache-v1',
+        });
+
+        // Generate the service-worker script from Rust/WASM.
+        const script = getServiceWorkerScript(optsJson);
+
+        // Host the script as a Blob URL.
+        // NOTE: Some browsers restrict Blob URL service workers to the tab
+        // that created them.  For production, serve sw.js as a static file
+        // from the origin root (e.g. /oxillama-sw.js).
+        const blob = new Blob([script], { type: 'application/javascript' });
+        const blobUrl = URL.createObjectURL(blob);
+
+        setText('sw-status', 'Registering service worker…', '');
+
+        // Call the Rust-generated register helper (returns a Promise).
+        const registration = await registerServiceWorker(blobUrl);
+
+        setText(
+          'sw-status',
+          `Registered. Scope: ${registration.scope}\n` +
+          'Models at /models/*.gguf will be cached after first load.',
+          'ok',
+        );
+
+        // Clean up the Blob URL — the SW is already registered.
+        URL.revokeObjectURL(blobUrl);
+      } catch (e) {
+        setText(
+          'sw-status',
+          'Registration failed: ' + String(e) +
+          '\n(Blob URL service workers may be restricted on some mobile browsers.)',
+          'err',
+        );
+      }
+    }
+
+    main().catch((err) => {
+      console.error('OxiLLaMa demo error:', err);
+      setText('sw-status', 'Fatal error: ' + String(err), 'err');
+    });
+  </script>
+</body>
+</html>

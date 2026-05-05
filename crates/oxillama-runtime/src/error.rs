@@ -117,4 +117,8 @@ pub enum RuntimeError {
     /// An internal RwLock or Mutex was poisoned.
     #[error("lock poisoned")]
     LockPoisoned,
+
+    /// Speculative-engine snapshot format is incompatible with this runtime.
+    #[error("speculative snapshot incompatible: {0}")]
+    SpecSnapshotIncompatible(String),
 }

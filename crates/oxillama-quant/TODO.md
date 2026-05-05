@@ -65,10 +65,10 @@ SIMD coverage matrix (v0.1.3):
 | Q1_0_G128 | yes | yes | yes | yes |
 | Q2_K | yes | yes | yes ✅ v0.1.3 | yes ✅ v0.1.1 |
 | Q3_K | yes | yes | yes ✅ v0.1.3 | yes ✅ v0.1.1 |
-| Q4_1 | yes | yes ✅ v0.1.1 | — | yes ✅ v0.1.1 |
+| Q4_1 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.4 | yes ✅ v0.1.1 |
 | Q5_0 | yes | yes | yes ✅ v0.1.1 | yes ✅ v0.1.1 |
-| Q5_1 | yes | yes ✅ v0.1.1 | — | yes ✅ v0.1.1 |
-| Q8_1 | yes | yes ✅ v0.1.1 | — | yes ✅ v0.1.1 |
+| Q5_1 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.4 | yes ✅ v0.1.1 |
+| Q8_1 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.4 | yes ✅ v0.1.1 |
 | Q8_K | yes (dequant only) | — | yes ✅ v0.1.1 | yes |
 | TQ1_0 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.1 | yes ✅ v0.1.1 |
 | TQ2_0 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.1 | yes ✅ v0.1.1 |

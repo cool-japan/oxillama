@@ -32,11 +32,17 @@ use wasm_bindgen::prelude::*;
 
 pub mod gpu_bridge;
 pub mod idb_cache;
+pub mod service_worker;
+pub mod simd_check;
 pub mod streaming_load;
 pub mod streaming_loader;
 pub mod webgpu;
 pub mod worker;
 
+pub use service_worker::{
+    get_service_worker_script, register_service_worker, ServiceWorkerOptions,
+};
+pub use simd_check::get_simd128_status;
 pub use streaming_loader::StreamingGgufLoader;
 pub use streaming_loader::StreamingLoadOptions;
 

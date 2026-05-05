@@ -194,10 +194,14 @@ Implementation highlights:
   - **Tests:** (a) `batch_submit_process_complete`. (b) `batch_persistence_across_restart`. (c) `batch_cancel_mid_flight`. (d) `batch_concurrent_jobs_dont_interleave_outputs`.
   - **Risk:** Disk fills under unbounded submission; enforce limits.
 
-- **Assistants API subset.**
-  `POST /v1/threads`, `POST /v1/threads/{id}/messages`,
-  `POST /v1/threads/{id}/runs` with persistent thread storage. Target
-  parity with the OpenAI assistants v2 specification.
+- [x] **Assistants API subset (done 2026-05-05)**
+  `POST /v1/threads`, `GET /v1/threads/{id}`,
+  `POST /v1/threads/{id}/messages`, `GET /v1/threads/{id}/messages`,
+  `POST /v1/threads/{id}/runs`, `GET /v1/threads/{id}/runs/{run_id}`,
+  `POST /v1/threads/{id}/runs/{run_id}/cancel`.
+  Persistent thread/message/run storage with atomic disk writes
+  (tempfile + rename), append-only JSONL message log, background run
+  worker reusing chat-template prompt formatting.  199 tests all pass.
 
 - ~~**WebSocket streaming.**~~
   ~~Full-duplex streaming alongside SSE for bidirectional tool~~

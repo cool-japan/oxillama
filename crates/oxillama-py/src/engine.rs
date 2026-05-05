@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyCapsule};
 
 use oxillama_runtime::{EngineConfig as RustEngineConfig, InferenceEngine, SamplerConfig};
 
@@ -666,6 +666,53 @@ impl PyEngine {
         Ok(numpy::PyArray1::from_vec(py, vec))
     }
 
+    /// Return the logits from the last forward pass as a DLPack capsule.
+    ///
+    /// The logits vector is produced by calling `forward_logits(text)` and
+    /// then wrapping the result as a 1-D `float32` DLPack tensor with shape
+    /// `[vocab_size]`.
+    ///
+    /// The returned object is a `PyCapsule` with name `"dltensor"` that any
+    /// DLPack-aware framework (PyTorch, JAX, NumPy ≥ 1.22, etc.) can consume
+    /// zero-copy via `__dlpack__` protocol.
+    ///
+    /// Args:
+    ///     text: Input text whose logits to compute.
+    ///
+    /// Returns:
+    ///     A `PyCapsule` wrapping the `[vocab_size]` float32 logit vector.
+    ///
+    /// Raises:
+    ///     RuntimeError: if no model is loaded.
+    ///     ValueError: if `text` tokenizes to the empty sequence.
+    #[pyo3(name = "logits_dlpack")]
+    #[pyo3(signature = (text))]
+    pub fn logits_dlpack(&mut self, py: Python<'_>, text: String) -> PyResult<Py<PyCapsule>> {
+        let logits = self.forward_logits(py, text)?;
+        let vocab_size = logits.len() as i64;
+        crate::dlpack::vec_to_dlpack(py, logits, vec![vocab_size])
+    }
+
+    /// Return the last hidden-state embeddings as a DLPack capsule.
+    ///
+    /// Computes a semantic embedding for `text` (same as `embed()`) and
+    /// returns the result as a 2-D `float32` DLPack tensor with shape
+    /// `[1, hidden_size]`.  The extra leading dimension makes the tensor
+    /// compatible with batched embedding APIs.
+    ///
+    /// Returns:
+    ///     A `PyCapsule` wrapping the `[1, hidden_size]` float32 embedding.
+    ///
+    /// Raises:
+    ///     RuntimeError: if no model is loaded.
+    #[pyo3(name = "embeddings_dlpack")]
+    #[pyo3(signature = (text))]
+    pub fn embeddings_dlpack(&mut self, py: Python<'_>, text: String) -> PyResult<Py<PyCapsule>> {
+        let embedding = self.embed(py, &text)?;
+        let hidden_size = embedding.len() as i64;
+        crate::dlpack::vec_to_dlpack(py, embedding, vec![1_i64, hidden_size])
+    }
+
     /// Download a GGUF model from HuggingFace Hub and construct a loaded
     /// `Engine` in one step.
     ///
@@ -733,13 +780,42 @@ impl PyEngine {
     /// the KV cache, sampler config, and a Blake3 fingerprint of the model
     /// file.  Model weights are **not** stored.
     ///
+    /// An optional `hub_origin` keyword argument accepts a Python `dict` with
+    /// keys `repo_id`, `filename`, and `sha256`.  When provided, the origin
+    /// metadata is written to a JSON sidecar file (`path + ".meta.json"`) so
+    /// that `Engine.restore()` / `Engine.from_snapshot_with_hub()` can
+    /// re-download the GGUF if it is absent on the restoring machine.
+    ///
+    /// Args:
+    ///     path:       Destination path for the snapshot file.
+    ///     hub_origin: Optional dict with `repo_id`, `filename`, `sha256` keys.
+    ///
     /// Raises:
     ///     GenerateError: if no model is loaded.
     ///     OSError: if the file cannot be written.
-    pub fn snapshot(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+    ///     ValueError: if `hub_origin` is provided but malformed.
+    #[pyo3(signature = (path, *, hub_origin = None))]
+    pub fn snapshot(
+        &self,
+        py: Python<'_>,
+        path: PathBuf,
+        hub_origin: Option<Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<()> {
         let bytes = py.detach(|| self.inner.snapshot()).map_err(runtime_to_py)?;
         py.detach(|| crate::snapshot::write_snapshot_atomic(&path, &bytes))
-            .map_err(crate::snapshot::io_to_py)
+            .map_err(crate::snapshot::io_to_py)?;
+
+        // Write the JSON meta sidecar when a hub_origin is supplied.
+        if let Some(dict) = hub_origin {
+            let origin = crate::snapshot::HubOrigin::from_py_dict(&dict)?;
+            let snap_bytes = std::fs::read(&path).map_err(crate::snapshot::io_to_py)?;
+            let raw_snap = oxillama_runtime::snapshot::EngineSnapshot::deserialize(&snap_bytes)
+                .map_err(runtime_to_py)?;
+            let meta =
+                crate::snapshot::EngineSnapshotMeta::from_engine_snapshot(&raw_snap, Some(origin));
+            crate::snapshot::write_meta(&path, &meta)?;
+        }
+        Ok(())
     }
 
     /// Return the engine state as a `bytes` object.
@@ -775,9 +851,13 @@ impl PyEngine {
     /// Reconstruct an `Engine` from a snapshot at `path`.
     ///
     /// If `model_path` is `None` (default), the model path embedded in the
-    /// snapshot is used.  Pass an explicit `model_path` to override, which is
-    /// useful when moving a snapshot between machines where the GGUF lives at
-    /// a different absolute path.
+    /// snapshot is used.  When a JSON metadata sidecar exists (`path +
+    /// ".meta.json"`) and contains `hub_origin`, the GGUF is re-downloaded
+    /// automatically from HuggingFace Hub if the local path is missing.
+    ///
+    /// Pass an explicit `model_path` to override all automatic resolution,
+    /// which is useful when moving a snapshot between machines where the GGUF
+    /// lives at a different absolute path.
     ///
     /// NOTE: When `model_path=None`, the snapshot bytes are deserialized twice
     /// (once to peek the embedded path, once in `resume`) — acceptable overhead
@@ -789,6 +869,7 @@ impl PyEngine {
     ///     GenerateError: if the snapshot is corrupted or incompatible.
     ///     LoadError: if the model fingerprint does not match.
     ///     OSError: if the snapshot file cannot be read.
+    ///     ValueError: if the SHA-256 of a re-downloaded file does not match.
     #[classmethod]
     #[pyo3(signature = (path, *, model_path = None))]
     pub fn restore(
@@ -802,13 +883,32 @@ impl PyEngine {
             .detach(|| std::fs::read(&path))
             .map_err(crate::snapshot::io_to_py)?;
 
-        // Resolve model path: use embedded path if not overridden.
+        // Resolve model path: explicit override takes priority.
         let resolved_model_path: PathBuf = match model_path {
             Some(p) => p,
             None => {
+                // Peek the embedded model path from the snapshot.
                 let snap = oxillama_runtime::snapshot::EngineSnapshot::deserialize(&bytes)
                     .map_err(runtime_to_py)?;
-                PathBuf::from(&snap.model_path)
+                let embedded_path = PathBuf::from(&snap.model_path);
+
+                // Check for a hub-aware metadata sidecar.
+                let meta_opt = crate::snapshot::read_meta(&path)?;
+                if let Some(meta) = meta_opt {
+                    if let Some(hub_origin) = meta.hub_origin {
+                        // Hub-aware path: may trigger a re-download.
+                        py.detach(|| {
+                            crate::snapshot::resolve_model_path_with_hub(
+                                &meta.model_path,
+                                &hub_origin,
+                            )
+                        })?
+                    } else {
+                        embedded_path
+                    }
+                } else {
+                    embedded_path
+                }
             }
         };
 
@@ -816,6 +916,83 @@ impl PyEngine {
         py.detach(|| oxillama_runtime::InferenceEngine::resume(&bytes, &resolved_model_path))
             .map_err(runtime_to_py)
             .map(|inner| Self { inner })
+    }
+
+    /// Reconstruct an `Engine` from a snapshot, using hub-aware model
+    /// resolution.
+    ///
+    /// This is a convenience classmethod that calls `restore(path)` and relies
+    /// entirely on the hub metadata written by `snapshot(path,
+    /// hub_origin=...)`.  If the GGUF is absent locally it is re-downloaded
+    /// from HuggingFace Hub and its SHA-256 is verified before loading.
+    ///
+    /// Equivalent to ``Engine.restore(path)`` when a ``.meta.json`` sidecar
+    /// exists alongside the snapshot.  Provided as a distinct method to make
+    /// the intent explicit at the call site.
+    ///
+    /// Args:
+    ///     snapshot_path: Path to the snapshot file.
+    ///
+    /// Returns:
+    ///     Engine: A fully loaded engine restored from the snapshot.
+    ///
+    /// Raises:
+    ///     GenerateError: if the snapshot is corrupted or incompatible.
+    ///     LoadError: if the model fingerprint does not match.
+    ///     OSError: if the snapshot file or sidecar cannot be read.
+    ///     ValueError: if the SHA-256 of the re-downloaded file does not match.
+    #[classmethod]
+    #[pyo3(name = "from_snapshot_with_hub")]
+    pub fn from_snapshot_with_hub(
+        cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        snapshot_path: PathBuf,
+    ) -> PyResult<Self> {
+        Self::restore(cls, py, snapshot_path, None)
+    }
+
+    /// Create an async-friendly wrapper around this engine.
+    ///
+    /// Returns a Python-level :class:`AsyncEngine` instance that wraps
+    /// ``self`` and exposes ``generate`` and ``stream`` coroutines, both
+    /// of which offload blocking inference to a thread-pool executor via
+    /// ``asyncio.get_running_loop().run_in_executor``.
+    ///
+    /// The returned :class:`AsyncEngine` holds a reference to this
+    /// :class:`Engine` object; the caller is responsible for ensuring the
+    /// engine remains alive for the duration of async use.
+    ///
+    /// Returns:
+    ///     AsyncEngine: an async-capable wrapper around ``self``.
+    ///
+    /// Raises:
+    ///     ImportError: if the ``oxillama_py`` package cannot be imported.
+    ///     RuntimeError: if :class:`AsyncEngine` cannot be instantiated.
+    ///
+    /// Example::
+    ///
+    ///     import asyncio
+    ///     from oxillama_py import EngineConfig, Engine
+    ///
+    ///     cfg = EngineConfig("model.gguf")
+    ///     engine = Engine(cfg)
+    ///     engine.load_model()
+    ///
+    ///     ae = engine.async_engine()
+    ///
+    ///     async def main():
+    ///         text = await ae.generate("Hello", max_tokens=64)
+    ///         print(text)
+    ///
+    ///     asyncio.run(main())
+    #[pyo3(signature = ())]
+    pub fn async_engine<'py>(
+        slf: &Bound<'py, PyEngine>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let module = py.import("oxillama_py")?;
+        let async_engine_cls = module.getattr("AsyncEngine")?;
+        async_engine_cls.call1((slf,))
     }
 
     /// Pickle refusal — Engine state must be persisted via `Engine.snapshot(path)`.

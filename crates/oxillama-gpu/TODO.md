@@ -38,7 +38,7 @@ shader coverage, batching, and attention fusion.
 | Source files      | 7 Rust files (`lib.rs`, `context.rs`, `buffer.rs`, `error.rs`, `kernels/mod.rs`, `kernels/q4_0.rs`, `kernels/q8_0.rs`) |
 | WGSL shaders      | 2 shader files (`shaders/gemv_f32.wgsl`, `shaders/batched_gemv_f32.wgsl`) with Q4_0 and Q8_0 entry points |
 | Tests             | 151 unit tests (smoke + error-display + gated end-to-end correctness) |
-| Quant coverage    | 14 / 25 quant types (Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q8_K, Q1_0_G128, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS; tiled GEMM + fused attention) |
+| Quant coverage    | 24 / 25 quant types (Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q8_K, Q1_0_G128, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ1_S, IQ1_M, IQ2_XS, IQ4_NL, TQ1_0, TQ2_0, Q4_1, Q5_0, Q5_1, Q8_1; tiled GEMM + fused attention) |
 | Pure Rust         | Yes — wgpu is Rust-native                    |
 | Default behaviour | Graceful CPU fallback when no adapter found  |
 
@@ -66,8 +66,12 @@ shader coverage, batching, and attention fusion.
 | IQ4_XS                    | ✓         | CPU dequant + GPU f32 GEMV                        |
 | Tiled GEMM                | ✓         | TILE_M/N=32, TILE_K=16; `gemm_f32.wgsl` — **new in v0.1.1** |
 | Fused attention           | ✓         | Online softmax, QK+AV single dispatch — **new in v0.1.1** |
-| I-quants (remaining)      | —         | v2.0                                              |
-| Ternary (TQ1_0, TQ2_0)    | —         | v2.0                                              |
+| IQ1_S                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
+| IQ1_M                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
+| IQ2_XS                    | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
+| IQ4_NL                    | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
+| TQ1_0                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
+| TQ2_0                     | ✓         | CPU dequant + GPU f32 GEMV — **new in v0.1.5**    |
 
 ## 3. Module Map
 
@@ -228,7 +232,7 @@ These items make up the remaining ~18 % of the v0.1.0 completion figure.
   tuned for tile-based mobile GPUs, coordinated with the `oxillama-wasm`
   hookup so a browser build gets real acceleration, not just portability.
 
-*Last updated: 2026-05-03 (v0.1.3 shipped — Q4_1/Q5_0/Q5_1/Q8_1 GPU kernels; 18 quant types on GPU, ~85% HF coverage; 1873 workspace tests)*
+*Last updated: 2026-05-05 (v0.1.5 shipped — IQ1_S/IQ1_M/IQ2_XS/IQ4_NL/TQ1_0/TQ2_0 GPU kernels; 24 quant types on GPU, ~95% HF coverage; 198 oxillama-gpu tests)*
 
 ## 8. Planned GPU Kernels (v2.0 — Scheduled 2026-04-19)
 
@@ -322,3 +326,53 @@ These items make up the remaining ~18 % of the v0.1.0 completion figure.
   - **Files:** `src/kernels/iq3_s.rs` (new); `src/kernels/mod.rs`; `src/lib.rs`.
   - **Tests:** `test_gpu_gemv_iq3_s_matches_cpu` — 64×256 GEMV, tol 1e-3.
   - **Risk:** IQ3_S decode is the most byte-fiddly — cross-reference reference impl twice before coding.
+
+## 10. Track C — Remaining 6 GPU Kernels (v0.1.5 — Scheduled 2026-05-05)
+
+### D1 — IQ1_S GPU GEMV kernel
+
+- [x] IQ1_S GPU GEMV kernel — 1-bit super-block with 8-bit scale (done 2026-05-05)
+  - **Goal:** `Iq1SGpuKernel` for `GgufTensorType::Iq1S`; CPU-dequant via IQ1S_GRID[2048] then `gemv_f32.wgsl`.
+  - **Design:** 50-byte block: d(f16)+qs[32]+qh[8×u16]. 8 sub-blocks of 32 weights. Per sub-block: 11-bit grid index from qs nibbles + qh[ib] bits. Scale from qh bits 12-14; delta ±0.125 from bit 15. Grid lookup → 8 i8 ternary weights. IQ1S_GRID split into iq1s_grid/data_a.rs + data_b.rs to stay under 2000 lines.
+  - **Files:** `src/kernels/iq1_s.rs` (new, ~295 LoC); `src/kernels/iq1s_grid/{mod,data_a,data_b}.rs` (new); `src/kernels/mod.rs`; `src/lib.rs`.
+  - **Tests:** Trait-bound, buffer-underflow, all-zero scale, all-positive decode (5 tests).
+
+### D2 — IQ1_M GPU GEMV kernel
+
+- [x] IQ1_M GPU GEMV kernel — 1-bit with 4-bit sub-block scales (done 2026-05-05)
+  - **Goal:** `Iq1MGpuKernel` for `GgufTensorType::Iq1M`; CPU-dequant via IQ1S_GRID then `gemv_f32.wgsl`.
+  - **Design:** 56-byte block: qs[32]+qh[16]+scales[8]. No explicit `d` — reconstructed FP16 from 4 nibbles across scales[0..4] bits[12..15]. Per sub-block: dl from scale nibble; 2 pairs of 4-weight sub-groups per sub-block; delta from qh bits 3 and 7.
+  - **Files:** `src/kernels/iq1_m.rs` (new, ~350 LoC); re-uses `iq1s_grid`.
+  - **Tests:** Trait-bound, buffer-underflow, all-zero scale, all-positive decode (5 tests).
+
+### D3 — IQ2_XS GPU GEMV kernel
+
+- [x] IQ2_XS GPU GEMV kernel — 2-bit with extra signs (done 2026-05-05)
+  - **Goal:** `Iq2XsGpuKernel` for `GgufTensorType::Iq2Xs`; CPU-dequant via IQ2XS_GRID[512] + KSIGNS_IQ2XS + KMASK_IQ2XS then `gemv_f32.wgsl`.
+  - **Design:** 74-byte block: d(f16)+qs[32×u16]+scales[8]. u16: lower 9 bits = grid idx, upper 7 = sign idx. Scale: db0/db1 from low/high nibbles of scales[ib32]. IQ2XS_GRID (512 entries, ~521 LoC) appended to iq_grids.rs (was 1410 → 1931 lines, under limit).
+  - **Files:** `src/kernels/iq2_xs.rs` (new, ~280 LoC); `src/kernels/iq_grids.rs` (appended IQ2XS_GRID).
+  - **Tests:** Trait-bound, buffer-underflow, all-zero scale, all-positive decode (5 tests).
+
+### D4 — IQ4_NL GPU GEMV kernel
+
+- [x] IQ4_NL GPU GEMV kernel — 4-bit non-linear levels (done 2026-05-05)
+  - **Goal:** `Iq4NlGpuKernel` for `GgufTensorType::Iq4Nl`; CPU-dequant via KVALUES_IQ4NL[16] then `gemv_f32.wgsl`.
+  - **Design:** 18-byte block (32 weights): d(f16)+nibbles[16]. w = d * KVALUES_IQ4NL[nibble]. Non-linear levels: [-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113].
+  - **Files:** `src/kernels/iq4_nl.rs` (new, ~215 LoC).
+  - **Tests:** Trait-bound, buffer-underflow, all-zero scale, level decode correctness (5 tests).
+
+### D5 — TQ1_0 GPU GEMV kernel
+
+- [x] TQ1_0 GPU GEMV kernel — ternary base-3 packed (done 2026-05-05)
+  - **Goal:** `Tq1_0GpuKernel` for `GgufTensorType::Tq1_0`; CPU-dequant via base-3 decode then `gemv_f32.wgsl`.
+  - **Design:** 54-byte block (256 weights): qs[48]+qh[4]+d(f16). qs: 5 ternary values/byte via base-3 (v = (q/3^i)%3 - 1). qh: 4 ternary values/byte via 2-bit pairs ((bits&3)-1). Total: 48×5+4×4=256 weights.
+  - **Files:** `src/kernels/tq1_0.rs` (new, ~320 LoC).
+  - **Tests:** Trait-bound, decode roundtrip qs, decode roundtrip qh, all-positive/all-negative scale (5 tests).
+
+### D6 — TQ2_0 GPU GEMV kernel
+
+- [x] TQ2_0 GPU GEMV kernel — ternary 2-bit codes (done 2026-05-05)
+  - **Goal:** `Tq2_0GpuKernel` for `GgufTensorType::Tq2_0`; CPU-dequant via 2-bit code → ternary then `gemv_f32.wgsl`.
+  - **Design:** 66-byte block (256 weights): qs[64]+d(f16). Per byte: 4 × 2-bit codes. code-1 → ternary value (-1, 0, +1). w = d * ternary.
+  - **Files:** `src/kernels/tq2_0.rs` (new, ~290 LoC).
+  - **Tests:** Trait-bound, buffer-underflow, all-positive/all-negative/mixed decode, zero scale (5 tests).

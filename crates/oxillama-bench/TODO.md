@@ -143,15 +143,23 @@ policy in benchmark harnesses either, even though they are not strictly
 
 ## 7. v2.0+ Vision
 
-- **Power / watt benchmarks.** Report `tokens / joule` via RAPL on Linux
-  (Intel `/sys/class/powercap/intel-rapl:*`) and IOKit on macOS (when a
-  Pure-Rust binding is available). Critical metric for edge deployment.
-- **Latency-vs-batch-size heatmap.** 2-D Criterion plot sweeping
-  `batch_size × seq_len` to expose the point where continuous batching stops
-  paying off; rendered as an SVG heatmap per architecture.
-- **CI regression gate.** Hard fail (not warn) when `tok/s` regresses by
-  more than a configurable threshold against the saved baseline; block the
-  merge queue until the regression is explained or reverted.
+- ~~**Power / watt benchmarks.**~~ ✅ Shipped (v0.1.6): `RaplReader` in
+  `src/power.rs` reads `/sys/class/powercap/intel-rapl:*` energy counters on
+  Linux; `measure_tokens_per_joule` wraps any closure; `compute_tokens_per_joule_from_delta`
+  is exposed for unit-testable formula verification.  Criterion bench at
+  `benches/power.rs` with `OXILLAMA_BENCH_PRINT_POWER=1` for optional output.
+  Gracefully returns `NoRapl` on non-Linux or when permissions are insufficient.
+- ~~**Latency-vs-batch-size heatmap.**~~ ✅ Shipped: `BatchHeatmap::run`
+  sweeps `batch_size × seq_len`, records `toks_per_sec`, `p99_latency_ms`,
+  and `memory_bytes` per cell; `summary_table` and `p99_table` render Markdown
+  grids; Criterion bench at `benches/batch_heatmap.rs` with
+  `OXILLAMA_BENCH_PRINT_HEATMAP=1` for optional table output.
+- ~~**CI regression gate.**~~ ✅ Shipped (v0.1.6): `RegressionGate` in
+  `src/regression_gate.rs` loads a JSON baseline (`from_file` / `save_baseline`),
+  checks per-metric thresholds (throughput: higher is better; latency: lower is
+  better), and returns structured `RegressionFailure` list.  `format_report`
+  emits a Markdown table.  New benchmarks absent from the baseline are silently
+  skipped.
 - **Flame-graph integration.** Optional `flame` feature that emits
   per-benchmark `*.folded` + SVG, using a Pure-Rust `pprof` replacement (or
   gating this feature when no Pure-Rust sampler is available).

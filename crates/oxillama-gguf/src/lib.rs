@@ -45,6 +45,8 @@ pub mod quantize_on_load;
 #[cfg(feature = "std")]
 pub mod resume;
 #[cfg(feature = "std")]
+pub mod safetensors;
+#[cfg(feature = "std")]
 pub mod schema;
 #[cfg(feature = "std")]
 pub mod sharded;
@@ -52,6 +54,8 @@ pub mod sharded;
 pub mod streaming;
 #[cfg(feature = "std")]
 pub mod writer;
+
+pub mod http_source;
 
 #[cfg(all(feature = "std", feature = "integrity"))]
 pub mod integrity;
@@ -75,6 +79,11 @@ pub use source::{FileSource, ReadSource};
 
 #[cfg(feature = "std")]
 pub use loader::GgufModel;
+#[cfg(feature = "std")]
+pub use safetensors::SafetensorsConverter;
+
+#[cfg(feature = "http")]
+pub use http_source::HttpRangeSource;
 #[cfg(feature = "std")]
 pub use quantize_on_load::{QuantPlan, QuantTarget};
 #[cfg(feature = "std")]

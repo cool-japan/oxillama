@@ -325,6 +325,245 @@ impl EngineSnapshot {
     }
 }
 
+// ─── SpeculativeEngineSnapshot ───────────────────────────────────────────────
+
+/// Magic bytes at the start of every speculative-engine snapshot.
+pub const SPEC_SNAPSHOT_MAGIC: &[u8; 8] = b"OXISPEC1";
+
+/// Version number for the `SpeculativeEngineSnapshot` wire format.
+const SPEC_SNAPSHOT_VERSION: u32 = 1;
+
+/// Portable snapshot of a complete [`crate::speculative::SpeculativeEngine`] session.
+///
+/// Contains individual [`EngineSnapshot`]s for both the target and draft models,
+/// plus the speculative-decoding loop state needed to resume deterministically.
+///
+/// ## Wire format
+///
+/// ```text
+/// [magic: 8 bytes][version: u32 LE][target_len: u64 LE][target_bytes: ...]
+/// [draft_len: u64 LE][draft_bytes: ...]
+/// [num_speculative: u64 LE][has_seed: u8][seed: u64 LE (if has_seed)]
+/// [accepted_len: u64 LE][accepted_tokens: u32 LE × accepted_len]
+/// [rng_state: u64 LE]
+/// ```
+///
+/// All multibyte integers are little-endian.  Neither `oxicode` nor `bincode`
+/// is used for the outer envelope so that the magic header can be verified
+/// before any heap allocation.
+#[derive(Debug, Clone)]
+pub struct SpeculativeEngineSnapshot {
+    /// Snapshot of the target (large, accurate) model session.
+    pub target_snapshot: EngineSnapshot,
+    /// Snapshot of the draft (small, fast) model session.
+    pub draft_snapshot: EngineSnapshot,
+    /// Number of speculative tokens proposed per round.
+    pub num_speculative: usize,
+    /// RNG seed that was used to initialise the accept/reject PRNG.
+    pub spec_seed: Option<u64>,
+    /// Token IDs accepted during the last speculation round (may be empty).
+    pub accepted_tokens: Vec<u32>,
+    /// Raw Xorshift64 state for the accept/reject PRNG.
+    pub rng_state: u64,
+}
+
+impl SpeculativeEngineSnapshot {
+    /// Encode this snapshot into a self-describing byte blob.
+    ///
+    /// The blob starts with [`SPEC_SNAPSHOT_MAGIC`] and can be decoded by
+    /// [`Self::decode`].
+    pub fn encode(&self) -> RuntimeResult<Vec<u8>> {
+        // Serialise the two inner snapshots first so we know their lengths.
+        let target_bytes = self.target_snapshot.serialize()?;
+        let draft_bytes = self.draft_snapshot.serialize()?;
+
+        // Pre-compute capacity: magic(8) + version(4) + target_len(8) + target
+        //   + draft_len(8) + draft + num_spec(8) + has_seed(1) + [seed(8)]
+        //   + accepted_len(8) + accepted * 4 + rng_state(8)
+        let seed_bytes = if self.spec_seed.is_some() {
+            9usize
+        } else {
+            1usize
+        };
+        let capacity = 8
+            + 4
+            + 8
+            + target_bytes.len()
+            + 8
+            + draft_bytes.len()
+            + 8
+            + seed_bytes
+            + 8
+            + self.accepted_tokens.len() * 4
+            + 8;
+
+        let mut buf: Vec<u8> = Vec::with_capacity(capacity);
+
+        // Magic + version
+        buf.extend_from_slice(SPEC_SNAPSHOT_MAGIC);
+        buf.extend_from_slice(&SPEC_SNAPSHOT_VERSION.to_le_bytes());
+
+        // Target snapshot (length-prefixed)
+        buf.extend_from_slice(&(target_bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&target_bytes);
+
+        // Draft snapshot (length-prefixed)
+        buf.extend_from_slice(&(draft_bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&draft_bytes);
+
+        // num_speculative
+        buf.extend_from_slice(&(self.num_speculative as u64).to_le_bytes());
+
+        // Optional seed: 0x00 = absent, 0x01 followed by 8 bytes = present
+        match self.spec_seed {
+            None => buf.push(0x00),
+            Some(seed) => {
+                buf.push(0x01);
+                buf.extend_from_slice(&seed.to_le_bytes());
+            }
+        }
+
+        // accepted_tokens (length-prefixed, each token as u32 LE)
+        buf.extend_from_slice(&(self.accepted_tokens.len() as u64).to_le_bytes());
+        for &tok in &self.accepted_tokens {
+            buf.extend_from_slice(&tok.to_le_bytes());
+        }
+
+        // rng_state
+        buf.extend_from_slice(&self.rng_state.to_le_bytes());
+
+        Ok(buf)
+    }
+
+    /// Decode a [`SpeculativeEngineSnapshot`] from raw bytes.
+    ///
+    /// Returns [`RuntimeError::SpecSnapshotIncompatible`] when the magic bytes
+    /// are wrong, the version is unsupported, or the buffer is truncated.
+    pub fn decode(bytes: &[u8]) -> RuntimeResult<Self> {
+        let mut pos = 0usize;
+
+        /// Read `N` bytes from `bytes` starting at `*pos`, advancing `*pos`.
+        macro_rules! read_exact {
+            ($n:expr, $label:expr) => {{
+                let end = pos + $n;
+                if end > bytes.len() {
+                    return Err(RuntimeError::SpecSnapshotIncompatible(format!(
+                        "truncated: expected {} bytes for {} at offset {}",
+                        $n, $label, pos
+                    )));
+                }
+                let slice = &bytes[pos..end];
+                pos = end;
+                slice
+            }};
+        }
+
+        // Magic
+        let magic = read_exact!(8, "magic");
+        if magic != SPEC_SNAPSHOT_MAGIC {
+            return Err(RuntimeError::SpecSnapshotIncompatible(format!(
+                "invalid magic bytes: expected {:?}, got {:?}",
+                SPEC_SNAPSHOT_MAGIC, magic
+            )));
+        }
+
+        // Version
+        let version = u32::from_le_bytes(
+            read_exact!(4, "version")
+                .try_into()
+                .expect("slice is exactly 4 bytes"),
+        );
+        if version != SPEC_SNAPSHOT_VERSION {
+            return Err(RuntimeError::SpecSnapshotIncompatible(format!(
+                "unsupported version {version} (expected {SPEC_SNAPSHOT_VERSION})"
+            )));
+        }
+
+        // Target snapshot
+        let target_len = u64::from_le_bytes(
+            read_exact!(8, "target_len")
+                .try_into()
+                .expect("slice is exactly 8 bytes"),
+        ) as usize;
+        let target_raw = read_exact!(target_len, "target_bytes");
+        let target_snapshot = EngineSnapshot::deserialize(target_raw).map_err(|e| {
+            RuntimeError::SpecSnapshotIncompatible(format!("target snapshot corrupt: {e}"))
+        })?;
+
+        // Draft snapshot
+        let draft_len = u64::from_le_bytes(
+            read_exact!(8, "draft_len")
+                .try_into()
+                .expect("slice is exactly 8 bytes"),
+        ) as usize;
+        let draft_raw = read_exact!(draft_len, "draft_bytes");
+        let draft_snapshot = EngineSnapshot::deserialize(draft_raw).map_err(|e| {
+            RuntimeError::SpecSnapshotIncompatible(format!("draft snapshot corrupt: {e}"))
+        })?;
+
+        // num_speculative
+        let num_speculative = u64::from_le_bytes(
+            read_exact!(8, "num_speculative")
+                .try_into()
+                .expect("slice is exactly 8 bytes"),
+        ) as usize;
+
+        // Optional seed
+        let has_seed = read_exact!(1, "has_seed")[0];
+        let spec_seed = if has_seed == 0x01 {
+            let seed_bytes = read_exact!(8, "seed");
+            Some(u64::from_le_bytes(
+                seed_bytes.try_into().expect("slice is exactly 8 bytes"),
+            ))
+        } else {
+            None
+        };
+
+        // accepted_tokens
+        let accepted_len = u64::from_le_bytes(
+            read_exact!(8, "accepted_len")
+                .try_into()
+                .expect("slice is exactly 8 bytes"),
+        ) as usize;
+        let mut accepted_tokens = Vec::with_capacity(accepted_len);
+        for _ in 0..accepted_len {
+            let tok = u32::from_le_bytes(
+                read_exact!(4, "accepted_token")
+                    .try_into()
+                    .expect("slice is exactly 4 bytes"),
+            );
+            accepted_tokens.push(tok);
+        }
+
+        // rng_state — last field; pos is advanced but not read after this.
+        let rng_state = u64::from_le_bytes(
+            read_exact!(8, "rng_state")
+                .try_into()
+                .expect("slice is exactly 8 bytes"),
+        );
+        // Suppress unused-assignment lint: pos is consumed on the last read.
+        let _ = pos;
+
+        Ok(Self {
+            target_snapshot,
+            draft_snapshot,
+            num_speculative,
+            spec_seed,
+            accepted_tokens,
+            rng_state,
+        })
+    }
+
+    /// Compute a 32-byte Blake3 fingerprint of the encoded snapshot bytes.
+    ///
+    /// Useful for deduplication and integrity checks without fully decoding
+    /// the snapshot.
+    pub fn fingerprint(&self) -> RuntimeResult<[u8; 32]> {
+        let encoded = self.encode()?;
+        Ok(*Hasher::new().update(&encoded).finalize().as_bytes())
+    }
+}
+
 // ─── InferenceEngine snapshot / resume ───────────────────────────────────────
 
 impl InferenceEngine {
@@ -433,6 +672,10 @@ impl InferenceEngine {
             mirostat_eta: snap.sampler_state.mirostat_eta,
             grammar: None,
             token_vocab: None,
+            // Logit bias and banned tokens are not persisted in v1 snapshots;
+            // they default to empty.
+            logit_bias: std::collections::HashMap::new(),
+            banned_tokens: Vec::new(),
         };
 
         // Re-parse grammar if present (state resets to initial — known limitation).
@@ -621,5 +864,95 @@ mod tests {
         } else {
             panic!("expected Attention sequence state payload");
         }
+    }
+
+    // ── SpeculativeEngineSnapshot tests ──────────────────────────────────────
+
+    fn make_spec_snapshot(accepted: Vec<u32>, rng_state: u64) -> SpeculativeEngineSnapshot {
+        SpeculativeEngineSnapshot {
+            target_snapshot: make_minimal_snapshot(),
+            draft_snapshot: make_minimal_snapshot(),
+            num_speculative: 4,
+            spec_seed: Some(0xdeadbeef),
+            accepted_tokens: accepted,
+            rng_state,
+        }
+    }
+
+    /// Full encode → decode roundtrip must preserve all fields.
+    #[test]
+    fn spec_snapshot_roundtrip() {
+        let original = make_spec_snapshot(vec![10u32, 20, 30], 0x00c0_ffee_cafe_babe_u64);
+        let bytes = original.encode().expect("encode must succeed");
+        let restored = SpeculativeEngineSnapshot::decode(&bytes).expect("decode must succeed");
+
+        assert_eq!(restored.num_speculative, 4);
+        assert_eq!(restored.spec_seed, Some(0xdeadbeef));
+        assert_eq!(restored.accepted_tokens, vec![10u32, 20, 30]);
+        assert_eq!(restored.rng_state, 0x00c0_ffee_cafe_babe_u64);
+        assert_eq!(restored.target_snapshot.arch_id, "llama");
+        assert_eq!(restored.draft_snapshot.arch_id, "llama");
+    }
+
+    /// Bytes starting with a wrong magic header must return `SpecSnapshotIncompatible`.
+    #[test]
+    fn spec_snapshot_rejects_wrong_magic() {
+        let snap = make_spec_snapshot(vec![], 42);
+        let mut bytes = snap.encode().expect("encode");
+        // Corrupt the magic header bytes
+        if bytes.len() >= 8 {
+            bytes[0] ^= 0xFF;
+        }
+        let result = SpeculativeEngineSnapshot::decode(&bytes);
+        assert!(
+            matches!(result, Err(RuntimeError::SpecSnapshotIncompatible(_))),
+            "wrong magic must return SpecSnapshotIncompatible, got {result:?}"
+        );
+    }
+
+    /// Truncated bytes must return `SpecSnapshotIncompatible`.
+    #[test]
+    fn spec_snapshot_rejects_truncated() {
+        let snap = make_spec_snapshot(vec![1u32, 2], 99);
+        let bytes = snap.encode().expect("encode");
+        // Feed only the first 12 bytes (magic + partial version)
+        let truncated = &bytes[..12.min(bytes.len())];
+        let result = SpeculativeEngineSnapshot::decode(truncated);
+        assert!(result.is_err(), "truncated bytes must return Err, got Ok");
+    }
+
+    /// Accepted token history must survive a full encode → decode cycle.
+    #[test]
+    fn spec_snapshot_preserves_accepted_history() {
+        let history = vec![1u32, 2, 3, 4, 5, 100, 200, 65535];
+        let snap = make_spec_snapshot(history.clone(), 0);
+        let bytes = snap.encode().expect("encode");
+        let restored = SpeculativeEngineSnapshot::decode(&bytes).expect("decode");
+        assert_eq!(
+            restored.accepted_tokens, history,
+            "accepted token history must be identical after roundtrip"
+        );
+    }
+
+    /// `spec_seed = None` is encoded and decoded faithfully.
+    #[test]
+    fn spec_snapshot_none_seed_roundtrip() {
+        let mut snap = make_spec_snapshot(vec![], 7);
+        snap.spec_seed = None;
+        let bytes = snap.encode().expect("encode");
+        let restored = SpeculativeEngineSnapshot::decode(&bytes).expect("decode");
+        assert!(
+            restored.spec_seed.is_none(),
+            "None seed must round-trip as None"
+        );
+    }
+
+    /// `fingerprint()` is deterministic for the same snapshot content.
+    #[test]
+    fn spec_snapshot_fingerprint_is_deterministic() {
+        let snap = make_spec_snapshot(vec![42u32], 0xbeef);
+        let fp1 = snap.fingerprint().expect("fingerprint 1");
+        let fp2 = snap.fingerprint().expect("fingerprint 2");
+        assert_eq!(fp1, fp2, "fingerprint must be deterministic");
     }
 }

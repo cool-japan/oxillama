@@ -4,12 +4,12 @@ Generated for PyO3 bindings exposed by OxiLLaMa.
 """
 
 import os
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Any, AsyncIterator, Callable, Optional, Sequence, Union
 
 try:
-    from typing import Protocol, runtime_checkable
+    from typing import Protocol, TypedDict, runtime_checkable
 except ImportError:
-    from typing_extensions import Protocol, runtime_checkable  # type: ignore[assignment]
+    from typing_extensions import Protocol, TypedDict, runtime_checkable  # type: ignore[assignment]
 
 try:
     import numpy as np
@@ -73,6 +73,25 @@ class StreamingCallback(Protocol):
 
 #: Convenience alias for a bare callable matching the streaming callback signature.
 TokenCallback = Callable[[str, int, bool], None]
+
+# ---------------------------------------------------------------------------
+# HubOrigin — hub-aware snapshot metadata (Track F, v0.1.6)
+# ---------------------------------------------------------------------------
+
+class HubOrigin(TypedDict):
+    """HuggingFace Hub origin for a GGUF model.
+
+    Supplied to ``Engine.snapshot(hub_origin=...)`` so that
+    ``Engine.restore()`` / ``Engine.from_snapshot_with_hub()`` can
+    re-download the model automatically when the local file is absent.
+    """
+
+    repo_id: str
+    """HuggingFace repository identifier, e.g. ``"mistralai/Mixtral-8x7B-Instruct-v0.1"``."""
+    filename: str
+    """Filename within the repository, e.g. ``"mixtral-8x7b.Q4_K_M.gguf"``."""
+    sha256: str
+    """Lower-case hex SHA-256 digest of the GGUF file (verified after download)."""
 
 # ---------------------------------------------------------------------------
 # SnapshotInfo
@@ -253,7 +272,12 @@ class Engine:
         token: Optional[str] = None,
         config: Optional[EngineConfig] = None,
     ) -> Engine: ...
-    def snapshot(self, path: Union[str, os.PathLike[str]]) -> None: ...
+    def snapshot(
+        self,
+        path: Union[str, os.PathLike[str]],
+        *,
+        hub_origin: Optional[HubOrigin] = None,
+    ) -> None: ...
     def snapshot_bytes(self) -> bytes: ...
     @classmethod
     def snapshot_info(cls, path: Union[str, os.PathLike[str]]) -> SnapshotInfo: ...
@@ -264,6 +288,23 @@ class Engine:
         *,
         model_path: Optional[Union[str, os.PathLike[str]]] = None,
     ) -> Engine: ...
+    @classmethod
+    def from_snapshot_with_hub(
+        cls,
+        snapshot_path: Union[str, os.PathLike[str]],
+    ) -> Engine: ...
+    def logits_dlpack(self, text: str) -> object: ...
+    """Return the logits for ``text`` as a DLPack ``"dltensor"`` PyCapsule.
+
+    Shape: ``[vocab_size]``, dtype float32, device CPU.
+    Compatible with ``torch.from_dlpack``, ``jax.dlpack.from_dlpack``, etc.
+    """
+    def embeddings_dlpack(self, text: str) -> object: ...
+    """Return the last hidden-state embedding for ``text`` as a DLPack capsule.
+
+    Shape: ``[1, hidden_size]``, dtype float32, device CPU.
+    """
+    def async_engine(self) -> "AsyncEngine": ...
     def __reduce__(self) -> None: ...
     def __reduce_ex__(self, protocol: int) -> None: ...
 
@@ -320,8 +361,12 @@ class SpeculativeEngine:
         progress_capture_text: bool = False,
         strict_progress: bool = False,
     ) -> str: ...
-    def __reduce__(self) -> None: ...
-    def __reduce_ex__(self, protocol: int) -> None: ...
+    def snapshot(self, path: str) -> None: ...
+    def snapshot_bytes(self) -> bytes: ...
+    @classmethod
+    def restore(cls, path: str, target_model: str, draft_model: str) -> "SpeculativeEngine": ...
+    def __reduce__(self) -> tuple: ...
+    def __reduce_ex__(self, protocol: int) -> tuple: ...
 
 # ---------------------------------------------------------------------------
 # Tokenizer
@@ -378,51 +423,96 @@ class CancellationToken:
     def __repr__(self) -> str: ...
 
 # ---------------------------------------------------------------------------
-# AsyncEngine
+# AsyncEngine (pure-Python, v0.1.5)
 # ---------------------------------------------------------------------------
 
 class AsyncEngine:
-    """Asyncio-friendly wrapper around :class:`Engine`."""
+    """Pure-Python async wrapper around any synchronous inference engine.
 
-    def __init__(self, config: EngineConfig) -> None: ...
-    @property
-    def engine(self) -> Engine: ...
-    def is_loaded(self) -> bool: ...
-    def reset(self) -> None: ...
-    async def load_model(self) -> None: ...
+    Accepts any object that exposes ``generate(prompt, max_tokens, **kwargs)``
+    and ``generate_streaming(prompt, max_tokens, callback, **kwargs)`` methods,
+    including the native :class:`Engine` and plain mock objects.
+
+    Blocking calls are offloaded to a private
+    :class:`~concurrent.futures.ThreadPoolExecutor` so that the asyncio event
+    loop is never blocked during inference.
+
+    Create via :meth:`Engine.async_engine` or directly::
+
+        ae = AsyncEngine(engine)
+        text = await ae.generate("Hello", max_tokens=128)
+
+        async for token in ae.stream("Hello", max_tokens=64):
+            print(token, end="", flush=True)
+    """
+
+    def __init__(self, engine: Any) -> None:
+        """Wrap *engine* for async use.
+
+        Args:
+            engine: Any object with ``generate`` and ``generate_streaming``
+                    methods.  Typically a native :class:`Engine` instance or
+                    a test mock.
+        """
+        ...
+
     async def generate(
         self,
         prompt: str,
-        *,
-        max_tokens: int = 128,
+        max_tokens: int = 512,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         seed: Optional[int] = None,
-        progress: ProgressLike = None,
-        progress_throttle_ms: Optional[int] = None,
-        progress_throttle_tokens: Optional[int] = None,
-        progress_capture_text: bool = False,
-        strict_progress: bool = False,
-    ) -> str: ...
-    async def embed(self, text: str) -> list[float]: ...
-    def generate_stream(
+        **kwargs: Any,
+    ) -> str:
+        """Return the full generated text for *prompt*.
+
+        Runs ``Engine.generate`` in the thread-pool executor so that the
+        asyncio event loop is not blocked during inference.
+
+        Args:
+            prompt:      Input text.
+            max_tokens:  Maximum tokens to generate (default 512).
+            temperature: Sampling temperature override.
+            top_p:       Nucleus sampling threshold override.
+            top_k:       Top-k limit override.
+            seed:        Random seed override.
+            **kwargs:    Additional keyword arguments forwarded to the
+                         underlying ``generate`` method.
+
+        Returns:
+            The generated text (not including the prompt).
+        """
+        ...
+
+    def stream(
         self,
         prompt: str,
-        *,
-        max_tokens: int = 128,
+        max_tokens: int = 512,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         seed: Optional[int] = None,
-        progress: ProgressLike = None,
-        progress_throttle_ms: Optional[int] = None,
-        progress_throttle_tokens: Optional[int] = None,
-        progress_capture_text: bool = False,
-        strict_progress: bool = False,
-    ) -> Any: ...
-    async def snapshot(self, path: Union[str, os.PathLike[str]]) -> None: ...
-    async def snapshot_bytes(self) -> bytes: ...
-    def __reduce__(self) -> None: ...
-    def __reduce_ex__(self, protocol: int) -> None: ...
-    def __repr__(self) -> str: ...
+        **kwargs: Any,
+    ) -> AsyncIterator[str]:
+        """Async generator that yields tokens as they are produced.
+
+        Generation runs in the thread-pool executor; each token is handed
+        off through a :class:`queue.Queue` so the event loop is never
+        blocked.
+
+        Args:
+            prompt:      Input text.
+            max_tokens:  Maximum tokens to generate (default 512).
+            temperature: Sampling temperature override.
+            top_p:       Nucleus sampling threshold override.
+            top_k:       Top-k limit override.
+            seed:        Random seed override.
+            **kwargs:    Additional keyword arguments forwarded to the
+                         underlying ``generate_streaming`` method.
+
+        Yields:
+            Individual decoded token strings.
+        """
+        ...

@@ -145,4 +145,17 @@ pub enum GgufError {
         /// Existing quantization format description.
         existing: String,
     },
+
+    /// HTTP error while loading a remote GGUF file via range requests.
+    #[cfg(feature = "http")]
+    #[error("HTTP error loading GGUF: {0}")]
+    HttpError(String),
+
+    /// Error parsing a safetensors binary file.
+    #[error("safetensors parse error: {0}")]
+    SafetensorsParseError(String),
+
+    /// Unsupported tensor dtype encountered in a safetensors file.
+    #[error("unsupported tensor dtype: {0}")]
+    UnsupportedDtype(String),
 }

@@ -12,6 +12,7 @@
 //! | [`Q4_0Avx512`]      | Q4_0       | 32  | 18  | ~2× |
 //! | [`Q4_1Avx512`]      | Q4_1       | Q4_1       | 32  | 20  | ~2× |
 //! | [`Q8_0Avx512`]      | Q8_0       | 32  | 34  | ~2× |
+//! | [`Q8_1Avx512`]      | Q8_1       | 32  | 36  | ~2× |
 //! | [`Q2_KAvx512`]      | Q2_K       | 256 | 84  | ~2× |
 //! | [`Q3_KAvx512`]      | Q3_K       | 256 | 110 | ~2× |
 //! | [`Q4_KAvx512`]      | Q4_K       | 256 | 144 | ~2× |
@@ -37,6 +38,7 @@ pub mod q5_1;
 pub mod q5_k;
 pub mod q6_k;
 pub mod q8_0;
+pub mod q8_1;
 pub mod q8_k;
 pub mod tq1_0;
 pub mod tq2_0;
@@ -53,6 +55,7 @@ pub use q5_1::Q5_1Avx512;
 pub use q5_k::Q5_KAvx512;
 pub use q6_k::Q6_KAvx512;
 pub use q8_0::Q8_0Avx512;
+pub use q8_1::Q8_1Avx512;
 pub use q8_k::Q8_KAvx512;
 pub use tq1_0::Tq1_0Avx512;
 pub use tq2_0::Tq2_0Avx512;

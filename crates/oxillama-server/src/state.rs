@@ -9,6 +9,7 @@
 //! - Multi-model LRU pool (C1), protected by a `Mutex` for admin mutations.
 //! - Prefix KV cache for system-prompt reuse across requests.
 //! - LoRA adapter registry (name → Arc<LoadedLora>).
+//! - Persistent thread store + run queue (Assistants API).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -18,9 +19,12 @@ use tokio::sync::mpsc;
 
 use crate::batch::{new_batch_store, BatchStore};
 use crate::batch_spool::{BatchQueueSender, BatchStore as DiskBatchStore};
+use crate::files_store::FilesStore;
 use crate::metrics::Metrics;
 use crate::queue::{BatchRequest, VocabBytes};
 use crate::router::ModelPool;
+use crate::threads::stream::RunEventSender;
+use crate::threads::{RunQueueSender, ThreadStore};
 
 use oxillama_runtime::sampling::SamplerConfig;
 use oxillama_runtime::{LoadedLora, PrefixCacheConfig, PrefixKvCache};
@@ -84,6 +88,27 @@ pub struct AppState {
     /// Populated via `POST /admin/loras`.  Request handlers look up adapters
     /// by name and pass them to the worker via `BatchRequest::Generate`.
     pub loras: Arc<RwLock<HashMap<String, Arc<LoadedLora>>>>,
+
+    /// Persistent thread/message/run store for the Assistants API.
+    ///
+    /// `None` when the Assistants API has not been configured (no `--threads-dir`
+    /// flag was passed at startup).  Route handlers return 503 in this case.
+    pub threads_store: Option<Arc<ThreadStore>>,
+
+    /// Sender into the run processing queue for the Assistants API.
+    ///
+    /// `None` when `threads_store` is `None`.
+    pub run_queue_tx: Option<RunQueueSender>,
+
+    /// Persistent files store for the Files API (`/v1/files`).
+    ///
+    /// `None` when the Files API has not been configured.
+    pub files_store: Option<Arc<FilesStore>>,
+
+    /// Broadcast sender for run lifecycle events (SSE streaming).
+    ///
+    /// `None` when SSE streaming is not enabled.
+    pub run_event_tx_broadcast: Option<RunEventSender>,
 }
 
 impl AppState {
@@ -126,7 +151,40 @@ impl AppState {
             model_pool: Mutex::new(ModelPool::new(4, 0)),
             prefix_cache: Arc::new(Mutex::new(PrefixKvCache::new(PrefixCacheConfig::default()))),
             loras: Arc::new(RwLock::new(HashMap::new())),
+            threads_store: None,
+            run_queue_tx: None,
+            files_store: None,
+            run_event_tx_broadcast: None,
         }
+    }
+
+    /// Attach a threads store and run queue to this `AppState`.
+    ///
+    /// Returns `self` with the `threads_store` and `run_queue_tx` fields
+    /// populated.  Designed for use in a builder chain:
+    ///
+    /// ```text
+    /// let state = AppState::new(...).with_threads(store, tx);
+    /// ```
+    pub fn with_threads(mut self, store: Arc<ThreadStore>, tx: RunQueueSender) -> Self {
+        self.threads_store = Some(store);
+        self.run_queue_tx = Some(tx);
+        self
+    }
+
+    /// Attach a files store to this `AppState`.
+    pub fn with_files(mut self, store: Arc<FilesStore>) -> Self {
+        self.files_store = Some(store);
+        self
+    }
+
+    /// Attach a run-event broadcast sender to this `AppState`.
+    ///
+    /// When set, the run worker broadcasts lifecycle events that SSE handlers
+    /// can subscribe to.
+    pub fn with_run_event_sender(mut self, tx: RunEventSender) -> Self {
+        self.run_event_tx_broadcast = Some(tx);
+        self
     }
 
     /// Create app state with an explicit disk batch store and queue sender.
@@ -160,6 +218,10 @@ impl AppState {
             model_pool: Mutex::new(ModelPool::new(4, 0)),
             prefix_cache: Arc::new(Mutex::new(PrefixKvCache::new(PrefixCacheConfig::default()))),
             loras: Arc::new(RwLock::new(HashMap::new())),
+            threads_store: None,
+            run_queue_tx: None,
+            files_store: None,
+            run_event_tx_broadcast: None,
         }
     }
 }

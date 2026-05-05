@@ -28,6 +28,7 @@ tracing.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 tokio-util.workspace = true
+futures-util.workspace = true
 
 # ── JWT auth (optional, feature = "jwt") ──
 hmac = { workspace = true, optional = true }

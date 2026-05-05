@@ -1,11 +1,15 @@
 //! OxiLLaMa CLI — Pure Rust LLM inference engine.
 
 mod config;
+mod convert;
 mod exit_codes;
 mod hub;
+mod quantize;
 mod session;
+mod tokenize;
 #[cfg(feature = "tui")]
 mod tui;
+mod verify;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -250,6 +254,21 @@ enum Commands {
         #[command(subcommand)]
         command: HubCommand,
     },
+
+    /// Re-quantize a GGUF model to a different quantization format.
+    Quantize(quantize::QuantizeArgs),
+
+    /// Convert a safetensors file to GGUF format.
+    Convert(convert::ConvertArgs),
+
+    /// Verify GGUF file integrity (magic, version, parse, optional SHA-256).
+    Verify(verify::VerifyArgs),
+
+    /// Tokenize a text string using the model's embedded tokenizer.
+    Tokenize(tokenize::TokenizeArgs),
+
+    /// Decode token IDs back to text using the model's embedded tokenizer.
+    Detokenize(tokenize::DetokenizeArgs),
 
     /// Generate shell completion scripts.
     Completions {
@@ -908,6 +927,26 @@ async fn run() -> Result<()> {
                 hub::pull(opts).map_err(|e| anyhow::anyhow!("hub pull failed: {e}"))?;
             }
         },
+
+        Commands::Quantize(args) => {
+            quantize::run_quantize(&args)?;
+        }
+
+        Commands::Convert(args) => {
+            convert::run_convert(&args)?;
+        }
+
+        Commands::Verify(args) => {
+            verify::run_verify(&args)?;
+        }
+
+        Commands::Tokenize(args) => {
+            tokenize::run_tokenize(&args)?;
+        }
+
+        Commands::Detokenize(args) => {
+            tokenize::run_detokenize(&args)?;
+        }
 
         Commands::Completions { shell } => {
             clap_complete::generate(

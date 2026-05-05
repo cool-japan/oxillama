@@ -9,6 +9,7 @@ pub mod layer_norm;
 pub mod linear;
 pub mod mla;
 pub mod moe;
+pub mod mrope;
 pub mod rms_norm;
 pub mod rope;
 pub mod sequence_state;
@@ -16,6 +17,7 @@ pub mod swiglu;
 
 pub use attention::effective_attention_span;
 pub use mla::{mla_forward, MlaConfig, MlaLatentCache, MlaWeights};
+pub use mrope::MRopeTable;
 pub use sequence_state::{
     AttentionSequenceState, Mamba2SequenceState, SequenceState, SsmLayerState,
 };

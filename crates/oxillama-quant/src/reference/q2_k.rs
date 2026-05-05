@@ -182,6 +182,120 @@ impl QuantKernel for Q2KRef {
         Ok(())
     }
 
+    /// Override required: the trait default assumes 1 Q8_0 block per weight block,
+    /// but Q2_K has 256 weights per block → 8 Q8_0 blocks (32 weights each).
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(Q2_K_BLOCK_SIZE);
+        let row_bytes = blocks_per_row * Q2_K_BLOCK_BYTES;
+        let q8_blocks_per_row = blocks_per_row * 8;
+        let acts_needed = q8_blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            let mut sum = 0.0f32;
+
+            for blk in 0..blocks_per_row {
+                let bo = row_start + blk * Q2_K_BLOCK_BYTES;
+                let block = &weights[bo..bo + Q2_K_BLOCK_BYTES];
+                let scales = &block[0..16];
+                let qs = &block[16..80];
+                let d = f16_to_f32(u16::from_le_bytes([block[80], block[81]]));
+                let dmin = f16_to_f32(u16::from_le_bytes([block[82], block[83]]));
+
+                let mut is = 0usize;
+                let mut qs_off = 0usize;
+                let mut col_off = 0usize;
+
+                for _group in 0..2 {
+                    for shift in (0..8usize).step_by(2) {
+                        // Sub-block A
+                        {
+                            let sc_byte = scales[is];
+                            is += 1;
+                            let dl = d * (sc_byte & 0x0F) as f32;
+                            let ml = dmin * (sc_byte >> 4) as f32;
+                            let q8_blk_idx = blk * 8 + col_off / 32;
+                            let q8_lane_base = col_off % 32;
+                            let a_start = q8_blk_idx * Q8_0_BLOCK_BYTES;
+                            let a_block = &acts_q8[a_start..a_start + Q8_0_BLOCK_BYTES];
+                            let d_a = f16_to_f32(u16::from_le_bytes([a_block[0], a_block[1]]));
+                            let q8_vals = &a_block[2..];
+                            let mut dot = 0.0f32;
+                            let mut sum_a = 0.0f32;
+                            for l in 0..16 {
+                                if col_off + l < n_cols.saturating_sub(blk * Q2_K_BLOCK_SIZE) {
+                                    let q2 = ((qs[qs_off + l] >> shift) & 3) as f32;
+                                    let q_a = q8_vals[q8_lane_base + l] as i8 as f32;
+                                    dot += q2 * q_a;
+                                    sum_a += q_a;
+                                }
+                            }
+                            sum += (dl * dot - ml * sum_a) * d_a;
+                            col_off += 16;
+                        }
+                        // Sub-block B
+                        {
+                            let sc_byte = scales[is];
+                            is += 1;
+                            let dl = d * (sc_byte & 0x0F) as f32;
+                            let ml = dmin * (sc_byte >> 4) as f32;
+                            let q8_blk_idx = blk * 8 + col_off / 32;
+                            let q8_lane_base = col_off % 32;
+                            let a_start = q8_blk_idx * Q8_0_BLOCK_BYTES;
+                            let a_block = &acts_q8[a_start..a_start + Q8_0_BLOCK_BYTES];
+                            let d_a = f16_to_f32(u16::from_le_bytes([a_block[0], a_block[1]]));
+                            let q8_vals = &a_block[2..];
+                            let mut dot = 0.0f32;
+                            let mut sum_a = 0.0f32;
+                            for l in 0..16 {
+                                if col_off + l < n_cols.saturating_sub(blk * Q2_K_BLOCK_SIZE) {
+                                    let q2 = ((qs[qs_off + 16 + l] >> shift) & 3) as f32;
+                                    let q_a = q8_vals[q8_lane_base + l] as i8 as f32;
+                                    dot += q2 * q_a;
+                                    sum_a += q_a;
+                                }
+                            }
+                            sum += (dl * dot - ml * sum_a) * d_a;
+                            col_off += 16;
+                        }
+                    }
+                    qs_off += 32;
+                }
+            }
+
+            *out_val += sum;
+        }
+
+        Ok(())
+    }
+
     fn block_size(&self) -> usize {
         Q2_K_BLOCK_SIZE
     }
@@ -194,6 +308,9 @@ impl QuantKernel for Q2KRef {
         "Q2_K"
     }
 }
+
+/// Q8_0 bytes per block for fused GEMV.
+const Q8_0_BLOCK_BYTES: usize = 34;
 
 fn f16_to_f32(bits: u16) -> f32 {
     half::f16::from_bits(bits).to_f32()
