@@ -256,7 +256,11 @@ pub async fn chat_completions(
         });
 
         // Dispatch to the worker.
-        let lora_selection = request.lora.as_ref().map(|l| l.to_pairs()).unwrap_or_default();
+        let lora_selection = request
+            .lora
+            .as_ref()
+            .map(|l| l.to_pairs())
+            .unwrap_or_default();
         state
             .queue
             .send(BatchRequest::GenerateStream {
@@ -310,7 +314,11 @@ pub async fn chat_completions(
         // Non-streaming: send a Generate request and await the result.
         let (reply_tx, reply_rx) = oneshot::channel::<Result<(String, UsageStats), String>>();
 
-        let lora_selection = request.lora.as_ref().map(|l| l.to_pairs()).unwrap_or_default();
+        let lora_selection = request
+            .lora
+            .as_ref()
+            .map(|l| l.to_pairs())
+            .unwrap_or_default();
         state
             .queue
             .send(BatchRequest::Generate {

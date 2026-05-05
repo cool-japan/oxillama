@@ -124,9 +124,7 @@ impl AppState {
             batch_disk_store,
             batch_queue_tx,
             model_pool: Mutex::new(ModelPool::new(4, 0)),
-            prefix_cache: Arc::new(Mutex::new(PrefixKvCache::new(
-                PrefixCacheConfig::default(),
-            ))),
+            prefix_cache: Arc::new(Mutex::new(PrefixKvCache::new(PrefixCacheConfig::default()))),
             loras: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -160,9 +158,7 @@ impl AppState {
             batch_disk_store,
             batch_queue_tx,
             model_pool: Mutex::new(ModelPool::new(4, 0)),
-            prefix_cache: Arc::new(Mutex::new(PrefixKvCache::new(
-                PrefixCacheConfig::default(),
-            ))),
+            prefix_cache: Arc::new(Mutex::new(PrefixKvCache::new(PrefixCacheConfig::default()))),
             loras: Arc::new(RwLock::new(HashMap::new())),
         }
     }

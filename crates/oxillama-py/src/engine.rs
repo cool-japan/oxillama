@@ -798,8 +798,9 @@ impl PyEngine {
         model_path: Option<PathBuf>,
     ) -> PyResult<Self> {
         // Read snapshot bytes with GIL released.
-        let bytes =
-            py.detach(|| std::fs::read(&path)).map_err(crate::snapshot::io_to_py)?;
+        let bytes = py
+            .detach(|| std::fs::read(&path))
+            .map_err(crate::snapshot::io_to_py)?;
 
         // Resolve model path: use embedded path if not overridden.
         let resolved_model_path: PathBuf = match model_path {
@@ -812,11 +813,9 @@ impl PyEngine {
         };
 
         // Load model and restore state with GIL released (may take seconds).
-        py.detach(|| {
-            oxillama_runtime::InferenceEngine::resume(&bytes, &resolved_model_path)
-        })
-        .map_err(runtime_to_py)
-        .map(|inner| Self { inner })
+        py.detach(|| oxillama_runtime::InferenceEngine::resume(&bytes, &resolved_model_path))
+            .map_err(runtime_to_py)
+            .map(|inner| Self { inner })
     }
 
     /// Pickle refusal — Engine state must be persisted via `Engine.snapshot(path)`.

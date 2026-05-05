@@ -550,9 +550,10 @@ async fn run() -> Result<()> {
             let prefix_cache = std::sync::Arc::new(std::sync::Mutex::new(
                 oxillama_runtime::PrefixKvCache::new(oxillama_runtime::PrefixCacheConfig::default()),
             ));
-            let loras = std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::<String, std::sync::Arc<oxillama_runtime::LoadedLora>>::new(),
-            ));
+            let loras = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::<
+                String,
+                std::sync::Arc<oxillama_runtime::LoadedLora>,
+            >::new()));
             oxillama_server::spawn_inference_worker(
                 engine,
                 queue_rx,

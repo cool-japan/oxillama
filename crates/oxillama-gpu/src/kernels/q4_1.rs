@@ -409,7 +409,10 @@ mod tests {
         let dispatcher = crate::GpuDispatcher::new();
         let kernel = dispatcher.get_kernel(oxillama_gguf::GgufTensorType::Q4_1);
         if dispatcher.has_gpu() {
-            assert!(kernel.is_some(), "Q4_1 kernel must be present when GPU is available");
+            assert!(
+                kernel.is_some(),
+                "Q4_1 kernel must be present when GPU is available"
+            );
         } else {
             assert!(kernel.is_none(), "Q4_1 kernel must be absent without GPU");
         }
@@ -436,11 +439,17 @@ mod tests {
 
         // Row 0: d=1.0, m=0.0, nibble=10 → w = 10.0
         for &v in &result[..32] {
-            assert!((v - 10.0).abs() < 1e-4, "row0 weight: expected 10.0, got {v}");
+            assert!(
+                (v - 10.0).abs() < 1e-4,
+                "row0 weight: expected 10.0, got {v}"
+            );
         }
         // Row 1: d=2.0, m=1.0, nibble=5 → w = 2.0*5 + 1.0 = 11.0
         for &v in &result[32..] {
-            assert!((v - 11.0).abs() < 1e-4, "row1 weight: expected 11.0, got {v}");
+            assert!(
+                (v - 11.0).abs() < 1e-4,
+                "row1 weight: expected 11.0, got {v}"
+            );
         }
     }
 
@@ -473,9 +482,8 @@ mod tests {
             None => return,
         };
 
-        let make_block = |d: f32, m: f32, pattern: u8| -> Vec<u8> {
-            make_q4_1_block(d, m, &[pattern; 16])
-        };
+        let make_block =
+            |d: f32, m: f32, pattern: u8| -> Vec<u8> { make_q4_1_block(d, m, &[pattern; 16]) };
 
         // Row 0: d=1.0, m=0.0, nibbles=0xAA (10) → weights all 10.0
         // Row 1: d=0.5, m=1.0, nibbles=0x22 (2)  → weights all 2.0

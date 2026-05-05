@@ -95,12 +95,10 @@ fn run_server(model_path: String, port: u16) -> anyhow::Result<()> {
     let prefix_cache = std::sync::Arc::new(std::sync::Mutex::new(
         oxillama_runtime::PrefixKvCache::new(oxillama_runtime::PrefixCacheConfig::default()),
     ));
-    let loras = std::sync::Arc::new(std::sync::RwLock::new(
-        std::collections::HashMap::<
-            String,
-            std::sync::Arc<oxillama_runtime::LoadedLora>,
-        >::new(),
-    ));
+    let loras = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::<
+        String,
+        std::sync::Arc<oxillama_runtime::LoadedLora>,
+    >::new()));
     spawn_inference_worker(engine, rx, prefix_cache, loras);
 
     // ── Build shared state ────────────────────────────────────────────────────

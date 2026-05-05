@@ -452,7 +452,12 @@ mod tests {
         }
         // Build 16 blocks concatenated
         let single = make_q2k_block(0.5, 0.25, &scales, &qs);
-        let data: Vec<u8> = single.iter().cloned().cycle().take(BLOCK_BYTES * 16).collect();
+        let data: Vec<u8> = single
+            .iter()
+            .cloned()
+            .cycle()
+            .take(BLOCK_BYTES * 16)
+            .collect();
 
         let mut out_avx512 = vec![0.0f32; BLOCK_SIZE];
         let mut out_ref = vec![0.0f32; BLOCK_SIZE];
@@ -750,10 +755,12 @@ mod tests {
         data.extend_from_slice(&block2);
         data.extend_from_slice(&block3);
 
-        let tensor_avx512 =
-            QuantTensor::new(data.clone(), vec![4, 256], oxillama_gguf::GgufTensorType::Q2K);
-        let tensor_ref =
-            QuantTensor::new(data, vec![4, 256], oxillama_gguf::GgufTensorType::Q2K);
+        let tensor_avx512 = QuantTensor::new(
+            data.clone(),
+            vec![4, 256],
+            oxillama_gguf::GgufTensorType::Q2K,
+        );
+        let tensor_ref = QuantTensor::new(data, vec![4, 256], oxillama_gguf::GgufTensorType::Q2K);
 
         let input: Vec<f32> = (0..256).map(|i| (i as f32 * 0.01) - 1.28).collect();
         let mut out_avx512 = vec![0.0f32; 4];
@@ -785,10 +792,12 @@ mod tests {
         data.extend_from_slice(&block);
         data.extend_from_slice(&block);
 
-        let tensor_avx512 =
-            QuantTensor::new(data.clone(), vec![1, 512], oxillama_gguf::GgufTensorType::Q2K);
-        let tensor_ref =
-            QuantTensor::new(data, vec![1, 512], oxillama_gguf::GgufTensorType::Q2K);
+        let tensor_avx512 = QuantTensor::new(
+            data.clone(),
+            vec![1, 512],
+            oxillama_gguf::GgufTensorType::Q2K,
+        );
+        let tensor_ref = QuantTensor::new(data, vec![1, 512], oxillama_gguf::GgufTensorType::Q2K);
 
         let input = vec![1.0f32; 512];
         let mut out_avx512 = vec![0.0f32; 1];

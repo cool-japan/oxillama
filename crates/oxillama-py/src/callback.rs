@@ -213,10 +213,15 @@ impl ProgressBridge {
 
         // Build the (tokens, elapsed_secs, is_final, text_so_far) 4-tuple
         // that the Python wrapper turns into a `ProgressEvent`.
-        let payload = PyTuple::new(py, [tokens_now.into_pyobject(py)?.into_any(),
-            elapsed.into_pyobject(py)?.into_any(),
-            is_final.into_pyobject(py)?.to_owned().into_any(),
-            text_view.into_pyobject(py)?.into_any()])?;
+        let payload = PyTuple::new(
+            py,
+            [
+                tokens_now.into_pyobject(py)?.into_any(),
+                elapsed.into_pyobject(py)?.into_any(),
+                is_final.into_pyobject(py)?.to_owned().into_any(),
+                text_view.into_pyobject(py)?.into_any(),
+            ],
+        )?;
 
         match self.callback.call1(py, (payload,)) {
             Ok(_) => Ok(()),

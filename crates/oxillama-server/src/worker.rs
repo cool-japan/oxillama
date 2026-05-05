@@ -82,11 +82,7 @@ fn try_prefix_cache_hit(
         max_memory_bytes: usize::MAX,
         min_prefix_len: 1,
     });
-    let snap = oxillama_runtime::CachedKvState::new(
-        cached_keys,
-        cached_values,
-        effective_match,
-    );
+    let snap = oxillama_runtime::CachedKvState::new(cached_keys, cached_values, effective_match);
     scratch.store_snapshot(&tokens[..effective_match], snap);
 
     let logits = if let Some((_m, cached)) = scratch.lookup(&tokens[..effective_match]) {
@@ -248,9 +244,7 @@ fn run_worker(
                     engine.unapply_all_loras();
                 }
 
-                let result = result
-                    .map(|(_, usage)| usage)
-                    .map_err(|e| e.to_string());
+                let result = result.map(|(_, usage)| usage).map_err(|e| e.to_string());
 
                 if reply.send(result).is_err() {
                     warn!("GenerateStream reply channel closed before result was delivered");
@@ -456,7 +450,10 @@ mod tests {
 
         // The worker should return an error (model not loaded), not panic.
         let result = reply_rx.await.expect("reply future should resolve");
-        assert!(result.is_err(), "should return engine error, got: {result:?}");
+        assert!(
+            result.is_err(),
+            "should return engine error, got: {result:?}"
+        );
     }
 
     /// `cache_prompt = false` path: worker resets and calls generate_with_config.

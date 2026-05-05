@@ -408,7 +408,10 @@ mod tests {
         let dispatcher = crate::GpuDispatcher::new();
         let kernel = dispatcher.get_kernel(oxillama_gguf::GgufTensorType::Q5_0);
         if dispatcher.has_gpu() {
-            assert!(kernel.is_some(), "Q5_0 kernel must be present when GPU is available");
+            assert!(
+                kernel.is_some(),
+                "Q5_0 kernel must be present when GPU is available"
+            );
         } else {
             assert!(kernel.is_none(), "Q5_0 kernel must be absent without GPU");
         }
@@ -438,10 +441,7 @@ mod tests {
             );
         }
         for &v in &result[32..] {
-            assert!(
-                (v - 7.5).abs() < 1e-4,
-                "row1 weight: expected 7.5, got {v}"
-            );
+            assert!((v - 7.5).abs() < 1e-4, "row1 weight: expected 7.5, got {v}");
         }
     }
 

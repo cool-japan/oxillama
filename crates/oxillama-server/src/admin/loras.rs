@@ -53,8 +53,7 @@ pub async fn admin_register_lora(
 
     let path = body.path.clone();
     let result = tokio::task::spawn_blocking(move || {
-        oxillama_runtime::LoadedLora::load(&path)
-            .map_err(|e| format!("{e}"))
+        oxillama_runtime::LoadedLora::load(&path).map_err(|e| format!("{e}"))
     })
     .await;
 
@@ -202,10 +201,7 @@ mod tests {
         let resp = app.oneshot(req).await.expect("oneshot");
         assert_eq!(resp.status(), StatusCode::OK);
         let json = parse_json(resp).await;
-        assert!(
-            json["loras"].is_array(),
-            "loras must be an array: {json}"
-        );
+        assert!(json["loras"].is_array(), "loras must be an array: {json}");
         assert_eq!(
             json["loras"].as_array().unwrap().len(),
             0,

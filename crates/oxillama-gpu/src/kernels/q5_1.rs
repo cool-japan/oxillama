@@ -395,7 +395,10 @@ mod tests {
         let block = make_q5_1_block(d, m, 0xFFFF_FFFFu32, &[0xFFu8; 16]);
         let result = dequant_q5_1_to_f32(&block, 1, 32).expect("dequant");
         for (i, &v) in result.iter().enumerate() {
-            assert!((v - 31.0).abs() < 1e-4, "weight[{i}] expected 31.0, got {v}");
+            assert!(
+                (v - 31.0).abs() < 1e-4,
+                "weight[{i}] expected 31.0, got {v}"
+            );
         }
     }
 
@@ -407,7 +410,10 @@ mod tests {
         let dispatcher = crate::GpuDispatcher::new();
         let kernel = dispatcher.get_kernel(oxillama_gguf::GgufTensorType::Q5_1);
         if dispatcher.has_gpu() {
-            assert!(kernel.is_some(), "Q5_1 kernel must be present when GPU is available");
+            assert!(
+                kernel.is_some(),
+                "Q5_1 kernel must be present when GPU is available"
+            );
         } else {
             assert!(kernel.is_none(), "Q5_1 kernel must be absent without GPU");
         }
@@ -431,10 +437,7 @@ mod tests {
         assert_eq!(result.len(), 64, "must produce 2 * BLOCK_SIZE values");
 
         for &v in &result[..32] {
-            assert!(
-                v.abs() < 1e-4,
-                "row0 weight: expected 0.0, got {v}"
-            );
+            assert!(v.abs() < 1e-4, "row0 weight: expected 0.0, got {v}");
         }
         for &v in &result[32..] {
             assert!(

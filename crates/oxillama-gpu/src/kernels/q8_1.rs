@@ -385,7 +385,10 @@ mod tests {
         let dispatcher = crate::GpuDispatcher::new();
         let kernel = dispatcher.get_kernel(oxillama_gguf::GgufTensorType::Q8_1);
         if dispatcher.has_gpu() {
-            assert!(kernel.is_some(), "Q8_1 kernel must be present when GPU is available");
+            assert!(
+                kernel.is_some(),
+                "Q8_1 kernel must be present when GPU is available"
+            );
         } else {
             assert!(kernel.is_none(), "Q8_1 kernel must be absent without GPU");
         }
