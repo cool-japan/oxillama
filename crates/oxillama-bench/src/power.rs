@@ -36,6 +36,7 @@
 //! ```
 
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::time::SystemTime;
 
 // ── Error types ────────────────────────────────────────────────────────────────
@@ -108,6 +109,7 @@ impl EnergyReading {
 /// counter resets transparently.
 pub struct RaplReader {
     /// Paths to each top-level domain's `energy_uj` file.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     domain_paths: Vec<PathBuf>,
     /// Wraparound limit read once from `max_energy_range_uj` on open.
     pub max_energy_uj: u64,
