@@ -146,6 +146,9 @@ impl KernelDispatcher {
                 GgufTensorType::Q4_0 => return Ok(Box::new(simd::avx512::Q4_0Avx512)),
                 GgufTensorType::Q4_1 => return Ok(Box::new(simd::avx512::Q4_1Avx512)),
                 GgufTensorType::Q8_0 => return Ok(Box::new(simd::avx512::Q8_0Avx512)),
+                GgufTensorType::Q8_1 => return Ok(Box::new(simd::avx512::Q8_1Avx512)),
+                GgufTensorType::Q2K => return Ok(Box::new(simd::avx512::Q2_KAvx512)),
+                GgufTensorType::Q3K => return Ok(Box::new(simd::avx512::Q3_KAvx512)),
                 GgufTensorType::Q4K => return Ok(Box::new(simd::avx512::Q4_KAvx512)),
                 GgufTensorType::Q1_0G128 => return Ok(Box::new(simd::avx512::Q1_0G128Avx512)),
                 GgufTensorType::Q5K => return Ok(Box::new(simd::avx512::Q5_KAvx512)),
@@ -155,6 +158,10 @@ impl KernelDispatcher {
                 GgufTensorType::Tq2_0 => return Ok(Box::new(simd::avx512::Tq2_0Avx512)),
                 GgufTensorType::Q5_0 => return Ok(Box::new(simd::avx512::Q5_0Avx512)),
                 GgufTensorType::Q8K => return Ok(Box::new(simd::avx512::Q8_KAvx512)),
+                GgufTensorType::Iq2Xxs => return Ok(Box::new(simd::avx512::Iq2XxsAvx512)),
+                GgufTensorType::Iq2Xs => return Ok(Box::new(simd::avx512::Iq2XsAvx512)),
+                GgufTensorType::Iq3S => return Ok(Box::new(simd::avx512::Iq3SAvx512)),
+                GgufTensorType::Iq4Xs => return Ok(Box::new(simd::avx512::Iq4XsAvx512)),
                 _ => {}
             }
         }

@@ -66,7 +66,7 @@ pub fn batched_flash_attention<V: BatchedKvView>(
     }
 
     let head_stride = num_heads * head_dim;
-    if head_stride == 0 || q_batch.len() % head_stride != 0 {
+    if head_stride == 0 || !q_batch.len().is_multiple_of(head_stride) {
         return Err(RuntimeError::AttentionError {
             message: format!(
                 "q_batch length {} is not a multiple of num_heads * head_dim = {}",

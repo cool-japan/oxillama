@@ -200,7 +200,7 @@ impl WebGpuDequantPipeline {
         const BLOCK_BYTES: usize = 18;
         const BLOCK_SIZE: usize = 32;
 
-        if data.len() % BLOCK_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_BYTES) {
             return Err(format!(
                 "Q4_0 data length {} is not a multiple of {BLOCK_BYTES} bytes per block",
                 data.len(),
@@ -232,7 +232,7 @@ impl WebGpuDequantPipeline {
         const BLOCK_BYTES: usize = 34;
         const BLOCK_SIZE: usize = 32;
 
-        if data.len() % BLOCK_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_BYTES) {
             return Err(format!(
                 "Q8_0 data length {} is not a multiple of {BLOCK_BYTES} bytes per block",
                 data.len(),

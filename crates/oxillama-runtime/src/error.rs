@@ -117,4 +117,12 @@ pub enum RuntimeError {
     /// An internal RwLock or Mutex was poisoned.
     #[error("lock poisoned")]
     LockPoisoned,
+
+    /// Speculative-engine snapshot format is incompatible with this runtime.
+    #[error("speculative snapshot incompatible: {0}")]
+    SpecSnapshotIncompatible(String),
+
+    /// Cannot pool an empty sequence (seq_len = 0).
+    #[error("cannot pool empty sequence")]
+    EmptySequence,
 }

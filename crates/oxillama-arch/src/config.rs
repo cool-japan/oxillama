@@ -177,6 +177,9 @@ pub struct ModelConfig {
     pub rope_scaling_type: RopeScalingType,
     /// RoPE scaling factor (`1.0` = no scaling).
     pub rope_scaling_factor: f32,
+    /// Vision encoder configuration (only populated for multimodal models like
+    /// Qwen2-VL).  `None` for text-only models.
+    pub vision_config: Option<VisionConfig>,
 }
 
 impl Default for ModelConfig {
@@ -206,8 +209,28 @@ impl Default for ModelConfig {
             swa_interleaved: false,
             rope_scaling_type: RopeScalingType::Standard,
             rope_scaling_factor: 1.0,
+            vision_config: None,
         }
     }
+}
+
+/// Vision encoder configuration for multimodal models (e.g. Qwen2-VL).
+///
+/// Populated from `vision.*` GGUF metadata keys when available.
+#[derive(Debug, Clone)]
+pub struct VisionConfig {
+    /// Input image size (square; width == height).
+    pub image_size: usize,
+    /// Patch size in pixels (square patches).
+    pub patch_size: usize,
+    /// Vision encoder hidden size.
+    pub hidden_size: usize,
+    /// Number of attention heads in the vision encoder.
+    pub num_heads: usize,
+    /// Number of transformer layers in the vision encoder.
+    pub num_layers: usize,
+    /// Window size for windowed attention (0 = full attention).
+    pub window_size: usize,
 }
 
 impl ModelConfig {
@@ -338,6 +361,7 @@ impl ModelConfig {
             swa_interleaved,
             rope_scaling_type,
             rope_scaling_factor,
+            vision_config: None,
         })
     }
 }

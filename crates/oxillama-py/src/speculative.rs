@@ -10,11 +10,17 @@
 //! `py.detach(...)` so Python threads remain unblocked during the
 //! Rust inference loop.  Streaming callbacks re-acquire the GIL per-token.
 
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyTuple, PyType};
 
 use oxillama_runtime::{SpeculativeConfig as RustSpeculativeConfig, SpeculativeEngine};
 
+use crate::callback::{
+    make_progress_bridge, ProgressBridge, DEFAULT_THROTTLE_MS, DEFAULT_THROTTLE_TOKENS,
+};
 use crate::engine::PyEngineConfig;
 use crate::error::runtime_to_py;
 
@@ -133,19 +139,196 @@ impl PySpeculativeEngine {
     /// Args:
     ///     prompt:     Input text.
     ///     max_tokens: Maximum number of new tokens (default 128).
+    ///     progress:   See :class:`oxillama_py.Engine.generate` (same contract).
+    ///     progress_throttle_ms: see :class:`oxillama_py.Engine.generate`.
+    ///     progress_throttle_tokens: see :class:`oxillama_py.Engine.generate`.
+    ///     progress_capture_text: see :class:`oxillama_py.Engine.generate`.
+    ///     strict_progress: see :class:`oxillama_py.Engine.generate`.
     ///
     /// Returns:
     ///     str: Generated text.
-    #[pyo3(signature = (prompt, max_tokens = 128))]
+    #[pyo3(signature = (
+        prompt,
+        max_tokens = 128,
+        *,
+        progress = None,
+        progress_throttle_ms = None,
+        progress_throttle_tokens = None,
+        progress_capture_text = false,
+        strict_progress = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &mut self,
         py: Python<'_>,
         prompt: &str,
         max_tokens: usize,
+        progress: Option<Py<PyAny>>,
+        progress_throttle_ms: Option<u64>,
+        progress_throttle_tokens: Option<usize>,
+        progress_capture_text: bool,
+        strict_progress: bool,
     ) -> PyResult<String> {
         let inner = &mut self.inner;
-        py.detach(|| inner.generate(prompt, max_tokens, |_| {}))
+        let bridge = make_progress_bridge(
+            py,
+            progress.as_ref(),
+            max_tokens,
+            progress_throttle_ms.unwrap_or(DEFAULT_THROTTLE_MS),
+            progress_throttle_tokens.unwrap_or(DEFAULT_THROTTLE_TOKENS),
+            progress_capture_text,
+        )?;
+        let bridge_arc: Option<Arc<Mutex<ProgressBridge>>> =
+            bridge.map(|b| Arc::new(Mutex::new(b)));
+        let result = py
+            .detach(|| {
+                let bridge_inner = bridge_arc.clone();
+                inner.generate(prompt, max_tokens, move |tok| {
+                    if let Some(ref bridge) = bridge_inner {
+                        Python::attach(|py| {
+                            if let Ok(mut b) = bridge.lock() {
+                                let _ = b.note_token(py, tok, false, false);
+                            }
+                        });
+                    }
+                })
+            })
+            .map_err(runtime_to_py);
+        if let Some(bridge) = bridge_arc.as_ref() {
+            if let Ok(mut b) = bridge.lock() {
+                if result.is_ok() {
+                    b.fire_final(py);
+                }
+                b.finalise(py, result.as_ref().err());
+                if strict_progress {
+                    if let Some(err) = b.take_stashed_error() {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Persist the speculative engine state to a file at `path`.
+    ///
+    /// The file is written atomically (temp-file → rename) within the same
+    /// directory as `path`.  Pass `path` to `SpeculativeEngine.restore` along
+    /// with the original `target_model` and `draft_model` paths to resume.
+    ///
+    /// Releases the GIL during the Rust snapshot + I/O work.
+    ///
+    /// Raises:
+    ///     IOError: if the target directory does not exist or is not writable.
+    ///     RuntimeError: if either sub-engine has no model loaded.
+    fn snapshot(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        let inner = &self.inner;
+        let path = Path::new(path).to_path_buf();
+        py.detach(|| inner.snapshot_to_file(&path))
             .map_err(runtime_to_py)
+    }
+
+    /// Return the snapshot as raw bytes (in-memory, no file I/O).
+    ///
+    /// Useful for network transport, embedding in a database, or piping to
+    /// another process.  The bytes can be written to a file and later passed
+    /// to `SpeculativeEngine.restore`.
+    ///
+    /// Releases the GIL during the Rust snapshot work.
+    fn snapshot_bytes(&self, py: Python<'_>) -> PyResult<Vec<u8>> {
+        let inner = &self.inner;
+        py.detach(|| inner.snapshot()).map_err(runtime_to_py)
+    }
+
+    /// Reconstruct a `SpeculativeEngine` from a snapshot file.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` — Path to the snapshot file produced by `snapshot()`.
+    /// * `target_model` — Path to the target (large) GGUF model file.  Must
+    ///   match the fingerprint embedded in the snapshot.
+    /// * `draft_model` — Path to the draft (small) GGUF model file.  Must
+    ///   match the fingerprint embedded in the snapshot.
+    ///
+    /// Releases the GIL while loading both models and restoring KV cache state.
+    ///
+    /// Raises:
+    ///     IOError: if the snapshot file or either model file cannot be read.
+    ///     RuntimeError: if the model fingerprint does not match the snapshot.
+    #[classmethod]
+    fn restore(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        path: &str,
+        target_model: &str,
+        draft_model: &str,
+    ) -> PyResult<Self> {
+        let path = Path::new(path).to_path_buf();
+        let target_path = Path::new(target_model).to_path_buf();
+        let draft_path = Path::new(draft_model).to_path_buf();
+        let inner = py
+            .detach(|| SpeculativeEngine::resume_from_file(&path, &target_path, &draft_path))
+            .map_err(runtime_to_py)?;
+        Ok(Self { inner })
+    }
+
+    /// Pickle support — writes the engine to a temp file and returns a
+    /// `(restore, (path, target_model, draft_model))` tuple so that Python's
+    /// `pickle` module can serialise and restore this object.
+    ///
+    /// The snapshot is written to `std::env::temp_dir()`.  The caller is
+    /// responsible for managing the temp file's lifetime if they need to
+    /// pickle and immediately clean up.
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        use pyo3::types::PyString;
+
+        // Write snapshot to a temp file.
+        let tmp_dir = std::env::temp_dir();
+        let snap_path = tmp_dir.join(format!(
+            "oxillama_spec_snap_{}.bin",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        self.inner
+            .snapshot_to_file(&snap_path)
+            .map_err(runtime_to_py)?;
+
+        let path_str = snap_path.to_str().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "snapshot temp path contains non-UTF-8 characters",
+            )
+        })?;
+
+        // We need the target and draft model paths from the snapshot.
+        // Re-read the snapshot to extract them.
+        let bytes = std::fs::read(&snap_path)
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+        let spec_snap = oxillama_runtime::snapshot::SpeculativeEngineSnapshot::decode(&bytes)
+            .map_err(runtime_to_py)?;
+
+        let target_model_path = spec_snap.target_snapshot.model_path.clone();
+        let draft_model_path = spec_snap.draft_snapshot.model_path.clone();
+
+        // Build (SpeculativeEngine.restore, (path, target_model, draft_model))
+        let cls = py.get_type::<Self>();
+        let args = PyTuple::new(
+            py,
+            &[
+                PyString::new(py, path_str).into_any(),
+                PyString::new(py, &target_model_path).into_any(),
+                PyString::new(py, &draft_model_path).into_any(),
+            ],
+        )?;
+        let restore_method = cls.getattr("restore")?;
+        let result = PyTuple::new(py, &[restore_method.into_any(), args.into_any()])?;
+        Ok(result.into())
+    }
+
+    /// Pickle protocol-aware variant (delegates to `__reduce__`).
+    fn __reduce_ex__(&self, py: Python<'_>, _protocol: i32) -> PyResult<Py<PyAny>> {
+        self.__reduce__(py)
     }
 
     /// Generate text from `prompt`, invoking `callback` with each accepted
@@ -158,28 +341,82 @@ impl PySpeculativeEngine {
     ///     prompt:     Input text.
     ///     max_tokens: Maximum number of new tokens.
     ///     callback:   Python callable invoked with each decoded token string.
+    ///     progress:   See :class:`oxillama_py.Engine.generate` (same contract).
+    ///     progress_throttle_ms: see :class:`oxillama_py.Engine.generate`.
+    ///     progress_throttle_tokens: see :class:`oxillama_py.Engine.generate`.
+    ///     progress_capture_text: see :class:`oxillama_py.Engine.generate`.
+    ///     strict_progress: see :class:`oxillama_py.Engine.generate`.
     ///
     /// Returns:
     ///     str: The full generated text.
-    #[pyo3(signature = (prompt, max_tokens = 128, callback = None))]
+    #[pyo3(signature = (
+        prompt,
+        max_tokens = 128,
+        callback = None,
+        *,
+        progress = None,
+        progress_throttle_ms = None,
+        progress_throttle_tokens = None,
+        progress_capture_text = false,
+        strict_progress = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_streaming(
         &mut self,
         py: Python<'_>,
         prompt: &str,
         max_tokens: usize,
         callback: Option<Py<PyAny>>,
+        progress: Option<Py<PyAny>>,
+        progress_throttle_ms: Option<u64>,
+        progress_throttle_tokens: Option<usize>,
+        progress_capture_text: bool,
+        strict_progress: bool,
     ) -> PyResult<String> {
         let inner = &mut self.inner;
-        py.detach(|| {
-            inner.generate(prompt, max_tokens, |tok| {
-                if let Some(ref cb) = callback {
-                    Python::attach(|py| {
-                        let _ = cb.call1(py, (tok,));
-                    });
-                }
+        let bridge = make_progress_bridge(
+            py,
+            progress.as_ref(),
+            max_tokens,
+            progress_throttle_ms.unwrap_or(DEFAULT_THROTTLE_MS),
+            progress_throttle_tokens.unwrap_or(DEFAULT_THROTTLE_TOKENS),
+            progress_capture_text,
+        )?;
+        let bridge_arc: Option<Arc<Mutex<ProgressBridge>>> =
+            bridge.map(|b| Arc::new(Mutex::new(b)));
+        let result = py
+            .detach(|| {
+                let bridge_inner = bridge_arc.clone();
+                inner.generate(prompt, max_tokens, |tok| {
+                    if let Some(ref cb) = callback {
+                        Python::attach(|py| {
+                            let _ = cb.call1(py, (tok,));
+                        });
+                    }
+                    if let Some(ref bridge) = bridge_inner {
+                        Python::attach(|py| {
+                            if let Ok(mut b) = bridge.lock() {
+                                let _ = b.note_token(py, tok, false, false);
+                            }
+                        });
+                    }
+                })
             })
-        })
-        .map_err(runtime_to_py)
+            .map_err(runtime_to_py);
+        if let Some(bridge) = bridge_arc.as_ref() {
+            if let Ok(mut b) = bridge.lock() {
+                if result.is_ok() {
+                    b.fire_final(py);
+                }
+                b.finalise(py, result.as_ref().err());
+                if strict_progress {
+                    if let Some(err) = b.take_stashed_error() {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        result
     }
 }
 

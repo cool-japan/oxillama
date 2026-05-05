@@ -4,7 +4,7 @@
 //! - bytes\[0..32\]   — hmask: 1 bit per weight; if set → subtract 0; if clear → subtract 4
 //! - bytes\[32..96\]  — qs: lower 2 bits of each 3-bit quant (4 per byte via shifts)
 //! - bytes\[96..108\] — 12 bytes packed scales (16 × 6-bit unsigned, decode then
-//!                      subtract 32 for signed range -32..31)
+//!   subtract 32 for signed range -32..31)
 //! - bytes\[108..110\] — FP16 super-block scale `d` (little-endian)
 //!
 //! Q3_K is a symmetric ("type-0") format — NO minimum offset.
@@ -199,6 +199,67 @@ impl QuantKernel for Q3_KAvx2 {
         Ok(())
     }
 
+    /// Fused Q3_K weight × Q8_0 activation GEMV using AVX2+FMA.
+    ///
+    /// Each Q3_K super-block (256 weights, 110 bytes) maps to 8 Q8_0 activation
+    /// blocks (32 weights each, 34 bytes each).  The 256 weights are organized as
+    /// 16 sub-blocks of 16 weights each.  Two sub-blocks (at positions `sb*16`
+    /// and `sb*16+16`) share one Q8_0 block of 32 activations.
+    ///
+    /// Fused formula per sub-block:  `dl * Σ(q3_i * q8_i) * d_a`
+    /// where `q3_i = q_lo_i - correction_i` (correction = 4 if hmask bit clear).
+    /// No intermediate f32 scratch buffer is allocated.
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        // One Q3_K super-block → 8 Q8_0 blocks (256 weights / 32 per Q8_0 block)
+        let q8_blocks_per_row = blocks_per_row * 8;
+        let acts_needed = q8_blocks_per_row * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < acts_needed {
+            return Err(QuantError::BufferTooSmall {
+                needed: acts_needed,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            // SAFETY: bounds checked above; CPU avx2+fma guaranteed by KernelDispatcher.
+            let row_sum = unsafe {
+                fused_q3k_q8_0_row_avx2(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            *out_val += row_sum;
+        }
+
+        Ok(())
+    }
+
     fn block_size(&self) -> usize {
         BLOCK_SIZE
     }
@@ -212,9 +273,237 @@ impl QuantKernel for Q3_KAvx2 {
     }
 }
 
+/// Q8_0 block bytes for fused GEMV.
+const Q8_0_BLOCK_BYTES: usize = 34;
+
 // ---------------------------------------------------------------------------
 // Internal AVX2 kernels
 // ---------------------------------------------------------------------------
+
+/// Fused Q3_K weight × Q8_0 activation dot product for one row using AVX2+FMA.
+///
+/// Q3_K layout (per 256-weight block): hmask[0..32], qs[32..96], scales[96..108], d[108..110].
+/// 256 weights = 16 sub-blocks × 16 weights. Two consecutive sub-blocks map to one Q8_0 block
+/// of 32 activations.  Sub-block `sb` (0..16) → Q8_0 block `blk*8 + sb/2`.
+///
+/// For each sub-block `sb` with signed scale `dl = d * sc[sb]`:
+///   contribution = dl * Σ(q3_i * q8_i) * d_a
+/// where q3_i = q_lo_i - correction_i (correction = 4 if hmask bit clear, else 0).
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES`
+/// - CPU must support `avx2` and `fma`
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fused_q3k_q8_0_row_avx2(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    let mut row_sum = 0.0f32;
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        // SAFETY: row_data.len() == blocks_per_row * BLOCK_BYTES; blk < blocks_per_row.
+        let block = &row_data[bo..bo + BLOCK_BYTES];
+
+        let hmask = &block[0..32];
+        let qs = &block[32..96];
+        let scales_raw = &block[96..108];
+        // SAFETY: block.len() >= 110.
+        let d = f16_to_f32(&block[108..]);
+        let sc = decode_scales(scales_raw);
+
+        let input_offset = blk * BLOCK_SIZE;
+        let cols_in_block = (n_cols - input_offset).min(BLOCK_SIZE);
+
+        if cols_in_block < BLOCK_SIZE {
+            // Scalar tail path — partial block.
+            // Mirrors the same iteration order as the fast path to keep index alignment.
+            let mut is = 0usize;
+            let mut col_off = 0usize;
+            let mut m_bit: u8 = 1;
+
+            for group in 0..2usize {
+                let qs_base = group * 32;
+                for _shift_idx in 0..4u32 {
+                    let shift = _shift_idx * 2;
+                    // Sub-block A (hmask[0..16])
+                    {
+                        let dl = d * sc[is];
+                        is += 1;
+                        let q8_blk_idx = blk * 8 + col_off / 32;
+                        let q8_lane_base = col_off % 32;
+                        let a_start = q8_blk_idx * Q8_0_BLOCK_BYTES;
+                        let a_block = &acts_q8[a_start..a_start + Q8_0_BLOCK_BYTES];
+                        let d_a = f16_to_f32(a_block);
+                        let q8_vals = &a_block[2..];
+                        let mut dot = 0.0f32;
+                        for l in 0..16 {
+                            if col_off + l < cols_in_block {
+                                let q_lo = ((qs[qs_base + l] >> shift) & 3) as i32;
+                                let sub = if hmask[l] & m_bit != 0 { 0 } else { 4 };
+                                let q3 = (q_lo - sub) as f32;
+                                let q_a = q8_vals[q8_lane_base + l] as i8 as f32;
+                                dot += q3 * q_a;
+                            }
+                        }
+                        row_sum += dl * dot * d_a;
+                        col_off += 16;
+                    }
+                    // Sub-block B (hmask[16..32])
+                    {
+                        let dl = d * sc[is];
+                        is += 1;
+                        let q8_blk_idx = blk * 8 + col_off / 32;
+                        let q8_lane_base = col_off % 32;
+                        let a_start = q8_blk_idx * Q8_0_BLOCK_BYTES;
+                        let a_block = &acts_q8[a_start..a_start + Q8_0_BLOCK_BYTES];
+                        let d_a = f16_to_f32(a_block);
+                        let q8_vals = &a_block[2..];
+                        let mut dot = 0.0f32;
+                        for l in 0..16 {
+                            if col_off + l < cols_in_block {
+                                let q_lo = ((qs[qs_base + 16 + l] >> shift) & 3) as i32;
+                                let sub = if hmask[16 + l] & m_bit != 0 { 0 } else { 4 };
+                                let q3 = (q_lo - sub) as f32;
+                                let q_a = q8_vals[q8_lane_base + l] as i8 as f32;
+                                dot += q3 * q_a;
+                            }
+                        }
+                        row_sum += dl * dot * d_a;
+                        col_off += 16;
+                    }
+                    m_bit = m_bit.wrapping_shl(1);
+                }
+            }
+        } else {
+            // Fast path: all 256 weights in bounds.
+            // SAFETY: hmask.len() == 32.
+            let hmask_lo = _mm_loadu_si128(hmask.as_ptr() as *const __m128i);
+            let hmask_hi = _mm_loadu_si128(hmask.as_ptr().add(16) as *const __m128i);
+            let mask_2bit = _mm_set1_epi8(0x03);
+
+            let mut is = 0usize;
+            let mut col_off = 0usize;
+
+            for group in 0..2usize {
+                let qs_base = group * 32;
+                // SAFETY: qs_base + 32 <= 64; qs.len() == 64.
+                let raw_a = _mm_loadu_si128(qs.as_ptr().add(qs_base) as *const __m128i);
+                let raw_b = _mm_loadu_si128(qs.as_ptr().add(qs_base + 16) as *const __m128i);
+
+                for shift_idx in 0..4u32 {
+                    let shift = shift_idx * 2;
+                    let bit_pos = (group as u32) * 4 + shift_idx;
+                    // SAFETY: bit_pos is 0..7, so 1u8 << bit_pos is in range 1..128.
+                    let m: u8 = 1u8 << bit_pos;
+                    let m_vec = _mm_set1_epi8(m as i8);
+
+                    // Sub-block A: 16 weights from hmask[0..16], qs[qs_base..qs_base+16]
+                    {
+                        let dl = d * sc[is];
+                        is += 1;
+                        let q8_blk_idx = blk * 8 + col_off / 32;
+                        let q8_lane_base = col_off % 32;
+                        let a_start = q8_blk_idx * Q8_0_BLOCK_BYTES;
+                        // SAFETY: acts_q8.len() >= blocks_per_row*8*Q8_0_BLOCK_BYTES.
+                        let a_block = &acts_q8[a_start..a_start + Q8_0_BLOCK_BYTES];
+                        let d_a = f16_to_f32(a_block);
+                        let q8_ptr = a_block.as_ptr().add(2 + q8_lane_base) as *const __m128i;
+
+                        // SAFETY: extract_2bit_16 requires avx2, shift in {0,2,4,6}.
+                        let q2_bytes = extract_2bit_16(raw_a, shift, mask_2bit);
+                        // SAFETY: hmask_correction_16 requires avx2.
+                        let corr_bytes = hmask_correction_16(hmask_lo, m_vec);
+
+                        // SAFETY: q8_ptr points to 16 valid i8 bytes.
+                        let qa_bytes = _mm_loadu_si128(q8_ptr);
+
+                        // q3_lo = q2 - correction (signed i32 arithmetic)
+                        let q2_lo = _mm256_cvtepu8_epi32(q2_bytes);
+                        let q2_hi = _mm256_cvtepu8_epi32(_mm_srli_si128(q2_bytes, 8));
+                        let c_lo = _mm256_cvtepu8_epi32(corr_bytes);
+                        let c_hi = _mm256_cvtepu8_epi32(_mm_srli_si128(corr_bytes, 8));
+                        let q3_lo = _mm256_sub_epi32(q2_lo, c_lo);
+                        let q3_hi = _mm256_sub_epi32(q2_hi, c_hi);
+
+                        // widen q8 i8 → i32
+                        let qa_lo = _mm256_cvtepi8_epi32(qa_bytes);
+                        let qa_hi = _mm256_cvtepi8_epi32(_mm_srli_si128(qa_bytes, 8));
+
+                        // dot = Σ(q3 * q8)
+                        let dot_acc = _mm256_add_epi32(
+                            _mm256_mullo_epi32(q3_lo, qa_lo),
+                            _mm256_mullo_epi32(q3_hi, qa_hi),
+                        );
+
+                        let dot = hsum_i32_avx2_q3k(dot_acc) as f32;
+                        row_sum += dl * dot * d_a;
+                        col_off += 16;
+                    }
+
+                    // Sub-block B: 16 weights from hmask[16..32], qs[qs_base+16..qs_base+32]
+                    {
+                        let dl = d * sc[is];
+                        is += 1;
+                        let q8_blk_idx = blk * 8 + col_off / 32;
+                        let q8_lane_base = col_off % 32;
+                        let a_start = q8_blk_idx * Q8_0_BLOCK_BYTES;
+                        // SAFETY: acts_q8.len() >= blocks_per_row*8*Q8_0_BLOCK_BYTES.
+                        let a_block = &acts_q8[a_start..a_start + Q8_0_BLOCK_BYTES];
+                        let d_a = f16_to_f32(a_block);
+                        let q8_ptr = a_block.as_ptr().add(2 + q8_lane_base) as *const __m128i;
+
+                        let q2_bytes = extract_2bit_16(raw_b, shift, mask_2bit);
+                        let corr_bytes = hmask_correction_16(hmask_hi, m_vec);
+
+                        let qa_bytes = _mm_loadu_si128(q8_ptr);
+
+                        let q2_lo = _mm256_cvtepu8_epi32(q2_bytes);
+                        let q2_hi = _mm256_cvtepu8_epi32(_mm_srli_si128(q2_bytes, 8));
+                        let c_lo = _mm256_cvtepu8_epi32(corr_bytes);
+                        let c_hi = _mm256_cvtepu8_epi32(_mm_srli_si128(corr_bytes, 8));
+                        let q3_lo = _mm256_sub_epi32(q2_lo, c_lo);
+                        let q3_hi = _mm256_sub_epi32(q2_hi, c_hi);
+
+                        let qa_lo = _mm256_cvtepi8_epi32(qa_bytes);
+                        let qa_hi = _mm256_cvtepi8_epi32(_mm_srli_si128(qa_bytes, 8));
+
+                        let dot_acc = _mm256_add_epi32(
+                            _mm256_mullo_epi32(q3_lo, qa_lo),
+                            _mm256_mullo_epi32(q3_hi, qa_hi),
+                        );
+
+                        let dot = hsum_i32_avx2_q3k(dot_acc) as f32;
+                        row_sum += dl * dot * d_a;
+                        col_off += 16;
+                    }
+                }
+            }
+        }
+    }
+
+    row_sum
+}
+
+/// Horizontal sum of a 256-bit i32 register (AVX2).
+///
+/// # Safety
+/// Requires `avx2`.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_i32_avx2_q3k(v: __m256i) -> i32 {
+    let hi = _mm256_extracti128_si256(v, 1);
+    let lo = _mm256_castsi256_si128(v);
+    let s = _mm_add_epi32(hi, lo);
+    let shuf = _mm_shuffle_epi32(s, 0b10_11_00_01);
+    let s2 = _mm_add_epi32(s, shuf);
+    let shuf2 = _mm_shuffle_epi32(s2, 0b00_00_10_10);
+    let s3 = _mm_add_epi32(s2, shuf2);
+    _mm_cvtsi128_si32(s3)
+}
 
 /// Dequantize one 110-byte Q3_K block into 256 FP32 values using AVX2.
 ///
@@ -781,5 +1070,129 @@ mod tests {
         let block = vec![0u8; BLOCK_BYTES];
         let mut output = vec![0.0f32; 10]; // too small
         assert!(Q3_KAvx2.dequant_block(&block, &mut output).is_err());
+    }
+
+    // ── matvec_q8_fused Q3_K ─────────────────────────────────────────────
+
+    fn make_q8_0_block(scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(34);
+        block.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+        for &v in values {
+            block.push(v as u8);
+        }
+        block
+    }
+
+    fn make_q8_acts(n_q8_blocks: usize, scale: f32, values: &[i8; 32]) -> Vec<u8> {
+        make_q8_0_block(scale, values).repeat(n_q8_blocks)
+    }
+
+    #[test]
+    fn test_q3k_avx2_fused_matches_reference() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // One Q3_K super-block (256 weights) needs 8 Q8_0 activation blocks.
+        let mut scales_raw = [0u8; 12];
+        for (i, s) in scales_raw.iter_mut().enumerate() {
+            *s = ((i * 11 + 3) & 0x3F) as u8;
+        }
+        let mut hmask = [0u8; 32];
+        for (i, h) in hmask.iter_mut().enumerate() {
+            *h = ((i * 13 + 7) & 0xFF) as u8;
+        }
+        let mut qs = [0u8; 64];
+        for (i, q) in qs.iter_mut().enumerate() {
+            *q = ((i * 7 + 3) & 0xFF) as u8;
+        }
+
+        let w_block = make_q3k_block(0.5, &scales_raw, &hmask, &qs);
+        let act_vals: [i8; 32] = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 0, 1, -1, 2, -2, 3, -3,
+            4, -4, 5, -5, 6, -6, 7, -7, 8,
+        ];
+        let acts = make_q8_acts(8, 0.1, &act_vals);
+
+        let mut out_avx2 = vec![0.0f32; 1];
+        let mut out_ref = vec![0.0f32; 1];
+
+        Q3_KAvx2
+            .matvec_q8_fused(&w_block, &acts, &mut out_avx2, 1, 256)
+            .expect("avx2 fused q3k single block");
+        Q3KRef
+            .matvec_q8_fused(&w_block, &acts, &mut out_ref, 1, 256)
+            .expect("ref fused q3k single block");
+
+        let err = (out_avx2[0] - out_ref[0]).abs();
+        assert!(
+            err < 1e-3,
+            "q3k_avx2_fused_matches_reference: avx2={} ref={} err={}",
+            out_avx2[0],
+            out_ref[0],
+            err
+        );
+    }
+
+    #[test]
+    fn test_q3k_avx2_fused_multi_row() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // 3 rows × 512 cols = 2 Q3_K super-blocks per row → 16 Q8_0 act blocks.
+        let n_rows = 3usize;
+        let n_cols = 512usize;
+        let blocks_per_row = 2usize;
+        let q8_blocks_per_row = blocks_per_row * 8; // 16
+
+        let mut all_weights = Vec::new();
+        for r in 0..n_rows {
+            for b in 0..blocks_per_row {
+                let mut scales_raw = [0u8; 12];
+                for (i, s) in scales_raw.iter_mut().enumerate() {
+                    *s = ((r * 11 + b * 7 + i * 5 + 3) & 0x3F) as u8;
+                }
+                let mut hmask = [0u8; 32];
+                for (i, h) in hmask.iter_mut().enumerate() {
+                    *h = ((r * 13 + b * 17 + i * 7) & 0xFF) as u8;
+                }
+                let mut qs = [0u8; 64];
+                for (i, q) in qs.iter_mut().enumerate() {
+                    *q = ((r * 5 + b * 23 + i * 11) & 0xFF) as u8;
+                }
+                all_weights.extend(make_q3k_block(
+                    0.5 + r as f32 * 0.1,
+                    &scales_raw,
+                    &hmask,
+                    &qs,
+                ));
+            }
+        }
+
+        let act_vals: [i8; 32] = [
+            2, -3, 5, -7, 1, -1, 4, -4, 6, -6, 3, -3, 2, -2, 1, -1, 8, -8, 7, -7, 6, -6, 5, -5, 4,
+            -4, 3, -3, 2, -2, 1, -1,
+        ];
+        let acts = make_q8_acts(q8_blocks_per_row, 0.05, &act_vals);
+
+        let mut out_avx2 = vec![0.0f32; n_rows];
+        let mut out_ref = vec![0.0f32; n_rows];
+
+        Q3_KAvx2
+            .matvec_q8_fused(&all_weights, &acts, &mut out_avx2, n_rows, n_cols)
+            .expect("avx2 fused q3k multi-row");
+        Q3KRef
+            .matvec_q8_fused(&all_weights, &acts, &mut out_ref, n_rows, n_cols)
+            .expect("ref fused q3k multi-row");
+
+        for i in 0..n_rows {
+            let err = (out_avx2[i] - out_ref[i]).abs();
+            assert!(
+                err < 1e-3,
+                "q3k fused multi-row row {i}: avx2={} ref={} err={}",
+                out_avx2[i],
+                out_ref[i],
+                err
+            );
+        }
     }
 }

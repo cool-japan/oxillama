@@ -32,11 +32,17 @@ use wasm_bindgen::prelude::*;
 
 pub mod gpu_bridge;
 pub mod idb_cache;
+pub mod service_worker;
+pub mod simd_check;
 pub mod streaming_load;
 pub mod streaming_loader;
 pub mod webgpu;
 pub mod worker;
 
+pub use service_worker::{
+    get_service_worker_script, register_service_worker, ServiceWorkerOptions,
+};
+pub use simd_check::get_simd128_status;
 pub use streaming_loader::StreamingGgufLoader;
 pub use streaming_loader::StreamingLoadOptions;
 
@@ -124,7 +130,7 @@ pub fn dequant_q4_0(data: &[u8]) -> Result<Vec<f32>, JsValue> {
     const BLOCK_BYTES: usize = 18;
     const BLOCK_SIZE: usize = 32;
 
-    if data.len() % BLOCK_BYTES != 0 {
+    if !data.len().is_multiple_of(BLOCK_BYTES) {
         return Err(JsValue::from_str(&format!(
             "Q4_0 data length {} is not a multiple of {} bytes per block",
             data.len(),
@@ -229,7 +235,7 @@ pub fn dequant_q4_k(data: &[u8]) -> Result<Vec<f32>, JsValue> {
     const BLOCK_BYTES: usize = 144;
     const BLOCK_SIZE: usize = 256;
 
-    if data.len() % BLOCK_BYTES != 0 {
+    if !data.len().is_multiple_of(BLOCK_BYTES) {
         return Err(JsValue::from_str(&format!(
             "Q4_K data length {} is not a multiple of {} bytes per block",
             data.len(),
@@ -266,7 +272,7 @@ pub fn dequant_q5_k(data: &[u8]) -> Result<Vec<f32>, JsValue> {
     const BLOCK_BYTES: usize = 176;
     const BLOCK_SIZE: usize = 256;
 
-    if data.len() % BLOCK_BYTES != 0 {
+    if !data.len().is_multiple_of(BLOCK_BYTES) {
         return Err(JsValue::from_str(&format!(
             "Q5_K data length {} is not a multiple of {} bytes per block",
             data.len(),
@@ -303,7 +309,7 @@ pub fn dequant_q6_k(data: &[u8]) -> Result<Vec<f32>, JsValue> {
     const BLOCK_BYTES: usize = 210;
     const BLOCK_SIZE: usize = 256;
 
-    if data.len() % BLOCK_BYTES != 0 {
+    if !data.len().is_multiple_of(BLOCK_BYTES) {
         return Err(JsValue::from_str(&format!(
             "Q6_K data length {} is not a multiple of {} bytes per block",
             data.len(),

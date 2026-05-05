@@ -106,12 +106,29 @@ impl SamplerChain {
 
     /// Build a chain from a `SamplerConfig`, replicating the standard pipeline.
     ///
-    /// Pipeline order: repetition penalty → temperature → top-K → min-P → top-P.
+    /// Pipeline order:
+    /// logit-bias → repetition penalty → DRY → XTC → TypicalP → TopA → Eta
+    ///   → temperature → top-K → min-P → top-P.
+    ///
+    /// Logit-bias must come first so that bans and boosts are visible to all
+    /// downstream filtering stages. The five advanced stages are inserted after
+    /// repetition penalty (they work on logit-scale values) but before temperature
+    /// scaling (so they see the pre-temperature distribution shape).
     pub fn from_config(config: &super::SamplerConfig) -> Self {
+        use super::advanced::{DryStage, EtaStage, TopAStage, TypicalPStage, XtcStage};
+
         let mut chain = Self::new();
 
         if let Some(seed) = config.seed {
             chain = chain.with_seed(seed);
+        }
+
+        // Insert logit-bias / banned-tokens stage first (before everything else).
+        if !config.logit_bias.is_empty() || !config.banned_tokens.is_empty() {
+            chain = chain.push(LogitBias::new(
+                config.logit_bias.clone(),
+                config.banned_tokens.clone(),
+            ));
         }
 
         if config.repetition_penalty != 1.0 {
@@ -120,6 +137,39 @@ impl SamplerChain {
                 config.repetition_penalty_window,
             ));
         }
+
+        // ── Advanced stages (Track B, v0.1.7) ────────────────────────────────
+        // Order: DRY → XTC → TypicalP → TopA → Eta
+        if config.dry_multiplier != 0.0 {
+            chain = chain.push(DryStage::new(
+                config.dry_multiplier,
+                config.dry_base,
+                config.dry_allowed_length,
+                Vec::new(), // sequence_breakers — not yet in SamplerConfig; extend later
+            ));
+        }
+
+        if config.xtc_threshold < 1.0 && config.xtc_probability > 0.0 {
+            let seed = config.seed.unwrap_or(0xDEAD_BEEF_CAFE_BABE);
+            chain = chain.push(XtcStage::new(
+                config.xtc_threshold,
+                config.xtc_probability,
+                seed,
+            ));
+        }
+
+        if config.typical_p < 1.0 {
+            chain = chain.push(TypicalPStage::new(config.typical_p));
+        }
+
+        if config.top_a != 0.0 {
+            chain = chain.push(TopAStage::new(config.top_a));
+        }
+
+        if config.eta_cutoff != 0.0 || config.epsilon_cutoff != 0.0 {
+            chain = chain.push(EtaStage::new(config.eta_cutoff, config.epsilon_cutoff));
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         if config.temperature <= 0.0 {
             // Greedy: just push the greedy selector
@@ -349,6 +399,71 @@ impl SamplerStage for MinP {
     }
 }
 
+/// Logit-bias stage — applies per-token additive biases and hard bans.
+///
+/// This stage must be positioned **before** temperature scaling, repetition
+/// penalty, and any filtering stages so that bans and biases influence all
+/// downstream steps uniformly.
+///
+/// Processing order (matches `sampling::mod::apply_logit_bias_and_banned_tokens`):
+/// 1. Banned tokens → `f32::NEG_INFINITY` (hard ban, cannot be overridden by bias).
+/// 2. Logit biases are added to surviving logits.
+pub struct LogitBias {
+    /// Per-token additive biases.
+    biases: std::collections::HashMap<u32, f32>,
+    /// Tokens that must never be sampled.
+    banned: Vec<u32>,
+}
+
+impl LogitBias {
+    /// Create a new logit-bias stage.
+    ///
+    /// `biases` maps token IDs to additive values (positive = boost,
+    /// negative = suppress).  `banned` is the list of tokens to hard-ban.
+    pub fn new(biases: std::collections::HashMap<u32, f32>, banned: Vec<u32>) -> Self {
+        Self { biases, banned }
+    }
+
+    /// Create a stage with only hard-banned tokens and no biases.
+    pub fn banned_only(banned: Vec<u32>) -> Self {
+        Self {
+            biases: std::collections::HashMap::new(),
+            banned,
+        }
+    }
+
+    /// Create a stage with only biases and no bans.
+    pub fn biases_only(biases: std::collections::HashMap<u32, f32>) -> Self {
+        Self {
+            biases,
+            banned: Vec::new(),
+        }
+    }
+}
+
+impl SamplerStage for LogitBias {
+    fn apply(&self, logits: &mut Vec<f32>, _recent_tokens: &[u32]) {
+        // Step 1: hard ban.
+        for &token in &self.banned {
+            let idx = token as usize;
+            if idx < logits.len() {
+                logits[idx] = f32::NEG_INFINITY;
+            }
+        }
+        // Step 2: additive bias (skip already-banned slots).
+        for (&token, &bias) in &self.biases {
+            let idx = token as usize;
+            if idx < logits.len() && logits[idx].is_finite() {
+                logits[idx] += bias;
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "logit_bias"
+    }
+}
+
 /// Greedy selection stage — sets all logits except the max to -inf.
 /// Use this as the final stage for deterministic (argmax) output.
 pub struct GreedySelect;
@@ -561,5 +676,75 @@ mod tests {
         let chain = chain.push(GreedySelect);
         assert!(!chain.is_empty());
         assert_eq!(chain.len(), 1);
+    }
+
+    // ── LogitBias stage tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_logit_bias_bans_token() {
+        let chain = SamplerChain::new()
+            .push(LogitBias::banned_only(vec![1]))
+            .push(GreedySelect);
+        // Token 1 would normally win (logit 5.0) but is banned.
+        let logits = vec![1.0f32, 5.0, 3.0];
+        let tok = chain.sample(&logits, &[]);
+        assert_eq!(
+            tok, 2,
+            "banned token 1 should never win; token 2 (3.0) should"
+        );
+    }
+
+    #[test]
+    fn test_logit_bias_boosts_token() {
+        let mut biases = std::collections::HashMap::new();
+        biases.insert(2u32, 100.0f32);
+        let chain = SamplerChain::new()
+            .push(LogitBias::biases_only(biases))
+            .push(GreedySelect);
+        let logits = vec![10.0f32, 10.0, 0.0]; // token 2 has lowest logit before bias
+        let tok = chain.sample(&logits, &[]);
+        assert_eq!(tok, 2, "large positive bias should make token 2 win");
+    }
+
+    #[test]
+    fn test_logit_bias_ban_wins_over_positive_bias() {
+        // A banned token should stay at -inf even if it also has a positive bias.
+        let mut biases = std::collections::HashMap::new();
+        biases.insert(0u32, 999.0f32); // very large positive bias on token 0
+        let chain = SamplerChain::new()
+            .push(LogitBias::new(biases, vec![0])) // but also banned
+            .push(GreedySelect);
+        let logits = vec![10.0f32, 1.0, 1.0];
+        let tok = chain.sample(&logits, &[]);
+        // Token 0 is banned — the positive bias must NOT override the ban.
+        assert_ne!(tok, 0, "ban must override positive bias");
+    }
+
+    #[test]
+    fn test_from_config_includes_logit_bias_stage() {
+        let mut biases = std::collections::HashMap::new();
+        biases.insert(0u32, -100.0f32);
+        let config = SamplerConfig {
+            temperature: 0.0,
+            logit_bias: biases,
+            ..SamplerConfig::greedy()
+        };
+        let chain = SamplerChain::from_config(&config);
+        let names = chain.stage_names();
+        assert!(
+            names.contains(&"logit_bias"),
+            "from_config should add logit_bias stage when bias map is non-empty"
+        );
+    }
+
+    #[test]
+    fn test_from_config_no_logit_bias_stage_when_empty() {
+        let config = SamplerConfig::greedy();
+        let chain = SamplerChain::from_config(&config);
+        let names = chain.stage_names();
+        assert!(
+            !names.contains(&"logit_bias"),
+            "from_config should NOT add logit_bias stage when both bias map and banned list are empty"
+        );
     }
 }

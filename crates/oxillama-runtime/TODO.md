@@ -41,9 +41,9 @@ into `arch` unless they have a concrete reason.
 
 | Field | Value |
 |---|---|
-| Version | 0.1.1 |
-| Completion | ~93% |
-| Source files | 15 (`src/**/*.rs`) |
+| Version | 0.1.3 |
+| Completion | ~98% |
+| Source files | 17 (`src/**/*.rs`) |
 | Largest file | `src/engine.rs` (~1.4K lines, under 2000-line policy) |
 | Default tokenizer backend | `tokenizer-wasm` (pure Rust, wasm32-safe) |
 | Alternate backend | `tokenizer-onig` (C regex, native only) |
@@ -174,9 +174,8 @@ Cached vocabulary
   - **Shipped:** `BatchedKvView` trait + `KvSlot` struct + `VecBatchedKvView` impl in `kv_cache/mod.rs`; `batched_flash_attention<V: BatchedKvView>` in new `batched_attention.rs` (~351 LoC); `slot_id: Option<usize>` field on `Sequence` in `scheduler.rs`.
   - **Note:** `ForwardPass::forward_batched` is now implemented in `oxillama-arch/src/traits.rs` (default returns `NotSupported`; LLaMA overrides with a real per-slot attention impl). `BatchedKvView` + `KvSlot` moved to `oxillama-arch/src/traits.rs` and re-exported from runtime. `kv_dim()`, `for_each_key()`, `for_each_value()` added to `KvCacheAccess` with defaults (contiguous path) and `PagedKvCache` overrides (multi-page path). `batched_attention.rs` wires through `forward_batched`.
   - **Tests (2 new):** `batched_kv_view_basic` (trait correctness), `batched_flash_decode_matches_serial` (batched output == two serial calls, tol 1e-5).
-- Single `LoadedLora` per engine — no multi-LoRA hot-swap / per-request
-  ✅ **Done**: `LoraStack` integrated into `InferenceEngine`; `push_lora`, `pop_lora`, `clear_loras`, `apply_lora_stack` support hot-swap without restart
-  adapter selection.
+- ~~Single `LoadedLora` per engine — no multi-LoRA hot-swap / per-request
+  adapter selection.~~ ✅ **Done**: `LoraStack` integrated into `InferenceEngine`; `push_lora`, `pop_lora`, `clear_loras`, `apply_lora_stack` support hot-swap without restart. Server wiring shipped v0.1.3 (`AppState::loras` registry + per-request `lora_selection`, `engine.unapply_all_loras()` reverts `QuantLinear.lora` fields after generation).
 - No CPU offload / lazy paging — entire model must fit in RAM.
 - ~~Speculative decoding has no delta-sync optimisation; KV resync
   re-prefills the full accepted history each round.~~ ✅ Shipped:
@@ -192,9 +191,11 @@ Cached vocabulary
 
 - ~~Prefix KV caching: radix-tree-indexed shared-prefix reuse across
   requests, with copy-on-write on divergence. Integrates with the
-  scheduler so system prompts are paid for once.~~ ✅ Shipped:
+  scheduler so system prompts are paid for once.~~ ✅ Fully shipped:
   `PrefixKvCache`, `RadixNode`, `CachedKvState`, LRU eviction, memory
-  tracking, hit/miss counters, `KvCache::restore_from_snapshot()`.
+  tracking, hit/miss counters, `KvCache::restore_from_snapshot()`
+  (v0.1.2). Server wiring completed v0.1.3: `prime_with_prefix`,
+  `generate_with_logits`, `store_kv_in_prefix_cache`, `CachedKvState::new`.
 - ~~Delta KV resync for speculative decoding.~~ ✅ Shipped:
   `SpeculativeDeltaSync` with `checkpoint`/`restore`, wired into
   `SpeculativeEngine`; draft only re-runs corrected token on rejection.
@@ -291,4 +292,60 @@ Cached vocabulary
   - **Files:** `src/snapshot.rs`, `src/engine.rs` (+80 LoC), `src/error.rs` (2 new variants), `src/kv_cache/mod.rs` (+100 LoC), `src/kv_cache/paged.rs`, `src/sampling/mod.rs` (Xorshift64 accessors), `src/sampling/grammar/machine.rs` (GrammarState::from_state_id), `crates/oxillama-arch/src/common/sequence_state.rs` (additive trait methods + Mamba2/Jamba overrides), `Cargo.toml` (oxicode dep), `tests/snapshot.rs`.
   - **Tests:** `snapshot_roundtrip_small`, `snapshot_rejects_wrong_model_fingerprint`, `snapshot_rejects_incompatible_version`, `snapshot_preserves_mirostat_mu`, `snapshot_preserves_grammar_state`, `snapshot_ssm_roundtrip`, `snapshot_paged_kv_roundtrip`, `snapshot_cross_process_determinism`.
 
-*Last updated: 2026-04-24 (v0.1.2)*
+- [x] SpeculativeEngine snapshot/restore (Track E, v0.1.3) ✅ **Done (2026-05-05)**
+  - `SpeculativeEngineSnapshot` (magic `b"OXISPEC1"`, version 1) in `src/snapshot.rs`: `encode()`, `decode()`, `fingerprint()`. LE binary envelope (not oxicode) so the magic check is O(1) before any allocation.
+  - `RuntimeError::SpecSnapshotIncompatible(String)` added to `src/error.rs`.
+  - `SpeculativeEngine::snapshot()`, `snapshot_to_file(path)`, `resume(bytes, target, draft)`, `resume_from_file(path, target, draft)` in `src/speculative.rs`.
+  - `Xorshift64::raw_state()` / `from_raw_state()` accessors for PRNG serialisation.
+  - `tempfile` moved from `[dev-dependencies]` to `[dependencies]` to support production atomic writes.
+  - 6 new Rust unit tests in `snapshot::tests`: roundtrip, wrong-magic rejection, truncated rejection, accepted-history preservation, None-seed roundtrip, fingerprint determinism.
+
+- [x] Logit-bias / banned-tokens API ✅ **Done (2026-05-05)**
+  - `SamplerConfig.logit_bias: HashMap<u32, f32>` and `SamplerConfig.banned_tokens: Vec<u32>` — applied as step 0 in both `sample_with_rng` (core path) and `sample_mirostat_v2`.
+  - `LogitBias` struct implementing `SamplerStage` — inserted as the first stage in `SamplerChain::from_config()` when either field is non-empty.
+  - Hard bans first (`NEG_INFINITY`), additive biases after; already-banned tokens are skipped in the bias pass.
+  - 4 new tests in `sampling::tests`: `banned_tokens_never_sampled`, `positive_bias_increases_token_probability`, `negative_bias_decreases`, `logit_bias_empty_config_no_op`.
+  - 5 new tests in `sampling::chain::tests`: coverage of `LogitBias` constructors and pipeline position.
+
+- [x] JSON-Schema → GBNF compiler ✅ **Done (2026-05-05)**
+  - `JsonSchemaCompiler::compile(schema_json: &str) -> GrammarResult<Grammar>` in `src/sampling/grammar/json_schema.rs`.
+  - Supports: `type` (string, number, integer, boolean, null, object, array), `properties` + `required`, `enum`, `items`, `minimum` / `maximum`, `minLength` / `maxLength`, `pattern` (literal-only; regex patterns return `GrammarError::ParseError`).
+  - Nested objects and arrays handled recursively; complex sub-schemas promoted to named helper rules.
+  - Exported from `lib.rs` as `JsonSchemaCompiler`.
+  - 15+ tests covering all type variants, enum, nested objects, pattern literals, error paths, and the empty-object fallback (`json-pair` helper rule).
+
+- [x] Beam search decoding ✅ **Done (2026-05-05)**
+  - `BeamSearchConfig { beam_width, max_new_tokens, length_penalty, early_stopping }` (defaults 4 / 256 / 1.0 / true).
+  - `BeamHypothesis { tokens, logprob_sum, finished }` with `score(length_penalty, prompt_len) -> f32`.
+  - `BeamForwardPass` trait: `forward_tokens(&mut self, tokens: &[u32]) -> RuntimeResult<Vec<f32>>`, `reset(&mut self)`.
+  - `EngineBeamAdapter<'a>` wraps `&'a mut InferenceEngine` for use with `beam_generate`.
+  - `beam_generate<F: BeamForwardPass>(config, prompt, forward, eos_id) -> RuntimeResult<Vec<BeamHypothesis>>` free function — log-softmax top-k expansion, per-step global sort, EOS detection, early stopping.
+  - `InferenceEngine::beam_generate()` convenience method (checks `is_loaded()`).
+  - Exported from `lib.rs`: `beam_generate`, `BeamForwardPass`, `BeamHypothesis`, `BeamSearchConfig`, `EngineBeamAdapter`.
+  - 8 tests: `test_score_formula`, `test_width_one_matches_greedy`, `test_beam_returns_beam_width_results`, `test_early_stopping_fires`, `test_log_softmax_correctness`, `test_beam_generate_errors_on_empty_prompt`, `test_unloaded_engine_errors`, `test_stub_engine_reset_called`.
+
+- [x] Advanced sampler stages (Track B, v0.1.3) ✅ **Done (2026-05-05)**
+  - **Shipped:** `src/sampling/advanced.rs` (~560 LoC):
+    - `DryStage` — "Don't Repeat Yourself" n-gram penalty; exponential amplification for longer matches.
+    - `XtcStage` — Exclude Top Choices; forces diversity by removing top-set tokens with configurable probability.
+    - `TypicalPStage` — Locally-typical sampling; keeps tokens near the distribution entropy.
+    - `TopAStage` — Adaptive threshold `a * max_prob²`; auto-adapts to distribution peakiness.
+    - `EtaStage` — Entropy-scaled cutoff `max(epsilon, eta / perplexity)`.
+  - **New `SamplerConfig` fields:** `dry_multiplier`, `dry_base`, `dry_allowed_length`, `xtc_threshold`, `xtc_probability`, `typical_p`, `top_a`, `eta_cutoff`, `epsilon_cutoff` (all `#[serde(default)]`).
+  - **Chain integration:** 5 stages inserted in `SamplerChain::from_config()` after `RepetitionPenalty`, before `TemperatureScale`.
+  - **Tests (12):** 5 passthrough tests, 5 active tests, 2 edge-case safety tests.
+  - **Re-exported** from `lib.rs`: `DryStage`, `XtcStage`, `TypicalPStage`, `TopAStage`, `EtaStage`.
+
+- [x] Embedding pooling modes (Track B, v0.1.3) ✅ **Done (2026-05-05)**
+  - **Shipped:** `src/embedding.rs` (~250 LoC):
+    - `PoolingMode` enum: `Last` (default), `Mean`, `Max`, `Cls` — with `Serialize`/`Deserialize`/`Default`.
+    - `pool_hidden_states(states, seq_len, hidden_size, mode) -> RuntimeResult<Vec<f32>>` kernel.
+    - Per-mode kernels: `pool_last`, `pool_mean`, `pool_max`, `pool_cls`.
+  - **New engine methods:** `embed_with(text, mode)` and `embed_batch_with(texts, mode)`.
+  - **Delegating:** `embed()` → `embed_with(text, PoolingMode::Last)`, `embed_batch()` → `embed_batch_with(texts, PoolingMode::Last)`.
+  - **New error variant:** `RuntimeError::EmptySequence` (`#[error("cannot pool empty sequence")]`).
+  - **New `ForwardPass` method:** `embed_all()` default → `Err(NotSupported)` for future multi-token pooling.
+  - **Tests (8):** `pooling_last_matches_last_row`, `pooling_mean_is_arithmetic_mean`, `pooling_max_is_elementwise_max`, `pooling_cls_matches_first_row`, plus 4 edge-case tests.
+  - **Re-exported** from `lib.rs`: `PoolingMode`.
+
+*Last updated: 2026-05-05 (v0.1.3 Track B)*

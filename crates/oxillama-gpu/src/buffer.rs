@@ -107,6 +107,84 @@ pub(crate) fn download_f32(
     Ok(result)
 }
 
+/// Upload a `&[u32]` slice to a GPU storage buffer (STORAGE | COPY_SRC).
+///
+/// Suitable for read-only shader storage bindings of `array<u32>`.
+#[cfg(feature = "gpu")]
+pub(crate) fn upload_u32(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(data),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    })
+}
+
+/// Create an empty, writable GPU storage buffer of `len` u32 elements.
+#[cfg(feature = "gpu")]
+pub(crate) fn create_output_u32(device: &wgpu::Device, label: &str, len: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: (len * std::mem::size_of::<u32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+/// Read back `len` u32 values from `src_buf` on the GPU.
+///
+/// Blocks until the GPU work submitted prior to this call completes.
+#[cfg(feature = "gpu")]
+pub(crate) fn download_u32(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    src_buf: &wgpu::Buffer,
+    len: usize,
+) -> GpuResult<Vec<u32>> {
+    let byte_len = (len * std::mem::size_of::<u32>()) as u64;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gpu-staging-readback-u32"),
+        size: byte_len,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("readback-u32"),
+    });
+    encoder.copy_buffer_to_buffer(src_buf, 0, &staging, 0, byte_len);
+    queue.submit([encoder.finish()]);
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .map_err(|e| GpuError::BufferMap {
+            detail: format!("{e:?}"),
+        })?;
+
+    rx.recv()
+        .map_err(|_| GpuError::BufferMap {
+            detail: "channel closed before GPU mapped u32 buffer".to_owned(),
+        })?
+        .map_err(|e| GpuError::BufferMap {
+            detail: format!("{e:?}"),
+        })?;
+
+    let view = slice.get_mapped_range();
+    let result: Vec<u32> = bytemuck::cast_slice(&view).to_vec();
+    drop(view);
+    staging.unmap();
+
+    Ok(result)
+}
+
 // ─── stub when the gpu feature is absent ─────────────────────────────────────
 //
 // No stubs needed here; the `buffer` module functions are only called from

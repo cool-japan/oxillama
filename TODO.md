@@ -8,6 +8,33 @@ and an OpenAI-compatible API server without any C/C++/Fortran code.
 
 ---
 
+## v0.1.3 Shipped (2026-05-05)
+
+v0.1.3 theme: **End-to-end feature completeness** across all crates: new architectures (BLOOM, Phi-3.5-MoE, Mixtral, StableLM, GPT-NeoX, LLaVA-1.6, Qwen2-VL), advanced sampler suite (DRY/XTC/TypicalP/TopA/Eta), `/v1/responses` + per-API-key rate limiting, AVX-512 IQ kernels + fused legacy matvec, GPU sampling kernels, speculative decoding bench + Python torch interop, server productionization (prefix-KV cache, multi-LoRA, Assistants API, Files store, Batch API, CLI tools, power benchmarks, DLPack interop).
+
+**BLOOM + Phi-3.5-MoE architectures** (`oxillama-arch`):
+`AlibiBias` primitive (`common/alibi.rs`) with slope formula matching transformers/modeling_bloom.py.
+`BloomArchitecture` (`"bloom"`) with ALiBi positional bias (no RoPE), pre-LayerNorm, GELU FFN, MHA; bias terms on all projections. `PhiMoeArchitecture` (`"phimoe"`) reusing Phi-3 merged QKV + partial RoPE + `SparseTopKMoe` router (16 experts, top-2). Test fixtures `build_minimal_bloom_gguf` + `build_minimal_phi_moe_gguf`. Arch count: 25 → 27.
+
+**Advanced sampler suite + embedding pooling** (`oxillama-runtime`):
+`DryStage` (n-gram DRY penalty, exponential growth), `XtcStage` (exclude top-choices with probability), `TypicalPStage` (locally-typical sampling via Shannon entropy), `TopAStage` (adaptive `a × max_prob²` threshold), `EtaStage` (entropy-scaled cutoff combining typical + epsilon). 9 new `SamplerConfig` fields, all `#[serde(default)]`, byte-identical defaults. `PoolingMode { Last, Mean, Max, Cls }` + `pool_hidden_states()` + `embed_with()` / `embed_batch_with()` API.
+
+**`/v1/responses` + per-API-key rate limiting** (`oxillama-server`):
+`ResponseStore` (in-memory `Arc<RwLock<HashMap>>`) with atomic create/get/update/list. `POST /v1/responses` (non-streaming + SSE `response.created / output_text.delta / completed / [DONE]`), `GET /v1/responses`, `GET /v1/responses/:id`. `previous_response_id` chains prior response into context. `PerKeyRateLimiter` with lazy per-key `TokenBucket` insertion, override map, `per_key_rate_limit_middleware`.
+
+**AVX-512 IQ kernels + fused legacy matvec** (`oxillama-quant`):
+`Iq2XxsAvx512`, `Iq2XsAvx512`, `Iq3SAvx512`, `Iq4XsAvx512` — `_mm512_permutexvar_epi8` grid lookup (AVX-512BW); 2× per-iter throughput over AVX2; runtime-guarded, auto-skip on non-AVX-512. `matvec_q8_fused` override for Q5_0/Q5_1/Q8_1 on both AVX2 and NEON paths; scalar parity oracles in reference tier.
+
+**GPU sampling kernels** (`oxillama-gpu`):
+`sampling.wgsl` — `softmax_logits` (256-thread shared-memory reduction, temperature scaling, temp=0 argmax path), `topk_partition` (workgroup cooperative top-k ≤ 256), `sample_categorical` (LCG RNG + CDF walk). `SamplingKernel` struct with `softmax()`, `top_k()`, `sample()` Rust wrappers; graceful `NoAdapter` fallback.
+
+**Speculative decoding bench + Python torch interop** (`oxillama-bench` + `oxillama-py`):
+`SpeculativeBenchConfig`, `SpeculativePoint`, `SpeculativeBenchTable` + `run_acceptance_sweep()` with deterministic acceptance simulation; `summary_table()` / `speedup_grid()` Markdown output; Criterion bench `benches/speculative.rs`. `torch_helper.py` pure-Python bridge: `Engine.logits_torch()` / `embeddings_torch()` via lazy `torch.from_dlpack(capsule)` (no Rust torch dependency).
+
+2,235 tests, 0 warnings. See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+---
+
 ## v0.1.1 Shipped (2026-04-24)
 
 v0.1.1 ships on top of v0.1.0's foundation: FlashAttention tiled CPU kernel
@@ -48,13 +75,13 @@ quant kernel, and 3 cargo-fuzz targets on the GGUF parser. 1,205 tests, 0 warnin
 
 | Metric | Value |
 |--------|-------|
-| Total Lines | ~87,444 Rust / ~110,634 total |
-| Source Files | 321 Rust files / 383 total |
+| Total Lines | ~96,000 Rust / ~122,000 total |
+| Source Files | 356 Rust files / 420 total |
 | Crates | 11 |
-| Test Count | 1,662 |
+| Test Count | 2,235 |
 | Warnings | 0 |
 | Coverage | 87.09% region / 87.23% function / 85.42% line |
-| Last Updated | 2026-04-24 |
+| Last Updated | 2026-05-05 |
 
 ---
 
@@ -64,11 +91,11 @@ quant kernel, and 3 cargo-fuzz targets on the GGUF parser. 1,205 tests, 0 warnin
 |-------|:------:|:----------:|
 | oxillama-gguf | Working | 93% |
 | oxillama-quant | Working | 100% |
-| oxillama-arch | Working | 98% |
-| oxillama-runtime | Working | 93% |
-| oxillama-server | Working | 98% |
-| oxillama-bench | Working | 78% |
-| oxillama-py | Scaffold | 52% |
+| oxillama-arch | Working | 99% |
+| oxillama-runtime | Working | 94% |
+| oxillama-server | Working | 99% |
+| oxillama-bench | Working | 88% |
+| oxillama-py | Scaffold | 84% |
 | oxillama-wasm | Working | 97% |
 | oxillama-gpu | Working | 93% |
 | oxillama (meta) | Working | 100% |
@@ -133,14 +160,14 @@ bench, gpu}`, so downstream apps only depend on one crate.
 Themes that span multiple crates. Each theme references the primary subcrate
 TODO where detailed work items live.
 
-### Prefix KV caching (runtime + server) — SHIPPED
+### Prefix KV caching (runtime + server) — FULLY SHIPPED ✅ v0.1.3
 
 ~~Radix-tree-indexed shared-prefix reuse with copy-on-write on divergence so that
-shared system prompts are paid for once across concurrent requests.~~ ✅ Shipped
-in `oxillama-runtime`: `PrefixKvCache`, `RadixNode`, `CachedKvState`, LRU
-eviction, memory tracking, hit/miss counters, `KvCache::restore_from_snapshot()`.
-Server-side integration (opt-in per-request flag) remains a v1.1 item
-(see `oxillama-server/TODO.md` §6).
+shared system prompts are paid for once across concurrent requests.~~ ✅ Fully
+shipped: runtime `PrefixKvCache` (v0.1.2) + server-side wiring (v0.1.3):
+`engine.prime_with_prefix`, `generate_with_logits`, `store_kv_in_prefix_cache`,
+per-request `cache_prompt` flag, `AppState::prefix_cache` Arc, and worker-side
+hit/miss/store logic.
 
 ### Function / tool calling (server + runtime grammar)
 
@@ -153,8 +180,9 @@ and `oxillama-runtime/TODO.md` §6.
 ### SIMD breadth (quant)
 
 Close the gap where 18 of 25 quantization types remain scalar-only: AVX-512 +
-NEON kernels for Q5_K / Q6_K (LLaMA-3 dominant formats); AVX2 for Q2_K / Q3_K
-(phone / Pi deployments); ~~AVX2 for IQ2_XXS (the most common I-quant in HF GGUF
+NEON kernels for Q5_K / Q6_K (LLaMA-3 dominant formats); ~~AVX2 for Q2_K / Q3_K
+(phone / Pi deployments)~~ ✅ Shipped in v0.1.1; ~~AVX-512 for Q2_K / Q3_K~~ ✅
+Shipped in v0.1.3; ~~AVX2 for IQ2_XXS (the most common I-quant in HF GGUF
 uploads)~~ ✅ Shipped. Full matrix in `oxillama-quant/TODO.md` §2 + §6.
 
 ### More architectures (arch + runtime feature flags) — SHIPPED
@@ -172,9 +200,11 @@ Details in `oxillama-arch/TODO.md` §6.
 Extend `oxillama-gpu` from 6 quant shaders to cover remaining K-quants,
 ~~batched GEMV for prefill~~ ✅ Shipped (`BatchedGpuKernel`, Q4_0 batched impl),
 ~~IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S GPU GEMV kernels~~ ✅ Shipped in v0.1.1 (+4 kernels,
-now 10 quant types on GPU), ~~tiled GEMM WGSL shader (TILE_M/N=32, TILE_K=16,
+now 14 quant types on GPU), ~~tiled GEMM WGSL shader (TILE_M/N=32, TILE_K=16,
 shared memory cooperative)~~ ✅ Shipped in v0.1.1, ~~fused attention WGSL kernel
 (single-dispatch QK+softmax+AV)~~ ✅ Shipped in v0.1.1,
+~~Q4_1/Q5_0/Q5_1/Q8_1 legacy quad GPU kernels~~ ✅ Shipped in v0.1.3 (now 18
+quant types on GPU, covers ~85% of community HuggingFace uploads),
 f16 accumulator paths, and naga cross-compile validation (MSL for Metal + SPIR-V
 for Vulkan). See `oxillama-gpu/TODO.md` §6.
 

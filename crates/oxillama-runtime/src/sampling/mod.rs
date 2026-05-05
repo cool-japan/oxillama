@@ -3,6 +3,7 @@
 //! Supports greedy, top-k, top-p (nucleus), min-p, temperature scaling,
 //! repetition penalty, Mirostat v2, and GBNF grammar-constrained sampling.
 
+pub mod advanced;
 pub mod chain;
 pub mod grammar;
 
@@ -48,6 +49,91 @@ pub struct SamplerConfig {
     #[serde(skip)]
     #[allow(clippy::type_complexity)]
     pub token_vocab: Option<Arc<Vec<(u32, Vec<u8>)>>>,
+
+    /// Per-token logit biases applied before top-k/top-p.
+    ///
+    /// Positive values increase a token's probability; negative values decrease it.
+    /// For example, `logit_bias[token_id] = 5.0` strongly encourages that token,
+    /// while `-100.0` effectively bans it (use `banned_tokens` for strict banning).
+    ///
+    /// Applied as: `logits[token_id] += bias` before the greedy / sampling steps.
+    #[serde(default)]
+    pub logit_bias: std::collections::HashMap<u32, f32>,
+
+    /// Tokens that must never be generated.
+    ///
+    /// Their logits are set to `f32::NEG_INFINITY` before any other sampling
+    /// step, including top-k/p filtering. This is a hard constraint — unlike
+    /// a large negative `logit_bias`, a banned token will never be selected
+    /// even if it is the only remaining candidate.
+    #[serde(default)]
+    pub banned_tokens: Vec<u32>,
+
+    // ── Advanced sampler stages (v0.1.7 Track B) ─────────────────────────────
+    /// DRY penalty multiplier (0.0 = disabled).
+    ///
+    /// Penalises tokens that would continue an n-gram already present in the
+    /// recent context. Higher values apply stronger penalties.
+    #[serde(default)]
+    pub dry_multiplier: f32,
+
+    /// DRY exponential base for match-length amplification (default = 1.75).
+    ///
+    /// Longer n-gram matches receive penalty `dry_multiplier * dry_base^(match_len - dry_allowed_length)`.
+    #[serde(default = "dry_base_default")]
+    pub dry_base: f32,
+
+    /// Minimum match length (in tokens) before DRY applies any penalty (default = 2).
+    #[serde(default = "dry_allowed_length_default")]
+    pub dry_allowed_length: usize,
+
+    /// XTC cumulative-probability threshold (0.0 = disabled; use ≥ 1.0 to disable).
+    ///
+    /// The "top set" is defined as the smallest set of tokens whose cumulative
+    /// probability exceeds this threshold.
+    #[serde(default)]
+    pub xtc_threshold: f32,
+
+    /// XTC exclusion probability — how often the top-set exclusion fires (default = 0.5).
+    #[serde(default = "xtc_probability_default")]
+    pub xtc_probability: f32,
+
+    /// Locally-typical sampling budget (1.0 = disabled / passthrough).
+    ///
+    /// Keeps only tokens whose information content is closest to the distribution
+    /// entropy until cumulative probability ≥ p.
+    #[serde(default = "typical_p_default")]
+    pub typical_p: f32,
+
+    /// Top-A adaptive threshold multiplier (0.0 = disabled).
+    ///
+    /// Keeps tokens with `prob >= top_a * max_prob²`.
+    #[serde(default)]
+    pub top_a: f32,
+
+    /// Eta-cutoff entropy-adaptive threshold (0.0 = disabled).
+    ///
+    /// Dynamic floor = `max(epsilon_cutoff, eta_cutoff / perplexity)`.
+    #[serde(default)]
+    pub eta_cutoff: f32,
+
+    /// Epsilon hard-floor probability used together with `eta_cutoff` (0.0 = no floor).
+    #[serde(default)]
+    pub epsilon_cutoff: f32,
+}
+
+// Default-value helpers for serde.
+fn dry_base_default() -> f32 {
+    1.75
+}
+fn dry_allowed_length_default() -> usize {
+    2
+}
+fn xtc_probability_default() -> f32 {
+    0.5
+}
+fn typical_p_default() -> f32 {
+    1.0
 }
 
 impl Default for SamplerConfig {
@@ -65,6 +151,18 @@ impl Default for SamplerConfig {
             mirostat_eta: 0.1,
             grammar: None,
             token_vocab: None,
+            logit_bias: std::collections::HashMap::new(),
+            banned_tokens: Vec::new(),
+            // Advanced stages (disabled by default)
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            xtc_threshold: 0.0,
+            xtc_probability: 0.5,
+            typical_p: 1.0,
+            top_a: 0.0,
+            eta_cutoff: 0.0,
+            epsilon_cutoff: 0.0,
         }
     }
 }
@@ -85,6 +183,17 @@ impl SamplerConfig {
             mirostat_eta: 0.1,
             grammar: None,
             token_vocab: None,
+            logit_bias: std::collections::HashMap::new(),
+            banned_tokens: Vec::new(),
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            xtc_threshold: 0.0,
+            xtc_probability: 0.5,
+            typical_p: 1.0,
+            top_a: 0.0,
+            eta_cutoff: 0.0,
+            epsilon_cutoff: 0.0,
         }
     }
 
@@ -103,6 +212,17 @@ impl SamplerConfig {
             seed: None,
             grammar: None,
             token_vocab: None,
+            logit_bias: std::collections::HashMap::new(),
+            banned_tokens: Vec::new(),
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            xtc_threshold: 0.0,
+            xtc_probability: 0.5,
+            typical_p: 1.0,
+            top_a: 0.0,
+            eta_cutoff: 0.0,
+            epsilon_cutoff: 0.0,
         }
     }
 }
@@ -192,6 +312,10 @@ impl Sampler {
         }
 
         let mut processed = logits.to_vec();
+
+        // Step 0: Apply logit bias and banned tokens — same order as
+        // sample_with_rng so both code paths behave identically.
+        apply_logit_bias_and_banned_tokens(&mut processed, &self.config);
 
         // Step 1: Apply repetition penalty
         apply_repetition_penalty(&mut processed, &self.config, recent_tokens);
@@ -344,6 +468,11 @@ fn sample_with_rng(
 
     let mut processed = logits.to_vec();
 
+    // Step 0: Apply logit bias and banned tokens FIRST — before any other
+    // transformation so that bans are absolute and biases influence all
+    // downstream filtering steps (top-k, top-p, grammar masking, etc.).
+    apply_logit_bias_and_banned_tokens(&mut processed, config);
+
     // Step 1: Apply repetition penalty
     apply_repetition_penalty(&mut processed, config, recent_tokens);
 
@@ -430,6 +559,37 @@ fn sample_with_rng(
 
     // Fallback: return last candidate (rounding issues)
     candidates.last().map(|&(idx, _)| idx).unwrap_or(0)
+}
+
+/// Apply logit bias and banned-token masking to logits in-place.
+///
+/// Processing order:
+/// 1. Banned tokens are set to `f32::NEG_INFINITY` unconditionally.
+/// 2. Logit biases are added to the surviving logits.
+///
+/// Both operations are applied before repetition penalty, grammar masking,
+/// and temperature / top-k / top-p filtering, so they influence all
+/// downstream steps.
+fn apply_logit_bias_and_banned_tokens(processed: &mut [f32], config: &SamplerConfig) {
+    // Step A: hard-ban tokens.
+    for &token in &config.banned_tokens {
+        let idx = token as usize;
+        if idx < processed.len() {
+            processed[idx] = f32::NEG_INFINITY;
+        }
+    }
+
+    // Step B: additive bias.
+    for (&token, &bias) in &config.logit_bias {
+        let idx = token as usize;
+        if idx < processed.len() {
+            // Do not modify already-banned tokens — a banned token must
+            // remain at -inf even if a positive bias is also specified.
+            if processed[idx].is_finite() {
+                processed[idx] += bias;
+            }
+        }
+    }
 }
 
 /// Apply repetition penalty to logits in-place.
@@ -789,6 +949,97 @@ mod tests {
         for &(_, p) in &candidates {
             assert!((p - 1.0 / 3.0).abs() < 0.01, "expected ~0.333, got {p}");
         }
+    }
+
+    // ── Logit-bias / banned-tokens tests ──────────────────────────────────────
+
+    #[test]
+    fn banned_tokens_never_sampled() {
+        // Only token 3 is allowed; all others are banned.
+        let vocab_size = 5usize;
+        let logits: Vec<f32> = (0..vocab_size).map(|i| i as f32).collect();
+
+        let mut banned = Vec::new();
+        for i in 0u32..vocab_size as u32 {
+            if i != 3 {
+                banned.push(i);
+            }
+        }
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            seed: Some(42),
+            banned_tokens: banned,
+            ..SamplerConfig::default()
+        };
+        let mut sampler = Sampler::new(config);
+        for _ in 0..50 {
+            let tok = sampler.sample(&logits, &[]);
+            assert_eq!(
+                tok, 3,
+                "only token 3 should ever be sampled when all others are banned"
+            );
+        }
+    }
+
+    #[test]
+    fn positive_bias_increases_token_probability() {
+        // Token 1 starts with a very low logit; add a large positive bias.
+        // After bias, token 1 should dominate and be selected nearly always.
+        let logits = vec![10.0f32, -20.0, -20.0, -20.0];
+        let mut bias = std::collections::HashMap::new();
+        bias.insert(1u32, 100.0f32); // huge positive bias on token 1
+
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            seed: Some(7),
+            logit_bias: bias,
+            ..SamplerConfig::default()
+        };
+        let mut sampler = Sampler::new(config);
+        // With a +100 bias, token 1's effective logit = 80, far above token 0's 10.
+        let tok = sampler.sample(&logits, &[]);
+        assert_eq!(tok, 1, "large positive bias should make token 1 dominate");
+    }
+
+    #[test]
+    fn negative_bias_decreases() {
+        // Token 0 has the highest raw logit; apply a strongly negative bias.
+        // Token 1 should win after bias.
+        let logits = vec![100.0f32, 1.0, 0.5, 0.1];
+        let mut bias = std::collections::HashMap::new();
+        bias.insert(0u32, -200.0f32); // strong negative on the top token
+
+        let config = SamplerConfig {
+            temperature: 0.0, // greedy — picks strictly by highest logit after bias
+            logit_bias: bias,
+            ..SamplerConfig::greedy()
+        };
+        let tok = sample(&logits, &config, &[]);
+        assert_eq!(
+            tok, 1,
+            "after large negative bias on token 0, token 1 should win"
+        );
+    }
+
+    #[test]
+    fn logit_bias_empty_config_no_op() {
+        // Empty logit_bias and empty banned_tokens must not change sampling behaviour.
+        let logits = vec![1.0f32, 2.0, 3.0, 0.5];
+        let config_empty = SamplerConfig {
+            temperature: 0.0,
+            logit_bias: std::collections::HashMap::new(),
+            banned_tokens: Vec::new(),
+            ..SamplerConfig::greedy()
+        };
+        let tok = sample(&logits, &config_empty, &[]);
+        // Greedy with no bias should still pick index 2 (value 3.0).
+        assert_eq!(tok, 2, "empty logit_bias / banned_tokens should be a no-op");
     }
 
     // ── Grammar-constrained sampling tests ────────────────────────────────────

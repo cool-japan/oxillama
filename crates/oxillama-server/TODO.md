@@ -144,6 +144,21 @@ Implementation highlights:
   stream, `tool_calls` arrays in both streaming and non-streaming
   responses.
 
+- ~~**Server-side prefix-KV cache wiring.**~~ ✅ Shipped in v0.1.3.
+  `AppState::prefix_cache: Arc<Mutex<PrefixKvCache>>`, per-request
+  `cache_prompt: bool` flag (default `true`), worker-side hit/miss/store
+  logic calling `engine.prime_with_prefix` + `engine.generate_with_logits`
+  on cache hit; full-prefill fallback on miss; `store_kv_in_prefix_cache`
+  stores post-generation KV state.
+
+- ~~**Multi-LoRA per-request registry + admin CRUD.**~~ ✅ Shipped in v0.1.3.
+  `AppState::loras: Arc<RwLock<HashMap<String, Arc<LoadedLora>>>>`;
+  `lora_selection: Vec<(String, f32)>` on `BatchRequest`; chat route
+  parses `"lora": "name"` or `"lora": [{"name": "...", "scale": 0.8}]`,
+  resolves → 400 on unknown name; `POST /admin/loras` (load GGUF + register),
+  `DELETE /admin/loras/{name}`, `GET /admin/loras`; `engine.unapply_all_loras()`
+  restores base weights after generation.
+
 ## 7. v2.0+ Vision
 
 - [x] **Multi-model router (LRU warm-pool) (done 2026-04-20)**
@@ -179,10 +194,14 @@ Implementation highlights:
   - **Tests:** (a) `batch_submit_process_complete`. (b) `batch_persistence_across_restart`. (c) `batch_cancel_mid_flight`. (d) `batch_concurrent_jobs_dont_interleave_outputs`.
   - **Risk:** Disk fills under unbounded submission; enforce limits.
 
-- **Assistants API subset.**
-  `POST /v1/threads`, `POST /v1/threads/{id}/messages`,
-  `POST /v1/threads/{id}/runs` with persistent thread storage. Target
-  parity with the OpenAI assistants v2 specification.
+- [x] **Assistants API subset (done 2026-05-05)**
+  `POST /v1/threads`, `GET /v1/threads/{id}`,
+  `POST /v1/threads/{id}/messages`, `GET /v1/threads/{id}/messages`,
+  `POST /v1/threads/{id}/runs`, `GET /v1/threads/{id}/runs/{run_id}`,
+  `POST /v1/threads/{id}/runs/{run_id}/cancel`.
+  Persistent thread/message/run storage with atomic disk writes
+  (tempfile + rename), append-only JSONL message log, background run
+  worker reusing chat-template prompt formatting.  199 tests all pass.
 
 - ~~**WebSocket streaming.**~~
   ~~Full-duplex streaming alongside SSE for bidirectional tool~~
@@ -227,4 +246,30 @@ Implementation highlights:
   - **Tests:** (a) `admin_load_unload_cycle`. (b) `admin_bearer_auth_rejects_missing_token`. (c) `admin_loopback_only_when_no_auth`. (d) `admin_stats_returns_metrics`.
   - **Risk:** Non-auth + public interface = full fleet control to anyone. Mitigate with hard startup error.
 
-*Last updated: 2026-04-24 (v0.1.2 — 165 tests, JWT auth with scopes shipped)*
+## 8. v0.1.3 — Responses API + Per-Key Rate Limiting (done 2026-05-05)
+
+- [x] **Responses API (`/v1/responses`)**
+  - `POST /v1/responses` — create a response (non-streaming or SSE when `stream: true`)
+  - `GET /v1/responses` — list all responses (descending `created_at`)
+  - `GET /v1/responses/:id` — retrieve one response
+  - `previous_response_id` chaining: prior input + output prepended to context
+  - SSE event names: `response.created`, `response.output_text.delta`, `response.completed`, `[DONE]`
+  - New module: `src/responses_store.rs` (`ResponseStore`, `ResponseRecord`, `ResponseStatus`)
+  - New module: `src/routes/responses.rs` (all three route handlers)
+  - `AppState::responses_store: Option<Arc<ResponseStore>>` + `with_responses_store()` builder
+  - `ServerError::ResponseNotFound` + `ServerError::PreviousResponseNotFound` → HTTP 404
+
+- [x] **Per-API-key rate limiting (`PerKeyRateLimiter`)**
+  - `PerKeyRateLimiter` with lazy-insert bucket map (`Arc<RwLock<HashMap<String, Mutex<TokenBucket>>>>`)
+  - `with_overrides(HashMap<String, (f64, f64)>)` builder for per-key capacity/rate
+  - `check_key(&str) -> bool` — fast read-lock path + slow write-lock insertion
+  - `per_key_rate_limit_middleware` reads `Authorization: Bearer` or `X-Api-Key`
+  - Anonymous requests (no key header) pass through
+  - `ServerConfig::per_key_rate_limits: Option<HashMap<String, (f64, f64)>>`
+  - `AppState::per_key_rate_limiter: Option<Arc<PerKeyRateLimiter>>` + `with_per_key_rate_limiter()` builder
+  - Layered in `build_app_with_config` when `state.per_key_rate_limiter.is_some()`
+  - Re-exported from `lib.rs`: `PerKeyRateLimiter`, `ResponseStore`
+  - 15 new tests (5 store unit + 5 route integration + 5 per-key unit)
+  - Total test count: 236 (all passing)
+
+*Last updated: 2026-05-05 (v0.1.3 — 236 tests, Responses API + per-key rate limiting shipped)*

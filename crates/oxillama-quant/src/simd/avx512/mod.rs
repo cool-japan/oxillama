@@ -10,8 +10,11 @@
 //! | Struct | Format | Block size | Block bytes | Throughput vs AVX2 |
 //! |--------|--------|-----------|-------------|-------------------|
 //! | [`Q4_0Avx512`]      | Q4_0       | 32  | 18  | ~2× |
-//! | [`Q4_1Avx512`]      | Q4_1       | 32  | 20  | ~2× |
+//! | [`Q4_1Avx512`]      | Q4_1       | Q4_1       | 32  | 20  | ~2× |
 //! | [`Q8_0Avx512`]      | Q8_0       | 32  | 34  | ~2× |
+//! | [`Q8_1Avx512`]      | Q8_1       | 32  | 36  | ~2× |
+//! | [`Q2_KAvx512`]      | Q2_K       | 256 | 84  | ~2× |
+//! | [`Q3_KAvx512`]      | Q3_K       | 256 | 110 | ~2× |
 //! | [`Q4_KAvx512`]      | Q4_K       | 256 | 144 | ~2× |
 //! | [`Q5_KAvx512`]      | Q5_K       | 256 | 176 | ~2× |
 //! | [`Q5_1Avx512`]      | Q5_1       | 32  | 24  | ~2× |
@@ -21,10 +24,20 @@
 //! | [`Tq2_0Avx512`]     | TQ2_0      | 256 | 66  | ~2× |
 //! | [`Q5_0Avx512`]      | Q5_0       | 32  | 22  | ~2× |
 //! | [`Q8_KAvx512`]      | Q8_K       | 256 | 292 | ~2× |
+//! | [`Iq2XxsAvx512`]    | IQ2_XXS    | 256 | 66  | ~2× |
+//! | [`Iq2XsAvx512`]     | IQ2_XS     | 256 | 74  | ~2× |
+//! | [`Iq3SAvx512`]      | IQ3_S      | 256 | 110 | ~2× |
+//! | [`Iq4XsAvx512`]     | IQ4_XS     | 256 | 136 | ~2× |
 
 #![cfg(all(feature = "simd-avx512", target_arch = "x86_64"))]
 
+pub mod iq2_xs;
+pub mod iq2_xxs;
+pub mod iq3_s;
+pub mod iq4_xs;
 pub mod q1_0_g128;
+pub mod q2_k;
+pub mod q3_k;
 pub mod q4_0;
 pub mod q4_1;
 pub mod q4_k;
@@ -33,12 +46,19 @@ pub mod q5_1;
 pub mod q5_k;
 pub mod q6_k;
 pub mod q8_0;
+pub mod q8_1;
 pub mod q8_k;
 pub mod tq1_0;
 pub mod tq2_0;
 mod util;
 
+pub use iq2_xs::Iq2XsAvx512;
+pub use iq2_xxs::Iq2XxsAvx512;
+pub use iq3_s::Iq3SAvx512;
+pub use iq4_xs::Iq4XsAvx512;
 pub use q1_0_g128::Q1_0G128Avx512;
+pub use q2_k::Q2_KAvx512;
+pub use q3_k::Q3_KAvx512;
 pub use q4_0::Q4_0Avx512;
 pub use q4_1::Q4_1Avx512;
 pub use q4_k::Q4_KAvx512;
@@ -47,6 +67,7 @@ pub use q5_1::Q5_1Avx512;
 pub use q5_k::Q5_KAvx512;
 pub use q6_k::Q6_KAvx512;
 pub use q8_0::Q8_0Avx512;
+pub use q8_1::Q8_1Avx512;
 pub use q8_k::Q8_KAvx512;
 pub use tq1_0::Tq1_0Avx512;
 pub use tq2_0::Tq2_0Avx512;

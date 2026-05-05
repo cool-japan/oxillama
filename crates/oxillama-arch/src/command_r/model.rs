@@ -398,6 +398,18 @@ impl ForwardPass for CommandRModel {
         }
         Ok(())
     }
+
+    fn unapply_all_loras(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.attn_q.clear_lora();
+            layer.attn_k.clear_lora();
+            layer.attn_v.clear_lora();
+            layer.attn_output.clear_lora();
+            layer.ffn_gate.clear_lora();
+            layer.ffn_up.clear_lora();
+            layer.ffn_down.clear_lora();
+        }
+    }
 }
 
 /// Load a Command-R model from a `GgufModel`.

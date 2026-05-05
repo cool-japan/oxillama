@@ -269,6 +269,7 @@ fn cpu_gemm(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "gpu")]
     fn make_random(len: usize, seed: u64) -> Vec<f32> {
         let mut v = Vec::with_capacity(len);
         let mut x = seed;

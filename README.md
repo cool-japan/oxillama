@@ -83,7 +83,7 @@ OxiLLaMa is a Pure Rust reimplementation of [llama.cpp](https://github.com/ggml-
 | [`oxillama-wasm`](crates/oxillama-wasm) | WebAssembly bindings | ~150 |
 | [`oxillama-cli`](crates/oxillama-cli) | CLI binary (`cargo install oxillama-cli`) | ~430 |
 
-**Total: ~107,000 lines of Pure Rust across 11 crates** (v0.1.2 — 2,020 tests passing)
+**Total: ~165,000 lines of Pure Rust across 11 crates** (v0.1.3 — 2,461 tests passing)
 
 ---
 
@@ -162,15 +162,17 @@ oxillama info --model path/to/model.gguf
 
 ---
 
-## What's New in v0.1.2 (2026-04-25)
+## What's New in v0.1.3 (2026-05-05)
 
-- **Conversation save/resume** — `/save` and `/load` slash commands in the chat REPL; state serialized via oxicode; SHA-256 KV sidecar for integrity verification.
-- **`oxillama hub` subcommand** — `hub pull`, `hub list`, `hub rm` for HuggingFace Hub model management; built on hf-hub 0.5 with pure Rust transport, no Python required.
-- **TUI chat mode** — `oxillama chat --tui` launches a full terminal UI (ratatui 0.30) with async token streaming via `spawn_blocking` + mpsc channels.
-- **DBRX, Grok-1, Mamba-2 real weight loading** — previously stub loaders now perform full weight loading from GGUF; all three architectures pass end-to-end forward pass tests.
-- **`KvCacheAccess` trait extensions** — new `kv_dim`, `for_each_key`, `for_each_value` methods; `BatchedKvView` and `KvSlot` promoted to `oxillama-arch`; `ForwardPass::forward_batched` ships a default impl plus a fully tested LLaMA specialisation.
-- **IQ3_S and IQ3_XXS codebook tables** — complete codebook data added to `oxillama-quant`; both formats now dequantize correctly in all kernel paths.
-- **Test suite: 1,898 → 2,020 tests** — per-crate breakdown: gguf=278, quant=382, arch=397, runtime=370, server=165, cli=38, bench=88, gpu=151, wasm=51, py=81.
+- **BLOOM + Phi-3.5-MoE Architectures** — 2 new architectures added; `AlibiBias` + BLOOM decoder stack; Phi-3.5-MoE sparse MoE (16 experts, top-2). Architecture count: 25 → 27.
+- **Advanced Sampler Suite** — 5 new sampling stages: DRY (n-gram penalty), XTC (exclude top choices), TypicalP (locally-typical), TopA (adaptive threshold), Eta (entropy-scaled cutoff).
+- **Embedding Pooling** — `PoolingMode { Last, Mean, Max, Cls }` + `embed_with()` / `embed_batch_with()` on `InferenceEngine`.
+- **Responses API + Per-API-Key Rate Limiting** — `/v1/responses` (POST/GET/GET by ID), SSE streaming, previous-response chaining; per-key `TokenBucket` rate limiter.
+- **AVX-512 IQ Kernels** — IQ2_XXS, IQ2_XS, IQ3_S, IQ4_XS AVX-512BW variants (2× throughput); fused `matvec_q8` for Q5_0/Q5_1/Q8_1.
+- **GPU Sampling Kernels** — `softmax_logits`, `topk_partition`, `sample_categorical` WGSL shaders; `SamplingKernel` API with CPU fallback.
+- **Speculative Decoding Bench** — `SpeculativeBenchTable`, `run_acceptance_sweep()`, Markdown 2-D speedup grid.
+- **Python Torch Interop** — `DLPackTensor` producer+consumer for `Vec<f32>` ↔ PyCapsule; `StreamingCallback` with `tokens_received()` progress.
+- **Test suite: 2,020 → 2,461 tests** — per-crate: gguf=278, quant=401, arch=451, runtime=420, server=195, cli=42, bench=129, gpu=201, wasm=213, py=131.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full diff.
 
@@ -234,4 +236,4 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for detai
 
 ---
 
-*Copyright 2026 COOLJAPAN OU (Team KitaSan). All rights reserved. — OxiLLaMa v0.1.2 (2026-04-25)*
+*Copyright 2026 COOLJAPAN OU (Team KitaSan). All rights reserved. — OxiLLaMa v0.1.3 (2026-05-05)*

@@ -42,7 +42,7 @@ workspace assumes this layer is correct and zero-copy where possible.
 ## 4. Shipped in v0.1.0
 
 ### Format parsing
-- Full GGUF v3 header: magic (`0x46475547`) check, version, tensor count,
+- Full GGUF v3 header: magic (`0x46554747`) check, version, tensor count,
   KV-pair count.
 - All 13 GGUF metadata value types: `UINT8`/`INT8`/`UINT16`/`INT16`/
   `UINT32`/`INT32`/`UINT64`/`INT64`/`FLOAT32`/`FLOAT64`/`BOOL`/`STRING`
@@ -151,13 +151,17 @@ Priority order (highest first):
 
 ## 7. v2.0+ Vision
 
-- **Remote GGUF streaming via HTTP range requests.** Fetch only the
-  tensors a given architecture needs — header + KV first, then tensor
-  offsets on demand. Major latency win for 30B+ models pulled from
-  HuggingFace mirrors. Pairs with the v1.1 lazy parser.
-- **safetensors import bridge.** Accept `.safetensors` on load, convert
-  to an in-memory GGUF view; covers the remainder of the HuggingFace
-  hub that has not been re-published in GGUF form.
+- ~~**Remote GGUF streaming via HTTP range requests.**~~ ✅ Shipped (v0.1.3
+  Track B). `HttpRangeSource` issues HTTP `Range:` requests, caches the
+  first 128 KiB eagerly, and exposes `GgufModel::from_url(url)`. Gated
+  behind `http` feature (`dep:ureq`, `native-tls`). All network-dependent
+  tests carry `#[ignore]`.
+- ~~**safetensors import bridge.**~~ ✅ Shipped (v0.1.3 Track B).
+  `SafetensorsConverter::load(path)` / `from_bytes(bytes)` parses the
+  8-byte LE header_size prefix + JSON tensor descriptors and produces an
+  in-memory `GgufModel` with `general.architecture = "safetensors_import"`.
+  Dtype mapping: `F32`→`F32`, `F16`→`F16`, `BF16`→`Bf16`, `I8`→`Q8_0`
+  (approximate). Unsupported dtypes → `GgufError::UnsupportedDtype`.
 - **Quantize-on-the-fly.** During parse, downcast `F16`/`BF16` weights
   to `Q4_0` / `Q8_0` via `oxillama-quant` kernels so that unquantised
   reference weights fit in consumer RAM without an explicit

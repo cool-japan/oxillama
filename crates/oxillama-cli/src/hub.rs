@@ -221,7 +221,8 @@ pub fn pull(opts: PullOptions) -> HubResult<PathBuf> {
         let data = std::fs::read(&local_path)?;
         let mut hasher = Sha256::new();
         hasher.update(&data);
-        let actual_hex = format!("{:x}", hasher.finalize());
+        let output = hasher.finalize();
+        let actual_hex: String = output.iter().map(|b| format!("{b:02x}")).collect();
         let expected_hex = expected_hex.to_lowercase();
         if actual_hex != expected_hex {
             return Err(HubError::Sha256Mismatch {

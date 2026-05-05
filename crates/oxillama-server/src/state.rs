@@ -7,19 +7,29 @@
 //! - In-memory batch store (legacy).
 //! - Disk-backed batch store + queue sender (C3).
 //! - Multi-model LRU pool (C1), protected by a `Mutex` for admin mutations.
+//! - Prefix KV cache for system-prompt reuse across requests.
+//! - LoRA adapter registry (name → `Arc<LoadedLora>`).
+//! - Persistent thread store + run queue (Assistants API).
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use tokio::sync::mpsc;
 
 use crate::batch::{new_batch_store, BatchStore};
 use crate::batch_spool::{BatchQueueSender, BatchStore as DiskBatchStore};
+use crate::files_store::FilesStore;
 use crate::metrics::Metrics;
 use crate::queue::{BatchRequest, VocabBytes};
+use crate::rate_limit::PerKeyRateLimiter;
+use crate::responses_store::ResponseStore;
 use crate::router::ModelPool;
+use crate::threads::stream::RunEventSender;
+use crate::threads::{RunQueueSender, ThreadStore};
 
 use oxillama_runtime::sampling::SamplerConfig;
+use oxillama_runtime::{LoadedLora, PrefixCacheConfig, PrefixKvCache};
 
 /// Shared application state accessible by all route handlers.
 ///
@@ -67,6 +77,51 @@ pub struct AppState {
     /// inference worker. In the current single-worker design the worker also
     /// holds the pool; admin mutations use `try_lock` to avoid deadlocks.
     pub model_pool: Mutex<ModelPool>,
+
+    /// Prefix KV cache for system-prompt reuse across requests.
+    ///
+    /// When a new request shares a long prefix with a previously-cached
+    /// sequence (e.g. a fixed system prompt), the matching KV state is
+    /// restored and only the suffix tokens need a fresh prefill pass.
+    pub prefix_cache: Arc<Mutex<PrefixKvCache>>,
+
+    /// Loaded LoRA adapter registry: stable name → `Arc<LoadedLora>`.
+    ///
+    /// Populated via `POST /admin/loras`.  Request handlers look up adapters
+    /// by name and pass them to the worker via `BatchRequest::Generate`.
+    pub loras: Arc<RwLock<HashMap<String, Arc<LoadedLora>>>>,
+
+    /// Persistent thread/message/run store for the Assistants API.
+    ///
+    /// `None` when the Assistants API has not been configured (no `--threads-dir`
+    /// flag was passed at startup).  Route handlers return 503 in this case.
+    pub threads_store: Option<Arc<ThreadStore>>,
+
+    /// Sender into the run processing queue for the Assistants API.
+    ///
+    /// `None` when `threads_store` is `None`.
+    pub run_queue_tx: Option<RunQueueSender>,
+
+    /// Persistent files store for the Files API (`/v1/files`).
+    ///
+    /// `None` when the Files API has not been configured.
+    pub files_store: Option<Arc<FilesStore>>,
+
+    /// Broadcast sender for run lifecycle events (SSE streaming).
+    ///
+    /// `None` when SSE streaming is not enabled.
+    pub run_event_tx_broadcast: Option<RunEventSender>,
+
+    /// In-memory store for Responses API objects.
+    ///
+    /// `None` when the Responses API has not been enabled.  Route handlers
+    /// return 503 (`ModelNotReady`) in this case.
+    pub responses_store: Option<Arc<ResponseStore>>,
+
+    /// Per-API-key token-bucket rate limiter.
+    ///
+    /// `None` when per-key rate limiting has not been configured.
+    pub per_key_rate_limiter: Option<Arc<PerKeyRateLimiter>>,
 }
 
 impl AppState {
@@ -107,7 +162,61 @@ impl AppState {
             batch_disk_store,
             batch_queue_tx,
             model_pool: Mutex::new(ModelPool::new(4, 0)),
+            prefix_cache: Arc::new(Mutex::new(PrefixKvCache::new(PrefixCacheConfig::default()))),
+            loras: Arc::new(RwLock::new(HashMap::new())),
+            threads_store: None,
+            run_queue_tx: None,
+            files_store: None,
+            run_event_tx_broadcast: None,
+            responses_store: None,
+            per_key_rate_limiter: None,
         }
+    }
+
+    /// Attach a threads store and run queue to this `AppState`.
+    ///
+    /// Returns `self` with the `threads_store` and `run_queue_tx` fields
+    /// populated.  Designed for use in a builder chain:
+    ///
+    /// ```text
+    /// let state = AppState::new(...).with_threads(store, tx);
+    /// ```
+    pub fn with_threads(mut self, store: Arc<ThreadStore>, tx: RunQueueSender) -> Self {
+        self.threads_store = Some(store);
+        self.run_queue_tx = Some(tx);
+        self
+    }
+
+    /// Attach a files store to this `AppState`.
+    pub fn with_files(mut self, store: Arc<FilesStore>) -> Self {
+        self.files_store = Some(store);
+        self
+    }
+
+    /// Attach a run-event broadcast sender to this `AppState`.
+    ///
+    /// When set, the run worker broadcasts lifecycle events that SSE handlers
+    /// can subscribe to.
+    pub fn with_run_event_sender(mut self, tx: RunEventSender) -> Self {
+        self.run_event_tx_broadcast = Some(tx);
+        self
+    }
+
+    /// Attach a Responses API store to this `AppState`.
+    ///
+    /// When set, the `/v1/responses` routes are fully operational.
+    pub fn with_responses_store(mut self, store: Arc<ResponseStore>) -> Self {
+        self.responses_store = Some(store);
+        self
+    }
+
+    /// Attach a per-API-key rate limiter to this `AppState`.
+    ///
+    /// When set, the `per_key_rate_limit_middleware` is applied to all routes
+    /// in `build_app_with_config`.
+    pub fn with_per_key_rate_limiter(mut self, limiter: Arc<PerKeyRateLimiter>) -> Self {
+        self.per_key_rate_limiter = Some(limiter);
+        self
     }
 
     /// Create app state with an explicit disk batch store and queue sender.
@@ -139,6 +248,14 @@ impl AppState {
             batch_disk_store,
             batch_queue_tx,
             model_pool: Mutex::new(ModelPool::new(4, 0)),
+            prefix_cache: Arc::new(Mutex::new(PrefixKvCache::new(PrefixCacheConfig::default()))),
+            loras: Arc::new(RwLock::new(HashMap::new())),
+            threads_store: None,
+            run_queue_tx: None,
+            files_store: None,
+            run_event_tx_broadcast: None,
+            responses_store: None,
+            per_key_rate_limiter: None,
         }
     }
 }

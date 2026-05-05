@@ -45,6 +45,51 @@ pub enum ServerError {
     /// The inference worker has exited; no new requests can be processed.
     #[error("inference worker is no longer running")]
     WorkerDead,
+
+    /// Thread not found in the persistent store.
+    #[error("thread not found: {0}")]
+    ThreadNotFound(String),
+
+    /// Run not found in the persistent store.
+    #[error("run not found: {0}")]
+    RunNotFound(String),
+
+    /// Attempted to transition a run that is already in a terminal state.
+    #[error("run is in terminal state: {0}")]
+    RunInTerminalState(String),
+
+    /// File not found in the persistent files store.
+    #[error("file not found: {0}")]
+    FileNotFound(String),
+
+    /// Uploaded file exceeds the maximum allowed size.
+    #[error("file too large: {0}")]
+    FileTooLarge(String),
+
+    /// Generic file store error.
+    #[error("file store error: {0}")]
+    FileStoreError(String),
+
+    /// Run step not found in the persistent store.
+    #[error("run step not found: {0}")]
+    RunStepNotFound(String),
+
+    /// Generic I/O error with context.
+    #[error("I/O error ({context}): {source}")]
+    IoError {
+        /// Human-readable context describing what operation failed.
+        context: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// Response not found in the in-memory responses store.
+    #[error("response {0} not found")]
+    ResponseNotFound(String),
+
+    /// Previous response not found when chaining with `previous_response_id`.
+    #[error("previous response {0} not found")]
+    PreviousResponseNotFound(String),
 }
 
 impl IntoResponse for ServerError {
@@ -54,19 +99,39 @@ impl IntoResponse for ServerError {
             ServerError::ModelNotReady => StatusCode::SERVICE_UNAVAILABLE,
             ServerError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
             ServerError::WorkerDead => StatusCode::SERVICE_UNAVAILABLE,
+            ServerError::ThreadNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::RunNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::RunInTerminalState(_) => StatusCode::CONFLICT,
+            ServerError::FileNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::FileTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ServerError::FileStoreError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::RunStepNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::ResponseNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::PreviousResponseNotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+
+        let error_type = match &self {
+            ServerError::InvalidRequest { .. } => "invalid_request_error",
+            ServerError::ModelNotReady => "service_unavailable",
+            ServerError::QueueFull => "rate_limit_error",
+            ServerError::WorkerDead => "service_unavailable",
+            ServerError::ThreadNotFound(_) => "not_found_error",
+            ServerError::RunNotFound(_) => "not_found_error",
+            ServerError::RunInTerminalState(_) => "conflict_error",
+            ServerError::FileNotFound(_) => "not_found_error",
+            ServerError::FileTooLarge(_) => "payload_too_large",
+            ServerError::FileStoreError(_) => "internal_error",
+            ServerError::RunStepNotFound(_) => "not_found_error",
+            ServerError::ResponseNotFound(_) => "not_found_error",
+            ServerError::PreviousResponseNotFound(_) => "not_found_error",
+            _ => "internal_error",
         };
 
         let body = serde_json::json!({
             "error": {
                 "message": self.to_string(),
-                "type": match &self {
-                    ServerError::InvalidRequest { .. } => "invalid_request_error",
-                    ServerError::ModelNotReady => "service_unavailable",
-                    ServerError::QueueFull => "rate_limit_error",
-                    ServerError::WorkerDead => "service_unavailable",
-                    _ => "internal_error",
-                },
+                "type": error_type,
             }
         });
 
@@ -153,5 +218,31 @@ mod tests {
     fn test_error_display_worker_dead() {
         let msg = ServerError::WorkerDead.to_string();
         assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn test_thread_not_found_returns_404() {
+        assert_eq!(
+            status_of(ServerError::ThreadNotFound("thread_xyz".into())),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn test_run_not_found_returns_404() {
+        assert_eq!(
+            status_of(ServerError::RunNotFound("run_xyz".into())),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn test_run_in_terminal_state_returns_409() {
+        assert_eq!(
+            status_of(ServerError::RunInTerminalState(
+                "run_xyz is completed".into()
+            )),
+            StatusCode::CONFLICT
+        );
     }
 }

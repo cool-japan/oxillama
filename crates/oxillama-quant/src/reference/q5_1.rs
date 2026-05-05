@@ -158,6 +158,89 @@ impl QuantKernel for Q5_1Ref {
     fn name(&self) -> &'static str {
         "Q5_1"
     }
+
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> crate::error::QuantResult<()> {
+        use crate::error::QuantError;
+
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+        let blocks_per_row = n_cols.div_ceil(Q5_1_BLOCK_SIZE);
+        let row_bytes = blocks_per_row * Q5_1_BLOCK_BYTES;
+        let q8_block_bytes: usize = 34;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < blocks_per_row * q8_block_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: blocks_per_row * q8_block_bytes,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            let mut sum = 0.0f32;
+
+            for blk in 0..blocks_per_row {
+                let bo = row_start + blk * Q5_1_BLOCK_BYTES;
+                let block = &weights[bo..bo + Q5_1_BLOCK_BYTES];
+                let d_w = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let m_w = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+                let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+                let qs = &block[8..24];
+
+                // Q8_0 activation block.
+                let ab = blk * q8_block_bytes;
+                let a_block = &acts_q8[ab..ab + q8_block_bytes];
+                let d_a = half::f16::from_le_bytes([a_block[0], a_block[1]]).to_f32();
+                let q8_vals = &a_block[2..];
+
+                let w_off = blk * Q5_1_BLOCK_SIZE;
+                let valid = (n_cols - w_off).min(Q5_1_BLOCK_SIZE);
+
+                let mut dot = 0.0f32;
+                let mut inp_sum = 0.0f32;
+                for i in 0..16 {
+                    let lo_nibble = qs[i] & 0x0F;
+                    let hi_nibble = (qs[i] >> 4) & 0x0F;
+                    let hi_bit_0 = ((qh >> i) & 1) as u8;
+                    let hi_bit_1 = ((qh >> (i + 16)) & 1) as u8;
+                    let q0 = (lo_nibble | (hi_bit_0 << 4)) as f32;
+                    let q1 = (hi_nibble | (hi_bit_1 << 4)) as f32;
+                    if i < valid {
+                        let a0 = (q8_vals[i] as i8) as f32 * d_a;
+                        dot += d_w * q0 * a0;
+                        inp_sum += a0;
+                    }
+                    if i + 16 < valid {
+                        let a1 = (q8_vals[i + 16] as i8) as f32 * d_a;
+                        dot += d_w * q1 * a1;
+                        inp_sum += a1;
+                    }
+                }
+                sum += dot + m_w * inp_sum;
+            }
+
+            *out_val += sum;
+        }
+
+        Ok(())
+    }
 }
 
 fn f16_to_f32(bits: u16) -> f32 {

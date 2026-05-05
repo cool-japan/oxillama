@@ -467,7 +467,7 @@ async fn gemv_on_gpu(
     cols: u32,
 ) -> Result<JsValue, JsValue> {
     // Validate
-    if cols % 32 != 0 {
+    if !cols.is_multiple_of(32) {
         return Err(JsValue::from_str(&format!(
             "cols={cols} must be a multiple of 32 for Q4_0 GEMV"
         )));

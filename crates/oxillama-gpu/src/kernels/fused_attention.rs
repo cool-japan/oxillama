@@ -78,6 +78,22 @@ impl Default for FusedAttentionKernel {
 
 // ─── GPU implementation ───────────────────────────────────────────────────────
 
+/// Cached shader + pipeline so compilation happens only once per process.
+#[cfg(feature = "gpu")]
+struct FusedAttnPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bgl: wgpu::BindGroupLayout,
+}
+
+// SAFETY: wgpu resource types are Send+Sync.
+#[cfg(feature = "gpu")]
+unsafe impl Send for FusedAttnPipeline {}
+#[cfg(feature = "gpu")]
+unsafe impl Sync for FusedAttnPipeline {}
+
+#[cfg(feature = "gpu")]
+static FUSED_ATTN_PIPELINE: std::sync::OnceLock<FusedAttnPipeline> = std::sync::OnceLock::new();
+
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn gpu_fused_attention(
@@ -94,10 +110,7 @@ fn gpu_fused_attention(
 ) -> GpuResult<Vec<f32>> {
     use crate::buffer::{create_output_f32, download_f32, upload_f32, upload_uniform};
     use bytemuck::{Pod, Zeroable};
-    use wgpu::{
-        BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, ComputePassDescriptor,
-        ComputePipelineDescriptor, PipelineLayoutDescriptor, ShaderModuleDescriptor, ShaderSource,
-    };
+    use wgpu::{BindGroupDescriptor, BindGroupEntry, ComputePassDescriptor};
 
     if head_dim > 64 {
         return Err(GpuError::UnsupportedType {
@@ -148,41 +161,47 @@ fn gpu_fused_attention(
     };
     let params_buf = upload_uniform(device, "attn-params", &params);
 
-    const WGSL: &str = include_str!("../shaders/attention_fused_f32.wgsl");
-    let shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("attention_fused_f32"),
-        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(WGSL)),
-    });
-
-    let bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("attn-bgl"),
-        entries: &[
-            bgl_storage_ro(0),
-            bgl_storage_ro(1),
-            bgl_storage_ro(2),
-            bgl_storage_rw(3),
-            bgl_uniform(4),
-        ],
-    });
-
-    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("attn-layout"),
-        bind_group_layouts: &[Some(&bgl)],
-        immediate_size: 0,
-    });
-
-    let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-        label: Some("attn-pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &shader,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
+    let cached = FUSED_ATTN_PIPELINE.get_or_init(|| {
+        use wgpu::{
+            BindGroupLayoutDescriptor, ComputePipelineDescriptor, PipelineLayoutDescriptor,
+            ShaderModuleDescriptor, ShaderSource,
+        };
+        const WGSL: &str = include_str!("../shaders/attention_fused_f32.wgsl");
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("attention_fused_f32"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(WGSL)),
+        });
+        let bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("attn-bgl"),
+            entries: &[
+                bgl_storage_ro(0),
+                bgl_storage_ro(1),
+                bgl_storage_ro(2),
+                bgl_storage_rw(3),
+                bgl_uniform(4),
+            ],
+        });
+        let pipeline = {
+            let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some("attn-layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            device.create_compute_pipeline(&ComputePipelineDescriptor {
+                label: Some("attn-pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        FusedAttnPipeline { pipeline, bgl }
     });
 
     let bind_group = device.create_bind_group(&BindGroupDescriptor {
         label: Some("attn-bg"),
-        layout: &bgl,
+        layout: &cached.bgl,
         entries: &[
             BindGroupEntry {
                 binding: 0,
@@ -217,7 +236,7 @@ fn gpu_fused_attention(
             label: Some("attn-pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&pipeline);
+        pass.set_pipeline(&cached.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(dispatch_x, 1, 1);
     }
@@ -332,6 +351,18 @@ pub(crate) fn cpu_attention(
 mod tests {
     use super::*;
 
+    /// Shared GPU context: initialized once, reused across all GPU tests in this
+    /// module so adapter enumeration and pipeline compilation pay only once.
+    #[cfg(feature = "gpu")]
+    fn shared_gpu_ctx() -> Option<std::sync::Arc<crate::context::GpuContext>> {
+        use std::sync::{Arc, OnceLock};
+        static SHARED: OnceLock<Option<Arc<crate::context::GpuContext>>> = OnceLock::new();
+        SHARED
+            .get_or_init(|| crate::context::GpuContext::try_init().map(Arc::new))
+            .clone()
+    }
+
+    #[cfg(feature = "gpu")]
     fn make_random(len: usize, seed: u64) -> Vec<f32> {
         let mut v = Vec::with_capacity(len);
         let mut x = seed;
@@ -378,9 +409,7 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     fn fused_attention_matches_cpu_causal() {
-        use crate::context::GpuContext;
-
-        let ctx = match GpuContext::try_init() {
+        let ctx = match shared_gpu_ctx() {
             Some(c) => c,
             None => return,
         };
@@ -425,9 +454,7 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     fn fused_attention_matches_cpu_long() {
-        use crate::context::GpuContext;
-
-        let ctx = match GpuContext::try_init() {
+        let ctx = match shared_gpu_ctx() {
             Some(c) => c,
             None => return,
         };
@@ -472,9 +499,7 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     fn fused_attention_decode_single_q() {
-        use crate::context::GpuContext;
-
-        let ctx = match GpuContext::try_init() {
+        let ctx = match shared_gpu_ctx() {
             Some(c) => c,
             None => return,
         };

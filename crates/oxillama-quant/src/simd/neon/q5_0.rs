@@ -423,6 +423,215 @@ impl QuantKernel for Q5_0Neon {
     fn name(&self) -> &'static str {
         "Q5_0_Neon"
     }
+
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> crate::error::QuantResult<()> {
+        use crate::error::QuantError;
+
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let q8_block_bytes: usize = 34;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < blocks_per_row * q8_block_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: blocks_per_row * q8_block_bytes,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            let partial = unsafe {
+                fused_q5_0_q8_0_row_neon(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            *out_val += partial;
+        }
+
+        Ok(())
+    }
+}
+
+/// Fused Q5_0 weight × Q8_0 activation dot product for one matrix row.
+///
+/// Decodes each Q5_0 block's 5-bit signed weights and the corresponding Q8_0
+/// activation block (2-byte FP16 scale + 32 i8 values), then accumulates using
+/// NEON vector multiply-accumulate.
+///
+/// # Safety
+/// Must be called on AArch64 with NEON. All slice bounds must be pre-validated.
+unsafe fn fused_q5_0_q8_0_row_neon(
+    weights_row: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    const Q8_BLOCK_BYTES: usize = 34;
+    let mut acc = vdupq_n_f32(0.0f32);
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        let block = &weights_row[bo..bo + BLOCK_BYTES];
+        let col_start = blk * BLOCK_SIZE;
+
+        let d_w = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let (qh_lo, qh_hi) = expand_qh(qh);
+
+        // Decode Q8_0 activation block
+        let ab = blk * Q8_BLOCK_BYTES;
+        let a_block = &acts_q8[ab..ab + Q8_BLOCK_BYTES];
+        let d_a = f16_to_f32(u16::from_le_bytes([a_block[0], a_block[1]]));
+
+        let col_end = (col_start + BLOCK_SIZE).min(n_cols);
+        let avail = col_end - col_start;
+
+        if avail == BLOCK_SIZE {
+            // Full block: use NEON for both halves.
+            // Decode Q5_0 to scratch buffer, then dot with scaled activations.
+            let qs_ptr = block.as_ptr().add(6);
+            let raw = vld1q_u8(qs_ptr);
+            let mask = vdupq_n_u8(0x0F);
+            let lo_nib = vandq_u8(raw, mask);
+            let hi_nib = vshrq_n_u8::<4>(raw);
+
+            let vqh_lo = vld1q_u8(qh_lo.as_ptr());
+            let vqh_hi = vld1q_u8(qh_hi.as_ptr());
+            let shift4 = vdupq_n_u8(4);
+            let qh_lo_sh = vshlq_u8(vqh_lo, vreinterpretq_s8_u8(shift4));
+            let qh_hi_sh = vshlq_u8(vqh_hi, vreinterpretq_s8_u8(shift4));
+            let q5_lo = vorrq_u8(lo_nib, qh_lo_sh);
+            let q5_hi = vorrq_u8(hi_nib, qh_hi_sh);
+
+            let sixteen_s32 = vdupq_n_s32(16);
+            let q5_lo_u16_low = vmovl_u8(vget_low_u8(q5_lo));
+            let q5_lo_u16_high = vmovl_u8(vget_high_u8(q5_lo));
+            let q5_hi_u16_low = vmovl_u8(vget_low_u8(q5_hi));
+            let q5_hi_u16_high = vmovl_u8(vget_high_u8(q5_hi));
+
+            // Signed int32 weight quants (subtract 16)
+            let wa = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(q5_lo_u16_low))),
+                sixteen_s32,
+            );
+            let wb = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_high_u16(q5_lo_u16_low)),
+                sixteen_s32,
+            );
+            let wc = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(q5_lo_u16_high))),
+                sixteen_s32,
+            );
+            let we = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_high_u16(q5_lo_u16_high)),
+                sixteen_s32,
+            );
+            let wg = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(q5_hi_u16_low))),
+                sixteen_s32,
+            );
+            let wh = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_high_u16(q5_hi_u16_low)),
+                sixteen_s32,
+            );
+            let wj = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(q5_hi_u16_high))),
+                sixteen_s32,
+            );
+            let wk = vsubq_s32(
+                vreinterpretq_s32_u32(vmovl_high_u16(q5_hi_u16_high)),
+                sixteen_s32,
+            );
+
+            // Float weight groups scaled by d_w
+            let d_w_vec = vdupq_n_f32(d_w);
+            let wfa = vmulq_f32(vcvtq_f32_s32(wa), d_w_vec);
+            let wfb = vmulq_f32(vcvtq_f32_s32(wb), d_w_vec);
+            let wfc = vmulq_f32(vcvtq_f32_s32(wc), d_w_vec);
+            let wfe = vmulq_f32(vcvtq_f32_s32(we), d_w_vec);
+            let wfg = vmulq_f32(vcvtq_f32_s32(wg), d_w_vec);
+            let wfh = vmulq_f32(vcvtq_f32_s32(wh), d_w_vec);
+            let wfj = vmulq_f32(vcvtq_f32_s32(wj), d_w_vec);
+            let wfk = vmulq_f32(vcvtq_f32_s32(wk), d_w_vec);
+
+            // Load and scale Q8_0 activation i8 values by d_a
+            let q8_ptr = a_block.as_ptr().add(2) as *const i8;
+            let aq0 = vld1q_s8(q8_ptr);
+            let aq1 = vld1q_s8(q8_ptr.add(16));
+
+            let aq0_lo = vmovl_s8(vget_low_s8(aq0));
+            let aq0_hi = vmovl_s8(vget_high_s8(aq0));
+            let aq1_lo = vmovl_s8(vget_low_s8(aq1));
+            let aq1_hi = vmovl_s8(vget_high_s8(aq1));
+
+            let d_a_vec = vdupq_n_f32(d_a);
+            let aa0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(aq0_lo))), d_a_vec);
+            let aa1 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(aq0_lo)), d_a_vec);
+            let aa2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(aq0_hi))), d_a_vec);
+            let aa3 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(aq0_hi)), d_a_vec);
+            let aa4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(aq1_lo))), d_a_vec);
+            let aa5 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(aq1_lo)), d_a_vec);
+            let aa6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(aq1_hi))), d_a_vec);
+            let aa7 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(aq1_hi)), d_a_vec);
+
+            // FMA: acc += w * a (sequential weight layout: lo-half first, then hi-half)
+            acc = vfmaq_f32(acc, wfa, aa0);
+            acc = vfmaq_f32(acc, wfb, aa1);
+            acc = vfmaq_f32(acc, wfc, aa2);
+            acc = vfmaq_f32(acc, wfe, aa3);
+            acc = vfmaq_f32(acc, wfg, aa4);
+            acc = vfmaq_f32(acc, wfh, aa5);
+            acc = vfmaq_f32(acc, wfj, aa6);
+            acc = vfmaq_f32(acc, wfk, aa7);
+        } else {
+            // Scalar tail for partial blocks
+            let qs = &block[6..22];
+            let q8_vals = &a_block[2..];
+            let mut block_dot = 0.0f32;
+            for i in 0..avail {
+                let byte = qs[i / 2];
+                let nibble = if i < 16 {
+                    byte & 0x0F
+                } else {
+                    (byte >> 4) & 0x0F
+                };
+                let hi_bit = ((qh >> i) & 1) as u8;
+                let q5 = (nibble | (hi_bit << 4)) as i32 - 16;
+                let a_val = (q8_vals[i] as i8) as f32 * d_a;
+                block_dot += d_w * q5 as f32 * a_val;
+            }
+            let scalar_vec = vdupq_n_f32(block_dot);
+            // Accumulate into lane 0 only via scalar
+            let lane0 = vgetq_lane_f32::<0>(acc) + block_dot;
+            acc = vdupq_n_f32(0.0f32);
+            acc = vsetq_lane_f32::<0>(lane0, acc);
+            let _ = scalar_vec;
+        }
+    }
+
+    hsum_f32x4(acc)
 }
 
 #[cfg(all(test, feature = "simd-neon", target_arch = "aarch64"))]
@@ -523,6 +732,69 @@ mod tests {
             out_neon[0],
             out_ref[0],
             err
+        );
+    }
+
+    #[test]
+    fn fused_q5_0_neon_matches_reference() {
+        let qh: u32 = 0xA5A5_A5A5;
+        let mut qs_w = [0u8; 16];
+        for (i, v) in qs_w.iter_mut().enumerate() {
+            *v = ((i * 11 + 5) & 0xFF) as u8;
+        }
+        let weight_block = make_block(0.5, qh, &qs_w);
+
+        // Build Q8_0 activation block (34 bytes)
+        let d_a = 0.25f32;
+        let mut acts_raw = [0i8; 32];
+        for (i, v) in acts_raw.iter_mut().enumerate() {
+            *v = ((i as i16 * 5 - 40).clamp(-128, 127)) as i8;
+        }
+        let mut acts_block = Vec::with_capacity(34);
+        acts_block.extend_from_slice(&half::f16::from_f32(d_a).to_bits().to_le_bytes());
+        for &v in &acts_raw {
+            acts_block.push(v as u8);
+        }
+
+        // Reference: dequant weight + dot with scaled activations
+        let mut w_dequant = vec![0.0f32; BLOCK_SIZE];
+        Q5_0Ref
+            .dequant_block(&weight_block, &mut w_dequant)
+            .expect("ref dequant");
+        let acts_f32: Vec<f32> = acts_raw.iter().map(|&v| v as f32 * d_a).collect();
+        let expected: f32 = w_dequant
+            .iter()
+            .zip(acts_f32.iter())
+            .map(|(w, a)| w * a)
+            .sum();
+
+        // NEON fused
+        let mut out_neon = vec![0.0f32; 1];
+        Q5_0Neon
+            .matvec_q8_fused(&weight_block, &acts_block, &mut out_neon, 1, BLOCK_SIZE)
+            .expect("neon fused");
+
+        let err = (out_neon[0] - expected).abs();
+        assert!(
+            err < 0.1,
+            "fused_q5_0_neon: got={} expected={} err={}",
+            out_neon[0],
+            expected,
+            err
+        );
+
+        // Also verify against reference Q5_0Ref::matvec_q8_fused
+        let mut out_ref = vec![0.0f32; 1];
+        Q5_0Ref
+            .matvec_q8_fused(&weight_block, &acts_block, &mut out_ref, 1, BLOCK_SIZE)
+            .expect("ref fused");
+        let ref_err = (out_neon[0] - out_ref[0]).abs();
+        assert!(
+            ref_err < 0.1,
+            "fused: neon={} ref={} err={}",
+            out_neon[0],
+            out_ref[0],
+            ref_err
         );
     }
 }

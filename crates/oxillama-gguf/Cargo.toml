@@ -19,6 +19,7 @@ mmap = ["dep:memmap2", "std"]
 test-utils = ["std"]
 integrity = ["std"]
 validate = ["integrity"]
+http = ["dep:ureq", "std"]
 
 [dependencies]
 thiserror.workspace = true
@@ -27,7 +28,8 @@ blake3.workspace = true
 oxicode.workspace = true
 half.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
+ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true

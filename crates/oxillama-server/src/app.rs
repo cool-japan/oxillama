@@ -11,9 +11,10 @@ use crate::batch;
 use crate::batch_spool;
 use crate::body_limit::body_limit_layer;
 use crate::config::ServerConfig;
-use crate::rate_limit::{rate_limit_middleware, RateLimiter};
+use crate::rate_limit::{per_key_rate_limit_middleware, rate_limit_middleware, RateLimiter};
 use crate::routes;
 use crate::state::AppState;
+use crate::threads;
 use crate::tracing_layer::tracing_middleware;
 use crate::ws::ws_handler;
 
@@ -50,12 +51,72 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             "/v1/batch_jobs/{id}/cancel",
             post(batch_spool::routes::cancel_batch),
         )
+        // ── Files API ─────────────────────────────────────────────────────
+        .route(
+            "/v1/files",
+            post(routes::files::create_file_handler).get(routes::files::list_files_handler),
+        )
+        .route(
+            "/v1/files/{file_id}",
+            get(routes::files::get_file_handler).delete(routes::files::delete_file_handler),
+        )
+        .route(
+            "/v1/files/{file_id}/content",
+            get(routes::files::get_file_content_handler),
+        )
+        // ── Assistants API ────────────────────────────────────────────────
+        .route("/v1/threads", post(threads::routes::create_thread_handler))
+        .route(
+            "/v1/threads/{thread_id}",
+            get(threads::routes::get_thread_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/messages",
+            post(threads::routes::create_message_handler)
+                .get(threads::routes::list_messages_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs",
+            post(threads::routes::create_run_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}",
+            get(threads::routes::get_run_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/cancel",
+            post(threads::routes::cancel_run_handler),
+        )
+        // ── Run Steps subresource ─────────────────────────────────────────
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/steps",
+            get(threads::steps::list_steps_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/steps/{step_id}",
+            get(threads::steps::get_step_handler),
+        )
+        // ── Responses API ─────────────────────────────────────────────────
+        .route(
+            "/v1/responses",
+            post(routes::responses::create_response).get(routes::responses::list_responses),
+        )
+        .route("/v1/responses/{id}", get(routes::responses::get_response))
         // ── Admin API ─────────────────────────────────────────────────────
         .route("/admin/models/load", post(admin::admin_load_model))
         .route("/admin/models/unload", post(admin::admin_unload_model))
         .route("/admin/models", get(admin::admin_list_models))
         .route("/admin/stats", get(admin::admin_stats))
         .route("/admin/health", get(admin::admin_health))
+        // ── LoRA registry ─────────────────────────────────────────────────
+        .route(
+            "/admin/loras",
+            post(admin::admin_register_lora).get(admin::admin_list_loras),
+        )
+        .route(
+            "/admin/loras/{name}",
+            axum::routing::delete(admin::admin_unregister_lora),
+        )
         .with_state(state)
 }
 
@@ -98,19 +159,79 @@ pub fn build_app_with_config(state: Arc<AppState>, config: &ServerConfig) -> Rou
             "/v1/batch_jobs/{id}/cancel",
             post(batch_spool::routes::cancel_batch),
         )
+        // ── Files API ─────────────────────────────────────────────────────
+        .route(
+            "/v1/files",
+            post(routes::files::create_file_handler).get(routes::files::list_files_handler),
+        )
+        .route(
+            "/v1/files/{file_id}",
+            get(routes::files::get_file_handler).delete(routes::files::delete_file_handler),
+        )
+        .route(
+            "/v1/files/{file_id}/content",
+            get(routes::files::get_file_content_handler),
+        )
+        // ── Assistants API ────────────────────────────────────────────────
+        .route("/v1/threads", post(threads::routes::create_thread_handler))
+        .route(
+            "/v1/threads/{thread_id}",
+            get(threads::routes::get_thread_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/messages",
+            post(threads::routes::create_message_handler)
+                .get(threads::routes::list_messages_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs",
+            post(threads::routes::create_run_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}",
+            get(threads::routes::get_run_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/cancel",
+            post(threads::routes::cancel_run_handler),
+        )
+        // ── Run Steps subresource ─────────────────────────────────────────
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/steps",
+            get(threads::steps::list_steps_handler),
+        )
+        .route(
+            "/v1/threads/{thread_id}/runs/{run_id}/steps/{step_id}",
+            get(threads::steps::get_step_handler),
+        )
+        // ── Responses API ─────────────────────────────────────────────────
+        .route(
+            "/v1/responses",
+            post(routes::responses::create_response).get(routes::responses::list_responses),
+        )
+        .route("/v1/responses/{id}", get(routes::responses::get_response))
         // ── Admin API ─────────────────────────────────────────────────────
         .route("/admin/models/load", post(admin::admin_load_model))
         .route("/admin/models/unload", post(admin::admin_unload_model))
         .route("/admin/models", get(admin::admin_list_models))
         .route("/admin/stats", get(admin::admin_stats))
-        .route("/admin/health", get(admin::admin_health));
+        .route("/admin/health", get(admin::admin_health))
+        // ── LoRA registry ─────────────────────────────────────────────────
+        .route(
+            "/admin/loras",
+            post(admin::admin_register_lora).get(admin::admin_list_loras),
+        )
+        .route(
+            "/admin/loras/{name}",
+            axum::routing::delete(admin::admin_unregister_lora),
+        );
 
     // Metrics endpoint
     if config.metrics_enabled {
         app = app.route("/metrics", get(routes::metrics::metrics));
     }
 
-    let mut app = app.with_state(state);
+    let mut app = app.with_state(Arc::clone(&state));
 
     // Admin auth extension.
     app = app.layer(axum::Extension(admin_auth));
@@ -125,7 +246,15 @@ pub fn build_app_with_config(state: Arc<AppState>, config: &ServerConfig) -> Rou
         app = app.layer(axum::middleware::from_fn(tracing_middleware));
     }
 
-    // Rate limiting layer
+    // Per-API-key rate limiter (applied after auth so the key is always in headers).
+    if let Some(per_key_limiter) = state.per_key_rate_limiter.as_ref().cloned() {
+        app = app.layer(axum::middleware::from_fn_with_state(
+            per_key_limiter,
+            per_key_rate_limit_middleware,
+        ));
+    }
+
+    // Global token-bucket rate limiting layer
     if config.rate_limit_capacity > 0.0 {
         let limiter = RateLimiter::new(config.rate_limit_capacity, config.rate_limit_rate);
         app = app

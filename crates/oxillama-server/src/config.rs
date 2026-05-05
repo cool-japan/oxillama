@@ -1,5 +1,7 @@
 //! Server configuration.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the OxiLLaMa API server.
@@ -61,6 +63,17 @@ pub struct ServerConfig {
     pub batch_spool_dir: Option<String>,
     /// Maximum pending bytes across all queued batch jobs.
     pub batch_max_pending_bytes: usize,
+
+    // ── Per-API-key rate limiting ─────────────────────────────────────────
+    /// Per-key override map: `api_key → (capacity, rate_per_second)`.
+    ///
+    /// When a request carries an API key that appears in this map, the
+    /// override `(capacity, rate)` pair is used instead of the server
+    /// defaults.  Keys absent from this map use `rate_limit_capacity` and
+    /// `rate_limit_rate` as their bucket parameters.
+    ///
+    /// `None` (the default) disables per-key rate limiting entirely.
+    pub per_key_rate_limits: Option<HashMap<String, (f64, f64)>>,
 }
 
 impl Default for ServerConfig {
@@ -90,6 +103,8 @@ impl Default for ServerConfig {
 
             batch_spool_dir: None,
             batch_max_pending_bytes: 1024 * 1024 * 1024, // 1 GiB
+
+            per_key_rate_limits: None,
         }
     }
 }

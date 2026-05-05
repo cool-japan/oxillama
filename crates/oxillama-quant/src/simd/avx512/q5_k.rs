@@ -4,11 +4,11 @@
 //! - bytes[0..2]   — FP16 super-block scale `d` (little-endian)
 //! - bytes[2..4]   — FP16 super-block minimum `dmin` (little-endian)
 //! - bytes[4..16]  — 12 bytes encoding 8 sub-block scales + 8 sub-block mins,
-//!                   6 bits each, packed (same packing as Q4_K)
+//!   6 bits each, packed (same packing as Q4_K)
 //! - bytes[16..48] — 32 bytes `qh` — the high (5th) bit of each 5-bit quant,
-//!                   bit `j` of byte `qh[l]` is the high bit of weight
-//!                   (group * 32 + l) in the lo sub-block (j < 4) or
-//!                   (group * 32 + l) in the hi sub-block (j >= 4).
+//!   bit `j` of byte `qh[l]` is the high bit of weight
+//!   (group * 32 + l) in the lo sub-block (j < 4) or
+//!   (group * 32 + l) in the hi sub-block (j >= 4).
 //! - bytes[48..176] — 128 packed nibble bytes (256 × 4-bit unsigned lo values)
 //!
 //! Block structure: 8 sub-blocks of 32 weights each (4 groups of 2 sub-blocks).

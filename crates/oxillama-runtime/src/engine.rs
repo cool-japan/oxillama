@@ -19,6 +19,7 @@ use oxillama_arch::config::ModelConfig;
 use oxillama_arch::traits::{ForwardPass, KvCacheAccess};
 use oxillama_gguf::GgufModel;
 
+use crate::embedding::{pool_hidden_states, PoolingMode};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::kv_cache::{KvCache, KvCacheSnapshot};
 use crate::metrics::{EngineMetrics, MetricsSnapshot};
@@ -602,6 +603,134 @@ impl InferenceEngine {
         Ok(())
     }
 
+    /// Remove all LoRA adapters from the loaded model's linear layers.
+    ///
+    /// Clears the `lora_stack` and calls `unapply_all_loras` on the forward
+    /// pass so every `QuantLinear.lora` field is set back to `None`.
+    ///
+    /// This is the necessary counterpart to `apply_lora_stack` for per-request
+    /// LoRA hot-swap: push adapters, apply, generate, then unapply.
+    ///
+    /// Does nothing when no model is loaded.
+    pub fn unapply_all_loras(&mut self) {
+        self.lora_stack.clear();
+        if let Some(fp) = self.forward_pass.as_mut() {
+            fp.unapply_all_loras();
+        }
+    }
+
+    /// Restore the KV cache from a cached prefix snapshot and run prefill for
+    /// the suffix tokens that follow the cached prefix.
+    ///
+    /// This is the prefix-KV-cache fast path: instead of re-prefilling the
+    /// entire prompt from scratch, the engine restores the KV state for the
+    /// longest matching cached prefix and only runs the forward pass for the
+    /// remaining suffix tokens.
+    ///
+    /// Restriction: the cached prefix must start at position 0 (i.e. it was
+    /// stored from the beginning of a sequence).  This matches how
+    /// `PrefixKvCache::store` snapshots KV state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::ModelNotLoaded`] if no model is loaded.
+    pub fn prime_with_prefix(
+        &mut self,
+        cached: &crate::kv_cache::prefix::CachedKvState,
+        restore_to: usize,
+        suffix_tokens: &[u32],
+    ) -> RuntimeResult<Vec<f32>> {
+        if suffix_tokens.is_empty() {
+            return Err(RuntimeError::ModelLoadError {
+                message: "prime_with_prefix: suffix_tokens must contain at least one token"
+                    .to_string(),
+            });
+        }
+        // Restore the KV cache to the requested number of prefix positions
+        // (which may be less than cached.seq_len() to handle the edge case
+        // where the caller wants to re-process the last cached token).
+        {
+            let kv = self.kv_cache.as_mut().ok_or(RuntimeError::ModelNotLoaded)?;
+            kv.restore_from_snapshot(cached.keys(), cached.values(), restore_to);
+        }
+        // Process suffix tokens from the restored position and return logits
+        // of the last suffix token (used to seed the autoregressive decode loop).
+        let forward_pass = self
+            .forward_pass
+            .as_mut()
+            .ok_or(RuntimeError::ModelNotLoaded)?;
+        let kv = self.kv_cache.as_mut().ok_or(RuntimeError::ModelNotLoaded)?;
+        let logits = forward_pass
+            .forward(suffix_tokens, kv)
+            .map_err(RuntimeError::Arch)?;
+        Ok(logits)
+    }
+
+    /// Run the autoregressive decode loop starting from pre-computed logits.
+    ///
+    /// Unlike [`Self::generate_with_config`], this does **not** run prefill — the
+    /// caller must have already primed the KV cache (via [`Self::prime_with_prefix`]
+    /// or a full prefill) and obtained the initial logits from that step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::ModelNotLoaded`] if no model is loaded.
+    pub fn generate_with_logits(
+        &mut self,
+        prompt_tokens: &[u32],
+        initial_logits: Vec<f32>,
+        max_tokens: usize,
+        sampler_config: SamplerConfig,
+        mut callback: impl FnMut(&str),
+    ) -> RuntimeResult<String> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or(RuntimeError::ModelNotLoaded)?;
+        let forward_pass = self
+            .forward_pass
+            .as_mut()
+            .ok_or(RuntimeError::ModelNotLoaded)?;
+        let kv_cache = self.kv_cache.as_mut().ok_or(RuntimeError::ModelNotLoaded)?;
+        let max_ctx = forward_pass.max_context_length();
+        let eos_token_id = self.eos_token_id;
+
+        let mut recent_tokens: Vec<u32> = prompt_tokens.to_vec();
+        let mut output_text = String::new();
+        let mut logits = initial_logits;
+
+        let mut sampler = Sampler::new(sampler_config);
+        self.metrics.record_request_start();
+
+        for _step in 0..max_tokens {
+            let next_token = sampler.sample(&logits, &recent_tokens);
+
+            if Some(next_token) == eos_token_id {
+                tracing::debug!("EOS token generated, stopping (primed path)");
+                break;
+            }
+
+            if kv_cache.seq_len() >= max_ctx {
+                tracing::warn!("context length reached, stopping generation (primed path)");
+                break;
+            }
+
+            let token_text = tokenizer.decode(&[next_token])?;
+            callback(&token_text);
+            output_text.push_str(&token_text);
+            recent_tokens.push(next_token);
+
+            let decode_start = Instant::now();
+            logits = forward_pass
+                .forward(&[next_token], kv_cache)
+                .map_err(RuntimeError::Arch)?;
+            self.metrics.record_decode_token(decode_start.elapsed());
+        }
+
+        self.metrics.record_request_complete();
+        Ok(output_text)
+    }
+
     /// Returns whether a model is currently loaded.
     pub fn is_loaded(&self) -> bool {
         self.forward_pass.is_some()
@@ -625,6 +754,26 @@ impl InferenceEngine {
     /// Returns a mutable reference to the KV cache, if a model is loaded.
     pub(crate) fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
         self.kv_cache.as_mut()
+    }
+
+    /// Store the current KV cache state into a `PrefixKvCache` under `tokens`.
+    ///
+    /// This is the public integration point for server-side prefix caching:
+    /// after a successful generation pass the worker calls this to persist the
+    /// KV state so future requests sharing the same prefix can skip prefill.
+    ///
+    /// If no model is loaded (KV cache absent) the call is a silent no-op.
+    pub fn store_kv_in_prefix_cache(
+        &mut self,
+        tokens: &[u32],
+        prefix_cache: &mut crate::kv_cache::prefix::PrefixKvCache,
+    ) {
+        if let Some(kv) = self.kv_cache.as_mut() {
+            let seq_len = kv.seq_len();
+            let kv_dim = kv.kv_dim();
+            let num_layers = kv.num_layers();
+            prefix_cache.store(tokens, kv, seq_len, kv_dim, num_layers);
+        }
     }
 
     /// Reset the KV cache (for starting a new conversation).
@@ -823,15 +972,35 @@ impl InferenceEngine {
         self.model_config.as_ref().map(|c| c.hidden_size)
     }
 
-    /// Compute a semantic embedding vector for the given text.
+    /// Compute a semantic embedding vector for the given text using `PoolingMode::Last`.
     ///
-    /// Runs tokenization → full transformer layers → final RMSNorm, then
-    /// L2-normalises the resulting `hidden_size`-dimensional vector.
-    /// The KV cache is reset before the pass so that embeddings for
-    /// different inputs are independent of each other.
+    /// This is a convenience wrapper around [`Self::embed_with`]. Runs tokenization →
+    /// full transformer layers → final RMSNorm, then L2-normalises the resulting
+    /// `hidden_size`-dimensional vector. The KV cache is reset before the pass
+    /// so that embeddings for different inputs are independent of each other.
     ///
     /// Returns `RuntimeError::ModelNotLoaded` if no model has been loaded.
     pub fn embed(&mut self, text: &str) -> RuntimeResult<Vec<f32>> {
+        self.embed_with(text, PoolingMode::Last)
+    }
+
+    /// Compute a semantic embedding vector for the given text using the specified
+    /// pooling strategy.
+    ///
+    /// Runs tokenization → full transformer layers → final RMSNorm → pooling,
+    /// then L2-normalises the resulting `hidden_size`-dimensional vector.
+    /// The KV cache is reset before the pass so that embeddings for different
+    /// inputs are independent of each other.
+    ///
+    /// # Pooling modes
+    ///
+    /// * [`PoolingMode::Last`] — last token hidden state (causal / decoder models).
+    /// * [`PoolingMode::Mean`] — mean across all token positions.
+    /// * [`PoolingMode::Max`]  — elementwise max across all token positions.
+    /// * [`PoolingMode::Cls`]  — first token hidden state (BERT / encoder models).
+    ///
+    /// Returns `RuntimeError::ModelNotLoaded` if no model has been loaded.
+    pub fn embed_with(&mut self, text: &str, mode: PoolingMode) -> RuntimeResult<Vec<f32>> {
         // Step 1: Reset the KV cache so this embedding is independent.
         // Must happen before we take any partial borrows below.
         self.reset();
@@ -865,7 +1034,24 @@ impl InferenceEngine {
         }
 
         // Step 4: Run the embed forward pass (all layers + output_norm, no LM head).
-        let hidden = forward_pass.embed(&tokens, kv_cache)?;
+        // The forward pass returns the hidden states for all token positions as a
+        // flat [seq_len × hidden_size] vector (or just hidden_size for single-token
+        // models). We retrieve all-states where available; otherwise fall back to
+        // the last-state path for backward compatibility.
+        let seq_len = tokens.len();
+        let hidden_size = forward_pass.hidden_size();
+
+        let all_hidden = forward_pass.embed_all(&tokens, kv_cache);
+        let hidden = match all_hidden {
+            Ok(states) if states.len() == seq_len * hidden_size && seq_len > 0 => {
+                // embed_all is supported and returned a correctly-shaped matrix.
+                pool_hidden_states(&states, seq_len, hidden_size, mode)?
+            }
+            _ => {
+                // Fall back to embed() (last-token path).
+                forward_pass.embed(&tokens, kv_cache)?
+            }
+        };
 
         // Step 5: L2-normalise the hidden vector for cosine-similarity compatibility.
         let norm: f32 = hidden.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -876,49 +1062,44 @@ impl InferenceEngine {
         }
     }
 
-    /// Extract embedding vectors for multiple input texts (batch variant).
+    /// Extract embedding vectors for multiple input texts using `PoolingMode::Last`.
     ///
-    /// Runs the model forward pass and returns the final hidden state
-    /// (post-normalization, pre-LM-head) as the embedding vector.
+    /// This is a convenience wrapper around [`Self::embed_batch_with`].
     /// Each text is processed independently with a fresh KV cache.
     pub fn embed_batch(&mut self, texts: &[String]) -> RuntimeResult<Vec<Vec<f32>>> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or(RuntimeError::ModelNotLoaded)?;
-        let forward_pass = self
-            .forward_pass
-            .as_mut()
-            .ok_or(RuntimeError::ModelNotLoaded)?;
-        let kv_cache = self.kv_cache.as_mut().ok_or(RuntimeError::ModelNotLoaded)?;
+        let str_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        self.embed_batch_with(&str_refs, PoolingMode::Last)
+    }
 
-        let hidden_size = forward_pass.hidden_size();
-        let mut embeddings = Vec::with_capacity(texts.len());
-
-        for text in texts {
-            // Reset cache for each text (embeddings are independent)
-            kv_cache.clear();
-
-            let tokens = tokenizer.encode(text)?;
-            if tokens.is_empty() {
-                embeddings.push(vec![0.0f32; hidden_size]);
-                continue;
-            }
-
-            // Process all tokens and get the final hidden state
-            let hidden_state = forward_pass.embed(&tokens, kv_cache)?;
-
-            // L2 normalize the embedding vector
-            let norm: f32 = hidden_state.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let embedding = if norm > 1e-12 {
-                hidden_state.iter().map(|x| x / norm).collect()
-            } else {
-                hidden_state
-            };
-
-            embeddings.push(embedding);
+    /// Extract embedding vectors for multiple input texts using the specified
+    /// pooling strategy.
+    ///
+    /// Each text is processed independently with a fresh KV cache.
+    /// The output order matches the input order.
+    ///
+    /// Returns `RuntimeError::ModelNotLoaded` if no model has been loaded.
+    pub fn embed_batch_with(
+        &mut self,
+        texts: &[&str],
+        mode: PoolingMode,
+    ) -> RuntimeResult<Vec<Vec<f32>>> {
+        // Validate that the engine is loaded by borrowing forward_pass and
+        // tokenizer — this also gives us the hidden_size for the zero-vector path.
+        {
+            let _fp = self
+                .forward_pass
+                .as_ref()
+                .ok_or(RuntimeError::ModelNotLoaded)?;
+            let _tok = self
+                .tokenizer
+                .as_ref()
+                .ok_or(RuntimeError::ModelNotLoaded)?;
         }
 
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for &text in texts {
+            embeddings.push(self.embed_with(text, mode)?);
+        }
         Ok(embeddings)
     }
 }
@@ -1917,5 +2098,46 @@ mod tests {
             "expected ModelNotLoaded, got {:?}",
             result
         );
+    }
+
+    /// `unapply_all_loras` on an unloaded engine must not panic.
+    #[test]
+    fn unapply_all_loras_noop_when_unloaded() {
+        let mut engine = InferenceEngine::new(EngineConfig::default());
+        engine.unapply_all_loras(); // must not panic
+        assert!(!engine.is_loaded());
+    }
+
+    /// `prime_with_prefix` on an unloaded engine returns `ModelNotLoaded`.
+    #[test]
+    fn prime_with_prefix_returns_model_not_loaded() {
+        use crate::kv_cache::prefix::{PrefixCacheConfig, PrefixKvCache};
+        use crate::kv_cache::KvCache;
+
+        let mut engine = InferenceEngine::new(EngineConfig::default());
+
+        // Build a minimal prefix cache and store a tiny entry so lookup returns Some.
+        let mut prefix_cache = PrefixKvCache::new(PrefixCacheConfig {
+            max_entries: 16,
+            max_memory_bytes: 1024 * 1024,
+            min_prefix_len: 1, // allow tiny prefixes
+        });
+        let kv = KvCache::new(1, 4, 32);
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        prefix_cache.store(&tokens, &kv, 3, 4, 1);
+
+        if let Some((match_len, cached)) = prefix_cache.lookup(&tokens) {
+            // Pass one suffix token so we don't hit the empty-suffix guard.
+            let suffix = &tokens[match_len.min(tokens.len() - 1)..];
+            let result = engine.prime_with_prefix(cached, match_len.saturating_sub(1), suffix);
+            assert!(
+                matches!(result, Err(RuntimeError::ModelNotLoaded)),
+                "unloaded engine must return ModelNotLoaded, got {:?}",
+                result
+            );
+        }
+        // If store did not cache (e.g. tokens.len() < min_prefix_len for some
+        // reason), the assertion is vacuously satisfied — the important property
+        // is that prime_with_prefix never panics when called without a model.
     }
 }

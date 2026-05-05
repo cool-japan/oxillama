@@ -34,6 +34,12 @@ pub struct UsageStats {
 /// `tokio::sync::mpsc::Sender::blocking_send` from within it is safe.
 pub type StreamCallback = Box<dyn FnMut(&str) + Send>;
 
+/// LoRA adapter selection for a single request.
+///
+/// Each entry is `(adapter_name, scale_multiplier)`.  The adapter must have
+/// been pre-loaded via `POST /admin/loras` and registered in `AppState::loras`.
+pub type LoraSelection = Vec<(String, f32)>;
+
 /// A single inference request dispatched to the worker task.
 pub enum BatchRequest {
     /// Non-streaming generation: prompt → full response string.
@@ -44,6 +50,12 @@ pub enum BatchRequest {
         max_tokens: usize,
         /// Per-request sampler configuration.
         config: SamplerConfig,
+        /// Whether to look up and store the prompt's KV state in the prefix
+        /// cache.  When `true` (default), the worker checks for a matching
+        /// cached prefix and skips the redundant prefill if found.
+        cache_prompt: bool,
+        /// LoRA adapters to apply for this request.  Empty means no LoRA.
+        lora_selection: LoraSelection,
         /// Channel to send the result back to the caller.
         reply: oneshot::Sender<Result<(String, UsageStats), String>>,
     },
@@ -56,6 +68,11 @@ pub enum BatchRequest {
         max_tokens: usize,
         /// Per-request sampler configuration.
         config: SamplerConfig,
+        /// Whether to look up and store the prompt's KV state in the prefix
+        /// cache.
+        cache_prompt: bool,
+        /// LoRA adapters to apply for this request.  Empty means no LoRA.
+        lora_selection: LoraSelection,
         /// Called with each token text inside the blocking worker thread.
         callback: StreamCallback,
         /// Channel that receives `Ok(UsageStats)` once generation is complete, or
@@ -77,18 +94,30 @@ impl std::fmt::Debug for BatchRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BatchRequest::Generate {
-                prompt, max_tokens, ..
+                prompt,
+                max_tokens,
+                cache_prompt,
+                lora_selection,
+                ..
             } => f
                 .debug_struct("Generate")
                 .field("prompt_len", &prompt.len())
                 .field("max_tokens", max_tokens)
+                .field("cache_prompt", cache_prompt)
+                .field("lora_count", &lora_selection.len())
                 .finish(),
             BatchRequest::GenerateStream {
-                prompt, max_tokens, ..
+                prompt,
+                max_tokens,
+                cache_prompt,
+                lora_selection,
+                ..
             } => f
                 .debug_struct("GenerateStream")
                 .field("prompt_len", &prompt.len())
                 .field("max_tokens", max_tokens)
+                .field("cache_prompt", cache_prompt)
+                .field("lora_count", &lora_selection.len())
                 .finish(),
             BatchRequest::Embed { text, .. } => f
                 .debug_struct("Embed")
@@ -132,6 +161,8 @@ mod tests {
             prompt: "hello".to_string(),
             max_tokens: 16,
             config: SamplerConfig::default(),
+            cache_prompt: true,
+            lora_selection: vec![],
             reply: reply_tx,
         })
         .await
@@ -175,6 +206,8 @@ mod tests {
             prompt: "secret prompt contents".to_string(),
             max_tokens: 32,
             config: SamplerConfig::default(),
+            cache_prompt: true,
+            lora_selection: vec![],
             reply: reply_tx,
         };
         let debug_str = format!("{req:?}");

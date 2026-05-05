@@ -1,7 +1,10 @@
 //! Core types for the GGUF format — quantization type IDs, value types, and constants.
 
-/// GGUF magic number: "GGUF" in little-endian (0x46475547).
-pub const GGUF_MAGIC: u32 = 0x4755_4746;
+/// GGUF magic number: "GGUF" in little-endian (0x46554747).
+///
+/// Equivalent to `u32::from_le_bytes(*b"GGUF")`, i.e. file bytes
+/// `[0x47, 0x47, 0x55, 0x46]` interpreted as a little-endian `u32`.
+pub const GGUF_MAGIC: u32 = 0x4655_4747;
 
 /// Default tensor data alignment in bytes.
 pub const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
@@ -565,7 +568,19 @@ mod tests {
     #[test]
     fn test_gguf_magic_constant() {
         // Magic "GGUF" as little-endian u32.
-        assert_eq!(GGUF_MAGIC, 0x4755_4746);
+        assert_eq!(GGUF_MAGIC, 0x4655_4747);
+    }
+
+    /// Regression test for issue #1: the GGUF magic constant must match the
+    /// canonical bit pattern produced by reading bytes `b"GGUF"` as a
+    /// little-endian `u32`. Anchoring the assertion to `from_le_bytes` rather
+    /// than a hex literal makes it impossible to silently re-introduce the
+    /// transposed-nibble typo that broke loading of valid GGUF files
+    /// (e.g. `Qwen3-1.7B-Q8_0.gguf`).
+    #[test]
+    fn test_issue_1_gguf_magic_constant() {
+        assert_eq!(GGUF_MAGIC, u32::from_le_bytes(*b"GGUF"));
+        assert_eq!(GGUF_MAGIC.to_le_bytes(), *b"GGUF");
     }
 
     #[test]

@@ -60,7 +60,7 @@ impl MmProjector {
                 detail: "clip_hidden_size must be > 0".to_string(),
             });
         }
-        if input.len() % self.clip_hidden_size != 0 {
+        if !input.len().is_multiple_of(self.clip_hidden_size) {
             return Err(ArchError::InvalidShape {
                 name: "mm_projector input".to_string(),
                 expected: vec![self.clip_hidden_size],
@@ -774,6 +774,10 @@ impl ForwardPass for LlavaModel {
 
     fn apply_lora(&mut self, lora: &LoadedLora) -> ArchResult<()> {
         self.language_model.apply_lora(lora)
+    }
+
+    fn unapply_all_loras(&mut self) {
+        self.language_model.unapply_all_loras();
     }
 }
 

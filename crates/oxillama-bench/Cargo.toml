@@ -14,6 +14,7 @@ readme = "README.md"
 [dependencies]
 oxillama-quant = { workspace = true, features = ["parallel"] }
 oxillama-gguf = { workspace = true, features = ["mmap"] }
+anyhow.workspace = true
 criterion.workspace = true
 half.workspace = true
 serde = { workspace = true }
@@ -22,6 +23,10 @@ tokio = { workspace = true }
 tracing.workspace = true
 sysinfo = { workspace = true }
 tabled = { workspace = true }
+
+[[bench]]
+name = "batch_heatmap"
+harness = false
 
 [[bench]]
 name = "cross_simd"
@@ -49,5 +54,13 @@ harness = false
 
 [[bench]]
 name = "end_to_end"
+harness = false
+
+[[bench]]
+name = "power"
+harness = false
+
+[[bench]]
+name = "speculative"
 harness = false
 

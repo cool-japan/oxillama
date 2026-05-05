@@ -42,14 +42,17 @@ pub mod async_support;
 pub mod callback;
 pub mod cancel;
 pub mod chat_template;
+pub mod dlpack;
 pub mod engine;
 pub mod error;
 #[cfg(feature = "hub")]
 pub mod hub;
 pub mod lora;
 pub mod sampler;
+pub mod snapshot;
 pub mod speculative;
 pub mod tokenizer;
+pub mod torch_interop;
 
 use pyo3::prelude::*;
 
@@ -67,6 +70,7 @@ fn oxillama_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<lora::PyLora>()?;
     m.add_class::<tokenizer::PyTokenizer>()?;
     m.add_class::<cancel::PyCancellationToken>()?;
+    m.add_class::<snapshot::PySnapshotInfo>()?;
     error::register_exceptions(m)?;
     Ok(())
 }

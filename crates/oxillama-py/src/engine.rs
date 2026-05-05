@@ -7,14 +7,18 @@
 //! blocked during inference.  Streaming callbacks re-acquire the GIL
 //! for each call via `Python::attach(...)`.
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyCapsule};
 
 use oxillama_runtime::{EngineConfig as RustEngineConfig, InferenceEngine, SamplerConfig};
 
+use crate::callback::{
+    make_progress_bridge, ProgressBridge, DEFAULT_THROTTLE_MS, DEFAULT_THROTTLE_TOKENS,
+};
 use crate::cancel::PyCancellationToken;
 
 use crate::error::runtime_to_py;
@@ -208,13 +212,50 @@ impl PyEngine {
     ///     top_p:       Override nucleus sampling threshold (keyword-only).
     ///     top_k:       Override top-k limit (keyword-only).
     ///     seed:        Override random seed (keyword-only).
+    ///     cancel_token: Cooperative cancellation handle (keyword-only).
+    ///     progress:    A ``tqdm`` pbar, ``ipywidgets.IntProgress`` widget, a
+    ///                  ``Callable[[ProgressEvent], None]``, or ``None``.
+    ///                  See :mod:`oxillama_py.progress` for the contract.
+    ///     progress_throttle_ms: Minimum milliseconds between throttled
+    ///                  progress callbacks (default 50).
+    ///     progress_throttle_tokens: Minimum tokens between throttled
+    ///                  progress callbacks (default 4).
+    ///     progress_capture_text: When ``True``, populate
+    ///                  ``ProgressEvent.text_so_far``.  Off by default to
+    ///                  avoid the O(n) string copy on every fired tick.
+    ///     strict_progress: When ``True``, re-raise the first Python exception
+    ///                  raised from the progress callback after generation
+    ///                  completes; otherwise the exception is silently
+    ///                  swallowed.
     ///
     /// Returns:
     ///     str: The generated text (not including the prompt).
     ///
     /// Raises:
     ///     RuntimeError: if no model is loaded.
-    #[pyo3(signature = (prompt, max_tokens = 128, *, temperature = None, top_p = None, top_k = None, seed = None, cancel_token = None))]
+    ///
+    /// # Jupyter example
+    ///
+    /// ```python
+    /// from tqdm.auto import tqdm
+    /// with tqdm(desc="Generating", unit="tok") as bar:
+    ///     text = engine.generate("Hello", max_tokens=128, progress=bar)
+    /// ```
+    #[pyo3(signature = (
+        prompt,
+        max_tokens = 128,
+        *,
+        temperature = None,
+        top_p = None,
+        top_k = None,
+        seed = None,
+        cancel_token = None,
+        progress = None,
+        progress_throttle_ms = None,
+        progress_throttle_tokens = None,
+        progress_capture_text = false,
+        strict_progress = false,
+    ))]
     pub fn generate(
         &mut self,
         py: Python<'_>,
@@ -225,16 +266,42 @@ impl PyEngine {
         top_k: Option<usize>,
         seed: Option<u64>,
         cancel_token: Option<Py<PyCancellationToken>>,
+        progress: Option<Py<PyAny>>,
+        progress_throttle_ms: Option<u64>,
+        progress_throttle_tokens: Option<usize>,
+        progress_capture_text: bool,
+        strict_progress: bool,
     ) -> PyResult<String> {
         let inner = &mut self.inner;
         let cancelled = cancel_token
             .as_ref()
             .map(|ct| Python::attach(|py| ct.borrow(py).cancelled.clone()));
+        let bridge = make_progress_bridge(
+            py,
+            progress.as_ref(),
+            max_tokens,
+            progress_throttle_ms.unwrap_or(DEFAULT_THROTTLE_MS),
+            progress_throttle_tokens.unwrap_or(DEFAULT_THROTTLE_TOKENS),
+            progress_capture_text,
+        )?;
+        let bridge_arc: Option<Arc<Mutex<ProgressBridge>>> =
+            bridge.map(|b| Arc::new(Mutex::new(b)));
         let make_cb = || {
             let cancelled = cancelled.clone();
-            move |_tok: &str| {
+            let bridge_inner = bridge_arc.clone();
+            move |tok: &str| {
                 if let Some(ref flag) = cancelled {
                     flag.load(Ordering::Relaxed);
+                }
+                if let Some(ref bridge) = bridge_inner {
+                    Python::attach(|py| {
+                        if let Ok(mut b) = bridge.lock() {
+                            // strict=false here — the post-call epilogue
+                            // raises the stashed error if `strict_progress`
+                            // was set.
+                            let _ = b.note_token(py, tok, false, false);
+                        }
+                    });
                 }
             }
         };
@@ -247,15 +314,36 @@ impl PyEngine {
                 py.detach(|| inner.generate(prompt, max_tokens, make_cb()))
                     .map_err(runtime_to_py)
             };
-        // Check if cancelled after generation finished
-        if let Some(ref flag) = cancelled {
-            if flag.load(Ordering::Relaxed) {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "generation cancelled",
-                ));
+        let was_cancelled = cancelled
+            .as_ref()
+            .map(|f| f.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        let final_result = if was_cancelled {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "generation cancelled",
+            ))
+        } else {
+            result
+        };
+        // Synthesise a final-tick callback (only on success) before the
+        // cleanup finaliser runs.  Then run the explicit finaliser (and
+        // propagate any stashed Python error if strict_progress was
+        // requested) before the bridge is dropped so the finaliser sees the
+        // actual error context.
+        if let Some(bridge) = bridge_arc.as_ref() {
+            if let Ok(mut b) = bridge.lock() {
+                if final_result.is_ok() {
+                    b.fire_final(py);
+                }
+                b.finalise(py, final_result.as_ref().err());
+                if strict_progress {
+                    if let Some(err) = b.take_stashed_error() {
+                        return Err(err);
+                    }
+                }
             }
         }
-        result
+        final_result
     }
 
     /// Generate text from `prompt`, invoking `callback` with each token as it
@@ -274,13 +362,38 @@ impl PyEngine {
     ///     top_p:       Override nucleus sampling threshold (keyword-only).
     ///     top_k:       Override top-k limit (keyword-only).
     ///     seed:        Override random seed (keyword-only).
+    ///     cancel_token: Cooperative cancellation handle (keyword-only).
+    ///     strict_callback: When ``True`` re-raise the first Python exception
+    ///                  raised inside ``callback`` after generation completes.
+    ///     progress:    See :meth:`generate` (same contract as the non-streaming
+    ///                  variant).  Compose freely with ``callback``.
+    ///     progress_throttle_ms: see :meth:`generate`.
+    ///     progress_throttle_tokens: see :meth:`generate`.
+    ///     progress_capture_text: see :meth:`generate`.
+    ///     strict_progress: see :meth:`generate`.
     ///
     /// Returns:
     ///     str: The full generated text (concatenation of all callback inputs).
     ///
     /// Raises:
     ///     RuntimeError: if no model is loaded.
-    #[pyo3(signature = (prompt, max_tokens = 128, callback = None, *, temperature = None, top_p = None, top_k = None, seed = None, cancel_token = None, strict_callback = false))]
+    #[pyo3(signature = (
+        prompt,
+        max_tokens = 128,
+        callback = None,
+        *,
+        temperature = None,
+        top_p = None,
+        top_k = None,
+        seed = None,
+        cancel_token = None,
+        strict_callback = false,
+        progress = None,
+        progress_throttle_ms = None,
+        progress_throttle_tokens = None,
+        progress_capture_text = false,
+        strict_progress = false,
+    ))]
     pub fn generate_streaming(
         &mut self,
         py: Python<'_>,
@@ -293,6 +406,11 @@ impl PyEngine {
         seed: Option<u64>,
         cancel_token: Option<Py<PyCancellationToken>>,
         strict_callback: bool,
+        progress: Option<Py<PyAny>>,
+        progress_throttle_ms: Option<u64>,
+        progress_throttle_tokens: Option<usize>,
+        progress_capture_text: bool,
+        strict_progress: bool,
     ) -> PyResult<String> {
         let inner = &mut self.inner;
         let cancelled = cancel_token
@@ -305,9 +423,23 @@ impl PyEngine {
         let error_slot: Arc<Mutex<Option<pyo3::PyErr>>> = Arc::new(Mutex::new(None));
         let error_slot_inner = error_slot.clone();
 
+        // Build the optional progress bridge before releasing the GIL so the
+        // helper-module import happens with the GIL we already hold.
+        let bridge = make_progress_bridge(
+            py,
+            progress.as_ref(),
+            max_tokens,
+            progress_throttle_ms.unwrap_or(DEFAULT_THROTTLE_MS),
+            progress_throttle_tokens.unwrap_or(DEFAULT_THROTTLE_TOKENS),
+            progress_capture_text,
+        )?;
+        let bridge_arc: Option<Arc<Mutex<ProgressBridge>>> =
+            bridge.map(|b| Arc::new(Mutex::new(b)));
+
         let result = py
             .detach(|| {
                 let cancelled_inner = cancelled.clone();
+                let bridge_inner = bridge_arc.clone();
                 let cb = move |tok: &str| {
                     // Check cancellation before invoking user callback.
                     if let Some(ref flag) = cancelled_inner {
@@ -329,6 +461,13 @@ impl PyEngine {
                             // else: swallow the error (legacy behaviour)
                         }
                     }
+                    if let Some(ref bridge) = bridge_inner {
+                        Python::attach(|py| {
+                            if let Ok(mut b) = bridge.lock() {
+                                let _ = b.note_token(py, tok, false, false);
+                            }
+                        });
+                    }
                 };
                 if has_overrides {
                     let config = build_override_config(inner, temperature, top_p, top_k, seed);
@@ -343,18 +482,44 @@ impl PyEngine {
         if strict_callback {
             if let Ok(mut slot) = error_slot.lock() {
                 if let Some(py_err) = slot.take() {
+                    // Drive the finaliser with the error so the widget renders
+                    // the failure state before we propagate.
+                    if let Some(bridge) = bridge_arc.as_ref() {
+                        if let Ok(mut b) = bridge.lock() {
+                            b.finalise(py, Some(&py_err));
+                        }
+                    }
                     return Err(py_err);
                 }
             }
         }
-        if let Some(ref flag) = cancelled {
-            if flag.load(Ordering::Relaxed) {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "generation cancelled",
-                ));
+
+        let was_cancelled = cancelled
+            .as_ref()
+            .map(|f| f.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        let final_result = if was_cancelled {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "generation cancelled",
+            ))
+        } else {
+            result
+        };
+
+        if let Some(bridge) = bridge_arc.as_ref() {
+            if let Ok(mut b) = bridge.lock() {
+                if final_result.is_ok() {
+                    b.fire_final(py);
+                }
+                b.finalise(py, final_result.as_ref().err());
+                if strict_progress {
+                    if let Some(err) = b.take_stashed_error() {
+                        return Err(err);
+                    }
+                }
             }
         }
-        result
+        final_result
     }
 
     /// Compute a semantic embedding vector for `text`.
@@ -501,6 +666,53 @@ impl PyEngine {
         Ok(numpy::PyArray1::from_vec(py, vec))
     }
 
+    /// Return the logits from the last forward pass as a DLPack capsule.
+    ///
+    /// The logits vector is produced by calling `forward_logits(text)` and
+    /// then wrapping the result as a 1-D `float32` DLPack tensor with shape
+    /// `[vocab_size]`.
+    ///
+    /// The returned object is a `PyCapsule` with name `"dltensor"` that any
+    /// DLPack-aware framework (PyTorch, JAX, NumPy ≥ 1.22, etc.) can consume
+    /// zero-copy via `__dlpack__` protocol.
+    ///
+    /// Args:
+    ///     text: Input text whose logits to compute.
+    ///
+    /// Returns:
+    ///     A `PyCapsule` wrapping the `[vocab_size]` float32 logit vector.
+    ///
+    /// Raises:
+    ///     RuntimeError: if no model is loaded.
+    ///     ValueError: if `text` tokenizes to the empty sequence.
+    #[pyo3(name = "logits_dlpack")]
+    #[pyo3(signature = (text))]
+    pub fn logits_dlpack(&mut self, py: Python<'_>, text: String) -> PyResult<Py<PyCapsule>> {
+        let logits = self.forward_logits(py, text)?;
+        let vocab_size = logits.len() as i64;
+        crate::dlpack::vec_to_dlpack(py, logits, vec![vocab_size])
+    }
+
+    /// Return the last hidden-state embeddings as a DLPack capsule.
+    ///
+    /// Computes a semantic embedding for `text` (same as `embed()`) and
+    /// returns the result as a 2-D `float32` DLPack tensor with shape
+    /// `[1, hidden_size]`.  The extra leading dimension makes the tensor
+    /// compatible with batched embedding APIs.
+    ///
+    /// Returns:
+    ///     A `PyCapsule` wrapping the `[1, hidden_size]` float32 embedding.
+    ///
+    /// Raises:
+    ///     RuntimeError: if no model is loaded.
+    #[pyo3(name = "embeddings_dlpack")]
+    #[pyo3(signature = (text))]
+    pub fn embeddings_dlpack(&mut self, py: Python<'_>, text: String) -> PyResult<Py<PyCapsule>> {
+        let embedding = self.embed(py, &text)?;
+        let hidden_size = embedding.len() as i64;
+        crate::dlpack::vec_to_dlpack(py, embedding, vec![1_i64, hidden_size])
+    }
+
     /// Download a GGUF model from HuggingFace Hub and construct a loaded
     /// `Engine` in one step.
     ///
@@ -560,6 +772,240 @@ impl PyEngine {
         let inner = &mut engine.inner;
         py.detach(|| inner.load_model()).map_err(runtime_to_py)?;
         Ok(engine)
+    }
+
+    /// Save the engine state to `path` atomically.
+    ///
+    /// The snapshot format is `OXISNAP1` — a portable byte blob containing
+    /// the KV cache, sampler config, and a Blake3 fingerprint of the model
+    /// file.  Model weights are **not** stored.
+    ///
+    /// An optional `hub_origin` keyword argument accepts a Python `dict` with
+    /// keys `repo_id`, `filename`, and `sha256`.  When provided, the origin
+    /// metadata is written to a JSON sidecar file (`path + ".meta.json"`) so
+    /// that `Engine.restore()` / `Engine.from_snapshot_with_hub()` can
+    /// re-download the GGUF if it is absent on the restoring machine.
+    ///
+    /// Args:
+    ///     path:       Destination path for the snapshot file.
+    ///     hub_origin: Optional dict with `repo_id`, `filename`, `sha256` keys.
+    ///
+    /// Raises:
+    ///     GenerateError: if no model is loaded.
+    ///     OSError: if the file cannot be written.
+    ///     ValueError: if `hub_origin` is provided but malformed.
+    #[pyo3(signature = (path, *, hub_origin = None))]
+    pub fn snapshot(
+        &self,
+        py: Python<'_>,
+        path: PathBuf,
+        hub_origin: Option<Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<()> {
+        let bytes = py.detach(|| self.inner.snapshot()).map_err(runtime_to_py)?;
+        py.detach(|| crate::snapshot::write_snapshot_atomic(&path, &bytes))
+            .map_err(crate::snapshot::io_to_py)?;
+
+        // Write the JSON meta sidecar when a hub_origin is supplied.
+        if let Some(dict) = hub_origin {
+            let origin = crate::snapshot::HubOrigin::from_py_dict(&dict)?;
+            let snap_bytes = std::fs::read(&path).map_err(crate::snapshot::io_to_py)?;
+            let raw_snap = oxillama_runtime::snapshot::EngineSnapshot::deserialize(&snap_bytes)
+                .map_err(runtime_to_py)?;
+            let meta =
+                crate::snapshot::EngineSnapshotMeta::from_engine_snapshot(&raw_snap, Some(origin));
+            crate::snapshot::write_meta(&path, &meta)?;
+        }
+        Ok(())
+    }
+
+    /// Return the engine state as a `bytes` object.
+    ///
+    /// Equivalent to `snapshot(path)` but returns the raw bytes in-memory
+    /// instead of writing them to disk.  Useful for streaming over a network
+    /// or storing in a database.
+    ///
+    /// Raises:
+    ///     GenerateError: if no model is loaded.
+    pub fn snapshot_bytes(&self, py: Python<'_>) -> PyResult<Vec<u8>> {
+        py.detach(|| self.inner.snapshot()).map_err(runtime_to_py)
+    }
+
+    /// Return metadata from the snapshot at `path` without loading the model.
+    ///
+    /// Returns a :class:`SnapshotInfo` with fields `arch_id`, `model_path`,
+    /// `tokenizer_path`, `max_context_length`, `num_threads`, `version`,
+    /// `magic`, and `tokens_count`.
+    ///
+    /// Raises:
+    ///     OSError: if the file cannot be read.
+    ///     GenerateError: if the snapshot format is invalid.
+    #[classmethod]
+    pub fn snapshot_info(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        path: PathBuf,
+    ) -> PyResult<crate::snapshot::PySnapshotInfo> {
+        py.detach(|| crate::snapshot::snapshot_info_from_path(&path))
+    }
+
+    /// Reconstruct an `Engine` from a snapshot at `path`.
+    ///
+    /// If `model_path` is `None` (default), the model path embedded in the
+    /// snapshot is used.  When a JSON metadata sidecar exists (`path +
+    /// ".meta.json"`) and contains `hub_origin`, the GGUF is re-downloaded
+    /// automatically from HuggingFace Hub if the local path is missing.
+    ///
+    /// Pass an explicit `model_path` to override all automatic resolution,
+    /// which is useful when moving a snapshot between machines where the GGUF
+    /// lives at a different absolute path.
+    ///
+    /// NOTE: When `model_path=None`, the snapshot bytes are deserialized twice
+    /// (once to peek the embedded path, once in `resume`) — acceptable overhead
+    /// for v0.1.3.
+    ///
+    /// The GGUF model is re-loaded from disk on every restore.
+    ///
+    /// Raises:
+    ///     GenerateError: if the snapshot is corrupted or incompatible.
+    ///     LoadError: if the model fingerprint does not match.
+    ///     OSError: if the snapshot file cannot be read.
+    ///     ValueError: if the SHA-256 of a re-downloaded file does not match.
+    #[classmethod]
+    #[pyo3(signature = (path, *, model_path = None))]
+    pub fn restore(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        path: PathBuf,
+        model_path: Option<PathBuf>,
+    ) -> PyResult<Self> {
+        // Read snapshot bytes with GIL released.
+        let bytes = py
+            .detach(|| std::fs::read(&path))
+            .map_err(crate::snapshot::io_to_py)?;
+
+        // Resolve model path: explicit override takes priority.
+        let resolved_model_path: PathBuf = match model_path {
+            Some(p) => p,
+            None => {
+                // Peek the embedded model path from the snapshot.
+                let snap = oxillama_runtime::snapshot::EngineSnapshot::deserialize(&bytes)
+                    .map_err(runtime_to_py)?;
+                let embedded_path = PathBuf::from(&snap.model_path);
+
+                // Check for a hub-aware metadata sidecar.
+                let meta_opt = crate::snapshot::read_meta(&path)?;
+                if let Some(meta) = meta_opt {
+                    if let Some(hub_origin) = meta.hub_origin {
+                        // Hub-aware path: may trigger a re-download.
+                        py.detach(|| {
+                            crate::snapshot::resolve_model_path_with_hub(
+                                &meta.model_path,
+                                &hub_origin,
+                            )
+                        })?
+                    } else {
+                        embedded_path
+                    }
+                } else {
+                    embedded_path
+                }
+            }
+        };
+
+        // Load model and restore state with GIL released (may take seconds).
+        py.detach(|| oxillama_runtime::InferenceEngine::resume(&bytes, &resolved_model_path))
+            .map_err(runtime_to_py)
+            .map(|inner| Self { inner })
+    }
+
+    /// Reconstruct an `Engine` from a snapshot, using hub-aware model
+    /// resolution.
+    ///
+    /// This is a convenience classmethod that calls `restore(path)` and relies
+    /// entirely on the hub metadata written by `snapshot(path,
+    /// hub_origin=...)`.  If the GGUF is absent locally it is re-downloaded
+    /// from HuggingFace Hub and its SHA-256 is verified before loading.
+    ///
+    /// Equivalent to ``Engine.restore(path)`` when a ``.meta.json`` sidecar
+    /// exists alongside the snapshot.  Provided as a distinct method to make
+    /// the intent explicit at the call site.
+    ///
+    /// Args:
+    ///     snapshot_path: Path to the snapshot file.
+    ///
+    /// Returns:
+    ///     Engine: A fully loaded engine restored from the snapshot.
+    ///
+    /// Raises:
+    ///     GenerateError: if the snapshot is corrupted or incompatible.
+    ///     LoadError: if the model fingerprint does not match.
+    ///     OSError: if the snapshot file or sidecar cannot be read.
+    ///     ValueError: if the SHA-256 of the re-downloaded file does not match.
+    #[classmethod]
+    #[pyo3(name = "from_snapshot_with_hub")]
+    pub fn from_snapshot_with_hub(
+        cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        snapshot_path: PathBuf,
+    ) -> PyResult<Self> {
+        Self::restore(cls, py, snapshot_path, None)
+    }
+
+    /// Create an async-friendly wrapper around this engine.
+    ///
+    /// Returns a Python-level :class:`AsyncEngine` instance that wraps
+    /// ``self`` and exposes ``generate`` and ``stream`` coroutines, both
+    /// of which offload blocking inference to a thread-pool executor via
+    /// ``asyncio.get_running_loop().run_in_executor``.
+    ///
+    /// The returned :class:`AsyncEngine` holds a reference to this
+    /// :class:`Engine` object; the caller is responsible for ensuring the
+    /// engine remains alive for the duration of async use.
+    ///
+    /// Returns:
+    ///     AsyncEngine: an async-capable wrapper around ``self``.
+    ///
+    /// Raises:
+    ///     ImportError: if the ``oxillama_py`` package cannot be imported.
+    ///     RuntimeError: if :class:`AsyncEngine` cannot be instantiated.
+    ///
+    /// Example::
+    ///
+    ///     import asyncio
+    ///     from oxillama_py import EngineConfig, Engine
+    ///
+    ///     cfg = EngineConfig("model.gguf")
+    ///     engine = Engine(cfg)
+    ///     engine.load_model()
+    ///
+    ///     ae = engine.async_engine()
+    ///
+    ///     async def main():
+    ///         text = await ae.generate("Hello", max_tokens=64)
+    ///         print(text)
+    ///
+    ///     asyncio.run(main())
+    #[pyo3(signature = ())]
+    pub fn async_engine<'py>(
+        slf: &Bound<'py, PyEngine>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let module = py.import("oxillama_py")?;
+        let async_engine_cls = module.getattr("AsyncEngine")?;
+        async_engine_cls.call1((slf,))
+    }
+
+    /// Pickle refusal — Engine state must be persisted via `Engine.snapshot(path)`.
+    fn __reduce__(&self) -> PyResult<()> {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "Engine cannot be pickled; use Engine.snapshot(path) and Engine.restore(path) \
+             instead — see oxillama_py.snapshot docs.",
+        ))
+    }
+
+    /// Pickle refusal (protocol-aware variant).
+    fn __reduce_ex__(&self, _protocol: i32) -> PyResult<()> {
+        self.__reduce__()
     }
 }
 

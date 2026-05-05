@@ -1,11 +1,15 @@
 //! OxiLLaMa CLI — Pure Rust LLM inference engine.
 
 mod config;
+mod convert;
 mod exit_codes;
 mod hub;
+mod quantize;
 mod session;
+mod tokenize;
 #[cfg(feature = "tui")]
 mod tui;
+mod verify;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -250,6 +254,21 @@ enum Commands {
         #[command(subcommand)]
         command: HubCommand,
     },
+
+    /// Re-quantize a GGUF model to a different quantization format.
+    Quantize(quantize::QuantizeArgs),
+
+    /// Convert a safetensors file to GGUF format.
+    Convert(convert::ConvertArgs),
+
+    /// Verify GGUF file integrity (magic, version, parse, optional SHA-256).
+    Verify(verify::VerifyArgs),
+
+    /// Tokenize a text string using the model's embedded tokenizer.
+    Tokenize(tokenize::TokenizeArgs),
+
+    /// Decode token IDs back to text using the model's embedded tokenizer.
+    Detokenize(tokenize::DetokenizeArgs),
 
     /// Generate shell completion scripts.
     Completions {
@@ -547,7 +566,19 @@ async fn run() -> Result<()> {
             // Start the single inference worker that owns the engine.
             let (queue_tx, queue_rx) =
                 tokio::sync::mpsc::channel::<oxillama_server::BatchRequest>(64);
-            oxillama_server::spawn_inference_worker(engine, queue_rx);
+            let prefix_cache = std::sync::Arc::new(std::sync::Mutex::new(
+                oxillama_runtime::PrefixKvCache::new(oxillama_runtime::PrefixCacheConfig::default()),
+            ));
+            let loras = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::<
+                String,
+                std::sync::Arc<oxillama_runtime::LoadedLora>,
+            >::new()));
+            oxillama_server::spawn_inference_worker(
+                engine,
+                queue_rx,
+                std::sync::Arc::clone(&prefix_cache),
+                std::sync::Arc::clone(&loras),
+            );
 
             let state = std::sync::Arc::new(oxillama_server::AppState::new(
                 queue_tx,
@@ -706,6 +737,7 @@ async fn run() -> Result<()> {
                 .unwrap_or("model")
                 .to_string();
 
+            #[cfg(feature = "tui")]
             let model_path_buf = std::path::PathBuf::from(&model);
 
             let config = oxillama_runtime::EngineConfig {
@@ -895,6 +927,26 @@ async fn run() -> Result<()> {
                 hub::pull(opts).map_err(|e| anyhow::anyhow!("hub pull failed: {e}"))?;
             }
         },
+
+        Commands::Quantize(args) => {
+            quantize::run_quantize(&args)?;
+        }
+
+        Commands::Convert(args) => {
+            convert::run_convert(&args)?;
+        }
+
+        Commands::Verify(args) => {
+            verify::run_verify(&args)?;
+        }
+
+        Commands::Tokenize(args) => {
+            tokenize::run_tokenize(&args)?;
+        }
+
+        Commands::Detokenize(args) => {
+            tokenize::run_detokenize(&args)?;
+        }
 
         Commands::Completions { shell } => {
             clap_complete::generate(

@@ -53,7 +53,7 @@ re-quantizes activations internally.
 | Production `unwrap()` | 0 |
 | Bench harness | Criterion (`benches/quant_kernels.rs`) |
 
-SIMD coverage matrix (v0.1.0):
+SIMD coverage matrix (v0.1.3):
 
 | Type | Scalar | AVX2 | AVX-512 | NEON |
 |---|:-:|:-:|:-:|:-:|
@@ -63,22 +63,22 @@ SIMD coverage matrix (v0.1.0):
 | Q6_K | yes | yes | yes | yes |
 | Q8_0 | yes | yes | yes | yes |
 | Q1_0_G128 | yes | yes | yes | yes |
-| Q2_K | yes | yes | — | — |
-| Q3_K | yes | yes | — | — |
-| Q4_1 | yes | — | — | — |
-| Q5_0 | yes | yes | — | — |
-| Q5_1 | yes | — | — | — |
-| Q8_1 | yes | — | — | — |
-| Q8_K | yes (dequant only) | — | — | yes |
-| TQ1_0 | yes | — | — | — |
-| TQ2_0 | yes | — | — | — |
-| IQ1_S, IQ1_M | yes | — | — | — |
-| IQ2_XXS, IQ2_XS, IQ2_S | yes | IQ2_XXS only | — | — |
-| IQ3_XXS, IQ3_S | yes | IQ3_S ✅ | — | — |
-| IQ4_NL, IQ4_XS | yes | IQ4_XS ✅ | — | — |
+| Q2_K | yes | yes | yes ✅ v0.1.3 | yes ✅ v0.1.1 |
+| Q3_K | yes | yes | yes ✅ v0.1.3 | yes ✅ v0.1.1 |
+| Q4_1 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.3 | yes ✅ v0.1.1 |
+| Q5_0 | yes | yes | yes ✅ v0.1.1 | yes ✅ v0.1.1 |
+| Q5_1 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.3 | yes ✅ v0.1.1 |
+| Q8_1 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.3 | yes ✅ v0.1.1 |
+| Q8_K | yes (dequant only) | — | yes ✅ v0.1.1 | yes |
+| TQ1_0 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.1 | yes ✅ v0.1.1 |
+| TQ2_0 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.1 | yes ✅ v0.1.1 |
+| IQ1_S, IQ1_M | yes | — | — | yes ✅ v0.1.1 |
+| IQ2_XXS, IQ2_XS, IQ2_S | yes | IQ2_XXS ✅ | — | all ✅ v0.1.1 |
+| IQ3_XXS, IQ3_S | yes | IQ3_S ✅ | — | both ✅ v0.1.1 |
+| IQ4_NL, IQ4_XS | yes | IQ4_XS ✅ | — | both ✅ v0.1.1 |
 | F16, BF16, F32 | yes (passthrough) | — | — | — |
 
-Six block formats have a full four-tier SIMD ladder (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q1_0_G128). Q2_K and Q3_K have scalar + AVX2. Q8_K has scalar + NEON. IQ2_XXS has scalar + AVX2. TQ1_0 and TQ2_0 have scalar reference kernels. Thirteen remaining formats ship with scalar-only paths. That gap is the v0.1.1 roadmap.
+Eight block formats have a full four-tier SIMD ladder (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q1_0_G128, Q2_K, Q3_K). Q8_K has scalar + NEON + AVX-512. IQ2_XXS has scalar + AVX2. TQ1_0/TQ2_0 have full AVX2+AVX-512+NEON coverage. All IQ* types have NEON acceleration. NEON covers Q4_1/Q5_0/Q5_1/Q8_1. AVX-512 gaps remain for Q4_1/Q5_1/Q8_1 (deferred).
 
 Feature flag behaviour:
 
@@ -209,7 +209,7 @@ Benchmarks and tests:
 
 Tracked against the remaining ~1% to 100%:
 
-- **SIMD coverage breadth:** ~2 of 27 types still run scalar-only (Q4_1, Q5_1). All IQ* types now have full AVX2+NEON coverage; TQ1_0/TQ2_0/Q5_0/Q8_K have AVX-512+NEON.
+- **SIMD coverage breadth:** ~2 of 27 types still lack AVX-512 (Q4_1, Q5_1). All IQ* types have full AVX2+NEON coverage; TQ1_0/TQ2_0/Q5_0/Q8_K have AVX-512+NEON. Q2_K/Q3_K now have full AVX-512 coverage (v0.1.3). Q4_1/Q8_1/Q5_1 AVX-512 deferred.
 - ~~**No IQ SIMD beyond IQ2_XXS:**~~ ✅ IQ2_XS, IQ3_S, IQ4_XS, and Q4_1 AVX2 kernels now ship; IQ2_XXS was already done.
 - ~~**Q8_K is dequant-only:** there is no `matvec_q8` fast path. The
   activation-side Q8_K is currently materialized via dequant→Q8_0 GEMV.~~ ✅ Fixed: Q8_K now has a true fused GEMV in scalar, AVX2, and NEON tiers.
@@ -239,6 +239,7 @@ Ordered by production impact.
 - ~~**Ternary SIMD acceleration:** AVX-512 VPOPCNTDQ and NEON vcntq_u8 paths
   for TQ1_0/TQ2_0, lifting them from scalar to hardware-accelerated popcount
   paths.~~ ✅ Fully shipped: TQ1_0 and TQ2_0 AVX2 kernels (previous run), plus NEON kernels (`src/simd/neon/tq1_0.rs`, `tq2_0.rs`) and AVX-512 kernels (`src/simd/avx512/tq1_0.rs`, `tq2_0.rs`) — all registered in the dispatcher. Also added AVX-512 Q5_0 (`avx512/q5_0.rs`) and Q8_K (`avx512/q8_k.rs`).
+- ~~**AVX-512 Q2_K / Q3_K:**~~ ✅ Shipped in v0.1.3: `Q2_KAvx512` (`simd/avx512/q2_k.rs`, ~700 LoC) and `Q3_KAvx512` (`simd/avx512/q3_k.rs`, ~830 LoC) registered in `dispatch.rs`. Closes the Q2_K/Q3_K AVX-512 gap; ~2× throughput vs AVX2 on AVX-512 hosts.
 - ~~**Complete IQ SIMD matrix:**~~ ✅ All 11 IQ types have full AVX2 + NEON coverage: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS all have NEON AArch64 kernels in `src/simd/neon/`. Wired into `dispatch.rs` NEON branch.
 - **Activation-aware weights:** per-group calibrated quantization where the
   group scale absorbs activation statistics (AWQ / GPTQ-style). Requires a
@@ -261,7 +262,7 @@ Ordered by production impact.
   route GEMM through `oxiblas` instead of the passthrough path. Moves the
   float tier from a dequant-shaped contract to a true BLAS integration.
 
-*Last updated: 2026-04-20 (v0.1.1)*
+*Last updated: 2026-05-03 (v0.1.3 — AVX-512 Q2_K/Q3_K shipped; 1873 workspace tests)*
 
 ## 8. Planned Kernels (A1–A8)
 

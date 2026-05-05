@@ -143,15 +143,23 @@ policy in benchmark harnesses either, even though they are not strictly
 
 ## 7. v2.0+ Vision
 
-- **Power / watt benchmarks.** Report `tokens / joule` via RAPL on Linux
-  (Intel `/sys/class/powercap/intel-rapl:*`) and IOKit on macOS (when a
-  Pure-Rust binding is available). Critical metric for edge deployment.
-- **Latency-vs-batch-size heatmap.** 2-D Criterion plot sweeping
-  `batch_size × seq_len` to expose the point where continuous batching stops
-  paying off; rendered as an SVG heatmap per architecture.
-- **CI regression gate.** Hard fail (not warn) when `tok/s` regresses by
-  more than a configurable threshold against the saved baseline; block the
-  merge queue until the regression is explained or reverted.
+- ~~**Power / watt benchmarks.**~~ ✅ Shipped (v0.1.3): `RaplReader` in
+  `src/power.rs` reads `/sys/class/powercap/intel-rapl:*` energy counters on
+  Linux; `measure_tokens_per_joule` wraps any closure; `compute_tokens_per_joule_from_delta`
+  is exposed for unit-testable formula verification.  Criterion bench at
+  `benches/power.rs` with `OXILLAMA_BENCH_PRINT_POWER=1` for optional output.
+  Gracefully returns `NoRapl` on non-Linux or when permissions are insufficient.
+- ~~**Latency-vs-batch-size heatmap.**~~ ✅ Shipped: `BatchHeatmap::run`
+  sweeps `batch_size × seq_len`, records `toks_per_sec`, `p99_latency_ms`,
+  and `memory_bytes` per cell; `summary_table` and `p99_table` render Markdown
+  grids; Criterion bench at `benches/batch_heatmap.rs` with
+  `OXILLAMA_BENCH_PRINT_HEATMAP=1` for optional table output.
+- ~~**CI regression gate.**~~ ✅ Shipped (v0.1.3): `RegressionGate` in
+  `src/regression_gate.rs` loads a JSON baseline (`from_file` / `save_baseline`),
+  checks per-metric thresholds (throughput: higher is better; latency: lower is
+  better), and returns structured `RegressionFailure` list.  `format_report`
+  emits a Markdown table.  New benchmarks absent from the baseline are silently
+  skipped.
 - **Flame-graph integration.** Optional `flame` feature that emits
   per-benchmark `*.folded` + SVG, using a Pure-Rust `pprof` replacement (or
   gating this feature when no Pure-Rust sampler is available).
@@ -165,4 +173,6 @@ policy in benchmark harnesses either, even though they are not strictly
 - **Regression history dashboard.** Persist criterion JSON to a small
   on-repo time-series and render a rolling-window plot per metric.
 
-*Last updated: 2026-04-20 (v0.1.1 — 79 tests; KV-cache scaling, cross-SIMD, memory profiler, tokenizer throughput, E2E stub bench all shipped)*
+- ~~**No speculative decoding benchmark.**~~ ✅ Shipped (v0.1.3): `run_acceptance_sweep`, `StubSpecEngine`, `SpeculativeBenchTable`, `SpeculativePoint`, `SpeculativeBenchConfig` in `src/speculative.rs`; Criterion bench at `benches/speculative.rs`; 8 unit tests; re-exported from `lib.rs`; `OXILLAMA_BENCH_PRINT_SPEC=1` enables Markdown table output.
+
+*Last updated: 2026-05-05 (v0.1.3 — speculative decoding acceptance sweep shipped; 8 new tests)*

@@ -8,6 +8,8 @@ A Pure Rust LLM inference engine with Python bindings via PyO3.
    :caption: Contents
 
    quickstart
+   progress
+   snapshot
    api
 
 Quickstart

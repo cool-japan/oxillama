@@ -30,7 +30,7 @@ const Q8_0_BLOCK_BYTES: usize = 34;
 ///
 /// Returns an error when `data.len()` is not a multiple of 32.
 pub fn quantize_f32_to_q4_0(data: &[f32]) -> QuantResult<Vec<u8>> {
-    if data.len() % BLOCK_SIZE != 0 {
+    if !data.len().is_multiple_of(BLOCK_SIZE) {
         return Err(QuantError::DimensionMismatch {
             expected: (data.len() / BLOCK_SIZE + 1) * BLOCK_SIZE,
             got: data.len(),
@@ -56,7 +56,7 @@ pub fn quantize_f32_to_q4_0(data: &[f32]) -> QuantResult<Vec<u8>> {
 ///
 /// Returns an error when `data.len()` is not a multiple of 32.
 pub fn quantize_f32_to_q8_0(data: &[f32]) -> QuantResult<Vec<u8>> {
-    if data.len() % BLOCK_SIZE != 0 {
+    if !data.len().is_multiple_of(BLOCK_SIZE) {
         return Err(QuantError::DimensionMismatch {
             expected: (data.len() / BLOCK_SIZE + 1) * BLOCK_SIZE,
             got: data.len(),

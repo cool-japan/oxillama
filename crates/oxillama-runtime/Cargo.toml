@@ -43,11 +43,11 @@ serde.workspace = true
 serde_json.workspace = true
 oxicode.workspace = true
 blake3.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 oxillama-gguf = { workspace = true, features = ["test-utils"] }
-tempfile.workspace = true
 
 [[bench]]
 name = "sampling"

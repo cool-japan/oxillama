@@ -238,6 +238,154 @@ impl QuantKernel for Q8_1Neon {
     fn name(&self) -> &'static str {
         "Q8_1_Neon"
     }
+
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> crate::error::QuantResult<()> {
+        use crate::error::QuantError;
+
+        if out.len() < n_rows {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows,
+                got: out.len(),
+            });
+        }
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let q8_block_bytes: usize = 34;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < blocks_per_row * q8_block_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: blocks_per_row * q8_block_bytes,
+                available: acts_q8.len(),
+            });
+        }
+
+        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+            let row_start = row * row_bytes;
+            let partial = unsafe {
+                fused_q8_1_q8_0_row_neon(
+                    &weights[row_start..row_start + row_bytes],
+                    acts_q8,
+                    blocks_per_row,
+                    n_cols,
+                )
+            };
+            *out_val += partial;
+        }
+
+        Ok(())
+    }
+}
+
+/// Fused Q8_1 weight × Q8_0 activation dot product for one matrix row.
+///
+/// Q8_1 layout: d (f16) at [0..2], s (f16, unused) at [2..4], qs (i8×32) at [4..36].
+/// Formula: `d_w * Σ(qs_weight_i * d_a * q8_0_act_i)`.
+///
+/// # Safety
+/// Must be called on AArch64 with NEON. All slice bounds must be pre-validated.
+unsafe fn fused_q8_1_q8_0_row_neon(
+    weights_row: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+) -> f32 {
+    const Q8_BLOCK_BYTES: usize = 34;
+    let mut acc = vdupq_n_f32(0.0f32);
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        let block = &weights_row[bo..bo + BLOCK_BYTES];
+        let col_start = blk * BLOCK_SIZE;
+
+        // Q8_1 weight: scale at [0..2], qs (int8) at [4..36]
+        let d_w = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+
+        // Decode Q8_0 activation block
+        let ab = blk * Q8_BLOCK_BYTES;
+        let a_block = &acts_q8[ab..ab + Q8_BLOCK_BYTES];
+        let d_a = f16_to_f32(u16::from_le_bytes([a_block[0], a_block[1]]));
+
+        let col_end = (col_start + BLOCK_SIZE).min(n_cols);
+        let avail = col_end - col_start;
+
+        if avail == BLOCK_SIZE {
+            // Full block: NEON decode of both weight and activation
+            let w_ptr = block.as_ptr().add(4) as *const i8;
+            let wq0 = vld1q_s8(w_ptr);
+            let wq1 = vld1q_s8(w_ptr.add(16));
+
+            let wq0_lo = vmovl_s8(vget_low_s8(wq0));
+            let wq0_hi = vmovl_s8(vget_high_s8(wq0));
+            let wq1_lo = vmovl_s8(vget_low_s8(wq1));
+            let wq1_hi = vmovl_s8(vget_high_s8(wq1));
+
+            let d_w_vec = vdupq_n_f32(d_w);
+            let wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(wq0_lo))), d_w_vec);
+            let wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(wq0_lo)), d_w_vec);
+            let wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(wq0_hi))), d_w_vec);
+            let wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(wq0_hi)), d_w_vec);
+            let wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(wq1_lo))), d_w_vec);
+            let wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(wq1_lo)), d_w_vec);
+            let wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(wq1_hi))), d_w_vec);
+            let wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(wq1_hi)), d_w_vec);
+
+            let q8_ptr = a_block.as_ptr().add(2) as *const i8;
+            let aq0 = vld1q_s8(q8_ptr);
+            let aq1 = vld1q_s8(q8_ptr.add(16));
+
+            let aq0_lo = vmovl_s8(vget_low_s8(aq0));
+            let aq0_hi = vmovl_s8(vget_high_s8(aq0));
+            let aq1_lo = vmovl_s8(vget_low_s8(aq1));
+            let aq1_hi = vmovl_s8(vget_high_s8(aq1));
+
+            let d_a_vec = vdupq_n_f32(d_a);
+            let aa0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(aq0_lo))), d_a_vec);
+            let aa1 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(aq0_lo)), d_a_vec);
+            let aa2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(aq0_hi))), d_a_vec);
+            let aa3 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(aq0_hi)), d_a_vec);
+            let aa4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(aq1_lo))), d_a_vec);
+            let aa5 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(aq1_lo)), d_a_vec);
+            let aa6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(aq1_hi))), d_a_vec);
+            let aa7 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(aq1_hi)), d_a_vec);
+
+            acc = vfmaq_f32(acc, wf0, aa0);
+            acc = vfmaq_f32(acc, wf1, aa1);
+            acc = vfmaq_f32(acc, wf2, aa2);
+            acc = vfmaq_f32(acc, wf3, aa3);
+            acc = vfmaq_f32(acc, wf4, aa4);
+            acc = vfmaq_f32(acc, wf5, aa5);
+            acc = vfmaq_f32(acc, wf6, aa6);
+            acc = vfmaq_f32(acc, wf7, aa7);
+        } else {
+            // Scalar tail for partial blocks
+            let qs = &block[4..36];
+            let q8_vals = &a_block[2..];
+            let mut block_dot = 0.0f32;
+            for i in 0..avail {
+                let w = (qs[i] as i8) as f32 * d_w;
+                let a_val = (q8_vals[i] as i8) as f32 * d_a;
+                block_dot += w * a_val;
+            }
+            let lane0 = vgetq_lane_f32::<0>(acc) + block_dot;
+            acc = vdupq_n_f32(0.0f32);
+            acc = vsetq_lane_f32::<0>(lane0, acc);
+        }
+    }
+
+    hsum_f32x4(acc)
 }
 
 #[cfg(all(test, feature = "simd-neon", target_arch = "aarch64"))]
@@ -388,5 +536,65 @@ mod tests {
                 err
             );
         }
+    }
+
+    #[test]
+    fn fused_q8_1_neon_matches_reference() {
+        let qs = fixed_qs();
+        let weight_block = make_block(0.5, &qs);
+
+        // Build Q8_0 activation block (34 bytes)
+        let d_a = 0.25f32;
+        let acts_raw = fixed_input();
+        let acts_i8: Vec<i8> = acts_raw
+            .iter()
+            .map(|&v| (v / d_a).clamp(-128.0, 127.0) as i8)
+            .collect();
+        let mut acts_block = Vec::with_capacity(34);
+        acts_block.extend_from_slice(&half::f16::from_f32(d_a).to_bits().to_le_bytes());
+        for &v in &acts_i8 {
+            acts_block.push(v as u8);
+        }
+
+        // Reference: dequant weight + dot with scaled activations
+        let mut w_dequant = vec![0.0f32; BLOCK_SIZE];
+        Q8_1Ref
+            .dequant_block(&weight_block, &mut w_dequant)
+            .expect("ref dequant");
+        let acts_f32: Vec<f32> = acts_i8.iter().map(|&v| v as f32 * d_a).collect();
+        let expected: f32 = w_dequant
+            .iter()
+            .zip(acts_f32.iter())
+            .map(|(w, a)| w * a)
+            .sum();
+
+        // NEON fused
+        let mut out_neon = vec![0.0f32; 1];
+        Q8_1Neon
+            .matvec_q8_fused(&weight_block, &acts_block, &mut out_neon, 1, BLOCK_SIZE)
+            .expect("neon fused");
+
+        let err = (out_neon[0] - expected).abs();
+        assert!(
+            err < 0.1,
+            "fused_q8_1_neon: got={} expected={} err={}",
+            out_neon[0],
+            expected,
+            err
+        );
+
+        // Verify against reference Q8_1Ref::matvec_q8_fused
+        let mut out_ref = vec![0.0f32; 1];
+        Q8_1Ref
+            .matvec_q8_fused(&weight_block, &acts_block, &mut out_ref, 1, BLOCK_SIZE)
+            .expect("ref fused");
+        let ref_err = (out_neon[0] - out_ref[0]).abs();
+        assert!(
+            ref_err < 0.1,
+            "fused: neon={} ref={} err={}",
+            out_neon[0],
+            out_ref[0],
+            ref_err
+        );
     }
 }

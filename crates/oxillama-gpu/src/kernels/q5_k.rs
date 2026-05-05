@@ -125,7 +125,7 @@ fn dequant_q5_k_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuResu
 
                     // Low 4 bits from qs.
                     let byte_idx = idx / 2;
-                    let lo_nibble = if idx % 2 == 0 {
+                    let lo_nibble = if idx.is_multiple_of(2) {
                         qs[byte_idx] & 0x0F
                     } else {
                         (qs[byte_idx] >> 4) & 0x0F

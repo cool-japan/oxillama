@@ -17,6 +17,49 @@ use tokio::sync::oneshot;
 
 use super::tools::{Tool, ToolCall, ToolCallDelta, ToolChoice};
 
+fn default_cache_prompt() -> bool {
+    true
+}
+
+/// A single LoRA adapter selection entry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoraEntry {
+    /// Stable adapter name registered via `POST /admin/loras`.
+    pub name: String,
+    /// Scale multiplier (default: 1.0).
+    #[serde(default = "default_lora_scale")]
+    pub scale: f32,
+}
+
+fn default_lora_scale() -> f32 {
+    1.0
+}
+
+/// LoRA adapter selection: either a single adapter name or a list of entries.
+///
+/// Single-string form: `"lora": "my_adapter"` → scale defaults to 1.0.
+/// Array form: `"lora": [{"name": "a", "scale": 0.8}, {"name": "b", "scale": 0.5}]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum LoraSelection {
+    /// Single adapter by name (scale = 1.0).
+    Single(String),
+    /// Ordered list of adapters with per-entry scales.
+    Multi(Vec<LoraEntry>),
+}
+
+impl LoraSelection {
+    /// Convert to the `(name, scale)` pairs expected by `BatchRequest`.
+    pub fn to_pairs(&self) -> Vec<(String, f32)> {
+        match self {
+            LoraSelection::Single(name) => vec![(name.clone(), 1.0)],
+            LoraSelection::Multi(entries) => {
+                entries.iter().map(|e| (e.name.clone(), e.scale)).collect()
+            }
+        }
+    }
+}
+
 /// Chat completion request (OpenAI-compatible).
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -44,6 +87,15 @@ pub struct ChatCompletionRequest {
     /// Tool choice policy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    /// Whether to use the prefix KV cache for this request (default: true).
+    ///
+    /// Set to `false` to force a full prefill even when a matching cached
+    /// prefix exists (e.g., for benchmarking or when the prompt is unique).
+    #[serde(default = "default_cache_prompt")]
+    pub cache_prompt: bool,
+    /// Optional LoRA adapter(s) to apply for this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lora: Option<LoraSelection>,
 }
 
 /// A single chat message.
@@ -204,12 +256,19 @@ pub async fn chat_completions(
         });
 
         // Dispatch to the worker.
+        let lora_selection = request
+            .lora
+            .as_ref()
+            .map(|l| l.to_pairs())
+            .unwrap_or_default();
         state
             .queue
             .send(BatchRequest::GenerateStream {
                 prompt,
                 max_tokens,
                 config: sampler_config,
+                cache_prompt: request.cache_prompt,
+                lora_selection,
                 callback,
                 reply: reply_tx,
             })
@@ -255,12 +314,19 @@ pub async fn chat_completions(
         // Non-streaming: send a Generate request and await the result.
         let (reply_tx, reply_rx) = oneshot::channel::<Result<(String, UsageStats), String>>();
 
+        let lora_selection = request
+            .lora
+            .as_ref()
+            .map(|l| l.to_pairs())
+            .unwrap_or_default();
         state
             .queue
             .send(BatchRequest::Generate {
                 prompt,
                 max_tokens,
                 config: sampler_config,
+                cache_prompt: request.cache_prompt,
+                lora_selection,
                 reply: reply_tx,
             })
             .await

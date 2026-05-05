@@ -28,6 +28,7 @@ tracing.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 tokio-util.workspace = true
+futures-util.workspace = true
 
 # ── JWT auth (optional, feature = "jwt") ──
 hmac = { workspace = true, optional = true }
@@ -38,3 +39,5 @@ base64 = { workspace = true, optional = true }
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 rand = { workspace = true }
+# rand_core 0.6 OsRng is needed for rsa 0.9 (which uses rand_core 0.6 CryptoRngCore)
+rand_core = { version = "0.6", features = ["getrandom"] }

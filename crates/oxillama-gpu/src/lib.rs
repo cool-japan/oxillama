@@ -33,12 +33,14 @@ pub mod kernels;
 pub use context::GpuContext;
 pub use context::GpuDeviceInfo;
 pub use error::{GpuError, GpuResult};
+pub use kernels::sampling::SamplingKernel;
 pub use kernels::{
     batched_gemv_f32, supports_f16, BatchedGemvConfig, BatchedGpuKernel, F16AccumulatorConfig,
-    FusedAttentionKernel, GpuKernel, Iq2SGpuKernel, Iq2XxsGpuKernel, Iq3SGpuKernel,
-    Iq3XxsGpuKernel, Iq4XsGpuKernel, Q1_0_G128GpuKernel, Q2_KGpuKernel, Q3_KGpuKernel,
-    Q4_0GpuKernel, Q4_KGpuKernel, Q5_KGpuKernel, Q6_KGpuKernel, Q8_0GpuKernel, Q8_KGpuKernel,
-    TiledGemmKernel,
+    FusedAttentionKernel, GpuKernel, Iq1MGpuKernel, Iq1SGpuKernel, Iq2SGpuKernel, Iq2XsGpuKernel,
+    Iq2XxsGpuKernel, Iq3SGpuKernel, Iq3XxsGpuKernel, Iq4NlGpuKernel, Iq4XsGpuKernel,
+    Q1_0_G128GpuKernel, Q2_KGpuKernel, Q3_KGpuKernel, Q4_0GpuKernel, Q4_1GpuKernel, Q4_KGpuKernel,
+    Q5_0GpuKernel, Q5_1GpuKernel, Q5_KGpuKernel, Q6_KGpuKernel, Q8_0GpuKernel, Q8_1GpuKernel,
+    Q8_KGpuKernel, TiledGemmKernel, Tq1_0GpuKernel, Tq2_0GpuKernel,
 };
 #[cfg(any(feature = "gpu", test))]
 pub use kernels::{dequant_q4_0_to_f16, dequant_q8_0_to_f16};
@@ -82,17 +84,27 @@ impl GpuDispatcher {
             GgufTensorType::Q2K => Some(Box::new(Q2_KGpuKernel)),
             GgufTensorType::Q3K => Some(Box::new(Q3_KGpuKernel)),
             GgufTensorType::Q4_0 => Some(Box::new(Q4_0GpuKernel)),
+            GgufTensorType::Q4_1 => Some(Box::new(Q4_1GpuKernel)),
             GgufTensorType::Q4K => Some(Box::new(Q4_KGpuKernel)),
+            GgufTensorType::Q5_0 => Some(Box::new(Q5_0GpuKernel)),
+            GgufTensorType::Q5_1 => Some(Box::new(Q5_1GpuKernel)),
             GgufTensorType::Q5K => Some(Box::new(Q5_KGpuKernel)),
             GgufTensorType::Q6K => Some(Box::new(Q6_KGpuKernel)),
             GgufTensorType::Q8_0 => Some(Box::new(Q8_0GpuKernel)),
+            GgufTensorType::Q8_1 => Some(Box::new(Q8_1GpuKernel)),
             GgufTensorType::Q8K => Some(Box::new(Q8_KGpuKernel)),
             GgufTensorType::Q1_0G128 => Some(Box::new(Q1_0_G128GpuKernel)),
             GgufTensorType::Iq4Xs => Some(Box::new(Iq4XsGpuKernel)),
             GgufTensorType::Iq2Xxs => Some(Box::new(Iq2XxsGpuKernel)),
             GgufTensorType::Iq2S => Some(Box::new(Iq2SGpuKernel)),
+            GgufTensorType::Iq2Xs => Some(Box::new(Iq2XsGpuKernel)),
             GgufTensorType::Iq3Xxs => Some(Box::new(Iq3XxsGpuKernel)),
             GgufTensorType::Iq3S => Some(Box::new(Iq3SGpuKernel)),
+            GgufTensorType::Iq1S => Some(Box::new(Iq1SGpuKernel)),
+            GgufTensorType::Iq1M => Some(Box::new(Iq1MGpuKernel)),
+            GgufTensorType::Iq4Nl => Some(Box::new(Iq4NlGpuKernel)),
+            GgufTensorType::Tq1_0 => Some(Box::new(Tq1_0GpuKernel)),
+            GgufTensorType::Tq2_0 => Some(Box::new(Tq2_0GpuKernel)),
             _ => None,
         }
     }
@@ -328,6 +340,74 @@ mod tests {
             assert!(
                 kernel.is_none(),
                 "Iq3S should not have a kernel without GPU"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_dispatcher_kernel_for_q4_1_when_gpu() {
+        let dispatcher = GpuDispatcher::new();
+        let kernel = dispatcher.get_kernel(GgufTensorType::Q4_1);
+        if dispatcher.has_gpu() {
+            assert!(
+                kernel.is_some(),
+                "Q4_1 should have a GPU kernel when GPU is present"
+            );
+        } else {
+            assert!(
+                kernel.is_none(),
+                "Q4_1 should not have a kernel without GPU"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_dispatcher_kernel_for_q5_0_when_gpu() {
+        let dispatcher = GpuDispatcher::new();
+        let kernel = dispatcher.get_kernel(GgufTensorType::Q5_0);
+        if dispatcher.has_gpu() {
+            assert!(
+                kernel.is_some(),
+                "Q5_0 should have a GPU kernel when GPU is present"
+            );
+        } else {
+            assert!(
+                kernel.is_none(),
+                "Q5_0 should not have a kernel without GPU"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_dispatcher_kernel_for_q5_1_when_gpu() {
+        let dispatcher = GpuDispatcher::new();
+        let kernel = dispatcher.get_kernel(GgufTensorType::Q5_1);
+        if dispatcher.has_gpu() {
+            assert!(
+                kernel.is_some(),
+                "Q5_1 should have a GPU kernel when GPU is present"
+            );
+        } else {
+            assert!(
+                kernel.is_none(),
+                "Q5_1 should not have a kernel without GPU"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_dispatcher_kernel_for_q8_1_when_gpu() {
+        let dispatcher = GpuDispatcher::new();
+        let kernel = dispatcher.get_kernel(GgufTensorType::Q8_1);
+        if dispatcher.has_gpu() {
+            assert!(
+                kernel.is_some(),
+                "Q8_1 should have a GPU kernel when GPU is present"
+            );
+        } else {
+            assert!(
+                kernel.is_none(),
+                "Q8_1 should not have a kernel without GPU"
             );
         }
     }

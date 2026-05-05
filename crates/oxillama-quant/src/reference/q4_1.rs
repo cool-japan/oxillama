@@ -92,9 +92,9 @@ impl QuantKernel for Q4_1Ref {
                 let inp = &input[input_offset..input_offset + n_remaining];
 
                 let mut input_sum = 0.0f32;
-                for i in 0..16 {
-                    let lo = (qs[i] & 0x0F) as f32;
-                    let hi = (qs[i] >> 4) as f32;
+                for (i, &q) in qs.iter().enumerate().take(16) {
+                    let lo = (q & 0x0F) as f32;
+                    let hi = (q >> 4) as f32;
                     let j0 = i * 2;
                     let j1 = i * 2 + 1;
                     if j0 < n_remaining {

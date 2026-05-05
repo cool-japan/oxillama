@@ -56,6 +56,19 @@ pub struct CachedKvState {
 }
 
 impl CachedKvState {
+    /// Construct a new `CachedKvState` from pre-built KV buffers.
+    ///
+    /// This is the public constructor used when re-assembling a state from
+    /// cloned data (e.g. after releasing a `Mutex` lock on a `PrefixKvCache`).
+    /// `keys` and `values` must each have one inner `Vec<f32>` per layer.
+    pub fn new(keys: Vec<Vec<f32>>, values: Vec<Vec<f32>>, seq_len: usize) -> Self {
+        Self {
+            keys,
+            values,
+            seq_len,
+        }
+    }
+
     /// Number of tokens this snapshot covers.
     pub fn seq_len(&self) -> usize {
         self.seq_len

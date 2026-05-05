@@ -21,12 +21,12 @@ production paths.
 - Version: **0.1.2** (workspace inherited).
 - Completion: **99%**.
 - Source files: **~45** under `src/**/*.rs`.
-- Supported architectures: **20** (18 feature-gated + Yi and InternLM3 compiled unconditionally).
-- Default features (17): `llama`, `qwen3`, `mistral`, `gemma`, `phi`,
-  `command-r`, `starcoder`, `llava`, `falcon`, `minicpm`, `olmo2`,
-  `granite`, `deepseek`, `dbrx`, `grok`, `mamba2`, `jamba`
-  (`llava` implies `llama`; `jamba` implies `mamba2`).
-- Tests: **397 passing**.
+- Supported architectures: **27** (25 feature-gated + Yi and InternLM3 compiled unconditionally).
+- Default features (20): `llama`, `qwen3`, `mistral`, `gemma`, `phi`,
+  `command-r`, `starcoder`, `llava`, `llava16`, `falcon`, `minicpm`, `olmo2`,
+  `granite`, `deepseek`, `dbrx`, `grok`, `mamba2`, `jamba`, `bloom`, `phimoe`
+  (`llava16` implies `llava`; `llava` implies `llama`; `jamba` implies `mamba2`).
+- Tests: **481 passing**.
 - Upstream dependencies: `oxillama-gguf`, `oxillama-quant`, `half`,
   `thiserror`, `tracing` — all workspace-pinned.
 - Policy compliance: no `unwrap()` in production paths, all files
@@ -54,6 +54,8 @@ production paths.
 | Mamba-2 | ✓ | Selective-scan SSM with learned Δ — new in v0.1.1; GGUF loaders completed in v0.1.2 |
 | Yi | ✓ | 01.AI Yi; LLaMA topology, GGUF arch `"yi"` |
 | InternLM3 | ✓ | Shanghai AI Lab InternLM3 |
+| BLOOM | ✓ | BigScience BLOOM; ALiBi positional bias, fused QKV, pre-LayerNorm with bias, GELU FFN |
+| Phi-3.5-MoE | ✓ | Microsoft Phi-MoE; partial RoPE, GQA, top-2 sparse SwiGLU MoE |
 
 ## 3. Module Map
 
@@ -94,6 +96,15 @@ production paths.
   optional Q/K norms; `mod.rs` + `model.rs`).
 - `src/llava/` — LLaVA-1.5 (CLIP ViT + MmProjector + LLaMA
   backbone; `mod.rs` + `model.rs`).
+- `src/bloom/` — BLOOM (BigScience; fused QKV, pre-LayerNorm with
+  bias, ALiBi positional bias via `common/alibi.rs`, GELU FFN;
+  `mod.rs`, `model.rs`, `config.rs`).
+- `src/phi_moe/` — Phi-3.5-MoE (partial RoPE, GQA, top-2 sparse
+  SwiGLU MoE with stacked expert tensors; `mod.rs`, `model.rs`,
+  `config.rs`).
+- `src/common/alibi.rs` — ALiBi positional bias primitive (`AlibiBias`
+  struct; slope computation for power-of-two and non-power-of-two head
+  counts; `apply()` modifies score buffer in-place before softmax).
 
 ### Dependency order (within the crate)
 
@@ -187,8 +198,7 @@ depends on `llama` for its language-model backbone and enables the
 - **State-space models** — [x] Mamba-2 implemented (`crates/oxillama-arch/src/mamba2/`);
   `SequenceState` trait in `common/sequence_state.rs` generalises KvCacheAccess for SSMs. (v0.1.1)
   Jamba hybrid: see B1 below.
-- **Advanced multimodal**: Qwen2-VL, LLaVA-1.6, Molmo — not
-  covered. Only LLaVA-1.5 ships today.
+- **Advanced multimodal**: ~~LLaVA-1.6~~ ✅ Shipped (v0.1.3, anyres tiling in `src/llava_next/`; registered under arch id `"llava16"`). Qwen2-VL, Molmo — not yet covered.
 - [x] **B4 — `tensor_loader.rs` preventive split via splitrs (planned 2026-04-20)** — DROPPED: `tensor_loader.rs` does not exist in the tree. Largest arch file is `llava/model.rs` at 1,210 lines (well under the 2,000-line splitrs threshold). The split intent is subsumed by B3's lora submodule restructure.
   - **Goal:** `crates/oxillama-arch/src/tensor_loader.rs` is approaching the 2000-LoC limit. Split before B1's Jamba additions push it over.
   - **Design:** Run `rslines 50 crates/oxillama-arch/src/tensor_loader.rs` to confirm size and identify natural split boundaries. Run `splitrs crates/oxillama-arch/src/tensor_loader.rs` to refactor into `tensor_loader/{mod,llama,qwen,mamba2,...}.rs` along arch boundaries. Re-export the public API from `tensor_loader/mod.rs` so callers see no API change. Verify with `cargo check -p oxillama-arch --all-features` and `cargo nextest run -p oxillama-arch --all-features`.
@@ -278,8 +288,7 @@ depends on `llama` for its language-model backbone and enables the
   - **Risk:** Jamba's exact MoE config varies by checkpoint. Default to top-2 of 16 (published config); overridable via metadata.
 - **Qwen2-VL** — advanced multimodal (dynamic resolution,
   M-RoPE).
-- **LLaVA-1.6** — improved vision encoder and higher-res patch
-  handling.
+- ~~**LLaVA-1.6**~~ ✅ Shipped (v0.1.3) — anyres tiling: variable grid (1×2, 2×1, 2×2, 3×1, 1×3) + global thumbnail, each tile independently CLIP-encoded, features concatenated before MM projector. Registered under `"llava16"`. Feature `llava16` (depends on `llava`). Files: `src/llava_next/{mod,model,tiler}.rs`.
 - **Molmo** — next-gen multimodal stack.
 - ~~**InternLM3**~~ ✅ Shipped (`src/internlm3/`).
 - **Yi-VL** — 01.AI's multimodal line.
@@ -397,4 +406,4 @@ depends on `llama` for its language-model backbone and enables the
   - Tests: (a) `ssm_scan_matches_reference` — 32-token sequence, tol 1e-5; (b) `conv1d_depthwise_matches_reference`; (c) `mamba2_forward_shape_and_finite` via `build_minimal_mamba2_gguf()`; (d) `sequence_state_reset_roundtrip`.
   - Risk: A stored as log(A) — MUST use `exp(-Δ * exp(log_A))`. ssm.rs should stay under 1000 LoC; split into scan.rs + state.rs if needed.
 
-*Last updated: 2026-04-25 (v0.1.2 — DBRX/Grok-1/Mamba-2 GGUF loaders completed; KvCacheAccess gained `kv_dim`/`for_each_key`/`for_each_value`; `BatchedKvView`+`KvSlot` moved to `traits.rs`; `ForwardPass::forward_batched` added (NotSupported default + LLaMA impl); 20 architectures, 397 tests, 1 skipped)*
+*Last updated: 2026-05-05 (v0.1.3 — BLOOM and Phi-3.5-MoE architectures added; ALiBi primitive in `common/alibi.rs`; `bloom/` and `phi_moe/` modules registered under `"bloom"` and `"phimoe"`; 27 architectures, 481 tests, 1 skipped)*

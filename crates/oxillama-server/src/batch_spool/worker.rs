@@ -172,6 +172,8 @@ async fn process_job(
                 prompt,
                 max_tokens,
                 config: sampler,
+                cache_prompt: false, // batch jobs use full prefill
+                lora_selection: vec![],
                 reply: reply_tx,
             })
             .await

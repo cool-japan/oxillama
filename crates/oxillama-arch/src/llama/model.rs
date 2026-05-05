@@ -470,6 +470,20 @@ impl ForwardPass for LlamaModel {
         Ok(())
     }
 
+    fn unapply_all_loras(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.attn_q.clear_lora();
+            layer.attn_k.clear_lora();
+            layer.attn_v.clear_lora();
+            layer.attn_output.clear_lora();
+            if let FfnVariant::Dense(dense) = &mut layer.ffn {
+                dense.gate.clear_lora();
+                dense.up.clear_lora();
+                dense.down.clear_lora();
+            }
+        }
+    }
+
     fn forward_batched(
         &mut self,
         q_batch: &[f32],
