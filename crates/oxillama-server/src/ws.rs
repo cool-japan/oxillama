@@ -20,7 +20,9 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot};
 
+use crate::queue::{BatchRequest, StreamCallback, UsageStats};
 use crate::state::AppState;
 
 // ── Request / response types ─────────────────────────────────────────────
@@ -103,10 +105,10 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>
 /// Drive a single WebSocket session end-to-end.
 ///
 /// 1. Receive one text frame containing a [`WsRequest`].
-/// 2. Stream placeholder token events (real inference is wired in via the
-///    inference worker queue in a future integration step).
+/// 2. Dispatch to the inference worker queue and stream token events as they
+///    arrive.
 /// 3. Send a `done` event and close.
-async fn handle_socket(mut socket: WebSocket, _state: Arc<AppState>) {
+async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     // ── Step 1: receive the request ──────────────────────────────────────
     let text = match receive_text(&mut socket).await {
         Some(t) => t,
@@ -121,33 +123,105 @@ async fn handle_socket(mut socket: WebSocket, _state: Arc<AppState>) {
         }
     };
 
-    // ── Step 2: stream tokens ────────────────────────────────────────────
-    // Placeholder: echo a fixed token stream.
-    // In the full integration this will submit `req` to `_state.queue` and
-    // forward streamed tokens from the response channel.
-    let _ = req.model; // suppress unused field warning until full integration
-    let stub_tokens: &[&str] = &["Hello", " from", " OxiLLaMa", " via", " WebSocket"];
-    let mut sent = 0u32;
-    for token in stub_tokens {
-        let event = WsEvent::Token {
-            delta: (*token).to_string(),
-        };
+    // ── Step 2: build prompt and sampler config ──────────────────────────
+    let prompt = format_ws_prompt(&req.messages);
+
+    let mut sampler_config = state.default_sampler.clone();
+    sampler_config.temperature = req.temperature;
+
+    // ── Step 3: create channels ──────────────────────────────────────────
+    // `token_tx` is moved directly into the callback; the callback is the
+    // sole sender.  When the worker drops the `BatchRequest` after completion,
+    // it drops the callback, which drops `token_tx`, causing `token_rx.recv()`
+    // to return `None` and the drain loop to exit cleanly.
+    let (token_tx, mut token_rx) = mpsc::channel::<String>(32);
+    let (reply_tx, reply_rx) = oneshot::channel::<Result<UsageStats, String>>();
+
+    // ── Step 4: build streaming callback ────────────────────────────────
+    let callback: StreamCallback = Box::new(move |token_text: &str| {
+        let _ = token_tx.blocking_send(token_text.to_string());
+    });
+
+    // ── Step 5: dispatch to the inference worker ─────────────────────────
+    if let Err(_e) = state
+        .queue
+        .send(BatchRequest::GenerateStream {
+            prompt,
+            max_tokens: req.max_tokens as usize,
+            config: sampler_config,
+            cache_prompt: true,
+            lora_selection: vec![],
+            callback,
+            reply: reply_tx,
+        })
+        .await
+    {
+        send_error(&mut socket, "Inference worker is unavailable").await;
+        return;
+    }
+
+    // ── Step 6: drain token stream ───────────────────────────────────────
+    while let Some(token) = token_rx.recv().await {
+        let event = WsEvent::Token { delta: token };
         if !send_event(&mut socket, &event).await {
             return;
         }
-        sent += 1;
     }
 
-    // ── Step 3: send done and close ──────────────────────────────────────
+    // ── Step 7: await completion and send done ───────────────────────────
+    let (finish_reason, usage) = match reply_rx.await {
+        Ok(Ok(stats)) => ("stop".to_string(), stats),
+        Ok(Err(msg)) => {
+            send_error(&mut socket, &format!("Generation failed: {msg}")).await;
+            return;
+        }
+        Err(_) => {
+            send_error(&mut socket, "Inference worker dropped the reply channel").await;
+            return;
+        }
+    };
+
     let done = WsEvent::Done {
-        finish_reason: "stop".to_string(),
+        finish_reason,
         usage: UsageSummary {
-            prompt_tokens: 0,
-            completion_tokens: sent,
+            prompt_tokens: usage.prompt_tokens as u32,
+            completion_tokens: usage.completion_tokens as u32,
         },
     };
     send_event(&mut socket, &done).await;
     // Close is implicit when socket is dropped.
+}
+
+/// Format a sequence of [`WsMessage`] entries into a Phi-3 chat prompt string.
+///
+/// Uses the same template as `chat.rs::format_chat_prompt` for consistency.
+fn format_ws_prompt(messages: &[WsMessage]) -> String {
+    let mut prompt = String::new();
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => {
+                prompt.push_str("<|system|>\n");
+                prompt.push_str(&msg.content);
+                prompt.push_str("\n<|end|>\n");
+            }
+            "user" => {
+                prompt.push_str("<|user|>\n");
+                prompt.push_str(&msg.content);
+                prompt.push_str("\n<|end|>\n");
+            }
+            "assistant" => {
+                prompt.push_str("<|assistant|>\n");
+                prompt.push_str(&msg.content);
+                prompt.push_str("\n<|end|>\n");
+            }
+            _ => {
+                prompt.push_str(&msg.content);
+                prompt.push('\n');
+            }
+        }
+    }
+    prompt.push_str("<|assistant|>\n");
+    prompt
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────

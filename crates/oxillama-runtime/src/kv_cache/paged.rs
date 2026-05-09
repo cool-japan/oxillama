@@ -245,34 +245,38 @@ impl KvCacheAccess for PagedKvCache {
             });
         }
 
-        // For now, we need to return a contiguous slice. The paged layout
-        // means we can't return a zero-copy slice if data spans multiple pages.
-        // This is a known limitation — the trait will need to evolve for
-        // truly zero-copy paged access (page-aware attention kernels).
+        // The KvCacheAccess trait returns `&[f32]`, which requires a contiguous
+        // slice already in memory.  Paged storage can only guarantee this for
+        // single-page sequences; multi-page sequences are non-contiguous by design.
         //
-        // SAFETY: We use interior mutability via the assemble buffer approach.
-        // Since we can't mutate &self, we return a reference to assembled data
-        // that lives in the pages themselves when seq_len fits in one page.
+        // Single-page fast path: return a zero-copy borrow of the first page.
+        // Multi-page sequences: return a typed error directing the caller to the
+        //   copy-out alternatives that work across page boundaries:
+        //     • `get_keys_into(&mut Vec<f32>)` — copies into a caller-supplied buffer.
+        //     • `for_each_key(layer, |pos, slice| …)` — page-aware iterator, no allocation.
+        //
+        // This is a deliberate structural constraint, not a temporary limitation:
+        // the `KvCacheAccess` trait's `Send + Sync` bound rules out interior
+        // mutability (`RefCell`/`UnsafeCell`) needed for lazy assembly in `&self`.
         if self.seq_len == 0 {
             return Ok(&[]);
         }
 
-        // Fast path: all data fits in a single page — return zero-copy slice
+        // Fast path: all data fits in a single page — return zero-copy slice.
         let pages_used = (self.seq_len - 1) / PAGE_SIZE + 1;
         if pages_used == 1 {
             let end = self.seq_len * self.kv_dim;
             return Ok(&self.layers[layer].key_pages[0].data[..end]);
         }
 
-        // Multi-page: we can't return a contiguous &[f32] without copying.
-        // This is a fundamental limitation of returning &[f32] from paged storage.
-        // For now, panic with a message pointing to the solution.
-        // TODO: Change trait to support page-aware iteration or accept a callback.
+        // Multi-page path: cannot return a non-contiguous reference.
+        // Use `get_keys_into()` or `for_each_key()` for multi-page access.
         Err(oxillama_arch::ArchError::ForwardPassError {
             layer,
             message: format!(
-                "paged KV cache: sequence length {} spans {} pages; \
-                 use get_keys_into() for multi-page access",
+                "paged KV cache: sequence length {} spans {} pages — \
+                 `get_keys()` only supports single-page sequences; \
+                 use `get_keys_into(&mut buf)` or `for_each_key()` for multi-page access",
                 self.seq_len, pages_used
             ),
         })
@@ -296,11 +300,14 @@ impl KvCacheAccess for PagedKvCache {
             return Ok(&self.layers[layer].value_pages[0].data[..end]);
         }
 
+        // Multi-page path: cannot return a non-contiguous reference.
+        // Use `get_values_into()` or `for_each_value()` for multi-page access.
         Err(oxillama_arch::ArchError::ForwardPassError {
             layer,
             message: format!(
-                "paged KV cache: sequence length {} spans {} pages; \
-                 use get_values_into() for multi-page access",
+                "paged KV cache: sequence length {} spans {} pages — \
+                 `get_values()` only supports single-page sequences; \
+                 use `get_values_into(&mut buf)` or `for_each_value()` for multi-page access",
                 self.seq_len, pages_used
             ),
         })

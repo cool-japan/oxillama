@@ -5,16 +5,20 @@
 //!
 //! ## Supported encoding targets
 //!
-//! | CLI flag  | GGUF type   | Encoder available |
-//! |-----------|-------------|-------------------|
-//! | `Q4_0`    | Q4_0        | yes — `quantize_f32_to_q4_0` |
-//! | `Q8_0`    | Q8_0        | yes — `quantize_f32_to_q8_0` |
-//! | `Q4_K_M`  | Q4_K (Q4K)  | not yet — returns `Err` |
-//! | `Q5_K_M`  | Q5_K (Q5K)  | not yet — returns `Err` |
-//! | `Q6_K`    | Q6_K (Q6K)  | not yet — returns `Err` |
+//! | CLI flag  | GGUF type   | Status |
+//! |-----------|-------------|--------|
+//! | `Q4_0`    | Q4_0        | supported — `quantize_f32_to_q4_0` |
+//! | `Q8_0`    | Q8_0        | supported — `quantize_f32_to_q8_0` |
+//! | `Q4_K_M`  | Q4_K (Q4K)  | not encodable — returns typed `Err` |
+//! | `Q5_K_M`  | Q5_K (Q5K)  | not encodable — returns typed `Err` |
+//! | `Q6_K`    | Q6_K (Q6K)  | not encodable — returns typed `Err` |
 //!
-//! K-quant encoding requires a complex block structure (super-blocks, nested
-//! scale quantization) that is not yet implemented in `oxillama-quant`.
+//! K-quant formats (Q4_K, Q5_K, Q6_K) use a complex super-block layout with
+//! nested 6-bit scale quantization.  Reference *dequantization* kernels for
+//! all three exist in `oxillama-quant`, but the inverse *quantization* (FP32 →
+//! K-quant) is not yet implemented.  Passing one of these targets is not a
+//! programming error — `run_quantize` returns a descriptive `anyhow::Error`
+//! rather than panicking or using `unimplemented!()`.
 
 use std::path::PathBuf;
 
@@ -43,13 +47,19 @@ pub enum QuantTarget {
 }
 
 impl QuantTarget {
-    /// Returns the corresponding `GgufTensorType`, or `None` if encoding is not
-    /// yet implemented for this target.
+    /// Returns the corresponding `GgufTensorType` when an encoder is available,
+    /// or `None` for targets whose *encoding* (FP32 → quantized bytes) is not
+    /// yet implemented.
+    ///
+    /// Callers convert `None` into a descriptive `anyhow::Error` via `ok_or_else`;
+    /// this must never panic or use `unimplemented!()`.
     fn as_tensor_type(&self) -> Option<GgufTensorType> {
         match self {
             QuantTarget::Q4_0 => Some(GgufTensorType::Q4_0),
             QuantTarget::Q8_0 => Some(GgufTensorType::Q8_0),
-            // K-quants require complex block encoders not yet available.
+            // K-quant formats have reference dequantization kernels in oxillama-quant
+            // but no matching encoder (FP32 → K-quant block bytes).  Returns None so
+            // `run_quantize` produces a descriptive error rather than panicking.
             QuantTarget::Q4Km | QuantTarget::Q5Km | QuantTarget::Q6K => None,
         }
     }

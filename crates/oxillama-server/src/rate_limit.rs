@@ -403,7 +403,7 @@ mod tests {
         );
 
         // Verify the map contains exactly one entry for this key.
-        let map = limiter.buckets.read().unwrap();
+        let map = limiter.buckets.read().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             map.len(),
             1,
