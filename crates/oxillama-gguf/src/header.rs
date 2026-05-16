@@ -197,4 +197,91 @@ mod tests {
         let err = GgufHeader::parse(&data, 0).unwrap_err();
         assert!(matches!(err, GgufError::UnsupportedVersion { version: 99 }));
     }
+
+    /// Regression test for issue #1 (file-on-disk variant).
+    ///
+    /// Writes minimal GGUF files to `std::env::temp_dir()` and validates:
+    /// 1. A file starting with correct magic bytes `b"GGUF"` parses successfully.
+    /// 2. A file starting with the old wrong constant `0x46475547` (reversed nibbles)
+    ///    is rejected with `GgufError::InvalidMagic`.
+    /// 3. A file with completely wrong magic is rejected.
+    ///
+    /// The correct GGUF magic on-disk is the 4 ASCII bytes `G G U F`
+    /// (`0x47 0x47 0x55 0x46`).  Interpreted as a little-endian `u32` this is
+    /// `0x46554747` — **not** `0x46475547` which is the big-endian reading.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_issue_1_gguf_magic_validation() {
+        use std::io::Write as _;
+
+        // Helper: build a minimal GGUF v3 byte payload with arbitrary magic.
+        let make_header = |magic_bytes: &[u8; 4]| -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(magic_bytes);
+            v.extend_from_slice(&3u32.to_le_bytes()); // version
+            v.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+            v.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
+            v
+        };
+
+        let tmp = std::env::temp_dir();
+
+        // ── 1. Correct magic (b"GGUF") must be accepted ──────────────────────
+        let correct_path = tmp.join("oxillama_issue1_correct_magic.gguf");
+        {
+            let mut f = std::fs::File::create(&correct_path)
+                .expect("create temp file for correct magic");
+            f.write_all(&make_header(b"GGUF"))
+                .expect("write correct header");
+        }
+        let correct_bytes =
+            std::fs::read(&correct_path).expect("read correct magic file");
+        let _ = std::fs::remove_file(&correct_path);
+        let (hdr, _) = GgufHeader::parse(&correct_bytes, 0)
+            .expect("correct GGUF magic b\"GGUF\" must parse without error");
+        assert_eq!(hdr.version, 3, "version should be 3");
+
+        // ── 2. Wrong magic (old transposed constant 0x46475547) ──────────────
+        //      The bytes on disk would be [0x47, 0x46, 0x47, 0x55] — NOT "GGUF".
+        let wrong_old_magic: u32 = 0x4647_5547;
+        let wrong_old_path = tmp.join("oxillama_issue1_wrong_old_magic.gguf");
+        {
+            let mut f = std::fs::File::create(&wrong_old_path)
+                .expect("create temp file for wrong old magic");
+            f.write_all(&wrong_old_magic.to_le_bytes())
+                .expect("write wrong old magic");
+            f.write_all(&3u32.to_le_bytes())
+                .expect("write version");
+            f.write_all(&0u64.to_le_bytes())
+                .expect("write tensor_count");
+            f.write_all(&0u64.to_le_bytes())
+                .expect("write kv_count");
+        }
+        let wrong_old_bytes =
+            std::fs::read(&wrong_old_path).expect("read wrong old magic file");
+        let _ = std::fs::remove_file(&wrong_old_path);
+        let err = GgufHeader::parse(&wrong_old_bytes, 0)
+            .expect_err("transposed-nibble magic must be rejected");
+        assert!(
+            matches!(err, GgufError::InvalidMagic { .. }),
+            "expected InvalidMagic, got: {err:?}"
+        );
+
+        // ── 3. All-zero magic must also be rejected ───────────────────────────
+        let zero_path = tmp.join("oxillama_issue1_zero_magic.gguf");
+        {
+            let mut f = std::fs::File::create(&zero_path)
+                .expect("create temp file for zero magic");
+            f.write_all(&make_header(&[0, 0, 0, 0]))
+                .expect("write zero header");
+        }
+        let zero_bytes = std::fs::read(&zero_path).expect("read zero magic file");
+        let _ = std::fs::remove_file(&zero_path);
+        let err2 = GgufHeader::parse(&zero_bytes, 0)
+            .expect_err("zero magic must be rejected");
+        assert!(
+            matches!(err2, GgufError::InvalidMagic { .. }),
+            "expected InvalidMagic for zeros, got: {err2:?}"
+        );
+    }
 }
