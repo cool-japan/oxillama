@@ -95,10 +95,9 @@ pub fn parse_worker_message(json: &str) -> Result<JsValue, JsValue> {
             // for JS workers that dispatch on `type` before forwarding to the real engine.
             let _ = (prompt, max_tokens);
             WorkerOutMessage::Error {
-                message:
-                    "Generate requires a loaded model: use WasmEngine.generate() \
+                message: "Generate requires a loaded model: use WasmEngine.generate() \
                      or the top-level generate() export instead of parseWorkerMessage()"
-                        .to_string(),
+                    .to_string(),
             }
         }
     };
@@ -221,10 +220,9 @@ mod tests {
     fn generate_dispatch_produces_error_variant_with_wasm_engine_directive() {
         // Simulate the dispatch that parse_worker_message performs for Generate.
         let response = WorkerOutMessage::Error {
-            message:
-                "Generate requires a loaded model: use WasmEngine.generate() \
+            message: "Generate requires a loaded model: use WasmEngine.generate() \
                  or the top-level generate() export instead of parseWorkerMessage()"
-                    .to_string(),
+                .to_string(),
         };
         let json = serde_json::to_string(&response).expect("must serialize");
         assert!(

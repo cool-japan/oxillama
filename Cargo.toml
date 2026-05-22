@@ -45,7 +45,7 @@ scirs2-core = { version = "0.4.4", default-features = false }
 scirs2-linalg = { version = "0.4.4", default-features = false }
 scirs2-neural = { version = "0.4.4", default-features = false }
 oxiblas = "0.2.1"
-oxifft = "0.3"
+oxifft = "0.3.2"
 
 # ── Error handling ──
 thiserror = "2.0.18"

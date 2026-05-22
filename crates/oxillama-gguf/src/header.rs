@@ -229,13 +229,12 @@ mod tests {
         // ── 1. Correct magic (b"GGUF") must be accepted ──────────────────────
         let correct_path = tmp.join("oxillama_issue1_correct_magic.gguf");
         {
-            let mut f = std::fs::File::create(&correct_path)
-                .expect("create temp file for correct magic");
+            let mut f =
+                std::fs::File::create(&correct_path).expect("create temp file for correct magic");
             f.write_all(&make_header(b"GGUF"))
                 .expect("write correct header");
         }
-        let correct_bytes =
-            std::fs::read(&correct_path).expect("read correct magic file");
+        let correct_bytes = std::fs::read(&correct_path).expect("read correct magic file");
         let _ = std::fs::remove_file(&correct_path);
         let (hdr, _) = GgufHeader::parse(&correct_bytes, 0)
             .expect("correct GGUF magic b\"GGUF\" must parse without error");
@@ -250,15 +249,12 @@ mod tests {
                 .expect("create temp file for wrong old magic");
             f.write_all(&wrong_old_magic.to_le_bytes())
                 .expect("write wrong old magic");
-            f.write_all(&3u32.to_le_bytes())
-                .expect("write version");
+            f.write_all(&3u32.to_le_bytes()).expect("write version");
             f.write_all(&0u64.to_le_bytes())
                 .expect("write tensor_count");
-            f.write_all(&0u64.to_le_bytes())
-                .expect("write kv_count");
+            f.write_all(&0u64.to_le_bytes()).expect("write kv_count");
         }
-        let wrong_old_bytes =
-            std::fs::read(&wrong_old_path).expect("read wrong old magic file");
+        let wrong_old_bytes = std::fs::read(&wrong_old_path).expect("read wrong old magic file");
         let _ = std::fs::remove_file(&wrong_old_path);
         let err = GgufHeader::parse(&wrong_old_bytes, 0)
             .expect_err("transposed-nibble magic must be rejected");
@@ -270,15 +266,13 @@ mod tests {
         // ── 3. All-zero magic must also be rejected ───────────────────────────
         let zero_path = tmp.join("oxillama_issue1_zero_magic.gguf");
         {
-            let mut f = std::fs::File::create(&zero_path)
-                .expect("create temp file for zero magic");
+            let mut f = std::fs::File::create(&zero_path).expect("create temp file for zero magic");
             f.write_all(&make_header(&[0, 0, 0, 0]))
                 .expect("write zero header");
         }
         let zero_bytes = std::fs::read(&zero_path).expect("read zero magic file");
         let _ = std::fs::remove_file(&zero_path);
-        let err2 = GgufHeader::parse(&zero_bytes, 0)
-            .expect_err("zero magic must be rejected");
+        let err2 = GgufHeader::parse(&zero_bytes, 0).expect_err("zero magic must be rejected");
         assert!(
             matches!(err2, GgufError::InvalidMagic { .. }),
             "expected InvalidMagic for zeros, got: {err2:?}"
