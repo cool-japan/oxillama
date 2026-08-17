@@ -5,6 +5,28 @@
 //! Pages are fixed-size slabs of `f32` values.  The pool never frees pages
 //! until it is itself dropped.
 
+use thiserror::Error;
+
+/// Errors returned by [`KvCachePool::free`].
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum KvPoolError {
+    /// The page index does not name a page in this pool.
+    #[error("KV pool: page index {page_idx} out of range (pool holds {total} pages)")]
+    OutOfRange {
+        /// The offending index.
+        page_idx: usize,
+        /// Number of pages the pool holds.
+        total: usize,
+    },
+
+    /// The page was already on the free list.
+    #[error("KV pool: page {page_idx} freed twice")]
+    DoubleFree {
+        /// The offending index.
+        page_idx: usize,
+    },
+}
+
 /// A pool of KV-cache pages.
 ///
 /// Pages are fixed-size slabs of `f32` data backed by a single `Vec` per page.
@@ -13,11 +35,22 @@
 ///
 /// The pool never shrinks — once a page is allocated it lives until the pool
 /// is dropped.
+///
+/// # Double-free safety
+///
+/// An explicit `in_use` bitset makes [`free`](Self::free) reject a page that is
+/// not currently allocated.  Without it, freeing the same index twice pushed it
+/// onto the free list twice and the next two `alloc()` calls handed the **same
+/// page to two owners** — silent cross-sequence KV corruption, guarded in debug
+/// builds only by a `debug_assert!` that checked the index range and not the
+/// state.
 pub struct KvCachePool {
     /// All allocated pages, indexed by page index.
     pages: Vec<Box<[f32]>>,
     /// Indices of pages currently not in use.
     free_list: Vec<usize>,
+    /// `in_use[i]` is true while page `i` is checked out.
+    in_use: Vec<bool>,
     /// Number of `f32` elements per page.
     page_size: usize,
 }
@@ -39,6 +72,7 @@ impl KvCachePool {
         Self {
             pages,
             free_list,
+            in_use: vec![false; initial_pages],
             page_size,
         }
     }
@@ -51,7 +85,9 @@ impl KvCachePool {
     ///
     /// [`free`]: KvCachePool::free
     pub fn alloc(&mut self) -> Option<usize> {
-        self.free_list.pop()
+        let idx = self.free_list.pop()?;
+        self.in_use[idx] = true;
+        Some(idx)
     }
 
     /// Return page `page_idx` to the free list.
@@ -59,16 +95,32 @@ impl KvCachePool {
     /// The page data is **not** zeroed; callers should zero or overwrite the
     /// slice before treating it as a fresh allocation.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics in debug builds if `page_idx >= total_pages()`.
-    pub fn free(&mut self, page_idx: usize) {
-        debug_assert!(
-            page_idx < self.pages.len(),
-            "KvCachePool::free: page_idx {page_idx} out of range (total {})",
-            self.pages.len()
-        );
+    /// * [`KvPoolError::OutOfRange`] when `page_idx` names no page.
+    /// * [`KvPoolError::DoubleFree`] when the page is not currently allocated.
+    ///   This is checked in **release** builds too — a double free silently
+    ///   aliases one page to two owners, which is far worse than the error.
+    pub fn free(&mut self, page_idx: usize) -> Result<(), KvPoolError> {
+        if page_idx >= self.pages.len() {
+            return Err(KvPoolError::OutOfRange {
+                page_idx,
+                total: self.pages.len(),
+            });
+        }
+        if !self.in_use[page_idx] {
+            return Err(KvPoolError::DoubleFree { page_idx });
+        }
+        self.in_use[page_idx] = false;
         self.free_list.push(page_idx);
+        Ok(())
+    }
+
+    /// Whether page `page_idx` is currently checked out.
+    ///
+    /// Returns `false` for an out-of-range index.
+    pub fn is_allocated(&self, page_idx: usize) -> bool {
+        self.in_use.get(page_idx).copied().unwrap_or(false)
     }
 
     /// Get an immutable slice to page `page_idx`.
@@ -128,7 +180,7 @@ mod tests {
         let idx1 = pool.alloc().expect("should allocate");
         assert_ne!(idx0, idx1);
 
-        pool.free(idx0);
+        pool.free(idx0).expect("free of a live page must succeed");
         assert_eq!(pool.used_pages(), 1);
         assert_eq!(pool.free_pages(), 3);
     }
@@ -146,7 +198,7 @@ mod tests {
     fn test_free_then_realloc() {
         let mut pool = KvCachePool::new(8, 1);
         let idx = pool.alloc().expect("alloc");
-        pool.free(idx);
+        pool.free(idx).expect("free of a live page must succeed");
         // Page should be back
         let idx2 = pool.alloc().expect("re-alloc after free");
         assert_eq!(idx, idx2);

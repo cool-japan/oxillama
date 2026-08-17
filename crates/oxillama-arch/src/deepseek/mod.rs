@@ -11,19 +11,24 @@
 //! The `ModelArchitecture::build()` impl returns an `Err(MissingTensor)` pointing
 //! callers to `load_deepseek_from_gguf()` which is the recommended entry point.
 
+pub mod loader;
+pub mod mla;
 pub mod model;
 pub mod moe;
+pub mod quant_moe;
 
+pub use loader::{load_deepseek_from_gguf, DeepSeekRouting};
+pub use mla::{ds_mla_forward, DeepSeekMlaWeights, QProjection};
 pub use model::{
-    build_deepseek_model, load_deepseek_from_gguf, DeepSeekLayer, DeepSeekModel, DenseFfn, FfnKind,
-    N_DENSE_LAYERS,
+    build_deepseek_model, DeepSeekLayer, DeepSeekModel, DenseFfn, FfnKind, N_DENSE_LAYERS,
 };
 pub use moe::{moe_forward, DeepSeekExpert, MoeConfig, MoeWeights, ScoringMode};
+pub use quant_moe::{ExpertActivation, GatingFunc, RoutedMoeConfig, RoutedQuantMoe};
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::traits::{ForwardPass, ModelArchitecture, TensorNamePattern};
-use oxillama_gguf::TensorStore;
+use oxillama_gguf::{GgufModel, TensorStore};
 
 /// Architecture plugin for DeepSeek-V2 models.
 ///
@@ -59,6 +64,15 @@ impl ModelArchitecture for DeepSeekArchitecture {
                    call load_deepseek_from_gguf() instead"
                 .to_string(),
         })
+    }
+
+    /// Route the registry straight at [`load_deepseek_from_gguf`].
+    fn build_from_gguf(
+        &self,
+        model: &GgufModel,
+        _config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Ok(Box::new(load_deepseek_from_gguf(model)?))
     }
 
     fn tensor_names(&self) -> Vec<TensorNamePattern> {

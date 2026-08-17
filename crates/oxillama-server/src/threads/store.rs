@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 use crate::error::{ServerError, ServerResult};
+use crate::resource_id::validate_resource_id;
 use crate::threads::types::{
     Run, RunError, RunStatus, RunStep, RunStepStatus, Thread, ThreadMessage,
 };
@@ -55,7 +56,7 @@ impl ThreadStore {
     /// Creates `{root}/{thread_id}/meta.json` atomically.  Fails if the
     /// directory already exists (duplicate ID).
     pub fn create_thread(&self, thread: &Thread) -> ServerResult<()> {
-        let dir = self.thread_dir(&thread.id);
+        let dir = self.thread_dir(&thread.id)?;
         fs::create_dir_all(&dir).map_err(|e| ServerError::IoError {
             context: format!("create thread directory {}", dir.display()),
             source: e,
@@ -69,7 +70,7 @@ impl ThreadStore {
     /// Returns `ServerError::ThreadNotFound` if no directory or `meta.json`
     /// exists for the given ID.
     pub fn get_thread(&self, id: &str) -> ServerResult<Thread> {
-        let path = self.thread_dir(id).join("meta.json");
+        let path = self.thread_dir(id)?.join("meta.json");
         let content =
             fs::read_to_string(&path).map_err(|_| ServerError::ThreadNotFound(id.to_string()))?;
         serde_json::from_str(&content).map_err(ServerError::Serialization)
@@ -104,7 +105,7 @@ impl ThreadStore {
     /// partially-written message — incomplete trailing lines are filtered out
     /// by `list_messages`.
     pub fn append_message(&self, thread_id: &str, msg: &ThreadMessage) -> ServerResult<()> {
-        let dir = self.thread_dir(thread_id);
+        let dir = self.thread_dir(thread_id)?;
         // Verify thread exists.
         if !dir.join("meta.json").exists() {
             return Err(ServerError::ThreadNotFound(thread_id.to_string()));
@@ -132,8 +133,9 @@ impl ThreadStore {
     /// so that a partial write at the end of a previous session does not break
     /// future reads.
     pub fn list_messages(&self, thread_id: &str) -> ServerResult<Vec<ThreadMessage>> {
-        let path = self.thread_dir(thread_id).join("messages.jsonl");
-        if !self.thread_dir(thread_id).join("meta.json").exists() {
+        let dir = self.thread_dir(thread_id)?;
+        let path = dir.join("messages.jsonl");
+        if !dir.join("meta.json").exists() {
             return Err(ServerError::ThreadNotFound(thread_id.to_string()));
         }
         if !path.exists() {
@@ -169,11 +171,11 @@ impl ThreadStore {
     /// Creates `{root}/{thread_id}/runs/{run_id}/status.json` atomically.
     /// Returns `ThreadNotFound` if the thread does not exist.
     pub fn create_run(&self, thread_id: &str, run: &Run) -> ServerResult<()> {
-        let thread_dir = self.thread_dir(thread_id);
+        let thread_dir = self.thread_dir(thread_id)?;
         if !thread_dir.join("meta.json").exists() {
             return Err(ServerError::ThreadNotFound(thread_id.to_string()));
         }
-        let run_dir = self.run_dir(thread_id, &run.id);
+        let run_dir = self.run_dir(thread_id, &run.id)?;
         fs::create_dir_all(&run_dir).map_err(|e| ServerError::IoError {
             context: format!("create run directory {}", run_dir.display()),
             source: e,
@@ -186,7 +188,7 @@ impl ThreadStore {
     ///
     /// Returns `RunNotFound` if no `status.json` exists for the given IDs.
     pub fn get_run(&self, thread_id: &str, run_id: &str) -> ServerResult<Run> {
-        let path = self.run_dir(thread_id, run_id).join("status.json");
+        let path = self.run_dir(thread_id, run_id)?.join("status.json");
         let content =
             fs::read_to_string(&path).map_err(|_| ServerError::RunNotFound(run_id.to_string()))?;
         serde_json::from_str(&content).map_err(ServerError::Serialization)
@@ -214,7 +216,7 @@ impl ThreadStore {
 
         run.status = status;
         run.last_error = error;
-        let run_dir = self.run_dir(thread_id, run_id);
+        let run_dir = self.run_dir(thread_id, run_id)?;
         self.write_json_atomic(&run_dir, "status.json", &run)?;
         Ok(())
     }
@@ -233,7 +235,7 @@ impl ThreadStore {
         let mut run = self.get_run(thread_id, run_id)?;
         run.status = status;
         run.last_error = error;
-        let run_dir = self.run_dir(thread_id, run_id);
+        let run_dir = self.run_dir(thread_id, run_id)?;
         self.write_json_atomic(&run_dir, "status.json", &run)?;
         Ok(())
     }
@@ -241,8 +243,8 @@ impl ThreadStore {
     // ── Run Step operations ───────────────────────────────────────────────────
 
     /// Return the path to a run's steps directory.
-    pub fn steps_dir(&self, thread_id: &str, run_id: &str) -> PathBuf {
-        self.run_dir(thread_id, run_id).join("steps")
+    pub fn steps_dir(&self, thread_id: &str, run_id: &str) -> ServerResult<PathBuf> {
+        Ok(self.run_dir(thread_id, run_id)?.join("steps"))
     }
 
     /// Persist a new run step to disk.
@@ -250,11 +252,13 @@ impl ThreadStore {
     /// Creates `{root}/{thread_id}/runs/{run_id}/steps/{step_id}.json`
     /// atomically.  Returns `RunNotFound` if the run does not exist.
     pub fn append_step(&self, thread_id: &str, run_id: &str, step: &RunStep) -> ServerResult<()> {
-        let run_dir = self.run_dir(thread_id, run_id);
+        validate_resource_id(&step.id)
+            .map_err(|_| ServerError::RunStepNotFound(step.id.clone()))?;
+        let run_dir = self.run_dir(thread_id, run_id)?;
         if !run_dir.join("status.json").exists() {
             return Err(ServerError::RunNotFound(run_id.to_string()));
         }
-        let steps_dir = self.steps_dir(thread_id, run_id);
+        let steps_dir = self.steps_dir(thread_id, run_id)?;
         fs::create_dir_all(&steps_dir).map_err(|e| ServerError::IoError {
             context: format!("create steps directory {}", steps_dir.display()),
             source: e,
@@ -268,11 +272,11 @@ impl ThreadStore {
     ///
     /// Returns `RunNotFound` if the run does not exist.
     pub fn list_steps(&self, thread_id: &str, run_id: &str) -> ServerResult<Vec<RunStep>> {
-        let run_dir = self.run_dir(thread_id, run_id);
+        let run_dir = self.run_dir(thread_id, run_id)?;
         if !run_dir.join("status.json").exists() {
             return Err(ServerError::RunNotFound(run_id.to_string()));
         }
-        let steps_dir = self.steps_dir(thread_id, run_id);
+        let steps_dir = self.steps_dir(thread_id, run_id)?;
         if !steps_dir.exists() {
             return Ok(Vec::new());
         }
@@ -303,7 +307,9 @@ impl ThreadStore {
     ///
     /// Returns `RunStepNotFound` if no step with this ID exists.
     pub fn get_step(&self, thread_id: &str, run_id: &str, step_id: &str) -> ServerResult<RunStep> {
-        let steps_dir = self.steps_dir(thread_id, run_id);
+        validate_resource_id(step_id)
+            .map_err(|_| ServerError::RunStepNotFound(step_id.to_string()))?;
+        let steps_dir = self.steps_dir(thread_id, run_id)?;
         let path = steps_dir.join(format!("{step_id}.json"));
         let content = fs::read_to_string(&path)
             .map_err(|_| ServerError::RunStepNotFound(step_id.to_string()))?;
@@ -331,7 +337,7 @@ impl ThreadStore {
             _ => {}
         }
         step.status = status;
-        let steps_dir = self.steps_dir(thread_id, run_id);
+        let steps_dir = self.steps_dir(thread_id, run_id)?;
         let filename = format!("{step_id}.json");
         self.write_json_atomic(&steps_dir, &filename, &step)?;
         Ok(())
@@ -340,13 +346,24 @@ impl ThreadStore {
     // ── Path helpers ─────────────────────────────────────────────────────────
 
     /// Return the path to a thread's subdirectory.
-    pub fn thread_dir(&self, thread_id: &str) -> PathBuf {
-        self.root_dir.join(thread_id)
+    ///
+    /// Rejects any `thread_id` that is not a single safe path component
+    /// (see [`crate::resource_id`]) — request-supplied IDs are otherwise
+    /// joined directly onto the store root, which is a path-traversal
+    /// sink (D2).
+    pub fn thread_dir(&self, thread_id: &str) -> ServerResult<PathBuf> {
+        validate_resource_id(thread_id)
+            .map_err(|_| ServerError::ThreadNotFound(thread_id.to_string()))?;
+        Ok(self.root_dir.join(thread_id))
     }
 
     /// Return the path to a run's subdirectory.
-    pub fn run_dir(&self, thread_id: &str, run_id: &str) -> PathBuf {
-        self.thread_dir(thread_id).join("runs").join(run_id)
+    ///
+    /// Validates both `thread_id` and `run_id`.
+    pub fn run_dir(&self, thread_id: &str, run_id: &str) -> ServerResult<PathBuf> {
+        let thread_dir = self.thread_dir(thread_id)?;
+        validate_resource_id(run_id).map_err(|_| ServerError::RunNotFound(run_id.to_string()))?;
+        Ok(thread_dir.join("runs").join(run_id))
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -725,5 +742,41 @@ mod tests {
         let final_run = store.get_run("thread_fc", "run_fc").expect("read final");
         assert_eq!(final_run.status, RunStatus::Expired);
         assert!(final_run.last_error.is_some());
+    }
+
+    /// D2 regression: a `thread_id` containing `../` segments must not let a
+    /// caller read metadata for arbitrary directories outside the store root.
+    #[test]
+    fn get_thread_rejects_path_traversal() {
+        let store = make_store("traversal_thread");
+        let err = store
+            .get_thread("../../../../etc")
+            .expect_err("path traversal id must be rejected");
+        assert!(matches!(err, ServerError::ThreadNotFound(_)));
+    }
+
+    /// D2 regression: same protection must apply to `run_id`.
+    #[test]
+    fn get_run_rejects_path_traversal() {
+        let store = make_store("traversal_run");
+        let thread = make_thread("thread_trav_run");
+        store.create_thread(&thread).expect("create");
+        let err = store
+            .get_run("thread_trav_run", "../../../../etc")
+            .expect_err("path traversal id must be rejected");
+        assert!(matches!(err, ServerError::RunNotFound(_)));
+    }
+
+    /// D2 regression: an absolute-looking `run_id` must not silently
+    /// discard the store root via `PathBuf::join`.
+    #[test]
+    fn get_run_rejects_absolute_looking_id() {
+        let store = make_store("traversal_run_abs");
+        let thread = make_thread("thread_trav_run_abs");
+        store.create_thread(&thread).expect("create");
+        let err = store
+            .get_run("thread_trav_run_abs", "/etc/passwd")
+            .expect_err("absolute-looking id must be rejected");
+        assert!(matches!(err, ServerError::RunNotFound(_)));
     }
 }

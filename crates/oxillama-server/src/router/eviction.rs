@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 ///
 /// The *front* of the deque is the least-recently-used model (first eviction
 /// candidate); the *back* is the most-recently-used.
+#[derive(Debug)]
 pub struct LruQueue {
     inner: VecDeque<String>,
 }

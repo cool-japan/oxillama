@@ -19,13 +19,13 @@ both sides of the interpreter boundary.
 
 | Key                 | Value                                                    |
 |---------------------|----------------------------------------------------------|
-| Version             | 0.1.1 (workspace-pinned)                                 |
-| Overall completion  | ~80% (all v1.1 items shipped; pickle + progress-bar gap remains) |
-| Rust source files   | 10 (`lib.rs`, `engine.rs`, `speculative.rs`, `lora.rs`, `sampler.rs`, `error.rs`, `callback.rs`, `async_support.rs`, `hub.rs`, `cancel.rs`) |
-| Rust unit tests     | 81 across all modules                                    |
-| Python tests        | 55 across pytest suites (config, sampler, streaming, exceptions, cancellation token; model-backed tests gated on `OXILLAMA_TEST_MODEL`) |
-| Public API items    | 16 (`EngineConfig`, `Engine`, `AsyncEngine`, `SamplerConfig`, `SpeculativeConfig`, `SpeculativeEngine`, `Lora`, `Tokenizer`, `CancellationToken`, + exception hierarchy) |
-| PyO3                | 0.28 (0.22 → 0.24 → 0.28; resolves RUSTSEC-2025-0020)   |
+| Version             | 0.1.4 (workspace-pinned)                                 |
+| Overall completion  | ~80% (all v1.1 items shipped; hub-download progress bar regression from the hf-hub 1.0 migration fixed 2026-08-17 — see Known Gaps) |
+| Rust source files   | 16 (`lib.rs`, `engine.rs`, `speculative.rs`, `lora.rs`, `sampler.rs`, `error.rs`, `callback.rs`, `async_support.rs`, `hub.rs`, `cancel.rs`, `chat_template.rs`, `dlpack.rs`, `generation.rs`, `snapshot.rs`, `tokenizer.rs`, `torch_interop.rs`) |
+| Rust unit tests     | 131 across all modules (verified 2026-08-17)             |
+| Python tests        | 226 across pytest suites (config, sampler, streaming, exceptions, cancellation token incl. live-engine early-exit; model-backed tests gated on `OXILLAMA_TEST_MODEL` — 184 pass / 42 skip without a model) |
+| Public API items    | 16 (`EngineConfig`, `Engine`, `AsyncEngine`, `SamplerConfig`, `SpeculativeConfig`, `SpeculativeEngine`, `Lora`, `Tokenizer`, `CancellationToken`, + exception hierarchy — the latter gained `GpuUnavailableError` in v0.1.4) |
+| PyO3                | 0.29.2 (0.22 → 0.24 → 0.28 → 0.29.2; resolves RUSTSEC-2025-0020, RUSTSEC-2026-0176, RUSTSEC-2026-0177) |
 | Wheel build         | via `maturin` (`pyproject.toml` + abi3-py38)            |
 | Target Python       | 3.8+ (stable ABI wheel)                                  |
 | Crate type          | `cdylib` + `rlib` (rlib for in-workspace `cargo test`)  |
@@ -40,14 +40,18 @@ both sides of the interpreter boundary.
 | `src/lora.rs`           | `Lora` (wraps `LoadedLora`) class                 |
 | `src/sampler.rs`        | `SamplerConfig` class (constructor + helpers)     |
 | `src/error.rs`          | `RuntimeError` / `ArchError` → Python exceptions  |
-| `src/callback.rs`       | *(planned)* streaming callback bridge             |
-| `src/streaming.rs`      | current streaming-callback helper module          |
+| `src/callback.rs`       | Streaming callback bridge + progress-bar `Throttler`/`ProgressBridge` |
+| `src/async_support.rs`  | `AsyncEngine` (`PyAsyncEngine`) async/await bindings |
+| `src/cancel.rs`         | `CancellationToken` cooperative-cancellation handle |
+| `src/chat_template.rs`  | Chat-template renderer (`chatml`/`llama3`/`alpaca`), invoked by `PyTokenizer::apply_chat_template` |
+| `src/dlpack.rs`         | DLPack v0.8 tensor export (`logits_dlpack`, `embeddings_dlpack`) |
+| `src/generation.rs`     | `FinishReason` / `GenerationConfig` / `GenerationOutcome` behind `generate_detailed` |
+| `src/hub.rs`            | HuggingFace Hub loader (`Engine.from_hub`, `hub.load_from_hub`); optional `hub` feature |
+| `src/snapshot.rs`       | `Engine.snapshot`/`restore` Pure-Rust persistence |
+| `src/tokenizer.rs`      | `Tokenizer` (`PyTokenizer`) class bindings        |
+| `src/torch_interop.rs`  | placeholder for future Rust-side `torch.Tensor` helpers |
 | `pyproject.toml`        | maturin build config (`features = ["pyo3/extension-module"]`) |
 | `python/tests/`         | pytest suite (imports the built extension)        |
-
-Note: the streaming helper currently lives at `src/streaming.rs` rather
-than `src/callback.rs`. Renaming to `callback.rs` is a v1.1 housekeeping
-item.
 
 ## 4. Shipped in v0.1.0
 
@@ -106,8 +110,8 @@ This is the 75% gap — the polish work the 25% number represents.
 - ~~**Error variants are flat-mapped**~~ ✅ Custom exception hierarchy
   shipped: `OxiLlamaError` → `LoadError`, `GenerateError`,
   `TokenizerError`, `GrammarError`, `QuantError` via `register_exceptions()`.
-- **Minimal pytest suite.** 26 tests cover the happy path on the
-  exposed surface; full-coverage property tests and fixture-driven
+- **Pytest suite breadth.** See the Status Snapshot table above for the
+  current pytest count; full-coverage property tests and fixture-driven
   minimal-GGUF round-trips are still outstanding.
 - ~~**No sphinx autodoc / readthedocs.io site.** Users rely on
   docstrings visible only via `help()` in a REPL.~~ ✅ `docs/` skeleton
@@ -122,6 +126,22 @@ This is the 75% gap — the polish work the 25% number represents.
   manually; no `Engine.from_hub("meta-llama/...")` convenience.~~ ✅
   `Engine.from_hub()` shipped (`hub.rs`); `oxillama_py.hub.load_from_hub()`
   convenience function added; GIL released during download.
+  **Regression found 2026-08-17 (v0.1.4), fixed same day:** the `hf-hub`
+  0.5 → 1.0 migration (`hub.rs`, gated behind the optional `hub` feature —
+  `default = []` in `Cargo.toml`) replaced `ApiBuilder::new()` (which
+  defaulted `progress = true`) with the 1.0 `HFClient::builder()` /
+  `split_id()` + `client.model()` API. hf-hub 1.0 has no built-in progress
+  renderer, only a `ProgressHandler` callback, and `oxillama-py` did not
+  depend on `indicatif` (unlike `oxillama-cli`, which does and implements
+  its own bar) — so `Engine.from_hub(...)` / `oxillama_py.hub.load_from_hub()`
+  downloads stopped showing a progress bar, a real user-visible regression
+  from v0.1.3. Fixed by adding `indicatif = { workspace = true, optional =
+  true }` to `crates/oxillama-py/Cargo.toml` (gated on `hub`, alongside
+  `hf-hub`) and a `PullProgress` struct in `hub.rs` implementing
+  `hf_hub::progress::ProgressHandler`, wired via `.progress(PullProgress::
+  new())` on the `download_file()` builder — a near-verbatim duplicate of
+  `oxillama-cli`'s `PullProgress` (see that struct's doc comment for why it
+  isn't shared instead).
 - [x] **`Engine.snapshot(path)` / `Engine.restore(path)` Pure-Rust persistence** (planned 2026-05-03, supersedes "No pickle / checkpoint support" gap)
   - **Goal:** First-class persistence on `Engine` (and `AsyncEngine`) without exposing pickle. Three methods on `PyEngine`:
     1. `engine.snapshot(path)` — atomic write of the live engine state (model fingerprint, KV cache, sampler config, grammar source, tokenizer path, context size, num_threads) to a Pure-Rust `OXISNAP1` file via the existing `InferenceEngine::snapshot()` API.
@@ -205,10 +225,63 @@ This is the 75% gap — the polish work the 25% number represents.
   `engine.cancel()` or cooperative cancellation handle is exposed.~~
   ✅ `CancellationToken` class shipped (`cancel.rs`); accepted as
   `cancel_token=` kwarg by `generate()` and `generate_streaming()`.
+  **Caveat found 2026-08-05 — ✅ fixed the same day:** cancellation used not to
+  shorten wall-clock generation time at all. `oxillama_runtime`'s decode loop
+  (`run_decode_loop` in `crates/oxillama-runtime/src/engine/generation.rs`) had
+  no cancellation check, and its per-token callback is infallible
+  (`impl FnMut(&str)`, no way to signal "stop"), so `inner.generate(...)` always
+  ran to natural completion (EOS or `max_tokens`) regardless of
+  `token.cancel()`. `Engine.generate()`'s callback even read the flag and threw
+  the result away (`flag.load(Ordering::Relaxed);` with no `if`) — a dead read
+  that looked like a check. Both methods only consulted `cancelled.load()`
+  *after* the blocking call returned, so `generate(..., max_tokens=2048,
+  cancel_token=t)` cancelled at token 1 still burned all 2048 forward passes
+  before raising.
+  **The fix:** `GenerationConfig` gained
+  `cancel_flag: Option<Arc<AtomicBool>>` (default `None`, zero-cost when
+  unused), checked once per decode iteration ahead of the `max_tokens` and
+  context-length checks, breaking with the new `FinishReason::Cancelled` and
+  returning everything produced so far. `Engine.generate()`,
+  `generate_streaming()`, and `generate_detailed()` now build that config
+  (via `build_generation_config` in `src/engine.rs`) and bind the token's flag
+  to it; the dead `flag.load()` read is gone. The post-hoc
+  `PyRuntimeError("generation cancelled")` is unchanged, so the Python-visible
+  contract is identical — only much faster.
+  **Coverage:** `crates/oxillama-runtime/tests/cancellation.rs` (synthetic
+  model: cancel after N tokens stops at N, pre-cancelled emits nothing, an
+  unraised flag changes nothing, plus the pre-tokenized entry point) and
+  `python/tests/test_cancellation_token.py`'s three `OXILLAMA_TEST_MODEL`-gated
+  tests, which compare against a *measured* uncancelled baseline rather than a
+  fixed wall-clock budget.
+  **Measured:** `test_progress.py::test_progress_callback_finalised_on_cancellation`
+  — documented above as taking "tens of minutes under load" for exactly this
+  reason — now completes in **2.35 s** on Qwen3-4B-Instruct.
 - ~~**Callback exceptions swallowed.**~~ ✅ Fixed: `strict_callback=True` kwarg on
   `generate_streaming()` propagates Python exceptions raised inside the callback
   instead of silencing them.  Default (`strict_callback=False`) preserves the
   original silent behaviour.
+- ~~**No input validation at the pyo3 boundary — `EngineConfig(context_size=0)`
+  and `SamplerConfig(temperature=-0.1)` constructed successfully instead of
+  raising.**~~ ✅ Fixed: the `#[new]` constructors (`EngineConfig.__new__` /
+  `SamplerConfig.__new__`, `engine.rs` / `sampler.rs`) now validate before
+  constructing and raise `ValueError` with a specific message on failure —
+  `model_path` (empty or whitespace-only), `context_size` (`0`; `None` still
+  means "use the model's default"), `temperature` (negative or `NaN`),
+  `top_p`/`min_p` (outside the closed interval `[0.0, 1.0]`),
+  `repetition_penalty` (non-positive or `NaN`), and `mirostat` (outside
+  `{0, 1, 2}`). Deliberately left unvalidated: `top_k`/`num_threads`/
+  `repetition_penalty_window` (unsigned at the FFI boundary — a negative
+  Python `int` is already rejected by pyo3's own argument conversion before
+  any of this crate's code runs, and `0` is a legitimate "auto"/"disabled"
+  value for each), and `frequency_penalty`/`presence_penalty` (negative is
+  valid OpenAI-style semantics, not a misbehaving input). The previously
+  unvalidated constructors are kept internally (`EngineConfig::new` /
+  `SamplerConfig::new`, not exposed to Python) for this module's own
+  already-known-valid Rust-side test fixtures. 11 new Rust unit tests
+  (`py_new` validation, `engine.rs`/`sampler.rs`) + 21 new pytest cases
+  (`test_engine_config.py`, `test_sampler_config.py`), including boundary
+  values (`0.0`/`1.0` for `top_p`/`min_p`, `repetition_penalty=1.0`, every
+  `mirostat` mode) proven still accepted.
 
 ## 6. v1.1 Roadmap
 
@@ -272,7 +345,9 @@ This is the 75% gap — the polish work the 25% number represents.
 
 - ~~**`torch.Tensor` interop.**~~ ✅ Shipped (v0.1.3 Track F): `torch_helper.py` adds `Engine.logits_torch(text)` and `Engine.embeddings_torch(text)` via DLPack zero-copy; monkey-patched onto `Engine` at import time by `__init__.py`; lazy `torch` import so absence of PyTorch never prevents package import; `logits_torch` / `embeddings_torch` stubs added to `__init__.pyi`; `src/torch_interop.rs` placeholder for future Rust-side helpers; Python test suite in `tests/test_torch_interop.py` (17 tests).
 
-*Last updated: 2026-05-05 (v0.1.3 — torch interop shipped; 17 new Python tests)*
+*Last updated: 2026-08-17 (v0.1.4 — hf-hub 1.0 migration; hub-download
+progress bar regression fixed same day via `indicatif` + `PullProgress`;
+PyO3 0.29.2)*
 
 ## Proposed follow-ups
 

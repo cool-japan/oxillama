@@ -74,6 +74,14 @@ pub struct BloomModel {
     pub bloom_config: BloomConfig,
     /// Token embeddings `[vocab_size, hidden_size]` (f32).
     pub token_embd: Vec<f32>,
+    /// LayerNorm applied immediately after the embedding lookup, BEFORE
+    /// layer 0 — BLOOM's defining feature (`word_embeddings_layernorm` in
+    /// HuggingFace, `token_embd_norm` in GGUF). Every layer receives
+    /// normalized embeddings; without this every layer receives raw
+    /// (un-normalized) embeddings instead, matching neither training nor
+    /// llama.cpp's `build_bloom`: `inpL = build_norm(inpL, model.tok_norm,
+    /// model.tok_norm_b, LLM_NORM, -1);` runs right after `build_inp_embd`.
+    pub token_embd_norm: LayerNorm,
     /// Transformer layers.
     pub layers: Vec<BloomLayer>,
     /// Final LayerNorm (with bias).
@@ -104,6 +112,7 @@ impl BloomModel {
     pub fn new(
         config: ModelConfig,
         token_embd: Vec<f32>,
+        token_embd_norm: LayerNorm,
         layers: Vec<BloomLayer>,
         output_norm: LayerNorm,
         output_weight: Vec<f32>,
@@ -124,6 +133,7 @@ impl BloomModel {
             config,
             bloom_config,
             token_embd,
+            token_embd_norm,
             layers,
             output_norm,
             output_weight,
@@ -143,12 +153,24 @@ impl BloomModel {
         }
     }
 
-    /// Copy the embedding for `token` into `buf_hidden`.
-    fn embed_token(&mut self, token: u32) {
+    /// Copy the embedding for `token` into `buf_hidden`, then apply
+    /// `token_embd_norm` — BLOOM normalizes the embedding BEFORE it ever
+    /// reaches layer 0 (see the field doc comment on
+    /// [`BloomModel::token_embd_norm`]).
+    fn embed_token(&mut self, token: u32) -> ArchResult<()> {
         let h = self.config.hidden_size;
         let offset = token as usize * h;
-        self.buf_hidden
-            .copy_from_slice(&self.token_embd[offset..offset + h]);
+        let row =
+            self.token_embd
+                .get(offset..offset + h)
+                .ok_or_else(|| ArchError::ConfigMismatch {
+                    param: "token id".to_string(),
+                    expected: format!("< {}", self.config.vocab_size),
+                    got: token.to_string(),
+                })?;
+        self.buf_hidden.copy_from_slice(row);
+        self.token_embd_norm.forward(&mut self.buf_hidden);
+        Ok(())
     }
 
     /// Dense matrix-vector product: `out[i] = dot(W[i, :], x)`.
@@ -214,8 +236,16 @@ impl BloomModel {
         // Store K, V in cache
         kv_cache.store_kv(layer_idx, &self.buf_k[..kv_dim], &self.buf_v[..kv_dim])?;
 
-        let cached_keys = kv_cache.get_keys(layer_idx)?.to_vec();
-        let cached_values = kv_cache.get_values(layer_idx)?.to_vec();
+        // Borrowed, not `.to_vec()`-copied: for BLOOM-7B (30 layers, kv_dim
+        // 4096) at 2048 context, copying the whole per-layer cache on every
+        // token would move ~2 GB/token. `kv_cache` is a separate `&mut dyn
+        // KvCacheAccess` parameter, not part of `self`, so borrowing it here
+        // does not conflict with the `&mut self.buf_*` writes below (compare
+        // `qwen3::model::attention`, which borrows the same way).
+        let cached_keys = crate::common::fetch_keys(&*kv_cache, layer_idx)?;
+        let cached_values = crate::common::fetch_values(&*kv_cache, layer_idx)?;
+        let cached_keys: &[f32] = &cached_keys;
+        let cached_values: &[f32] = &cached_values;
 
         // Compute raw attention scores: scores[h, 0, k] for decode (seq_q = 1)
         // shape: [num_heads, 1, seq_len] -> flattened as [num_heads * seq_len]
@@ -387,10 +417,12 @@ impl ForwardPass for BloomModel {
         kv_cache: &mut dyn KvCacheAccess,
     ) -> ArchResult<Vec<f32>> {
         let start_pos = kv_cache.seq_len();
+        crate::common::validate_context_bounds(&self.config, start_pos, tokens.len())?;
+        crate::common::validate_token_ids(&self.config, tokens)?;
 
         for (i, &token) in tokens.iter().enumerate() {
             let position = start_pos + i;
-            self.embed_token(token);
+            self.embed_token(token)?;
 
             for layer_idx in 0..self.layers.len() {
                 self.layer_forward(layer_idx, position, kv_cache)?;
@@ -406,21 +438,25 @@ impl ForwardPass for BloomModel {
         // LM head: vocab_size × hidden_size
         let vocab_size = self.config.vocab_size;
         let hidden_size = self.config.hidden_size;
-        self.buf_logits.fill(0.0);
+        if self.buf_logits.len() != vocab_size {
+            self.buf_logits.resize(vocab_size, 0.0);
+        }
         for v in 0..vocab_size {
             let row = &self.output_weight[v * hidden_size..(v + 1) * hidden_size];
             self.buf_logits[v] = row.iter().zip(normed.iter()).map(|(w, &x)| w * x).sum();
         }
 
-        Ok(self.buf_logits.clone())
+        Ok(std::mem::take(&mut self.buf_logits))
     }
 
     fn embed(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
         let start_pos = kv_cache.seq_len();
+        crate::common::validate_context_bounds(&self.config, start_pos, tokens.len())?;
+        crate::common::validate_token_ids(&self.config, tokens)?;
 
         for (i, &token) in tokens.iter().enumerate() {
             let position = start_pos + i;
-            self.embed_token(token);
+            self.embed_token(token)?;
 
             for layer_idx in 0..self.layers.len() {
                 self.layer_forward(layer_idx, position, kv_cache)?;
@@ -517,11 +553,31 @@ impl ModelArchitecture for BloomArchitecture {
         })
     }
 
+    fn build_from_gguf(
+        &self,
+        model: &GgufModel,
+        config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Ok(Box::new(load_bloom_from_gguf(model, config)?))
+    }
+
     fn tensor_names(&self) -> Vec<TensorNamePattern> {
         let mut patterns = vec![
             TensorNamePattern {
                 pattern: "token_embd.weight".to_string(),
                 description: "Token embedding matrix".to_string(),
+                required: true,
+            },
+            TensorNamePattern {
+                pattern: "token_embd_norm.weight".to_string(),
+                description: "word_embeddings_layernorm scale — applied right after the embedding \
+                     lookup, before layer 0"
+                    .to_string(),
+                required: true,
+            },
+            TensorNamePattern {
+                pattern: "token_embd_norm.bias".to_string(),
+                description: "word_embeddings_layernorm bias".to_string(),
                 required: true,
             },
             TensorNamePattern {
@@ -594,8 +650,19 @@ pub fn load_bloom_from_gguf(model: &GgufModel, config: &ModelConfig) -> ArchResu
     let intermediate_size = config.intermediate_size;
     let qkv_dim = num_heads * 3 * head_dim;
 
-    // Token embeddings
+    // Token embeddings, followed IMMEDIATELY by `word_embeddings_layernorm`
+    // (BLOOM's defining feature — see `BloomModel::token_embd_norm`'s doc
+    // comment). Both tensors are unconditionally required on every real
+    // BLOOM checkpoint: `llama-model.cpp`'s `LLM_ARCH_BLOOM` branch creates
+    // `tok_norm`/`tok_norm_b` with no `TENSOR_NOT_REQUIRED` flag.
     let token_embd = load_f32_tensor(model, "token_embd.weight", &dispatcher)?;
+    let token_embd_norm_w = load_f32_tensor(model, "token_embd_norm.weight", &dispatcher)?;
+    let token_embd_norm_b = load_f32_tensor(model, "token_embd_norm.bias", &dispatcher)?;
+    let token_embd_norm = LayerNorm::new(
+        token_embd_norm_w,
+        Some(token_embd_norm_b),
+        config.rms_norm_eps,
+    );
 
     // Transformer layers
     let mut layers = Vec::with_capacity(config.num_layers);
@@ -610,20 +677,20 @@ pub fn load_bloom_from_gguf(model: &GgufModel, config: &ModelConfig) -> ArchResu
         // Fused QKV
         let attn_qkv_weight =
             load_f32_tensor(model, &format!("{prefix}.attn_qkv.weight"), &dispatcher)?;
-        let attn_qkv_bias_raw =
-            load_f32_tensor(model, &format!("{prefix}.attn_qkv.bias"), &dispatcher)?;
-        let mut attn_qkv_bias = vec![0.0f32; qkv_dim];
-        attn_qkv_bias[..attn_qkv_bias_raw.len().min(qkv_dim)]
-            .copy_from_slice(&attn_qkv_bias_raw[..attn_qkv_bias_raw.len().min(qkv_dim)]);
+        let attn_qkv_bias = require_bias_len(
+            &format!("{prefix}.attn_qkv.bias"),
+            load_f32_tensor(model, &format!("{prefix}.attn_qkv.bias"), &dispatcher)?,
+            qkv_dim,
+        )?;
 
         // Attention output projection
         let attn_output_weight =
             load_f32_tensor(model, &format!("{prefix}.attn_output.weight"), &dispatcher)?;
-        let attn_output_bias_raw =
-            load_f32_tensor(model, &format!("{prefix}.attn_output.bias"), &dispatcher)?;
-        let mut attn_output_bias = vec![0.0f32; hidden_size];
-        attn_output_bias[..attn_output_bias_raw.len().min(hidden_size)]
-            .copy_from_slice(&attn_output_bias_raw[..attn_output_bias_raw.len().min(hidden_size)]);
+        let attn_output_bias = require_bias_len(
+            &format!("{prefix}.attn_output.bias"),
+            load_f32_tensor(model, &format!("{prefix}.attn_output.bias"), &dispatcher)?,
+            hidden_size,
+        )?;
 
         // Pre-FFN LayerNorm
         let ffn_ln_w = load_f32_tensor(model, &format!("{prefix}.ffn_norm.weight"), &dispatcher)?;
@@ -633,20 +700,20 @@ pub fn load_bloom_from_gguf(model: &GgufModel, config: &ModelConfig) -> ArchResu
         // FFN up (W1)
         let ffn_up_weight =
             load_f32_tensor(model, &format!("{prefix}.ffn_up.weight"), &dispatcher)?;
-        let ffn_up_bias_raw =
-            load_f32_tensor(model, &format!("{prefix}.ffn_up.bias"), &dispatcher)?;
-        let mut ffn_up_bias = vec![0.0f32; intermediate_size];
-        ffn_up_bias[..ffn_up_bias_raw.len().min(intermediate_size)]
-            .copy_from_slice(&ffn_up_bias_raw[..ffn_up_bias_raw.len().min(intermediate_size)]);
+        let ffn_up_bias = require_bias_len(
+            &format!("{prefix}.ffn_up.bias"),
+            load_f32_tensor(model, &format!("{prefix}.ffn_up.bias"), &dispatcher)?,
+            intermediate_size,
+        )?;
 
         // FFN down (W2)
         let ffn_down_weight =
             load_f32_tensor(model, &format!("{prefix}.ffn_down.weight"), &dispatcher)?;
-        let ffn_down_bias_raw =
-            load_f32_tensor(model, &format!("{prefix}.ffn_down.bias"), &dispatcher)?;
-        let mut ffn_down_bias = vec![0.0f32; hidden_size];
-        ffn_down_bias[..ffn_down_bias_raw.len().min(hidden_size)]
-            .copy_from_slice(&ffn_down_bias_raw[..ffn_down_bias_raw.len().min(hidden_size)]);
+        let ffn_down_bias = require_bias_len(
+            &format!("{prefix}.ffn_down.bias"),
+            load_f32_tensor(model, &format!("{prefix}.ffn_down.bias"), &dispatcher)?,
+            hidden_size,
+        )?;
 
         layers.push(BloomLayer {
             attn_norm,
@@ -679,10 +746,36 @@ pub fn load_bloom_from_gguf(model: &GgufModel, config: &ModelConfig) -> ArchResu
     Ok(BloomModel::new(
         config.clone(),
         token_embd,
+        token_embd_norm,
         layers,
         output_norm,
         output_weight,
     ))
+}
+
+/// Validate a bias tensor's length against the shape the layer needs it at,
+/// instead of silently zero-padding a short one or truncating a long one.
+///
+/// The previous behaviour manufactured a bias vector that did not match what
+/// the checkpoint actually stored whenever a bias tensor's declared element
+/// count disagreed with the projection's output width — wrong output with no
+/// error, for a case that should never legitimately arise (BLOOM never omits
+/// or reshapes a bias tensor) and therefore signals a malformed or truncated
+/// GGUF.
+///
+/// # Errors
+///
+/// [`ArchError::InvalidShape`] naming `tensor_name` when `raw.len() !=
+/// expected`.
+fn require_bias_len(tensor_name: &str, raw: Vec<f32>, expected: usize) -> ArchResult<Vec<f32>> {
+    if raw.len() != expected {
+        return Err(ArchError::InvalidShape {
+            name: tensor_name.to_string(),
+            expected: vec![expected],
+            got: vec![raw.len()],
+        });
+    }
+    Ok(raw)
 }
 
 /// Load a tensor as `f32`, dequantizing if necessary.
@@ -858,7 +951,7 @@ mod tests {
         let token_embd = vec![0.01f32; v * h];
         let output_weight = vec![0.01f32; v * h];
 
-        BloomModel::new(config, token_embd, vec![layer], final_ln, output_weight)
+        BloomModel::new(config, token_embd, ln, vec![layer], final_ln, output_weight)
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -931,21 +1024,60 @@ mod tests {
         assert!(!has_rope, "BLOOM tensor names must not include rope_freqs");
     }
 
-    /// Load BLOOM from a minimal synthetic GGUF — checks end-to-end path.
+    // The end-to-end loader-behavior BL1 regression tests (checkpoint with
+    // `token_embd_norm` loads; forward pass after load is finite) live in
+    // `crates/oxillama-arch/tests/bloom_regressions.rs` — a black-box
+    // integration test using only public API, so it can be `git stash`-
+    // verified against `bloom/model.rs` independently of this file. The test
+    // below stays here because it needs private-field access
+    // (`embed_token`, `buf_hidden`) that an external test crate cannot reach.
+
+    /// BL1: loading a checkpoint that is MISSING `token_embd_norm.weight`
+    /// must fail loudly, not silently skip normalization. Constructed by
+    /// parsing the fixture above and then dropping just that one tensor is
+    /// awkward with the writer API, so this instead asserts directly against
+    /// the (documented-stale) shared fixture, which predates BL1 and
+    /// legitimately lacks the tensor.
     #[test]
-    fn bloom_load_from_synthetic_gguf() {
+    fn bloom_missing_token_embd_norm_is_a_loud_error() {
         use oxillama_gguf::test_utils::build_minimal_bloom_gguf;
         let bytes = build_minimal_bloom_gguf();
         let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("parse GGUF");
         let config =
             crate::config::ModelConfig::from_metadata(&gguf.file.metadata).expect("parse config");
-        let mut model = load_bloom_from_gguf(&gguf, &config).expect("load bloom");
-        let kv_dim = config.num_attention_heads * config.head_dim;
-        let mut kv = SimpleKvCache::new(config.num_layers, kv_dim, config.max_context_length);
-        let logits = model.forward(&[0u32], &mut kv).expect("forward");
-        assert_eq!(logits.len(), config.vocab_size);
-        for &v in &logits {
-            assert!(v.is_finite(), "logit must be finite: {v}");
+        let result = load_bloom_from_gguf(&gguf, &config);
+        match result {
+            Err(ArchError::MissingTensor { name }) => {
+                assert!(
+                    name.contains("token_embd_norm"),
+                    "expected MissingTensor naming token_embd_norm, got: {name}"
+                );
+            }
+            Err(other) => panic!("expected MissingTensor, got a different error: {other:?}"),
+            Ok(_) => panic!(
+                "a checkpoint without token_embd_norm must fail loudly, not load successfully"
+            ),
         }
+    }
+
+    /// BL1: the normalization must actually run — a model with a non-trivial
+    /// `token_embd_norm` produces different `buf_hidden` after `embed_token`
+    /// than the raw embedding row would.
+    #[test]
+    fn bloom_token_embd_norm_actually_changes_the_embedding() {
+        let mut model = build_tiny_bloom();
+        // Overwrite token_embd_norm with a non-identity transform (weight=2,
+        // bias=1) so its effect is observable.
+        let h = model.config.hidden_size;
+        model.token_embd_norm = LayerNorm::new(vec![2.0f32; h], Some(vec![1.0f32; h]), 1e-5);
+
+        let raw_row = model.token_embd[..h].to_vec();
+        model.embed_token(0).expect("embed_token");
+
+        assert_ne!(
+            model.buf_hidden, raw_row,
+            "buf_hidden after embed_token must differ from the raw embedding row \
+             once token_embd_norm is non-identity"
+        );
     }
 }

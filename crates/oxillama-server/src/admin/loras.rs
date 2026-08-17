@@ -51,6 +51,23 @@ pub async fn admin_register_lora(
             .into_response();
     }
 
+    // D1: reject adapter paths outside the configured allow-list (a no-op
+    // when `allowed_model_dirs` is empty, i.e. not configured).
+    if let Err(message) =
+        crate::admin::path_guard::validate_model_path(&body.path, &state.allowed_model_dirs)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                }
+            })),
+        )
+            .into_response();
+    }
+
     let path = body.path.clone();
     let result = tokio::task::spawn_blocking(move || {
         oxillama_runtime::LoadedLora::load(&path).map_err(|e| format!("{e}"))

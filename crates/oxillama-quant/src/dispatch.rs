@@ -31,10 +31,37 @@ pub struct SimdCapabilities {
     pub avx2: bool,
     /// x86_64 AVX-512F support.
     pub avx512f: bool,
+    /// x86_64 AVX-512BW (byte/word) support.
+    ///
+    /// **Separate from AVX-512F.**  AVX-512F only defines 32- and 64-bit
+    /// integer lanes; every `epi8`/`epi16` operation — including
+    /// `_mm512_cvtepi8_epi16` and `_mm512_madd_epi16`, the instructions the
+    /// fused Q8_0-activation kernels want — lives in AVX-512BW.  Knights
+    /// Landing/Mill (the only shipped AVX-512F parts without BW) would execute
+    /// an illegal instruction if a BW kernel were dispatched on the strength of
+    /// the `avx512f` bit alone, so `simd/avx512/int_dot.rs` selects its lane
+    /// width from *this* bit and keeps an AVX-512F-only fallback that produces
+    /// bit-identical integer results.
+    pub avx512bw: bool,
     /// x86_64 FMA support (usually paired with AVX2).
     pub fma: bool,
     /// ARM NEON support.
     pub neon: bool,
+    /// ARMv8.2 `dotprod` (SDOT/UDOT) support.
+    ///
+    /// NEON itself is mandatory on aarch64, but `dotprod` is an optional
+    /// extension — present on Apple Silicon and most modern server/mobile
+    /// ARM cores, but not guaranteed on every aarch64 CPU (e.g. a Cortex-A53
+    /// or a generic `aarch64-unknown-linux-gnu` build's minimum baseline).
+    /// `simd::neon::int_dot` uses this (via [`crate::simd::cached_capabilities`])
+    /// to select the SDOT-instruction fast path or a portable widening
+    /// fallback at runtime, rather than baking one in at compile time via
+    /// `#[cfg(target_feature = "dotprod")]` — the previous approach, which
+    /// meant a generic-aarch64 binary built with `-C target-feature=+dotprod`
+    /// would `SIGILL` on real hardware that lacks the extension, and the
+    /// widening fallback path was never exercised at all on Apple Silicon
+    /// (where the crate's target always compiles `dotprod` in).
+    pub dotprod: bool,
 }
 
 impl SimdCapabilities {
@@ -43,8 +70,10 @@ impl SimdCapabilities {
         Self {
             avx2: Self::detect_avx2(),
             avx512f: Self::detect_avx512f(),
+            avx512bw: Self::detect_avx512bw(),
             fma: Self::detect_fma(),
             neon: Self::detect_neon(),
+            dotprod: Self::detect_dotprod(),
         }
     }
 
@@ -61,6 +90,20 @@ impl SimdCapabilities {
         } else {
             "scalar"
         }
+    }
+
+    /// Whether the AVX2 kernel tier is safe to dispatch to.
+    ///
+    /// Every kernel under `simd/avx2/` carries
+    /// `#[target_feature(enable = "avx2,fma")]` (see `simd/avx2/mod.rs`'s
+    /// module doc), so `avx2` support alone is not enough — the CPU must also
+    /// support FMA3, or those kernels execute an illegal `VFMADD` instruction.
+    /// `avx2` and `fma` are typically paired on real hardware but are
+    /// independently detected bits in `CPUID`, so a host that reports one
+    /// without the other is possible (older virtualized/emulated
+    /// configurations in particular) and must not take this path.
+    pub fn avx2_usable(&self) -> bool {
+        self.avx2 && self.fma
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -83,6 +126,18 @@ impl SimdCapabilities {
         false
     }
 
+    /// AVX-512BW is an independent `CPUID` bit from AVX-512F — probe it, never
+    /// infer it from `avx512f`.  See the [`Self::avx512bw`] field doc.
+    #[cfg(target_arch = "x86_64")]
+    fn detect_avx512bw() -> bool {
+        std::arch::is_x86_feature_detected!("avx512bw")
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn detect_avx512bw() -> bool {
+        false
+    }
+
     #[cfg(target_arch = "x86_64")]
     fn detect_fma() -> bool {
         std::arch::is_x86_feature_detected!("fma")
@@ -101,6 +156,18 @@ impl SimdCapabilities {
 
     #[cfg(not(target_arch = "aarch64"))]
     fn detect_neon() -> bool {
+        false
+    }
+
+    /// `dotprod` (SDOT/UDOT) is an optional ARMv8.2 extension, unlike NEON
+    /// itself — must be probed at runtime, not assumed.
+    #[cfg(target_arch = "aarch64")]
+    fn detect_dotprod() -> bool {
+        std::arch::is_aarch64_feature_detected!("dotprod")
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn detect_dotprod() -> bool {
         false
     }
 }
@@ -133,9 +200,11 @@ impl KernelDispatcher {
 
     /// Get the best available kernel for the given quantization type.
     ///
-    /// Currently returns reference (scalar) kernels for all types.
-    /// When SIMD features are enabled and the CPU supports them,
-    /// this will return optimized SIMD kernels instead.
+    /// Selects, in order, the best platform-specific SIMD kernel the enabled
+    /// Cargo features and runtime CPU detection allow (AVX-512, then
+    /// AVX2+FMA, then NEON), falling back to the oxiblas-backed float kernels
+    /// for F32/F16/BF16 and finally the portable scalar reference kernel for
+    /// every other supported type.
     ///
     /// Returns an error if the quantization type is not yet implemented.
     pub fn get_kernel(&self, tensor_type: GgufTensorType) -> QuantResult<Box<dyn QuantKernel>> {
@@ -166,9 +235,10 @@ impl KernelDispatcher {
             }
         }
 
-        // 2. AVX2 path
+        // 2. AVX2 path — gated on `avx2_usable()` (avx2 AND fma), not `avx2`
+        // alone; see that method's doc for why.
         #[cfg(all(feature = "simd-avx2", target_arch = "x86_64"))]
-        if simd::cached_capabilities().avx2 {
+        if simd::cached_capabilities().avx2_usable() {
             match tensor_type {
                 GgufTensorType::Q4_0 => return Ok(Box::new(simd::avx2::Q4_0Avx2)),
                 GgufTensorType::Q5_0 => return Ok(Box::new(simd::avx2::Q5_0Avx2)),
@@ -436,6 +506,41 @@ mod tests {
         // Just verify it doesn't panic and returns something
         let tier = caps.best_tier();
         assert!(!tier.is_empty());
+    }
+
+    /// Regression test for the dispatch gate that used to check `avx2` alone:
+    /// every kernel under `simd/avx2/` requires BOTH `avx2` and `fma`
+    /// (`#[target_feature(enable = "avx2,fma")]`), so `avx2_usable()` must
+    /// require both bits and must not degrade to "avx2 alone is enough" for
+    /// any combination.
+    #[test]
+    fn test_avx2_usable_requires_both_avx2_and_fma() {
+        let base = SimdCapabilities {
+            avx2: false,
+            avx512f: false,
+            avx512bw: false,
+            fma: false,
+            neon: false,
+            dotprod: false,
+        };
+        assert!(!base.avx2_usable(), "neither bit set");
+        assert!(
+            !SimdCapabilities { avx2: true, ..base }.avx2_usable(),
+            "avx2 without fma must not be usable — kernels need FMA3"
+        );
+        assert!(
+            !SimdCapabilities { fma: true, ..base }.avx2_usable(),
+            "fma without avx2 must not be usable"
+        );
+        assert!(
+            SimdCapabilities {
+                avx2: true,
+                fma: true,
+                ..base
+            }
+            .avx2_usable(),
+            "both bits set must be usable"
+        );
     }
 
     #[test]

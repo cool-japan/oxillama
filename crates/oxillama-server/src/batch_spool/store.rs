@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
+use crate::resource_id::validate_resource_id;
+
 /// Status of a batch job (persisted to `status.json`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -79,8 +81,15 @@ impl BatchStore {
     }
 
     /// Path to a job's subdirectory.
-    pub fn job_dir(&self, job_id: &str) -> PathBuf {
-        self.dir.join(job_id)
+    ///
+    /// Rejects any `job_id` that is not a single safe path component (see
+    /// [`crate::resource_id`]) — `job_id` is request-supplied (URL path
+    /// segment) and is otherwise joined directly onto the spool root, which
+    /// is a path-traversal sink (D2).
+    pub fn job_dir(&self, job_id: &str) -> std::io::Result<PathBuf> {
+        validate_resource_id(job_id)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        Ok(self.dir.join(job_id))
     }
 
     /// Create a new job on disk.
@@ -96,7 +105,7 @@ impl BatchStore {
         endpoint: &str,
         total_lines: u32,
     ) -> std::io::Result<BatchJobMeta> {
-        let dir = self.job_dir(job_id);
+        let dir = self.job_dir(job_id)?;
         fs::create_dir_all(&dir)?;
 
         // Write input (not atomic — written once before any worker sees it).
@@ -123,13 +132,13 @@ impl BatchStore {
 
     /// Overwrite `status.json` atomically.
     pub fn update_status(&self, job_id: &str, status: &BatchJobMeta) -> std::io::Result<()> {
-        let dir = self.job_dir(job_id);
+        let dir = self.job_dir(job_id)?;
         self.write_status_atomic(&dir, status)
     }
 
     /// Read `status.json` for a job.
     pub fn read_status(&self, job_id: &str) -> std::io::Result<BatchJobMeta> {
-        let path = self.job_dir(job_id).join("status.json");
+        let path = self.job_dir(job_id)?.join("status.json");
         let content = fs::read_to_string(&path)?;
         serde_json::from_str(&content).map_err(|e| {
             std::io::Error::new(
@@ -143,7 +152,7 @@ impl BatchStore {
     ///
     /// The line must NOT contain a trailing newline — one will be added.
     pub fn append_output(&self, job_id: &str, line: &str) -> std::io::Result<()> {
-        let path = self.job_dir(job_id).join("output.jsonl");
+        let path = self.job_dir(job_id)?.join("output.jsonl");
         let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(f, "{}", line)?;
         Ok(())
@@ -151,7 +160,7 @@ impl BatchStore {
 
     /// Append a single JSONL error record to `errors.jsonl`.
     pub fn append_error(&self, job_id: &str, line: &str) -> std::io::Result<()> {
-        let path = self.job_dir(job_id).join("errors.jsonl");
+        let path = self.job_dir(job_id)?.join("errors.jsonl");
         let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(f, "{}", line)?;
         Ok(())
@@ -159,7 +168,7 @@ impl BatchStore {
 
     /// Read all lines from `input.jsonl`.
     pub fn read_input_lines(&self, job_id: &str) -> std::io::Result<Vec<String>> {
-        let path = self.job_dir(job_id).join("input.jsonl");
+        let path = self.job_dir(job_id)?.join("input.jsonl");
         let f = File::open(&path)?;
         let reader = BufReader::new(f);
         reader
@@ -170,7 +179,7 @@ impl BatchStore {
 
     /// Read all output lines from `output.jsonl`.
     pub fn read_output_lines(&self, job_id: &str) -> std::io::Result<Vec<String>> {
-        let path = self.job_dir(job_id).join("output.jsonl");
+        let path = self.job_dir(job_id)?.join("output.jsonl");
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -384,5 +393,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // clean up from previous run
         let _store = BatchStore::new(dir.clone()).expect("BatchStore::new should succeed");
         assert!(dir.exists(), "spool directory should be created");
+    }
+
+    /// D2 regression: a `job_id` containing `../` segments must not let a
+    /// caller escape the spool root.
+    #[test]
+    fn job_dir_rejects_path_traversal() {
+        let store = temp_store("traversal");
+        let err = store
+            .job_dir("../../../../etc")
+            .expect_err("path traversal id must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// D2 regression: an absolute-looking `job_id` must be rejected rather
+    /// than silently discarding the spool root via `PathBuf::join`.
+    #[test]
+    fn job_dir_rejects_absolute_looking_id() {
+        let store = temp_store("traversal_abs");
+        let err = store
+            .job_dir("/etc/passwd")
+            .expect_err("absolute-looking id must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

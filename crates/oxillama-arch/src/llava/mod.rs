@@ -9,14 +9,20 @@
 //! - Vision encoder: `v.patch_embd.weight`, `v.position_embd.weight`, `v.blk.*`
 //! - MM projector: `mm.0.weight`, `mm.0.bias`, `mm.2.weight`, `mm.2.bias`
 
+pub mod clip;
+pub mod inject;
 pub mod model;
+pub mod projector;
 
-pub use model::{load_llava_from_gguf, LlavaModel};
+pub use clip::{ClipEncoder, ClipEncoderLayer, ClipFfnOp, ClipVisionParams};
+pub use inject::{Prompt, Segment, VisualTokens};
+pub use model::{clip_params_from_metadata, load_clip_tower, load_llava_from_gguf, LlavaModel};
+pub use projector::MmProjector;
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::traits::{ForwardPass, ModelArchitecture, TensorNamePattern};
-use oxillama_gguf::TensorStore;
+use oxillama_gguf::{GgufModel, TensorStore};
 
 /// LLaVA architecture plugin.
 pub struct LlavaArchitecture;
@@ -63,6 +69,38 @@ impl ModelArchitecture for LlavaArchitecture {
         Err(ArchError::MissingTensor {
             name: "token_embd.weight (use load_llava_from_gguf for full loading)".to_string(),
         })
+    }
+
+    /// Build from a single GGUF that carries backbone, projector and tower.
+    ///
+    /// # Reachability
+    ///
+    /// This entry point is only reachable for the legacy single-file layout.
+    /// A modern LLaVA checkpoint declares `general.architecture = "llama"` and
+    /// keeps `mm.*`/`v.*` in a separate `clip`-architecture mmproj file
+    /// (`gguf-py/gguf/constants.py:805`), so the registry never routes it here.
+    /// Those callers use [`LlavaModel::load_with_mmproj`] with both files — the
+    /// equivalent of llama.cpp's `--mmproj` flag.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::MissingTensor`] when the file has no `mm.*`/`v.*` tensors,
+    /// naming the mmproj entry point.
+    fn build_from_gguf(
+        &self,
+        model: &GgufModel,
+        config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        if !model.file.tensors.contains("mm.0.weight") {
+            return Err(ArchError::MissingTensor {
+                name: "mm.0.weight — this GGUF has no multimodal projector; \
+                       a LLaVA checkpoint ships its projector and CLIP tower in a separate \
+                       `clip`-architecture mmproj file, so load it with \
+                       LlavaModel::load_with_mmproj(main, mmproj, config)"
+                    .to_string(),
+            });
+        }
+        Ok(Box::new(load_llava_from_gguf(model, config)?))
     }
 
     fn tensor_names(&self) -> Vec<TensorNamePattern> {

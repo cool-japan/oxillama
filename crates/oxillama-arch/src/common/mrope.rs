@@ -1,31 +1,66 @@
 //! Multimodal Rotary Position Embedding (M-RoPE).
 //!
-//! Qwen2-VL extends standard 1D RoPE to three axes:
-//! - **Time / text** (t): used for temporal / text-sequence positions.
+//! Qwen2-VL extends standard 1D RoPE to three (optionally four) axes:
+//! - **Time / text** (t): temporal / text-sequence position.
 //! - **Height** (h): 2D spatial row index of a vision patch.
 //! - **Width** (w): 2D spatial column index of a vision patch.
+//! - **Extra** (e): the vision encoder's extra position id (Qwen3-VL).
 //!
-//! The head dimension is split into three equal thirds.  Each third is rotated
-//! with its own axis's cosine/sine table.  For text-only tokens the three
-//! position indices are set to the same value `(pos, pos, pos)`, which
-//! degrades exactly to standard 1-D RoPE applied to the full head vector.
+//! # How the reference actually works
+//!
+//! `ggml_mrope_cache_init` builds **one global frequency series** over the full
+//! rotary dimension — `theta_scale = base^(-2 / n_dims)` applied cumulatively —
+//! and uses the section table only to decide *which axis position* multiplies
+//! each frequency:
+//!
+//! ```text
+//! sect_dims = sections[0] + sections[1] + sections[2] + sections[3]
+//! sector    = pair_index % sect_dims
+//! axis      = t  if sector <  sections[0]
+//!             h  if sector <  sections[0] + sections[1]
+//!             w  if sector <  sections[0] + sections[1] + sections[2]
+//!             e  otherwise
+//! theta     = pos[axis] * base^(-2 * pair_index / n_dims)
+//! ```
+//!
+//! and the rotation is **global GPT-NeoX pairing**:
+//! `rotate_pairs(n_dims, n_dims/2, …)` rotates `(x[j], x[j + n_dims/2])`.
+//!
+//! The section widths come from the GGUF key `{arch}.rope.dimension_sections`
+//! (e.g. `[16, 24, 24, 0]` for Qwen2-VL's 128-wide heads).
+//!
+//! An implementation that splits the head into equal thirds, restarts the
+//! frequency series inside each third and pairs *within* a third computes a
+//! different function entirely.
 //!
 //! ## Reference
 //! Qwen2-VL: "Enhancing Vision-Language Model's Perception of the World at Any
-//! Resolution" (Qwen Team, 2024).
+//! Resolution" (Qwen Team, 2024); `ggml/src/ggml-cpu/ops.cpp`.
 
-/// Precomputed M-RoPE frequency tables for three spatial axes.
+use crate::error::{ArchError, ArchResult};
+
+/// Which positional axis drives a given rotation pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MRopeAxis {
+    /// Time / text position.
+    Time,
+    /// Vision patch row.
+    Height,
+    /// Vision patch column.
+    Width,
+    /// Extra vision-encoder position id.
+    Extra,
+}
+
+/// Precomputed M-RoPE frequency tables for the positional axes.
 ///
-/// Each axis holds `max_seq_len × half_dim_per_axis` cos/sin values.
-/// `half_dim_per_axis = head_dim / 6` — the head is split into three equal
-/// thirds (one per axis), then each third is split into a rotation pair.
-///
-/// # Invariant
-///
-/// `head_dim` must be divisible by 6 so that `head_dim / 3` is even.
+/// All four tables share the same **global** frequency series
+/// `base^(-2j / head_dim)`; they differ only in which position index was used
+/// to build them.  [`MRopeTable::apply_mrope`] then selects, per rotation pair,
+/// the table named by the section layout.
 #[derive(Debug, Clone)]
 pub struct MRopeTable {
-    /// Cosine values for the time/text axis: `[max_seq_len, half_dim_per_axis]`.
+    /// Cosine values for the time/text axis: `[max_seq_len, half_dim]`.
     cos_t: Vec<f32>,
     /// Cosine values for the height axis.
     cos_h: Vec<f32>,
@@ -37,33 +72,93 @@ pub struct MRopeTable {
     sin_h: Vec<f32>,
     /// Sine values for the width axis.
     sin_w: Vec<f32>,
-    /// Number of rotation pairs per axis = `head_dim / 6`.
-    half_dim_per_axis: usize,
+    /// Per-rotation-pair axis assignment, length `half_dim`.
+    axis_of: Vec<MRopeAxis>,
+    /// Number of rotation pairs = `head_dim / 2`.
+    half_dim: usize,
+    /// The rotary dimension count this table was built for.
+    head_dim: usize,
+    /// Section widths `[t, h, w, e]` in rotation-pair units.
+    sections: [usize; 4],
     /// Maximum precomputed sequence length.
     max_seq_len: usize,
 }
 
 impl MRopeTable {
-    /// Build the M-RoPE frequency tables.
+    /// Build the M-RoPE frequency tables with the default equal-thirds split.
+    ///
+    /// Equivalent to [`Self::new_with_sections`] with
+    /// `[half/3, half/3, half - 2*(half/3), 0]` where `half = head_dim / 2`.
+    ///
+    /// Prefer [`Self::new_with_sections`] with the checkpoint's
+    /// `{arch}.rope.dimension_sections` — Qwen2-VL ships `[16, 24, 24, 0]`,
+    /// which is **not** an equal split of its 64 rotation pairs.
+    pub fn new(head_dim: usize, max_seq_len: usize, base: f32) -> Self {
+        let sections = default_sections(head_dim / 2);
+        // Cannot fail: `default_sections` always sums to `half_dim`.
+        match Self::new_with_sections(head_dim, max_seq_len, base, &sections) {
+            Ok(table) => table,
+            Err(_) => Self::empty(head_dim, max_seq_len, sections),
+        }
+    }
+
+    /// Build the M-RoPE frequency tables from an explicit section layout.
     ///
     /// # Arguments
-    /// * `head_dim` — Full attention head dimension.  Must be divisible by 6.
-    /// * `max_seq_len` — Maximum sequence length (rows in the table).
+    /// * `head_dim` — rotary dimension count (`n_rot`).
+    /// * `max_seq_len` — maximum position index (rows in each table).
     /// * `base` — RoPE base frequency (typically 10000.0).
+    /// * `sections` — `{arch}.rope.dimension_sections`, in **rotation-pair**
+    ///   units. One to four entries; missing entries are treated as `0`.
     ///
-    /// # Returns
-    /// A fully precomputed `MRopeTable` ready for use in `apply_mrope`.
+    /// # Errors
     ///
-    /// # Panics
-    /// Does not panic even when `head_dim` is not divisible by 6;
-    /// `half_dim_per_axis` is floored via integer division and the table is
-    /// simply smaller than ideal.
-    pub fn new(head_dim: usize, max_seq_len: usize, base: f32) -> Self {
-        // Each axis gets head_dim/3 dims; half of that forms the rotation pairs.
-        let dim_per_axis = head_dim / 3;
-        let half_dim_per_axis = dim_per_axis / 2;
+    /// [`ArchError::InvalidConfig`] if `sections` is empty or sums to zero, or
+    /// [`ArchError::InvalidShape`] if the sum exceeds `head_dim / 2`
+    /// (ggml asserts `sect_dims <= ne0`).
+    pub fn new_with_sections(
+        head_dim: usize,
+        max_seq_len: usize,
+        base: f32,
+        sections: &[usize],
+    ) -> ArchResult<Self> {
+        let half_dim = head_dim / 2;
+        let mut sect = [0usize; 4];
+        for (slot, &v) in sect.iter_mut().zip(sections.iter()) {
+            *slot = v;
+        }
+        let sect_dims: usize = sect.iter().sum();
 
-        let capacity = max_seq_len * half_dim_per_axis;
+        if sections.is_empty() || sect_dims == 0 {
+            return Err(ArchError::InvalidConfig {
+                detail: "rope.mrope_sections must contain at least one non-zero section"
+                    .to_string(),
+            });
+        }
+        if sect_dims > half_dim {
+            return Err(ArchError::InvalidShape {
+                name: "rope.mrope_sections".to_string(),
+                expected: vec![half_dim],
+                got: vec![sect_dims],
+            });
+        }
+
+        // One global frequency series across the whole rotary dimension.
+        let freqs: Vec<f32> = (0..half_dim)
+            .map(|j| {
+                if head_dim == 0 {
+                    1.0
+                } else {
+                    1.0 / base.powf((2 * j) as f32 / head_dim as f32)
+                }
+            })
+            .collect();
+
+        let axis_of: Vec<MRopeAxis> = (0..half_dim)
+            .map(|j| axis_for_pair(j, &sect, sect_dims))
+            .collect();
+
+        let capacity = max_seq_len * half_dim;
         let mut cos_t = Vec::with_capacity(capacity);
         let mut sin_t = Vec::with_capacity(capacity);
         let mut cos_h = Vec::with_capacity(capacity);
@@ -72,59 +167,61 @@ impl MRopeTable {
         let mut sin_w = Vec::with_capacity(capacity);
 
         for pos in 0..max_seq_len {
-            for i in 0..half_dim_per_axis {
-                // Standard RoPE frequency formula: 1 / base^(2i / dim).
-                // Here dim = dim_per_axis (not full head_dim) so that each axis
-                // uses the same frequency spacing as standard 1D RoPE over its
-                // sub-dimension.  When all three axes receive the same position
-                // the concatenation is identical to applying standard RoPE to the
-                // full head_dim vector.
-                let freq = compute_mrope_freq(i, half_dim_per_axis, base);
+            for &freq in &freqs {
                 let theta = pos as f32 * freq;
-                cos_t.push(theta.cos());
-                sin_t.push(theta.sin());
-                cos_h.push(theta.cos());
-                sin_h.push(theta.sin());
-                cos_w.push(theta.cos());
-                sin_w.push(theta.sin());
+                let (s, c) = theta.sin_cos();
+                cos_t.push(c);
+                sin_t.push(s);
+                cos_h.push(c);
+                sin_h.push(s);
+                cos_w.push(c);
+                sin_w.push(s);
             }
         }
 
-        Self {
+        Ok(Self {
             cos_t,
             cos_h,
             cos_w,
             sin_t,
             sin_h,
             sin_w,
-            half_dim_per_axis,
+            axis_of,
+            half_dim,
+            head_dim,
+            sections: sect,
+            max_seq_len,
+        })
+    }
+
+    fn empty(head_dim: usize, max_seq_len: usize, sections: [usize; 4]) -> Self {
+        Self {
+            cos_t: Vec::new(),
+            cos_h: Vec::new(),
+            cos_w: Vec::new(),
+            sin_t: Vec::new(),
+            sin_h: Vec::new(),
+            sin_w: Vec::new(),
+            axis_of: Vec::new(),
+            half_dim: 0,
+            head_dim,
+            sections,
             max_seq_len,
         }
     }
 
     /// Apply M-RoPE in-place to a single attention-head vector.
     ///
-    /// The head vector `x` of length `head_dim` is partitioned into three equal
-    /// thirds.  Each third is rotated using the cos/sin table for the
-    /// corresponding axis at the given position index.
+    /// Rotation pair `j` uses `(x[j], x[j + head_dim/2])` — global GPT-NeoX
+    /// pairing — with the position index of the axis its section assigns.
     ///
-    /// | Segment of `x`              | Axis  | Position used |
-    /// |-----------------------------|-------|---------------|
-    /// | `x[0  ..dim/3]`             | time  | `t_pos`       |
-    /// | `x[dim/3..2*dim/3]`         | height| `h_pos`       |
-    /// | `x[2*dim/3..dim]`           | width | `w_pos`       |
+    /// For text-only tokens call with `t_pos == h_pos == w_pos`; the result is
+    /// then exactly standard 1-D NeoX RoPE over the whole head vector.
     ///
-    /// For text-only tokens call with `t_pos == h_pos == w_pos`.  The result
-    /// is then identical to standard 1-D RoPE applied across the full vector.
+    /// **Never panics.** Out-of-range positions leave `x` untouched; use
+    /// [`Self::try_apply_mrope`] to have that reported instead.
     ///
-    /// # Arguments
-    /// * `x`        — Mutable slice of length `head_dim` (modified in-place).
-    /// * `t_pos`    — Time/text sequence position.
-    /// * `h_pos`    — Height (row) patch index.
-    /// * `w_pos`    — Width (column) patch index.
-    /// * `head_dim` — Must match the `head_dim` used when constructing the table.
-    ///
-    /// If any position exceeds `max_seq_len` the operation is silently skipped.
+    /// `head_dim` must match the value the table was constructed with.
     pub fn apply_mrope(
         &self,
         x: &mut [f32],
@@ -133,39 +230,70 @@ impl MRopeTable {
         w_pos: usize,
         head_dim: usize,
     ) {
-        if self.half_dim_per_axis == 0 {
-            return;
+        let _ = self.try_apply_mrope(x, t_pos, h_pos, w_pos, head_dim);
+    }
+
+    /// Apply M-RoPE in-place, reporting out-of-range positions.
+    ///
+    /// # Errors
+    ///
+    /// * [`ArchError::ConfigMismatch`] when any axis position is at or beyond
+    ///   [`Self::max_seq_len`].  This used to be a silent no-op, so a
+    ///   too-long sequence produced *unrotated* queries and keys with no
+    ///   diagnostic at all.
+    /// * [`ArchError::InvalidShape`] when `head_dim` disagrees with the table
+    ///   or `x` is shorter than `2 * half_dim`.
+    pub fn try_apply_mrope(
+        &self,
+        x: &mut [f32],
+        t_pos: usize,
+        h_pos: usize,
+        w_pos: usize,
+        head_dim: usize,
+    ) -> ArchResult<()> {
+        if self.half_dim == 0 {
+            return Ok(());
         }
-        if t_pos >= self.max_seq_len || h_pos >= self.max_seq_len || w_pos >= self.max_seq_len {
-            return;
+        if head_dim != self.head_dim {
+            return Err(ArchError::InvalidShape {
+                name: "mrope.head_dim".to_string(),
+                expected: vec![self.head_dim],
+                got: vec![head_dim],
+            });
+        }
+        let max_pos = t_pos.max(h_pos).max(w_pos);
+        if max_pos >= self.max_seq_len {
+            return Err(ArchError::ConfigMismatch {
+                param: "mrope.position".to_string(),
+                expected: format!("< max_seq_len ({})", self.max_seq_len),
+                got: format!("({t_pos}, {h_pos}, {w_pos})"),
+            });
+        }
+        let half = self.half_dim;
+        if x.len() < 2 * half {
+            return Err(ArchError::InvalidShape {
+                name: "mrope.head_vector".to_string(),
+                expected: vec![2 * half],
+                got: vec![x.len()],
+            });
         }
 
-        let dim_per_axis = head_dim / 3;
-        let half = self.half_dim_per_axis;
-
-        // Each axis segment: x[base..base+dim_per_axis].
-        // Within that segment the first `half` elements are the "real" part and
-        // elements `[half..dim_per_axis]` are the "imaginary" part — same layout
-        // as standard RoPE.
-        apply_axis_rotation(x, 0, dim_per_axis, half, &self.cos_t, &self.sin_t, t_pos);
-        apply_axis_rotation(
-            x,
-            dim_per_axis,
-            2 * dim_per_axis,
-            half,
-            &self.cos_h,
-            &self.sin_h,
-            h_pos,
-        );
-        apply_axis_rotation(
-            x,
-            2 * dim_per_axis,
-            3 * dim_per_axis,
-            half,
-            &self.cos_w,
-            &self.sin_w,
-            w_pos,
-        );
+        for j in 0..half {
+            let (cos, sin, pos) = match self.axis_of[j] {
+                MRopeAxis::Time | MRopeAxis::Extra => (&self.cos_t, &self.sin_t, t_pos),
+                MRopeAxis::Height => (&self.cos_h, &self.sin_h, h_pos),
+                MRopeAxis::Width => (&self.cos_w, &self.sin_w, w_pos),
+            };
+            let idx = pos * half + j;
+            let (Some(&c), Some(&s)) = (cos.get(idx), sin.get(idx)) else {
+                continue;
+            };
+            let x0 = x[j];
+            let x1 = x[j + half];
+            x[j] = x0 * c - x1 * s;
+            x[j + half] = x0 * s + x1 * c;
+        }
+        Ok(())
     }
 
     /// Maximum sequence length for which frequency tables were precomputed.
@@ -174,62 +302,56 @@ impl MRopeTable {
         self.max_seq_len
     }
 
-    /// Number of rotation pairs per axis (`head_dim / 6`).
+    /// Total number of rotation pairs (`head_dim / 2`).
+    #[inline]
+    pub fn half_dim(&self) -> usize {
+        self.half_dim
+    }
+
+    /// Section widths `[t, h, w, e]` in rotation-pair units.
+    #[inline]
+    pub fn sections(&self) -> [usize; 4] {
+        self.sections
+    }
+
+    /// Which axis drives rotation pair `pair_index`.
+    #[inline]
+    pub fn axis_of(&self, pair_index: usize) -> Option<MRopeAxis> {
+        self.axis_of.get(pair_index).copied()
+    }
+
+    /// Number of rotation pairs per axis under an equal-thirds split.
+    ///
+    /// Retained for source compatibility with the previous API; it describes
+    /// the *default* layout only and has no meaning once real
+    /// `rope.mrope_sections` are supplied.
     #[inline]
     pub fn half_dim_per_axis(&self) -> usize {
-        self.half_dim_per_axis
+        self.sections[0]
     }
 }
 
 // ---- Private helpers -------------------------------------------------------
 
-/// Standard RoPE frequency formula for a single dimension index within an axis.
-///
-/// Equivalent to `1 / base^(2i / (2 * half_dim))`.
-#[inline]
-fn compute_mrope_freq(i: usize, half_dim: usize, base: f32) -> f32 {
-    1.0 / base.powf((2 * i) as f32 / (2 * half_dim) as f32)
+/// The equal-thirds fallback layout, in rotation-pair units.
+fn default_sections(half_dim: usize) -> [usize; 4] {
+    let third = half_dim / 3;
+    [third, third, half_dim - 2 * third, 0]
 }
 
-/// Apply RoPE rotation in-place to one axis segment of `x`.
-///
-/// Rotates pairs `(x[seg_start + i], x[seg_start + half + i])` for `i in 0..half`.
-///
-/// # Arguments
-/// * `x`           — Full head vector (mutable).
-/// * `seg_start`   — Start index of the axis segment.
-/// * `seg_end`     — One-past-end of the axis segment (used for bounds check only).
-/// * `half`        — Number of rotation pairs in this axis.
-/// * `cos`         — Cosine table: `[max_seq_len, half]`.
-/// * `sin`         — Sine table: `[max_seq_len, half]`.
-/// * `pos`         — Sequence / position index for this axis.
-#[inline]
-fn apply_axis_rotation(
-    x: &mut [f32],
-    seg_start: usize,
-    seg_end: usize,
-    half: usize,
-    cos: &[f32],
-    sin: &[f32],
-    pos: usize,
-) {
-    // Avoid out-of-bounds if the segment is smaller than expected.
-    if seg_end > x.len() || seg_start + 2 * half > x.len() {
-        return;
-    }
-
-    let offset = pos * half;
-    if offset + half > cos.len() {
-        return;
-    }
-
-    for i in 0..half {
-        let x0 = x[seg_start + i];
-        let x1 = x[seg_start + half + i];
-        let c = cos[offset + i];
-        let s = sin[offset + i];
-        x[seg_start + i] = x0 * c - x1 * s;
-        x[seg_start + half + i] = x0 * s + x1 * c;
+/// ggml's sector → axis mapping.
+fn axis_for_pair(pair_index: usize, sections: &[usize; 4], sect_dims: usize) -> MRopeAxis {
+    let sector = pair_index % sect_dims;
+    let sec_h = sections[0] + sections[1];
+    let sec_w = sec_h + sections[2];
+    if sector < sections[0] {
+        MRopeAxis::Time
+    } else if sector < sec_h {
+        MRopeAxis::Height
+    } else if sector < sec_w {
+        MRopeAxis::Width
+    } else {
+        MRopeAxis::Extra
     }
 }
 
@@ -238,107 +360,121 @@ mod tests {
     use super::*;
     use crate::common::rope::RopeTable;
 
-    /// M-RoPE with (pos, pos, pos) must produce the same result as applying
-    /// standard 1-D RoPE **independently to each third** of the head vector.
+    /// With `t == h == w`, M-RoPE must be **exactly** standard 1-D NeoX RoPE
+    /// over the full head vector — not three independent sub-rotations.
     ///
-    /// This exercises the core invariant: when all three axes receive the same
-    /// position index, M-RoPE is equivalent to three independent RoPE applications,
-    /// each over a sub-dimension of size `head_dim / 3`.
-    ///
-    /// Note: this is NOT the same as a single full-head 1-D RoPE, because the
-    /// frequency spacing uses `dim_per_axis = head_dim / 3` as the denominator,
-    /// not the full `head_dim`.
+    /// The previous implementation restarted the frequency series inside each
+    /// third and could only match a per-third reference; its own test said so.
     #[test]
-    fn mrope_text_only_matches_1d_rope() {
-        // head_dim must be divisible by 6 for the third-split to be exact.
-        // We use 24 = 6×4, so dim_per_axis = 8, half_per_axis = 4.
+    fn mrope_text_only_matches_full_width_1d_rope() {
         let head_dim = 24usize;
         let max_seq = 32usize;
         let base = 10000.0f32;
         let pos = 5usize;
 
-        let dim_per_axis = head_dim / 3; // = 8
-
-        // Build M-RoPE table.
         let mrope = MRopeTable::new(head_dim, max_seq, base);
+        let rope = RopeTable::new_standard(head_dim, max_seq, base);
 
-        // Build a standard RoPE table over dim_per_axis (= 8 dims, half = 4).
-        let rope_axis = RopeTable::new_standard(dim_per_axis, max_seq, base);
-
-        // Build a non-trivial test vector.
         let x_init: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
 
-        // Apply M-RoPE with equal positions on all axes.
         let mut x_mm = x_init.clone();
         mrope.apply_mrope(&mut x_mm, pos, pos, pos, head_dim);
 
-        // Reference: apply the per-axis RoPE independently to each 8-element third.
-        let mut x_ref = x_init.clone();
-        for axis in 0..3 {
-            let start = axis * dim_per_axis;
-            let mut third: Vec<f32> = x_ref[start..start + dim_per_axis].to_vec();
-            rope_axis.apply(&mut third, pos);
-            x_ref[start..start + dim_per_axis].copy_from_slice(&third);
-        }
+        let mut x_ref = x_init;
+        rope.apply(&mut x_ref, pos);
 
-        // M-RoPE must match the per-axis reference within floating-point tolerance.
         for (i, (a, b)) in x_mm.iter().zip(x_ref.iter()).enumerate() {
             assert!(
                 (a - b).abs() < 1e-5,
-                "mismatch at dim {i}: mrope={a}, per-axis-rope={b}"
+                "mismatch at dim {i}: mrope={a}, 1d-rope={b}"
             );
         }
     }
 
-    /// Changing h_pos should only affect the middle third of the head vector,
-    /// leaving the first and last thirds unchanged.
+    /// Qwen2-VL ships `[16, 24, 24]` for 128-wide heads: not an equal split.
+    #[test]
+    fn mrope_honours_qwen2_vl_sections() {
+        let head_dim = 128usize;
+        let table =
+            MRopeTable::new_with_sections(head_dim, 8, 10000.0, &[16, 24, 24, 0]).expect("table");
+        assert_eq!(table.sections(), [16, 24, 24, 0]);
+        assert_eq!(table.half_dim(), 64);
+
+        for j in 0..16 {
+            assert_eq!(table.axis_of(j), Some(MRopeAxis::Time), "pair {j}");
+        }
+        for j in 16..40 {
+            assert_eq!(table.axis_of(j), Some(MRopeAxis::Height), "pair {j}");
+        }
+        for j in 40..64 {
+            assert_eq!(table.axis_of(j), Some(MRopeAxis::Width), "pair {j}");
+        }
+    }
+
+    /// The frequency series is global: pair `j` uses `base^(-2j/head_dim)`
+    /// regardless of which section it lands in.
+    #[test]
+    fn mrope_frequencies_are_global() {
+        let head_dim = 128usize;
+        let base = 10000.0f32;
+        let table =
+            MRopeTable::new_with_sections(head_dim, 4, base, &[16, 24, 24, 0]).expect("table");
+
+        // Position 1, sin(theta) ≈ theta for the small-frequency pairs.
+        for j in [20usize, 45, 63] {
+            let want = 1.0f32 / base.powf((2 * j) as f32 / head_dim as f32);
+            let got = table.sin_h[table.half_dim() + j];
+            assert!(
+                (got - want).abs() < want * 1e-3,
+                "pair {j}: sin = {got}, expected global freq {want}"
+            );
+        }
+    }
+
+    /// Changing `h_pos` must move exactly the height section and nothing else.
     #[test]
     fn mrope_vision_axes_independent() {
-        let head_dim = 24usize;
-        let max_seq = 32usize;
-        let base = 10000.0f32;
-        let t_pos = 0usize;
-        let w_pos = 3usize;
-        let h_pos_a = 2usize;
-        let h_pos_b = 7usize;
-
-        let mrope = MRopeTable::new(head_dim, max_seq, base);
+        let head_dim = 128usize;
+        let table =
+            MRopeTable::new_with_sections(head_dim, 32, 10000.0, &[16, 24, 24, 0]).expect("table");
+        let half = table.half_dim();
         let x_init: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.3).collect();
 
         let mut x_a = x_init.clone();
-        mrope.apply_mrope(&mut x_a, t_pos, h_pos_a, w_pos, head_dim);
+        table.apply_mrope(&mut x_a, 1, 2, 3, head_dim);
+        let mut x_b = x_init;
+        table.apply_mrope(&mut x_b, 1, 7, 3, head_dim);
 
-        let mut x_b = x_init.clone();
-        mrope.apply_mrope(&mut x_b, t_pos, h_pos_b, w_pos, head_dim);
-
-        let dim_per_axis = head_dim / 3;
-
-        // Time third (0..dim/3) must be identical — same t_pos.
-        for i in 0..dim_per_axis {
-            assert!(
-                (x_a[i] - x_b[i]).abs() < 1e-7,
-                "time axis should be equal at {i}: {:.6} vs {:.6}",
-                x_a[i],
-                x_b[i]
+        for j in 0..half {
+            let differs =
+                (x_a[j] - x_b[j]).abs() > 1e-6 || (x_a[j + half] - x_b[j + half]).abs() > 1e-6;
+            let is_height = table.axis_of(j) == Some(MRopeAxis::Height);
+            assert_eq!(
+                differs,
+                is_height,
+                "pair {j} (axis {:?}) changed = {differs}",
+                table.axis_of(j)
             );
         }
+    }
 
-        // Height third (dim/3..2*dim/3) must differ because h_pos_a != h_pos_b.
-        let h_third_differs =
-            (dim_per_axis..2 * dim_per_axis).any(|i| (x_a[i] - x_b[i]).abs() > 1e-6);
-        assert!(
-            h_third_differs,
-            "height axis results must differ when h_pos changes"
-        );
+    /// Positions past the table used to be a silent no-op.
+    #[test]
+    fn mrope_out_of_range_position_is_reported() {
+        let table = MRopeTable::new_with_sections(24, 8, 10000.0, &[4, 4, 4, 0]).expect("table");
+        let mut x = vec![1.0f32; 24];
+        assert!(table.try_apply_mrope(&mut x, 8, 0, 0, 24).is_err());
+        assert!(table.try_apply_mrope(&mut x, 0, 99, 0, 24).is_err());
+        assert!(table.try_apply_mrope(&mut x, 7, 7, 7, 24).is_ok());
+        // The infallible entry point must not panic.
+        table.apply_mrope(&mut x, 10_000, 0, 0, 24);
+    }
 
-        // Width third (2*dim/3..dim) must be identical — same w_pos.
-        for i in 2 * dim_per_axis..head_dim {
-            assert!(
-                (x_a[i] - x_b[i]).abs() < 1e-7,
-                "width axis should be equal at {i}: {:.6} vs {:.6}",
-                x_a[i],
-                x_b[i]
-            );
-        }
+    #[test]
+    fn mrope_rejects_oversized_sections() {
+        // 64 pairs available, sections ask for 100.
+        assert!(MRopeTable::new_with_sections(128, 4, 10000.0, &[50, 50, 0, 0]).is_err());
+        assert!(MRopeTable::new_with_sections(128, 4, 10000.0, &[0, 0, 0, 0]).is_err());
+        assert!(MRopeTable::new_with_sections(128, 4, 10000.0, &[]).is_err());
     }
 }

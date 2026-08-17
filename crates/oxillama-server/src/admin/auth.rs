@@ -9,16 +9,22 @@
 //!   Non-loopback requests receive `401 Unauthorized`.
 //!
 //! The startup check (`ensure_admin_security`) must be called before the
-//! server begins accepting connections; it terminates the process if the admin
-//! listen address is non-loopback AND no token is configured.
+//! server begins accepting connections; it returns `Err` (rather than
+//! terminating the process itself) if the admin listen address is
+//! non-loopback AND no token is configured, so the caller can decide how to
+//! report the failure.
+
+use std::net::SocketAddr;
 
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{ConnectInfo, Request},
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
+
+use crate::error::{ServerError, ServerResult};
 
 /// Admin authentication configuration, shared with the middleware via
 /// `axum::Extension`.
@@ -69,13 +75,41 @@ fn bearer_token_matches(headers: &header::HeaderMap, expected: &str) -> bool {
 
 /// Determine if the request is from a loopback address.
 ///
-/// This inspects the `X-Forwarded-For` header (first IP) when present, then
-/// the `X-Real-IP` header, and finally falls back to the connection address
-/// embedded by tower via the [`axum::extract::ConnectInfo`] extension.
+/// The **authoritative** source of truth is the actual TCP peer address,
+/// delivered by axum via the [`ConnectInfo<SocketAddr>`] request extension
+/// (populated when the server is bound with
+/// `into_make_service_with_connect_info::<SocketAddr>()`). If that extension
+/// is absent — e.g. the service was bound without connect-info propagation —
+/// we **fail closed** and deny loopback status rather than trusting
+/// client-controlled headers. This was previously the reverse: no
+/// `ConnectInfo` and no forwarding headers defaulted to `true` (allow),
+/// which meant every request on any deployment that forgot
+/// `into_make_service_with_connect_info` was treated as trusted loopback
+/// traffic regardless of its real origin (D1).
 ///
-/// In test environments without real sockets we default to allowing loopback.
+/// `X-Forwarded-For` / `X-Real-IP` are honored only to *narrow* the
+/// decision (a real loopback peer forwarding on behalf of a non-loopback
+/// client is correctly denied); they can never *widen* it — a spoofed
+/// header claiming `127.0.0.1` from a genuinely remote peer is denied,
+/// because the real peer address is checked first and is authoritative
+/// whenever present.
 fn is_loopback(req: &Request<Body>) -> bool {
-    // Check X-Forwarded-For (first entry).
+    let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>() else {
+        // No verified peer address available: fail closed.
+        return false;
+    };
+
+    if !peer.ip().is_loopback() {
+        // The real socket peer is not loopback. A forwarding header cannot
+        // override this — it would let a remote attacker simply claim to be
+        // loopback via a spoofed `X-Forwarded-For: 127.0.0.1`.
+        return false;
+    }
+
+    // The real peer *is* loopback (e.g. a local reverse proxy). If it
+    // identifies a further upstream client via forwarding headers, that
+    // client's address is what actually matters, so check it — this can
+    // only turn a `true` into `false`, never the reverse.
     if let Some(xff) = req.headers().get("x-forwarded-for") {
         if let Ok(val) = xff.to_str() {
             let first = val.split(',').next().unwrap_or("").trim();
@@ -84,8 +118,6 @@ fn is_loopback(req: &Request<Body>) -> bool {
             }
         }
     }
-
-    // Check X-Real-IP.
     if let Some(xri) = req.headers().get("x-real-ip") {
         if let Ok(val) = xri.to_str() {
             if let Ok(ip) = val.trim().parse::<std::net::IpAddr>() {
@@ -94,7 +126,6 @@ fn is_loopback(req: &Request<Body>) -> bool {
         }
     }
 
-    // No forwarding headers: in a test / embedded context default to allow.
     true
 }
 
@@ -111,13 +142,14 @@ fn unauthorized_response(message: &str) -> Response {
 /// Safety check called at startup.
 ///
 /// If `admin_host` is a non-loopback address AND no `token` is configured,
-/// prints an error and exits the process with code 1.
-///
-/// This prevents accidentally exposing the admin API to the network without
-/// any authentication.
-pub fn ensure_admin_security(admin_host: &str, token: &Option<String>) {
+/// returns `Err(ServerError::InsecureAdminBinding)` instead of starting the
+/// server. This prevents accidentally exposing the admin API to the network
+/// without any authentication. Callers (typically `main`/CLI) are
+/// responsible for reporting the error and exiting — library code must not
+/// call `std::process::exit` itself (D11).
+pub fn ensure_admin_security(admin_host: &str, token: &Option<String>) -> ServerResult<()> {
     if token.is_some() {
-        return; // Token present — safe regardless of address.
+        return Ok(()); // Token present — safe regardless of address.
     }
 
     // Parse the host part (strip port if present).
@@ -129,14 +161,15 @@ pub fn ensure_admin_security(admin_host: &str, token: &Option<String>) {
     ) || matches!(host, "localhost");
 
     if !is_loopback_addr {
-        eprintln!(
-            "FATAL: admin listen address '{admin_host}' is non-loopback \
-             but no admin bearer_token is configured.\n\
-             Set [admin] bearer_token = \"...\" in server.toml or \
-             bind the admin interface to 127.0.0.1."
+        tracing::error!(
+            admin_host,
+            "admin listen address is non-loopback but no admin bearer_token is configured; \
+             set [admin] bearer_token = \"...\" in server.toml or bind the admin interface \
+             to 127.0.0.1"
         );
-        std::process::exit(1);
+        return Err(ServerError::InsecureAdminBinding(admin_host.to_string()));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -154,6 +187,17 @@ mod tests {
 
     fn make_req_without_auth() -> Request<Body> {
         Request::builder()
+            .body(Body::empty())
+            .expect("build request")
+    }
+
+    /// Build a request carrying a `ConnectInfo<SocketAddr>` extension for
+    /// the given peer IP, as axum would when the server is bound with
+    /// `into_make_service_with_connect_info::<SocketAddr>()`.
+    fn req_from_peer(ip: &str) -> Request<Body> {
+        let addr: SocketAddr = format!("{ip}:54321").parse().expect("valid socket addr");
+        Request::builder()
+            .extension(ConnectInfo(addr))
             .body(Body::empty())
             .expect("build request")
     }
@@ -187,13 +231,73 @@ mod tests {
 
     #[test]
     fn ensure_admin_security_passes_with_token() {
-        // Must not panic or exit.
-        ensure_admin_security("0.0.0.0:8888", &Some("tok".to_string()));
+        assert!(ensure_admin_security("0.0.0.0:8888", &Some("tok".to_string())).is_ok());
     }
 
     #[test]
     fn ensure_admin_security_passes_loopback_no_token() {
-        ensure_admin_security("127.0.0.1:8888", &None);
-        ensure_admin_security("localhost:8888", &None);
+        assert!(ensure_admin_security("127.0.0.1:8888", &None).is_ok());
+        assert!(ensure_admin_security("localhost:8888", &None).is_ok());
+    }
+
+    /// D11 regression: a non-loopback bind with no token must return a
+    /// typed error instead of calling `std::process::exit` (which would
+    /// abort the whole test binary, not just fail this test).
+    #[test]
+    fn ensure_admin_security_rejects_non_loopback_no_token_without_exiting() {
+        let result = ensure_admin_security("0.0.0.0:8888", &None);
+        assert!(matches!(
+            result,
+            Err(ServerError::InsecureAdminBinding(ref addr)) if addr == "0.0.0.0:8888"
+        ));
+    }
+
+    /// D1 regression: with no `ConnectInfo` extension present (e.g. the
+    /// service wasn't bound with `into_make_service_with_connect_info`),
+    /// the old behavior defaulted to "loopback" (fail open). It must now
+    /// fail closed.
+    #[test]
+    fn is_loopback_denies_when_connect_info_missing() {
+        let req = make_req_without_auth();
+        assert!(!is_loopback(&req));
+    }
+
+    /// D1 regression: a genuinely remote peer cannot claim loopback status
+    /// via a spoofed `X-Forwarded-For` header.
+    #[test]
+    fn is_loopback_denies_spoofed_forwarded_for_header() {
+        let mut req = req_from_peer("203.0.113.7");
+        req.headers_mut().insert(
+            "x-forwarded-for",
+            "127.0.0.1".parse().expect("valid header value"),
+        );
+        assert!(!is_loopback(&req));
+    }
+
+    /// A real loopback peer with no forwarding headers is allowed.
+    #[test]
+    fn is_loopback_allows_real_loopback_peer() {
+        let req = req_from_peer("127.0.0.1");
+        assert!(is_loopback(&req));
+    }
+
+    /// A real remote peer with no forwarding headers is denied.
+    #[test]
+    fn is_loopback_denies_real_remote_peer() {
+        let req = req_from_peer("203.0.113.7");
+        assert!(!is_loopback(&req));
+    }
+
+    /// A real loopback peer (e.g. a local reverse proxy) forwarding on
+    /// behalf of a genuinely remote client is denied — the forwarding
+    /// header may only narrow, not widen, trust.
+    #[test]
+    fn is_loopback_denies_loopback_peer_forwarding_remote_client() {
+        let mut req = req_from_peer("127.0.0.1");
+        req.headers_mut().insert(
+            "x-forwarded-for",
+            "203.0.113.7".parse().expect("valid header value"),
+        );
+        assert!(!is_loopback(&req));
     }
 }

@@ -107,7 +107,7 @@ impl QuantKernel for Iq4XsAvx2 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: bounds checked; avx2+fma guaranteed by dispatcher.
             *out = unsafe {
@@ -118,7 +118,7 @@ impl QuantKernel for Iq4XsAvx2 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -171,8 +171,10 @@ unsafe fn decode_sub_block(nibbles: &[u8], scale: f32, output: &mut [f32]) {
         let byte = nibbles[i];
         let lo = (byte & 0x0F) as usize;
         let hi = ((byte >> 4) & 0x0F) as usize;
-        staging[i * 2] = KVALUES_IQ4NL[lo] as f32;
-        staging[i * 2 + 1] = KVALUES_IQ4NL[hi] as f32;
+        // GGML split-half layout *within the sub-block*: byte `i` holds
+        // weight `i` (low nibble) and weight `i + 16` (high nibble).
+        staging[i] = KVALUES_IQ4NL[lo] as f32;
+        staging[i + SUB_BLOCK_SIZE / 2] = KVALUES_IQ4NL[hi] as f32;
     }
 
     let scale_vec = _mm256_set1_ps(scale);
@@ -241,14 +243,24 @@ unsafe fn gemv_row_avx2(
             let nibble_offset = sub * NIBBLES_PER_SUB;
             let w_col_base = col + sub * SUB_BLOCK_SIZE;
 
-            // Process in 8-wide chunks: 4 nibble-bytes → 8 weights → 8 input values.
+            // Process in 8-wide chunks: 8 weights → 8 input values.
             // SUB_BLOCK_SIZE=32, so 4 chunks of 8 per sub-block.
+            //
+            // Split-half layout: weights 0..16 of the sub-block come from the
+            // *low* nibbles of nibble-bytes 0..16 and weights 16..32 from the
+            // *high* nibbles of the same bytes.  So a chunk of 8 consecutive
+            // weights maps to 8 consecutive bytes, taking one nibble half.
+            const SUB_HALF: usize = SUB_BLOCK_SIZE / 2;
             for chunk in 0..(SUB_BLOCK_SIZE / 8) {
                 let mut w8 = [0.0f32; 8];
-                for i in 0..4 {
-                    let byte = nibbles[nibble_offset + chunk * 4 + i];
-                    w8[i * 2] = KVALUES_IQ4NL[(byte & 0x0F) as usize] as f32;
-                    w8[i * 2 + 1] = KVALUES_IQ4NL[((byte >> 4) & 0x0F) as usize] as f32;
+                for (i, w) in w8.iter_mut().enumerate() {
+                    let widx = chunk * 8 + i;
+                    let nib = if widx < SUB_HALF {
+                        nibbles[nibble_offset + widx] & 0x0F
+                    } else {
+                        (nibbles[nibble_offset + widx - SUB_HALF] >> 4) & 0x0F
+                    };
+                    *w = KVALUES_IQ4NL[nib as usize] as f32;
                 }
 
                 let c_base = w_col_base + chunk * 8;

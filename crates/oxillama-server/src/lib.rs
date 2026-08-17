@@ -44,8 +44,10 @@ pub mod files_store;
 #[cfg(feature = "jwt")]
 pub mod jwt_auth;
 pub mod metrics;
+pub mod prefix_registry;
 pub mod queue;
 pub mod rate_limit;
+pub mod resource_id;
 pub mod responses_store;
 pub mod router;
 pub mod routes;
@@ -60,16 +62,18 @@ pub mod ws;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 
-pub use app::build_app;
+pub use app::{build_app, build_app_with_config};
 pub use auth::ApiKeys;
 pub use config::ServerConfig;
 pub use error::{ServerError, ServerResult};
 pub use metrics::Metrics;
+pub use prefix_registry::{cache_namespace, PrefixCacheRegistry, DEFAULT_MAX_NAMESPACES};
 pub use queue::{BatchRequest, LoraSelection, VocabBytes};
 pub use rate_limit::{PerKeyRateLimiter, RateLimiter};
+pub use resource_id::validate_resource_id;
 pub use responses_store::ResponseStore;
 pub use router::{ModelLoader, ModelPool, ModelSpec};
 pub use shutdown::{shutdown_signal, ShutdownSignal, ShutdownTrigger};
-pub use state::AppState;
+pub use state::{AppState, BackendInfo};
 pub use threads::{new_run_queue, RunQueueSender, ThreadStore};
 pub use worker::spawn_inference_worker;

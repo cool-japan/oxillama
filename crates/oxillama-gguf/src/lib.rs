@@ -28,6 +28,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+pub mod bytes;
 pub mod error;
 pub mod header;
 pub mod metadata;
@@ -64,6 +65,7 @@ pub mod integrity;
 #[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub mod test_utils;
 
+pub use bytes::{ByteOwner, SharedBytes};
 pub use error::{GgufError, GgufResult};
 pub use header::GgufHeader;
 pub use metadata::{MetadataStore, MetadataValue};

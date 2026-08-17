@@ -21,6 +21,7 @@ pyo3::create_exception!(oxillama_py, TokenizerError, OxiLlamaError);
 pyo3::create_exception!(oxillama_py, GrammarError, OxiLlamaError);
 pyo3::create_exception!(oxillama_py, QuantError, OxiLlamaError);
 pyo3::create_exception!(oxillama_py, KvCacheFullError, OxiLlamaError);
+pyo3::create_exception!(oxillama_py, GpuUnavailableError, OxiLlamaError);
 
 /// Register all custom exception classes on the Python module so that
 /// they are importable as `oxillama_py.OxiLlamaError`, etc.
@@ -32,6 +33,10 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("GrammarError", m.py().get_type::<GrammarError>())?;
     m.add("QuantError", m.py().get_type::<QuantError>())?;
     m.add("KvCacheFullError", m.py().get_type::<KvCacheFullError>())?;
+    m.add(
+        "GpuUnavailableError",
+        m.py().get_type::<GpuUnavailableError>(),
+    )?;
     Ok(())
 }
 
@@ -54,6 +59,7 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// - `Quant(…)`           → `QuantError`
 /// - `Io(…)`              → `LoadError`
 /// - `Grammar(…)`         → `GrammarError`
+/// - `GpuUnavailable`     → `GpuUnavailableError`
 pub fn runtime_to_py(err: RuntimeError) -> PyErr {
     match err {
         RuntimeError::ModelNotLoaded => {
@@ -115,6 +121,9 @@ pub fn runtime_to_py(err: RuntimeError) -> PyErr {
         }
         RuntimeError::EmptySequence => {
             GenerateError::new_err("Input tokenizes to an empty sequence — provide at least one token")
+        }
+        RuntimeError::GpuUnavailable { reason } => {
+            GpuUnavailableError::new_err(format!("GPU unavailable: {reason}"))
         }
     }
 }
@@ -239,6 +248,9 @@ mod tests {
             RuntimeError::LockPoisoned,
             RuntimeError::SpecSnapshotIncompatible("test detail".to_string()),
             RuntimeError::EmptySequence,
+            RuntimeError::GpuUnavailable {
+                reason: "test".to_string(),
+            },
         ];
 
         for variant in variants {
@@ -329,6 +341,19 @@ mod tests {
         assert!(
             rust_msg.contains("9999"),
             "Rust error message should contain max_ctx=9999, got: {rust_msg}"
+        );
+    }
+
+    /// `GpuUnavailable` Rust message must contain the wrapped reason.
+    #[test]
+    fn test_gpu_unavailable_message() {
+        let rust_msg = RuntimeError::GpuUnavailable {
+            reason: "no compatible GPU adapter is available on this host".to_string(),
+        }
+        .to_string();
+        assert!(
+            rust_msg.contains("no compatible GPU adapter is available on this host"),
+            "Rust error message should contain original reason, got: {rust_msg}"
         );
     }
 }

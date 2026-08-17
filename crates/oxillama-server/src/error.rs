@@ -90,6 +90,12 @@ pub enum ServerError {
     /// Previous response not found when chaining with `previous_response_id`.
     #[error("previous response {0} not found")]
     PreviousResponseNotFound(String),
+
+    /// Admin listener is bound to a non-loopback address without a bearer
+    /// token configured. Refusing to start rather than serving an
+    /// unauthenticated admin API to the network.
+    #[error("admin listen address '{0}' is non-loopback but no admin bearer_token is configured")]
+    InsecureAdminBinding(String),
 }
 
 impl IntoResponse for ServerError {
@@ -135,7 +141,13 @@ impl IntoResponse for ServerError {
             }
         });
 
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        if matches!(self, ServerError::QueueFull) {
+            response
+                .headers_mut()
+                .insert("retry-after", axum::http::HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
@@ -243,6 +255,24 @@ mod tests {
                 "run_xyz is completed".into()
             )),
             StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn test_queue_full_carries_retry_after_header() {
+        let resp = ServerError::QueueFull.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("retry-after").map(|v| v.to_str().ok()),
+            Some(Some("1"))
+        );
+    }
+
+    #[test]
+    fn test_insecure_admin_binding_returns_500() {
+        assert_eq!(
+            status_of(ServerError::InsecureAdminBinding("0.0.0.0:8080".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 }

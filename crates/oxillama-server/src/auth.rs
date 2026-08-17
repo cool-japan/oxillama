@@ -44,7 +44,11 @@ pub async fn auth_middleware(
     match auth_header {
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
-            if api_keys.0.iter().any(|k| k == token) {
+            if api_keys
+                .0
+                .iter()
+                .any(|k| constant_time_eq(k.as_bytes(), token.as_bytes()))
+            {
                 next.run(request).await
             } else {
                 unauthorized_response("Invalid API key")
@@ -53,6 +57,27 @@ pub async fn auth_middleware(
         Some(_) => unauthorized_response("Authorization header must use Bearer scheme"),
         None => unauthorized_response("Missing Authorization header"),
     }
+}
+
+/// Constant-time byte-slice equality (D8 fix).
+///
+/// `a.iter().any(|k| k == token)` (the previous implementation) uses
+/// `==` on `String`/`&str`, whose comparison short-circuits on the first
+/// mismatched byte. For a value compared against attacker-controlled
+/// input, that turns "how many leading bytes matched before the compare
+/// bailed out" into a timing side channel an attacker can use to recover
+/// a valid API key byte-by-byte. This implementation always walks every
+/// byte of both inputs (once length-equal) and only branches once, on
+/// the final accumulated result.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn unauthorized_response(message: &str) -> Response {
@@ -143,5 +168,25 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_identical() {
+        assert!(constant_time_eq(b"sk-secret-key", b"sk-secret-key"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_content_same_length() {
+        assert!(!constant_time_eq(b"sk-secret-key", b"sk-secret-kex"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_length() {
+        assert!(!constant_time_eq(b"short", b"a-much-longer-value"));
+    }
+
+    #[test]
+    fn constant_time_eq_empty_slices_are_equal() {
+        assert!(constant_time_eq(b"", b""));
     }
 }

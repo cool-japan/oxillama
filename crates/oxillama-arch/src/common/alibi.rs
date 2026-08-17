@@ -152,12 +152,20 @@ fn compute_alibi_slopes(num_heads: usize) -> Vec<f32> {
     let half_n = n / 2; // guaranteed to be at least 1 since n >= 2 (num_heads >= 2 when num_heads != n)
     let base_half = make_slopes(half_n);
 
-    // Intermediate slopes: odd-indexed elements of the `n`-head full schedule
+    // Intermediate slopes: **even**-indexed elements of the `n`-head full
+    // schedule (`get_slopes(2 * closest)[0::2]` in HuggingFace's
+    // `modeling_bloom.py`).  `base_slopes[i] == start^(i + 1)` with
+    // `start = 2^(-8/n)`, so the even indices are `start^1, start^3, start^5, …`
+    // — matching llama.cpp's `powf(m1, 2 * (h - n_head_log2) + 1)`.
+    //
+    // Taking the odd indices instead yields `start^2, start^4, …`, which for
+    // 12 heads collapses onto the power-of-two schedule `[2^-1 … 2^-4]`
+    // instead of the correct `[2^-0.5, 2^-1.5, 2^-2.5, 2^-3.5]`.
     let intermediates: Vec<f32> = base_slopes
         .iter()
         .copied()
         .enumerate()
-        .filter(|(i, _)| i % 2 != 0)
+        .filter(|(i, _)| i.is_multiple_of(2))
         .map(|(_, v)| v)
         .collect();
 

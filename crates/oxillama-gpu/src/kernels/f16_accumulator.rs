@@ -76,18 +76,22 @@ pub fn dequant_q4_0_to_f16(weight_bytes: &[u8], rows: usize, cols: usize) -> Gpu
             let scale_bits = u16::from_le_bytes([block[0], block[1]]);
             let scale_f32 = half::f16::from_bits(scale_bits).to_f32();
 
+            // Split-half layout — see the matching comment in
+            // `kernels::q4_0::dequant_q4_0_to_f32`, which this path must stay
+            // numerically identical to (mixed-precision f16 fast path).
             for i in 0..(Q4_0_BLOCK_SIZE / 2) {
                 let byte = block[2 + i];
                 let lo = (byte & 0x0F) as i32 - 8;
                 let hi = ((byte >> 4) & 0x0F) as i32 - 8;
 
-                let base_col = blk * Q4_0_BLOCK_SIZE + i * 2;
-                if base_col < cols {
-                    f16_weights[row * cols + base_col] =
+                let col0 = blk * Q4_0_BLOCK_SIZE + i;
+                let col1 = col0 + 16;
+                if col0 < cols {
+                    f16_weights[row * cols + col0] =
                         half::f16::from_f32(lo as f32 * scale_f32).to_bits();
                 }
-                if base_col + 1 < cols {
-                    f16_weights[row * cols + base_col + 1] =
+                if col1 < cols {
+                    f16_weights[row * cols + col1] =
                         half::f16::from_f32(hi as f32 * scale_f32).to_bits();
                 }
             }
@@ -422,7 +426,7 @@ mod tests {
     #[test]
     fn test_dequant_q4_0_to_f16_known_values() {
         // scale = 2.0, first nibble byte = 0x9A → lo = (0xA - 8) = 2, hi = (0x9 - 8) = 1
-        // expected: weight[0] = 2 * 2.0 = 4.0, weight[1] = 1 * 2.0 = 2.0
+        // Split-half layout: weight[0] = lo * 2.0 = 4.0, weight[16] = hi * 2.0 = 2.0.
         let mut nibbles = [0x88u8; 16];
         nibbles[0] = 0x9A;
         let block = make_q4_0_block(2.0, &nibbles);
@@ -430,14 +434,15 @@ mod tests {
             dequant_q4_0_to_f16(&block, 1, Q4_0_BLOCK_SIZE).expect("dequant should succeed");
 
         let w0 = half::f16::from_bits(result[0]).to_f32();
-        let w1 = half::f16::from_bits(result[1]).to_f32();
+        let w16 = half::f16::from_bits(result[16]).to_f32();
         assert!((w0 - 4.0).abs() < 0.05, "expected ~4.0, got {w0}");
-        assert!((w1 - 2.0).abs() < 0.05, "expected ~2.0, got {w1}");
+        assert!((w16 - 2.0).abs() < 0.05, "expected ~2.0, got {w16}");
     }
 
     #[test]
     fn test_dequant_q4_0_to_f16_negative() {
         // scale = 1.0, nibble byte = 0x35 → lo = (5 - 8) = -3, hi = (3 - 8) = -5
+        // Split-half layout: weight[0] = -3.0, weight[16] = -5.0.
         let mut nibbles = [0x88u8; 16];
         nibbles[0] = 0x35;
         let block = make_q4_0_block(1.0, &nibbles);
@@ -445,9 +450,9 @@ mod tests {
             dequant_q4_0_to_f16(&block, 1, Q4_0_BLOCK_SIZE).expect("dequant should succeed");
 
         let w0 = half::f16::from_bits(result[0]).to_f32();
-        let w1 = half::f16::from_bits(result[1]).to_f32();
+        let w16 = half::f16::from_bits(result[16]).to_f32();
         assert!((w0 - (-3.0)).abs() < 0.05, "expected ~-3.0, got {w0}");
-        assert!((w1 - (-5.0)).abs() < 0.05, "expected ~-5.0, got {w1}");
+        assert!((w16 - (-5.0)).abs() < 0.05, "expected ~-5.0, got {w16}");
     }
 
     #[test]
@@ -535,7 +540,8 @@ mod tests {
         let f16_vals =
             dequant_q4_0_to_f16(&block, 1, Q4_0_BLOCK_SIZE).expect("f16 dequant should succeed");
 
-        // Manually dequant to f32 for comparison.
+        // Manually dequant to f32 for comparison (split-half layout: byte i's
+        // low nibble is weight i, high nibble is weight i + 16).
         let scale = half::f16::from_f32(0.25).to_f32();
         let expected_f32: Vec<f32> = {
             let mut out = vec![0.0f32; Q4_0_BLOCK_SIZE];
@@ -543,8 +549,8 @@ mod tests {
                 let byte = nibbles[i];
                 let lo = (byte & 0x0F) as i32 - 8;
                 let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-                out[i * 2] = lo as f32 * scale;
-                out[i * 2 + 1] = hi as f32 * scale;
+                out[i] = lo as f32 * scale;
+                out[i + 16] = hi as f32 * scale;
             }
             out
         };

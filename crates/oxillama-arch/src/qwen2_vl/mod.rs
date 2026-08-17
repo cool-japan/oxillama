@@ -13,11 +13,13 @@
 //! ## Architecture ID
 //! Registered under the GGUF key `"qwen2vl"`.
 
+pub mod loader;
 pub mod model;
 pub mod vision;
 
-pub use model::{load_qwen2vl_from_gguf, MmMerger, Qwen2Layer, Qwen2VlModel};
-pub use vision::{Qwen2VlVisionEncoder, VisionBlock};
+pub use loader::load_qwen2vl_from_gguf;
+pub use model::{MRopePos, MmMerger, Qwen2Layer, Qwen2VlModel, Qwen2VlVision};
+pub use vision::{apply_vision_rope, Qwen2VlVisionEncoder, VisionBlock, VisionFfnOp, VisionNorm};
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};

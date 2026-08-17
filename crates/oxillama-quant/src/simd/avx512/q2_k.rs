@@ -119,7 +119,7 @@ impl QuantKernel for Q2_KAvx512 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row/block bounds verified above.
             // CPU avx512f support guaranteed by KernelDispatcher.
@@ -131,7 +131,7 @@ impl QuantKernel for Q2_KAvx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -151,6 +151,37 @@ impl QuantKernel for Q2_KAvx512 {
             self.gemv(quant_matrix, input_row, output_row)?;
         }
         Ok(())
+    }
+
+    /// Fused Q2_K weight × Q8_0 activation GEMV — **explicitly delegated** to
+    /// [`crate::simd::avx2::Q2_KAvx2`].
+    ///
+    /// Same reasoning as [`crate::simd::avx512::q4_k`]: the AVX-512 tier is
+    /// selected ahead of AVX2, so leaving this un-overridden would remove the
+    /// fused decode path instead of merely not improving it.  Q2_K's 2-bit
+    /// quants with per-sub-block scale *and* min bytes make a 512-bit
+    /// re-derivation an unvalidatable rewrite on this hardware.
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        crate::simd::avx512::fused::delegate_to_avx2(
+            &crate::simd::avx2::Q2_KAvx2,
+            weights,
+            acts_q8,
+            out,
+            n_rows,
+            n_cols,
+        )
+    }
+
+    /// `ceil(K/256) * 8` — bit-for-bit the gate `Q2_KAvx2` advertises.
+    fn q8_fused_acts_blocks(&self, n_cols: usize) -> Option<usize> {
+        crate::simd::avx512::fused::delegated_acts_blocks_k(n_cols)
     }
 
     fn block_size(&self) -> usize {

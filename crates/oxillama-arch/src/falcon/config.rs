@@ -1,7 +1,28 @@
 //! Falcon-specific configuration parsed from GGUF metadata.
 //!
-//! Covers both Falcon-1 (7B/40B, parallel attention+MLP, ALiBi) and
-//! Falcon-2 (11B, Group-Query Attention, RoPE).
+//! Covers the whole family that llama.cpp maps onto `LLM_ARCH_FALCON`:
+//! Falcon-7B, Falcon-40B (which additionally ships a second per-layer
+//! LayerNorm, `attn_norm_2`) and Falcon-2-11B (GQA).
+//!
+//! # Reference
+//!
+//! `~/work/refs/llama.cpp/src/models/falcon.cpp` (`llm_build_falcon`) is the
+//! single graph every one of those checkpoints runs.  It contains **no**
+//! hyper-parameter branch whatsoever:
+//!
+//! * `ggml_rope_ext` is applied to Q and K unconditionally ("using mode = 2
+//!   for neox mode"), and there is no ALiBi code anywhere in the function.
+//! * `GGML_ASSERT(n_embd_head == hparams.n_rot)` — full-head-dim rotary, never
+//!   partial.
+//! * The residual combination is unconditionally parallel:
+//!   `cur = ffn_out; cur = add(cur, ffn_inp /* attention out */); cur =
+//!   add(cur, inpL /* residual */)`, with the FFN reading the **first** norm
+//!   (`build_ffn(attn_norm, ...)`, commented `// !! use the attn norm, not the
+//!   result`).
+//!
+//! [`FalconConfig::from_model_config`] therefore derives
+//! `rope = true`, `alibi = false`, `parallel_attn = true` for every checkpoint,
+//! with no heuristic in between.
 
 use crate::config::ModelConfig;
 use crate::error::ArchResult;
@@ -16,8 +37,8 @@ pub struct FalconConfig {
     pub n_heads: usize,
     /// Number of key/value heads.
     ///
-    /// Falcon-1 (MHA): equals `n_heads`.
-    /// Falcon-2 (GQA): typically a fraction of `n_heads`.
+    /// Falcon-7B (MQA): `1`.
+    /// Falcon-40B / Falcon-2 (GQA): a fraction of `n_heads`.
     pub n_kv_heads: usize,
     /// Number of transformer layers.
     pub n_layers: usize,
@@ -27,27 +48,41 @@ pub struct FalconConfig {
     pub vocab_size: usize,
     /// FFN intermediate dimension.
     pub intermediate_size: usize,
-    /// RMSNorm / LayerNorm epsilon.
+    /// LayerNorm epsilon.
     pub norm_eps: f32,
-    /// Whether attention and FFN run in parallel (Falcon-1 feature).
+    /// Whether attention and FFN run in parallel.
     ///
-    /// In parallel mode both branches receive the same layer-norm input and
-    /// their outputs are summed before the residual add — instead of the
-    /// standard sequential attn → residual → ffn → residual chain.
+    /// **Always `true`** when derived from GGUF metadata: `llm_build_falcon`
+    /// sums the attention output, the FFN output and the residual stream
+    /// unconditionally, and never re-normalises the post-attention hidden
+    /// state.  The field (and the sequential branch it selects in
+    /// [`FalconForward`](crate::falcon::FalconForward)) is retained only for
+    /// hand-constructed configurations; no Falcon checkpoint can reach it.
+    ///
+    /// Before this was fixed the flag was derived as `config.activation ==
+    /// "gelu"`, which is `false` for every real Falcon GGUF (the crate's
+    /// default activation for `falcon` is `"silu"`), so every checkpoint ran
+    /// the *sequential* graph — the wrong topology — and then silently reused
+    /// `attn_norm` as its pre-FFN norm because Falcon ships no `ffn_norm`.
     pub parallel_attn: bool,
-    /// Whether ALiBi positional bias is used (Falcon-1).
+    /// Whether ALiBi positional bias is used instead of rotary embeddings.
     ///
-    /// When `true` the model adds head-specific linear biases to the attention
-    /// logits rather than applying rotary embeddings.
+    /// **Always `false`** when derived from GGUF metadata: `llm_build_falcon`
+    /// has no ALiBi path.  Kept as an explicit opt-in for hand-constructed
+    /// configurations (and to keep the flag honest — when set, the attention
+    /// kernel really does apply the bias).
     pub alibi: bool,
-    /// Whether RoPE (rotary positional embeddings) is used (Falcon-2).
+    /// Whether RoPE (rotary positional embeddings) is used.
     ///
-    /// Mutually exclusive with `alibi`.  When both fields arrive from metadata
-    /// the RoPE flag takes precedence.
+    /// **Always `true`** when derived from GGUF metadata.
     pub rope: bool,
     /// RoPE base frequency (default 10 000.0).
     pub rope_freq_base: f32,
-    /// Dimension of each attention head (`hidden_size / n_heads`).
+    /// Dimension of each attention head.
+    ///
+    /// Taken from [`ModelConfig::head_dim`], which prefers the GGUF
+    /// `{arch}.attention.key_length` key and only falls back to
+    /// `hidden_size / n_heads`.
     pub head_dim: usize,
 }
 
@@ -58,6 +93,11 @@ impl FalconConfig {
     /// derives all Falcon-specific fields.  Falls back to sensible defaults so
     /// that a minimal metadata store (as used in unit tests) still produces a
     /// valid struct.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; the signature stays fallible so that future
+    /// metadata validation does not become a breaking change.
     pub fn from_model_config(config: &ModelConfig) -> ArchResult<Self> {
         let n_heads = config.num_attention_heads.max(1);
         let n_kv_heads = config.num_kv_heads.max(1);
@@ -65,35 +105,29 @@ impl FalconConfig {
         let hidden_size = config.hidden_size.max(1);
         let vocab_size = config.vocab_size.max(1);
         let intermediate_size = config.intermediate_size.max(1);
-        let head_dim = hidden_size.checked_div(n_heads).unwrap_or(64).max(1);
 
-        // RoPE detection: if the GGUF contained `falcon.rope.freq_base` it will
-        // have been parsed into `config.rope_freq_base` with a non-default value
-        // (i.e., != 0.0). We use 10 000.0 as the canonical RoPE default.
+        // `ModelConfig::head_dim` already prefers `{arch}.attention.key_length`
+        // and falls back to `hidden_size / n_heads`; re-deriving the division
+        // here would throw the GGUF-declared width away.
+        let head_dim = if config.head_dim > 0 {
+            config.head_dim
+        } else {
+            hidden_size.checked_div(n_heads).unwrap_or(64).max(1)
+        };
+
         let rope_freq_base = if config.rope_freq_base > 0.0 {
             config.rope_freq_base
         } else {
             10_000.0
         };
 
-        // Falcon-2 (11B) has a finite rope_freq_base in the GGUF and uses RoPE.
-        // Falcon-1 GGUF files do NOT include `falcon.rope.freq_base`; they use ALiBi.
-        // We treat the presence of RoPE freq_base (non-default) as the RoPE flag.
-        // The `config.rope_freq_base` field is 0.0 for Falcon-1 GGUF files where
-        // the key is absent; our parser assigns 10 000.0 as default, so we cannot
-        // distinguish by value alone.  Instead we rely on `config.activation` or
-        // the architecture string:
-        //   - If `config.activation` is "gelu" → Falcon-1 style → ALiBi.
-        //   - Otherwise (most Falcon-2) → RoPE.
-        //
-        // For the purposes of tests and real GGUF files we follow this heuristic.
-        // Code consumers can override by directly constructing `FalconConfig`.
-        let rope = config.activation != "gelu";
-        let alibi = !rope;
-
-        // Parallel attention is a Falcon-1 default.  We enable it when not using
-        // RoPE (heuristic for Falcon-1).
-        let parallel_attn = alibi;
+        // Constants, not heuristics — see the module docs and
+        // `src/models/falcon.cpp`.  `llm_build_falcon` ropes Q/K
+        // unconditionally, has no ALiBi code path, and combines
+        // `ffn_out + attn_out + residual` with no branch.
+        let rope = true;
+        let alibi = false;
+        let parallel_attn = true;
 
         Ok(Self {
             n_heads,
@@ -111,11 +145,14 @@ impl FalconConfig {
         })
     }
 
-    /// Compute ALiBi slope for head `h` out of `n_heads` total.
+    /// Compute the ALiBi slope for head `h` out of `n_heads` total.
     ///
     /// The standard ALiBi formula is `m_h = 2^(-8h/n_heads)` where `h` is
-    /// 1-indexed.  This matches the reference implementation in
-    /// `transformer/src/transformers/models/falcon/modeling_falcon.py`.
+    /// 1-indexed.
+    ///
+    /// **Not reached by any GGUF-derived Falcon configuration** — llama.cpp's
+    /// `llm_build_falcon` applies RoPE, never ALiBi.  Retained as the kernel
+    /// behind the opt-in [`FalconConfig::alibi`] flag.
     pub fn alibi_slope(h: usize, n_heads: usize) -> f32 {
         let ratio = 8.0 * (h + 1) as f32 / n_heads as f32;
         2.0_f32.powf(-ratio)
@@ -128,14 +165,17 @@ mod tests {
     use crate::config::ModelConfig;
     use oxillama_gguf::{MetadataStore, MetadataValue};
 
-    fn make_falcon1_config() -> ModelConfig {
+    /// Falcon-7B-ish metadata with the activation forced to `"gelu"`.
+    ///
+    /// `"gelu"` is the exact string the pre-fix formula keyed off
+    /// (`let rope = config.activation != "gelu";`), so this fixture is the one
+    /// that used to come out as ALiBi-without-RoPE.
+    fn make_gelu_falcon_config() -> ModelConfig {
         let mut store = MetadataStore::new();
         store.insert(
             "general.architecture".to_string(),
             MetadataValue::String("falcon".to_string()),
         );
-        // Falcon-1 uses GELU activation (old BigCode-style FFN)
-        // We signal ALiBi by keeping activation = "gelu"
         store.insert(
             "falcon.embedding_length".to_string(),
             MetadataValue::Uint32(4544),
@@ -149,12 +189,13 @@ mod tests {
             "falcon.attention.head_count_kv".to_string(),
             MetadataValue::Uint32(1),
         );
-        let mut cfg = ModelConfig::from_metadata(&store).expect("falcon1 config");
+        let mut cfg = ModelConfig::from_metadata(&store).expect("falcon config");
         cfg.activation = "gelu".to_string();
         cfg
     }
 
-    fn make_falcon2_config() -> ModelConfig {
+    /// Falcon-2-11B-ish metadata (GQA), default activation.
+    fn make_gqa_falcon_config() -> ModelConfig {
         let mut store = MetadataStore::new();
         store.insert(
             "general.architecture".to_string(),
@@ -173,27 +214,64 @@ mod tests {
             "falcon.attention.head_count_kv".to_string(),
             MetadataValue::Uint32(8),
         );
-        ModelConfig::from_metadata(&store).expect("falcon2 config")
+        ModelConfig::from_metadata(&store).expect("falcon config")
     }
 
+    /// F1 regression — the `"gelu"` activation must not switch RoPE off.
+    ///
+    /// Pre-fix values for this exact config: `rope = false`, `alibi = true`,
+    /// `parallel_attn = true` (from `rope = activation != "gelu"`,
+    /// `alibi = !rope`, `parallel_attn = alibi`).  `llm_build_falcon` has no
+    /// ALiBi path at all, so two of those three were wrong.
     #[test]
-    fn test_falcon1_is_alibi_parallel() {
-        let cfg = FalconConfig::from_model_config(&make_falcon1_config()).unwrap();
-        assert!(cfg.alibi, "Falcon-1 should use ALiBi");
-        assert!(!cfg.rope, "Falcon-1 should not use RoPE");
-        assert!(cfg.parallel_attn, "Falcon-1 should use parallel attention");
+    fn test_gelu_activation_still_uses_rope_never_alibi() {
+        let cfg = FalconConfig::from_model_config(&make_gelu_falcon_config()).expect("config");
+        assert!(cfg.rope, "Falcon always ropes (ggml_rope_ext, neox mode)");
+        assert!(!cfg.alibi, "llm_build_falcon has no ALiBi code path");
+        assert!(cfg.parallel_attn, "Falcon is unconditionally parallel");
     }
 
+    /// F1 regression — GQA Falcon is parallel too.
+    ///
+    /// Pre-fix values for this config (activation defaults to `"silu"` for
+    /// `falcon`): `rope = true`, `alibi = false`, `parallel_attn = false`.
+    /// The last one made every real Falcon GGUF run the sequential graph.
     #[test]
-    fn test_falcon2_is_rope_gqa() {
-        let cfg = FalconConfig::from_model_config(&make_falcon2_config()).unwrap();
+    fn test_gqa_falcon_is_rope_and_parallel() {
+        let cfg = FalconConfig::from_model_config(&make_gqa_falcon_config()).expect("config");
         assert!(cfg.rope, "Falcon-2 should use RoPE");
         assert!(!cfg.alibi, "Falcon-2 should not use ALiBi");
         assert!(
-            !cfg.parallel_attn,
-            "Falcon-2 should not use parallel attention"
+            cfg.parallel_attn,
+            "attention and FFN are unconditionally parallel in llm_build_falcon"
         );
         assert!(cfg.n_kv_heads < cfg.n_heads, "Falcon-2 should use GQA");
+    }
+
+    /// The three topology flags do not depend on the activation string.
+    #[test]
+    fn test_flags_are_activation_independent() {
+        for activation in ["gelu", "silu", "gelu_pytorch_tanh", ""] {
+            let mut model_config = make_gqa_falcon_config();
+            model_config.activation = activation.to_string();
+            let cfg = FalconConfig::from_model_config(&model_config).expect("config");
+            assert!(cfg.rope, "activation {activation:?} must not disable RoPE");
+            assert!(
+                !cfg.alibi,
+                "activation {activation:?} must not enable ALiBi"
+            );
+            assert!(
+                cfg.parallel_attn,
+                "activation {activation:?} must not disable parallel attention"
+            );
+        }
+    }
+
+    #[test]
+    fn test_head_dim_comes_from_model_config() {
+        let cfg = FalconConfig::from_model_config(&make_gqa_falcon_config()).expect("config");
+        assert_eq!(cfg.head_dim, 2048 / 32);
+        assert_eq!(cfg.n_heads * cfg.head_dim, cfg.hidden_size);
     }
 
     #[test]
@@ -205,8 +283,7 @@ mod tests {
         for i in 1..slopes.len() {
             assert!(
                 slopes[i] < slopes[i - 1],
-                "ALiBi slopes should be monotonically decreasing: {:?}",
-                slopes
+                "ALiBi slopes should be monotonically decreasing: {slopes:?}"
             );
         }
     }

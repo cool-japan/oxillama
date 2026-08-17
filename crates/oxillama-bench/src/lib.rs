@@ -15,6 +15,7 @@ pub mod memory;
 pub mod memory_profiler;
 pub mod power;
 pub mod prefill_decode;
+pub mod real_e2e;
 pub mod regression_gate;
 pub mod simd_comparison;
 pub mod speculative;
@@ -40,6 +41,10 @@ pub use prefill_decode::{
     KvCacheScalingConfig, KvCacheScalingPoint, KvCacheScalingResult, PrefillDecodeBench,
     PrefillDecodeConfig, PrefillDecodePoint, PrefillDecodeResult, PrefillVsDecodeResult,
     KV_CACHE_CONTEXT_SIZES,
+};
+pub use real_e2e::{
+    run_real_e2e_bench, run_real_e2e_bench_for, RealE2eConfig, RealE2eReport, DECODE_TOKENS,
+    MODEL_ENV_VAR,
 };
 pub use regression_gate::{BaselineEntry, RegressionFailure, RegressionGate};
 pub use simd_comparison::{

@@ -28,6 +28,8 @@ pub enum ResponseStatus {
     Completed,
     /// The response failed.
     Failed,
+    /// The client disconnected before generation completed (D4).
+    Cancelled,
 }
 
 /// A stored response object as returned by `GET /v1/responses/:id`.

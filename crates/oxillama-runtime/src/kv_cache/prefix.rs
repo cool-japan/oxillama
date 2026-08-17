@@ -13,9 +13,12 @@
 //! 5. LRU eviction removes least-recently-used entries when capacity is exceeded.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use oxillama_arch::traits::KvCacheAccess;
+
+use crate::error::RuntimeResult;
 
 use super::KvCache;
 
@@ -45,14 +48,26 @@ impl Default for PrefixCacheConfig {
 // ── Cached KV state ──────────────────────────────────────────────────────────
 
 /// Snapshot of KV cache state for a prefix.
+///
+/// The per-layer buffers sit behind an [`Arc`], so cloning a `CachedKvState` —
+/// which the radix tree does whenever a node is split and a caller does when
+/// lifting a hit out from under a lock — is a refcount bump rather than a copy
+/// of `num_layers × seq_len × kv_dim × 4 × 2` bytes.  For a 32-layer model with
+/// a 2000-token prompt at `kv_dim` 1024 that is ~520 MB per clone avoided.
 #[derive(Clone)]
 pub struct CachedKvState {
     /// Per-layer key tensors flattened: `[layer][seq_pos * kv_dim]`.
-    keys: Vec<Vec<f32>>,
+    keys: Arc<Vec<Vec<f32>>>,
     /// Per-layer value tensors flattened.
-    values: Vec<Vec<f32>>,
+    values: Arc<Vec<Vec<f32>>>,
     /// Number of tokens this state covers.
     seq_len: usize,
+    /// Byte footprint, computed once at construction.
+    ///
+    /// The cache's running memory counter reads this; recomputing it by summing
+    /// every layer on each eviction-loop iteration is what made `evict_lru`
+    /// quadratic.
+    memory_bytes: usize,
 }
 
 impl CachedKvState {
@@ -62,10 +77,12 @@ impl CachedKvState {
     /// cloned data (e.g. after releasing a `Mutex` lock on a `PrefixKvCache`).
     /// `keys` and `values` must each have one inner `Vec<f32>` per layer.
     pub fn new(keys: Vec<Vec<f32>>, values: Vec<Vec<f32>>, seq_len: usize) -> Self {
+        let float_count: usize = keys.iter().chain(values.iter()).map(|v| v.len()).sum();
         Self {
-            keys,
-            values,
+            keys: Arc::new(keys),
+            values: Arc::new(values),
             seq_len,
+            memory_bytes: float_count * std::mem::size_of::<f32>(),
         }
     }
 
@@ -85,14 +102,17 @@ impl CachedKvState {
     }
 
     /// Estimated memory usage in bytes.
-    fn memory_bytes(&self) -> usize {
-        let float_count: usize = self
-            .keys
-            .iter()
-            .chain(self.values.iter())
-            .map(|v| v.len())
-            .sum();
-        float_count * std::mem::size_of::<f32>()
+    ///
+    /// Counts the buffers once regardless of how many `CachedKvState` handles
+    /// share them, which is the right accounting for the cache's budget: an
+    /// entry is only freed when the last handle to it goes away.
+    pub fn memory_bytes(&self) -> usize {
+        self.memory_bytes
+    }
+
+    /// The number of layers this snapshot covers.
+    pub fn num_layers(&self) -> usize {
+        self.keys.len()
     }
 }
 
@@ -108,9 +128,17 @@ struct RadixNode {
     cached_kv: Option<CachedKvState>,
     /// Last access timestamp for LRU eviction.
     last_access: Instant,
-    /// Reference count (how many active sequences use this prefix).
-    ref_count: u32,
 }
+
+// NOTE: this node used to carry a `ref_count` field described as "how many
+// active sequences use this prefix", consulted by `find_lru_candidate` as an
+// "in use, don't evict" guard.  Nothing ever incremented it, so the guard was
+// inert — but it was also unnecessary.  `PrefixKvCache::lookup` takes
+// `&mut self` and hands back a `&CachedKvState` borrowed from it, so the borrow
+// checker already forbids any `store`/evict call while a caller holds a hit,
+// and every consumer that needs the data beyond that borrow (the server's
+// `try_prefix_cache_hit`) clones it — now an `Arc` bump — before releasing the
+// lock.  The field is gone rather than left as a lie.
 
 impl RadixNode {
     /// Create a new node with the given token segment.
@@ -120,7 +148,6 @@ impl RadixNode {
             children: HashMap::new(),
             cached_kv: None,
             last_access: Instant::now(),
-            ref_count: 0,
         }
     }
 
@@ -168,11 +195,13 @@ impl RadixNode {
     }
 
     /// Insert KV data at the leaf matching `tokens`, splitting nodes as needed.
-    fn insert(&mut self, tokens: &[u32], kv: CachedKvState) {
+    ///
+    /// Returns the entry that was displaced, if any, so the cache can keep its
+    /// running entry/byte counters exact without re-walking the tree.
+    fn insert(&mut self, tokens: &[u32], kv: CachedKvState) -> Option<CachedKvState> {
         if tokens.is_empty() {
-            self.cached_kv = Some(kv);
             self.last_access = Instant::now();
-            return;
+            return self.cached_kv.replace(kv);
         }
 
         let common = common_prefix_len(&self.tokens, tokens);
@@ -184,9 +213,8 @@ impl RadixNode {
 
         let remaining = &tokens[common..];
         if remaining.is_empty() {
-            self.cached_kv = Some(kv);
             self.last_access = Instant::now();
-            return;
+            return self.cached_kv.replace(kv);
         }
 
         let first = remaining[0];
@@ -197,10 +225,10 @@ impl RadixNode {
 
         // If the child already exists, recurse into it.
         if child.tokens == remaining {
-            child.cached_kv = Some(kv);
             child.last_access = Instant::now();
+            child.cached_kv.replace(kv)
         } else {
-            child.insert(remaining, kv);
+            child.insert(remaining, kv)
         }
     }
 
@@ -214,13 +242,15 @@ impl RadixNode {
         new_child.children = std::mem::take(&mut self.children);
         new_child.cached_kv = self.cached_kv.take();
         new_child.last_access = self.last_access;
-        new_child.ref_count = self.ref_count;
 
         self.tokens.truncate(pos);
         self.children.insert(first_of_suffix, Box::new(new_child));
     }
 
     /// Count the number of nodes that carry cached KV data.
+    ///
+    /// Only the audit path uses this now — the cache keeps a running counter.
+    #[cfg(test)]
     fn count_entries(&self) -> usize {
         let mine = usize::from(self.cached_kv.is_some());
         let children_count: usize = self.children.values().map(|c| c.count_entries()).sum();
@@ -228,6 +258,9 @@ impl RadixNode {
     }
 
     /// Sum the estimated memory of all cached KV states in this subtree.
+    ///
+    /// Only the audit path uses this now — the cache keeps a running counter.
+    #[cfg(test)]
     fn total_memory(&self) -> usize {
         let mine = self.cached_kv.as_ref().map_or(0, |kv| kv.memory_bytes());
         let children_mem: usize = self.children.values().map(|c| c.total_memory()).sum();
@@ -236,73 +269,66 @@ impl RadixNode {
 
     /// Find and remove the LRU eviction candidate in this subtree.
     ///
-    /// Returns the memory freed (0 if nothing was evicted).
-    fn evict_lru_one(&mut self) -> usize {
+    /// Returns the number of bytes freed, or `None` when the subtree holds no
+    /// evictable entry.  `Some(0)` is a real outcome (a zero-length snapshot
+    /// still occupies an entry slot), which is why this is an `Option` rather
+    /// than a bare count — the old `0 means nothing happened` convention made
+    /// `evict_lru` spin forever on such an entry.
+    fn evict_lru_one(&mut self) -> Option<usize> {
         // Collect candidates: this node and all descendants.
         let mut oldest_time = Instant::now();
         let mut oldest_path: Option<Vec<u32>> = None;
-        let mut oldest_mem: usize = 0;
 
-        self.find_lru_candidate(&mut oldest_time, &mut oldest_path, &mut oldest_mem, &[]);
+        self.find_lru_candidate(&mut oldest_time, &mut oldest_path, &[]);
 
-        if let Some(path) = oldest_path {
-            self.remove_cached_at(&path)
-        } else {
-            0
-        }
+        let path = oldest_path?;
+        self.remove_cached_at(&path)
     }
 
-    /// Recursively find the LRU candidate with `ref_count == 0`.
+    /// Recursively find the least-recently-used node that carries cached data.
     fn find_lru_candidate(
         &self,
         oldest_time: &mut Instant,
         oldest_path: &mut Option<Vec<u32>>,
-        oldest_mem: &mut usize,
         prefix: &[u32],
     ) {
-        if self.cached_kv.is_some() && self.ref_count == 0 && self.last_access < *oldest_time {
+        if self.cached_kv.is_some() && (oldest_path.is_none() || self.last_access < *oldest_time) {
             *oldest_time = self.last_access;
             let mut path = prefix.to_vec();
             path.extend_from_slice(&self.tokens);
             *oldest_path = Some(path);
-            *oldest_mem = self.cached_kv.as_ref().map_or(0, |kv| kv.memory_bytes());
         }
 
         for child in self.children.values() {
             let mut child_prefix = prefix.to_vec();
             child_prefix.extend_from_slice(&self.tokens);
-            child.find_lru_candidate(oldest_time, oldest_path, oldest_mem, &child_prefix);
+            child.find_lru_candidate(oldest_time, oldest_path, &child_prefix);
         }
     }
 
     /// Remove cached KV data at the node reached by following `path` tokens.
     ///
-    /// Returns the memory freed.
-    fn remove_cached_at(&mut self, path: &[u32]) -> usize {
+    /// Returns `Some(bytes_freed)` when an entry was actually removed.
+    fn remove_cached_at(&mut self, path: &[u32]) -> Option<usize> {
         let common = common_prefix_len(&self.tokens, path);
         if common < self.tokens.len() {
-            return 0;
+            return None;
         }
 
         let remaining = &path[common..];
         if remaining.is_empty() {
             // This is the target node.
-            let freed = self.cached_kv.as_ref().map_or(0, |kv| kv.memory_bytes());
-            self.cached_kv = None;
-            return freed;
+            return self.cached_kv.take().map(|kv| kv.memory_bytes());
         }
 
-        if let Some(&first) = remaining.first() {
-            if let Some(child) = self.children.get_mut(&first) {
-                let freed = child.remove_cached_at(remaining);
-                // If the child is now empty (no cache, no children), prune it.
-                if child.cached_kv.is_none() && child.children.is_empty() {
-                    self.children.remove(&first);
-                }
-                return freed;
-            }
+        let &first = remaining.first()?;
+        let child = self.children.get_mut(&first)?;
+        let freed = child.remove_cached_at(remaining);
+        // If the child is now empty (no cache, no children), prune it.
+        if child.cached_kv.is_none() && child.children.is_empty() {
+            self.children.remove(&first);
         }
-        0
+        freed
     }
 
     /// Clear all cached data in this subtree.
@@ -333,6 +359,16 @@ pub struct PrefixKvCache {
     hit_count: u64,
     /// Cache miss counter.
     miss_count: u64,
+    /// Running count of nodes carrying cached KV data.
+    ///
+    /// Maintained incrementally.  `evict_lru` used to call `count_entries()`
+    /// and `total_memory()` — each a full tree traversal — on *every* iteration
+    /// of both eviction loops, and `evict_lru_one` traversed twice more, so a
+    /// single `store()` that had to evict `k` entries from a tree of `n` nodes
+    /// cost `O(k · n)`.
+    entry_count: usize,
+    /// Running total of [`CachedKvState::memory_bytes`] across all entries.
+    memory_bytes: usize,
 }
 
 impl PrefixKvCache {
@@ -343,6 +379,8 @@ impl PrefixKvCache {
             config,
             hit_count: 0,
             miss_count: 0,
+            entry_count: 0,
+            memory_bytes: 0,
         }
     }
 
@@ -373,8 +411,25 @@ impl PrefixKvCache {
     /// Store KV cache state for a token prefix.
     ///
     /// Extracts the relevant KV data from the live cache via the
-    /// [`KvCacheAccess`] trait.  If the prefix is shorter than
-    /// `min_prefix_len`, the store is silently skipped.
+    /// [`KvCacheAccess`] trait.  Returns `true` when an entry was stored.
+    ///
+    /// # The length invariant
+    ///
+    /// The trie key is `tokens`, so the snapshot must cover **exactly**
+    /// `tokens.len()` positions:
+    ///
+    /// * If `seq_len > tokens.len()` the snapshot is **truncated** to the key
+    ///   length.  This is the normal case for a server that stores after the
+    ///   decode loop has run: `InferenceEngine::store_kv_in_prefix_cache` used
+    ///   to pass `kv.seq_len()` — prompt *plus everything generated* — and the
+    ///   entry then retained the completion's KV for a key that never mentions
+    ///   it.  Positions past the prompt are simply not part of this prefix.
+    /// * If `seq_len < tokens.len()` the store is **refused**.  Storing it
+    ///   would let a later `lookup` report `matched = tokens.len()` against a
+    ///   shorter snapshot, and `prime_with_prefix` would then mark unwritten
+    ///   positions valid.
+    ///
+    /// A prefix shorter than `min_prefix_len` is skipped, as before.
     pub fn store(
         &mut self,
         tokens: &[u32],
@@ -382,43 +437,100 @@ impl PrefixKvCache {
         seq_len: usize,
         kv_dim: usize,
         num_layers: usize,
-    ) {
+    ) -> bool {
         if tokens.len() < self.config.min_prefix_len {
-            return;
+            return false;
         }
+        if seq_len < tokens.len() {
+            tracing::warn!(
+                tokens = tokens.len(),
+                seq_len,
+                "prefix cache store refused: the KV state is shorter than its trie key"
+            );
+            return false;
+        }
+        let store_len = tokens.len();
 
         // Snapshot the KV state from the live cache.
         let mut keys = Vec::with_capacity(num_layers);
         let mut values = Vec::with_capacity(num_layers);
+        let end = store_len * kv_dim;
 
         for layer in 0..num_layers {
-            let k = kv_cache.get_keys(layer).unwrap_or(&[]);
-            let v = kv_cache.get_values(layer).unwrap_or(&[]);
-            let end = seq_len * kv_dim;
-            keys.push(k[..end.min(k.len())].to_vec());
-            values.push(v[..end.min(v.len())].to_vec());
+            // `fetch_keys`/`fetch_values` borrow FP32 contiguous storage and
+            // gather anything else (FP16 elements, paged layouts), so a prefix
+            // cache in front of an f16 KV cache stores real data instead of
+            // refusing every layer.
+            let (k, v) = match (
+                oxillama_arch::common::fetch_keys(kv_cache, layer),
+                oxillama_arch::common::fetch_values(kv_cache, layer),
+            ) {
+                (Ok(k), Ok(v)) => (k, v),
+                (Err(e), _) | (_, Err(e)) => {
+                    // Previously `unwrap_or(&[])`, which stored an entry with
+                    // empty layers and turned an unreadable cache into a
+                    // silently corrupt cache hit later on.
+                    tracing::warn!(
+                        layer,
+                        error = %e,
+                        "prefix cache store refused: KV cache layer is not readable"
+                    );
+                    return false;
+                }
+            };
+            if k.len() < end || v.len() < end {
+                tracing::warn!(
+                    layer,
+                    keys = k.len(),
+                    values = v.len(),
+                    needed = end,
+                    "prefix cache store refused: KV cache layer is shorter than the prefix"
+                );
+                return false;
+            }
+            keys.push(k[..end].to_vec());
+            values.push(v[..end].to_vec());
         }
 
-        let snapshot = CachedKvState {
-            keys,
-            values,
-            seq_len,
-        };
-
-        self.root.insert(tokens, snapshot);
-
-        // Evict if over limits.
-        self.evict_lru();
+        self.insert_entry(tokens, CachedKvState::new(keys, values, store_len));
+        true
     }
 
     /// Store a pre-built [`CachedKvState`] directly for a token prefix.
     ///
     /// This is useful when the caller has already constructed the snapshot.
-    pub fn store_snapshot(&mut self, tokens: &[u32], snapshot: CachedKvState) {
+    /// Returns `true` when an entry was stored; the same length invariant as
+    /// [`store`](Self::store) applies, except that a snapshot longer than the
+    /// key cannot be truncated here (the caller built it, so a mismatch is a
+    /// caller bug) and is refused.
+    pub fn store_snapshot(&mut self, tokens: &[u32], snapshot: CachedKvState) -> bool {
         if tokens.len() < self.config.min_prefix_len {
-            return;
+            return false;
         }
-        self.root.insert(tokens, snapshot);
+        if snapshot.seq_len() != tokens.len() {
+            tracing::warn!(
+                tokens = tokens.len(),
+                seq_len = snapshot.seq_len(),
+                "prefix cache store_snapshot refused: snapshot length must equal the key length"
+            );
+            return false;
+        }
+        self.insert_entry(tokens, snapshot);
+        true
+    }
+
+    /// Insert `snapshot` under `tokens`, keeping the running counters exact.
+    fn insert_entry(&mut self, tokens: &[u32], snapshot: CachedKvState) {
+        let added = snapshot.memory_bytes();
+        match self.root.insert(tokens, snapshot) {
+            Some(replaced) => {
+                self.memory_bytes = self.memory_bytes + added - replaced.memory_bytes();
+            }
+            None => {
+                self.entry_count += 1;
+                self.memory_bytes += added;
+            }
+        }
         self.evict_lru();
     }
 
@@ -426,34 +538,40 @@ impl PrefixKvCache {
     ///
     /// Copies the cached KV data into the target cache's buffers and resets
     /// the target's sequence position to match the snapshot.
-    pub fn restore(cached: &CachedKvState, target: &mut KvCache) {
-        target.restore_from_snapshot(&cached.keys, &cached.values, cached.seq_len);
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`KvCache::restore_from_snapshot`]'s validation: the target's
+    /// layer count must match and every layer must actually carry
+    /// `seq_len * kv_dim` floats.
+    pub fn restore(cached: &CachedKvState, target: &mut KvCache) -> RuntimeResult<()> {
+        target.restore_from_snapshot(&cached.keys, &cached.values, cached.seq_len)
     }
 
-    /// Evict least-recently-used entries until memory is under the limit.
+    /// Evict least-recently-used entries until both limits are satisfied.
     fn evict_lru(&mut self) {
-        // Evict by entry count.
-        while self.root.count_entries() > self.config.max_entries {
-            if self.root.evict_lru_one() == 0 {
-                break; // No more evictable entries.
-            }
-        }
-        // Evict by memory.
-        while self.root.total_memory() > self.config.max_memory_bytes {
-            if self.root.evict_lru_one() == 0 {
-                break;
+        while self.entry_count > self.config.max_entries
+            || self.memory_bytes > self.config.max_memory_bytes
+        {
+            match self.root.evict_lru_one() {
+                Some(freed) => {
+                    self.entry_count = self.entry_count.saturating_sub(1);
+                    self.memory_bytes = self.memory_bytes.saturating_sub(freed);
+                }
+                // No evictable entry left; the limits cannot be met.
+                None => break,
             }
         }
     }
 
     /// Current number of cached prefixes (nodes with KV data).
     pub fn len(&self) -> usize {
-        self.root.count_entries()
+        self.entry_count
     }
 
     /// Whether the cache is empty (no cached KV data).
     pub fn is_empty(&self) -> bool {
-        self.root.count_entries() == 0
+        self.entry_count == 0
     }
 
     /// Clear all cached entries.
@@ -461,11 +579,13 @@ impl PrefixKvCache {
         self.root.clear_all();
         self.hit_count = 0;
         self.miss_count = 0;
+        self.entry_count = 0;
+        self.memory_bytes = 0;
     }
 
     /// Current estimated memory usage in bytes.
     pub fn memory_usage(&self) -> usize {
-        self.root.total_memory()
+        self.memory_bytes
     }
 
     /// Number of cache hits since creation.
@@ -624,11 +744,7 @@ mod tests {
 
         for i in 0u32..3 {
             let tokens = vec![100 + i, 200 + i];
-            let snapshot = CachedKvState {
-                keys: vec![vec![i as f32; 4]],
-                values: vec![vec![i as f32; 4]],
-                seq_len: 2,
-            };
+            let snapshot = CachedKvState::new(vec![vec![i as f32; 4]], vec![vec![i as f32; 4]], 2);
             pcache.store_snapshot(&tokens, snapshot);
         }
 
@@ -648,11 +764,7 @@ mod tests {
 
         for i in 0u32..5 {
             let tokens = vec![100 + i, 200 + i];
-            let snapshot = CachedKvState {
-                keys: vec![vec![i as f32; 4]],
-                values: vec![vec![i as f32; 4]],
-                seq_len: 2,
-            };
+            let snapshot = CachedKvState::new(vec![vec![i as f32; 4]], vec![vec![i as f32; 4]], 2);
             pcache.store_snapshot(&tokens, snapshot);
         }
 
@@ -697,7 +809,7 @@ mod tests {
 
         // Restore into a fresh KvCache.
         let mut target = KvCache::new(num_layers, 128, kv_dim);
-        PrefixKvCache::restore(&cached_kv_clone, &mut target);
+        PrefixKvCache::restore(&cached_kv_clone, &mut target).expect("restore must succeed");
 
         assert_eq!(target.seq_len(), num_tokens);
 
@@ -733,11 +845,7 @@ mod tests {
         assert_eq!(pcache.memory_usage(), 0);
 
         // 1 layer, kv_dim=4, 2 tokens → keys: 8 floats, values: 8 floats = 64 bytes.
-        let snapshot = CachedKvState {
-            keys: vec![vec![0.0f32; 8]], // 2 tokens * kv_dim=4
-            values: vec![vec![0.0f32; 8]],
-            seq_len: 2,
-        };
+        let snapshot = CachedKvState::new(vec![vec![0.0f32; 8]], vec![vec![0.0f32; 8]], 2);
         pcache.store_snapshot(&[1, 2], snapshot);
 
         // 8 floats * 4 bytes * 2 (keys + values) = 64 bytes.
@@ -758,11 +866,7 @@ mod tests {
         assert_eq!(pcache.hits(), 0);
 
         // Store something.
-        let snapshot = CachedKvState {
-            keys: vec![vec![0.0; 4]],
-            values: vec![vec![0.0; 4]],
-            seq_len: 2,
-        };
+        let snapshot = CachedKvState::new(vec![vec![0.0; 4]], vec![vec![0.0; 4]], 2);
         pcache.store_snapshot(&[1, 2], snapshot);
 
         // Hit.
@@ -824,11 +928,7 @@ mod tests {
         assert!(pcache.is_empty());
         assert_eq!(pcache.len(), 0);
 
-        let snapshot = CachedKvState {
-            keys: vec![vec![0.0; 4]],
-            values: vec![vec![0.0; 4]],
-            seq_len: 2,
-        };
+        let snapshot = CachedKvState::new(vec![vec![0.0; 4]], vec![vec![0.0; 4]], 2);
         pcache.store_snapshot(&[1, 2], snapshot);
 
         assert!(!pcache.is_empty());
@@ -855,16 +955,8 @@ mod tests {
         let mut pcache = PrefixKvCache::new(default_config());
 
         // Insert [1,2,3,4] then [1,2,5,6]. This forces a split at [1,2].
-        let snap_a = CachedKvState {
-            keys: vec![vec![1.0; 4]],
-            values: vec![vec![2.0; 4]],
-            seq_len: 4,
-        };
-        let snap_b = CachedKvState {
-            keys: vec![vec![3.0; 4]],
-            values: vec![vec![4.0; 4]],
-            seq_len: 4,
-        };
+        let snap_a = CachedKvState::new(vec![vec![1.0; 4]], vec![vec![2.0; 4]], 4);
+        let snap_b = CachedKvState::new(vec![vec![3.0; 4]], vec![vec![4.0; 4]], 4);
 
         pcache.store_snapshot(&[1, 2, 3, 4], snap_a);
         pcache.store_snapshot(&[1, 2, 5, 6], snap_b);
@@ -879,5 +971,53 @@ mod tests {
         let (m_b, kv_b) = pcache.lookup(&[1, 2, 5, 6]).expect("lookup B");
         assert_eq!(m_b, 4);
         assert_eq!(kv_b.keys()[0][0], 3.0);
+    }
+
+    // ── Running counters vs. tree traversal ──────────────────────────────
+
+    /// `len()` and `memory_usage()` are maintained incrementally now instead of
+    /// being recomputed by a full tree walk on every eviction-loop iteration.
+    /// That is only sound if they stay exactly equal to what the walk reports,
+    /// so this test compares them after insert / replace / split / evict
+    /// traffic.
+    #[test]
+    fn running_counters_match_a_full_traversal() {
+        let mut pcache = PrefixKvCache::new(PrefixCacheConfig {
+            max_entries: 4,
+            max_memory_bytes: 16 * 1024,
+            min_prefix_len: 1,
+        });
+
+        let mk =
+            |n: usize| CachedKvState::new(vec![vec![0.0f32; 4]; 2], vec![vec![0.0f32; 4]; 2], n);
+
+        let keys: Vec<Vec<u32>> = vec![
+            vec![1, 2, 3, 4],
+            vec![1, 2, 5, 6], // forces a split at [1,2]
+            vec![1, 2],       // lands on the split node itself
+            vec![9, 9, 9, 9],
+            vec![1, 2, 3, 4], // a replacement, not a new entry
+            vec![7, 7],
+            vec![8, 8], // pushes past max_entries, forcing eviction
+        ];
+
+        for key in &keys {
+            let n = key.len();
+            pcache.store_snapshot(key, mk(n));
+            assert_eq!(
+                pcache.len(),
+                pcache.root.count_entries(),
+                "entry counter drifted from the tree after storing {key:?}"
+            );
+            assert_eq!(
+                pcache.memory_usage(),
+                pcache.root.total_memory(),
+                "memory counter drifted from the tree after storing {key:?}"
+            );
+        }
+
+        pcache.clear();
+        assert_eq!(pcache.len(), pcache.root.count_entries());
+        assert_eq!(pcache.memory_usage(), pcache.root.total_memory());
     }
 }

@@ -2,9 +2,10 @@
 //!
 //! IQ4_NL block format (18 bytes per 32 weights):
 //! - bytes[0..2]:   FP16 scale `d` (little-endian)
-//! - bytes[2..18]:  16 nibble-bytes encoding 32 four-bit weights.
-//!   Low nibble  = `weight[2i]`,
-//!   High nibble = `weight[2i+1]`.
+//! - bytes[2..18]:  16 nibble-bytes encoding 32 four-bit weights, in GGML's
+//!   split-half layout (`dequantize_row_iq4_nl`):
+//!   Low nibble  of byte `j` = `weight[j]`,
+//!   High nibble of byte `j` = `weight[j + 16]`.
 //!
 //! Dequantisation: `w = d * KVALUES_IQ4NL[nibble]`
 //!
@@ -45,8 +46,8 @@ impl QuantKernel for Iq4NlRef {
             let byte = block[2 + i];
             let lo = (byte & 0x0F) as usize;
             let hi = ((byte >> 4) & 0x0F) as usize;
-            output[i * 2] = d * KVALUES_IQ4NL[lo] as f32;
-            output[i * 2 + 1] = d * KVALUES_IQ4NL[hi] as f32;
+            output[i] = d * KVALUES_IQ4NL[lo] as f32;
+            output[i + IQ4_NL_BLOCK_SIZE / 2] = d * KVALUES_IQ4NL[hi] as f32;
         }
 
         Ok(())
@@ -81,7 +82,7 @@ impl QuantKernel for Iq4NlRef {
         let blocks_per_row = n_cols.div_ceil(IQ4_NL_BLOCK_SIZE);
         let row_bytes = blocks_per_row * IQ4_NL_BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -95,17 +96,18 @@ impl QuantKernel for Iq4NlRef {
                     let byte = block[2 + i];
                     let lo = (byte & 0x0F) as usize;
                     let hi = ((byte >> 4) & 0x0F) as usize;
-                    let idx = input_offset + i * 2;
-                    if idx + 1 < n_cols {
-                        sum += KVALUES_IQ4NL[lo] as f32 * d * input[idx];
-                        sum += KVALUES_IQ4NL[hi] as f32 * d * input[idx + 1];
-                    } else if idx < n_cols {
-                        sum += KVALUES_IQ4NL[lo] as f32 * d * input[idx];
+                    let idx_lo = input_offset + i;
+                    let idx_hi = idx_lo + IQ4_NL_BLOCK_SIZE / 2;
+                    if idx_lo < n_cols {
+                        sum += KVALUES_IQ4NL[lo] as f32 * d * input[idx_lo];
+                    }
+                    if idx_hi < n_cols {
+                        sum += KVALUES_IQ4NL[hi] as f32 * d * input[idx_hi];
                     }
                 }
             }
             *out = sum;
-        }
+        });
 
         Ok(())
     }
@@ -158,8 +160,8 @@ mod tests {
     #[test]
     fn test_dequant_block_known_values() {
         // d = 1.0, first nibble byte = 0x50
-        //   lo = 0 → KVALUES[0] = -127
-        //   hi = 5 → KVALUES[5] = -35
+        //   lo = 0 → KVALUES[0] = -127  → weight 0
+        //   hi = 5 → KVALUES[5] = -35   → weight 16 (split-half layout)
         let mut nibbles = [0x00u8; 16];
         nibbles[0] = 0x50;
         let block = make_iq4_nl_block(1.0, nibbles);
@@ -172,8 +174,14 @@ mod tests {
             out[0]
         );
         assert!(
-            (out[1] - (-35.0f32)).abs() < 0.1,
-            "out[1] = {}, expected -35",
+            (out[16] - (-35.0f32)).abs() < 0.1,
+            "out[16] = {}, expected -35",
+            out[16]
+        );
+        // Weight 1 comes from byte 1's low nibble (0x0 → KVALUES[0] = -127).
+        assert!(
+            (out[1] - (-127.0f32)).abs() < 0.1,
+            "out[1] = {}, expected -127",
             out[1]
         );
     }

@@ -8,7 +8,8 @@ use crate::common::sequence_state::{AttentionSequenceState, SequenceState};
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::lora::{LoadedLora, LoraStack};
-use oxillama_gguf::TensorStore;
+use oxillama_gguf::{GgufModel, TensorStore};
+use std::sync::Arc;
 
 /// Pattern for matching expected tensor names in a model file.
 #[derive(Debug, Clone)]
@@ -19,6 +20,60 @@ pub struct TensorNamePattern {
     pub description: String,
     /// Whether this tensor is required for the architecture.
     pub required: bool,
+}
+
+/// One stored [`QuantKernel`](oxillama_quant::QuantKernel) binding inside a
+/// loaded model, as handed to [`ForwardPass::remap_quant_kernels`].
+///
+/// A site identifies *where* in the model a kernel is bound and *what weight*
+/// it is dispatched for; a backend decides from `weight.tensor_type` and
+/// `weight.shape` whether it can serve that binding itself.
+///
+/// `role` is drawn from a fixed, stable set — `"attn_q"`, `"attn_k"`,
+/// `"attn_v"`, `"attn_output"`, `"ffn_gate"`, `"ffn_up"`, `"ffn_down"`,
+/// `"output"` — and is part of the contract: an architecture must not rename
+/// its projections here, even when its own GGUF tensor names differ.
+pub struct QuantKernelSite<'a> {
+    /// Transformer block index, or `None` for the LM head.
+    pub layer: Option<usize>,
+    /// Stable short name of the projection this kernel serves.
+    pub role: &'static str,
+    /// The quantized weight tensor this kernel is dispatched for.
+    pub weight: &'a oxillama_quant::QuantTensor,
+}
+
+/// The visitor [`ForwardPass::remap_quant_kernels`] drives.
+///
+/// Receives one [`QuantKernelSite`] together with the kernel currently stored
+/// there, and returns the kernel to store instead — returning the argument
+/// unchanged is the identity remap.
+pub type QuantKernelRemap<'a> = dyn FnMut(
+        QuantKernelSite<'_>,
+        Arc<dyn oxillama_quant::QuantKernel>,
+    ) -> Arc<dyn oxillama_quant::QuantKernel>
+    + 'a;
+
+/// Hand one stored kernel binding to `f` and store the returned kernel back.
+///
+/// `weight` and `slot` must be disjoint places (distinct fields of the same
+/// layer or model), otherwise the caller cannot form both borrows.
+#[cfg(any(feature = "llama", feature = "qwen3"))]
+pub(crate) fn remap_kernel_slot(
+    f: &mut QuantKernelRemap<'_>,
+    layer: Option<usize>,
+    role: &'static str,
+    weight: &oxillama_quant::QuantTensor,
+    slot: &mut Arc<dyn oxillama_quant::QuantKernel>,
+) {
+    let current = Arc::clone(slot);
+    *slot = f(
+        QuantKernelSite {
+            layer,
+            role,
+            weight,
+        },
+        current,
+    );
 }
 
 /// Trait for a model architecture plugin.
@@ -40,6 +95,49 @@ pub trait ModelArchitecture: Send + Sync {
         config: &ModelConfig,
         tensors: &TensorStore,
     ) -> ArchResult<Box<dyn ForwardPass>>;
+
+    /// Build a runnable model from a fully-loaded GGUF file.
+    ///
+    /// [`Self::build`] only receives the tensor *metadata* table, which is why
+    /// ~22 of the 27 implementations return
+    /// `MissingTensor { name: "… (use X::from_gguf for full loading)" }` and
+    /// the registry can build nothing.  This entry point receives the payload
+    /// too, so every architecture can route its existing `from_gguf` loader
+    /// through the registry instead of forcing the engine to keep a hard-coded
+    /// `match` over architecture names.
+    ///
+    /// # Migration
+    ///
+    /// Each architecture overrides this with a one-line delegation:
+    ///
+    /// ```ignore
+    /// fn build_from_gguf(
+    ///     &self,
+    ///     model: &GgufModel,
+    ///     config: &ModelConfig,
+    /// ) -> ArchResult<Box<dyn ForwardPass>> {
+    ///     Ok(Box::new(LlamaModel::from_gguf(model, config)?))
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The default returns [`ArchError::NotSupported`]; architectures that have
+    /// not migrated yet are therefore reported explicitly rather than
+    /// pretending a tensor is missing.
+    fn build_from_gguf(
+        &self,
+        model: &GgufModel,
+        config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        let _ = (model, config);
+        Err(ArchError::NotSupported {
+            detail: format!(
+                "architecture '{}' has not implemented build_from_gguf()",
+                self.arch_id()
+            ),
+        })
+    }
 
     /// Expected tensor name patterns for this architecture.
     ///
@@ -258,22 +356,65 @@ pub trait ForwardPass: Send + Sync {
     /// [`QuantLinear::set_lora`](crate::common::linear::QuantLinear::set_lora)
     /// for every layer whose name appears in `lora.adapters`.
     ///
-    /// The default implementation is a no-op: models that do not yet support
-    /// LoRA patching will silently ignore the adapter.  Override this method
-    /// in each architecture implementation that supports LoRA.
+    /// The default implementation returns [`ArchError::NotSupported`].
+    ///
+    /// It used to return `Ok(())`, which meant that the five engine-reachable
+    /// architectures without an override (qwen3, mistral, gemma, phi,
+    /// starcoder) accepted an adapter, ignored it, and reported success.  A
+    /// loud failure is strictly better than a silent no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::NotSupported`] unless the architecture overrides this.
     fn apply_lora(&mut self, lora: &LoadedLora) -> ArchResult<()> {
         let _ = lora;
-        Ok(())
+        Err(ArchError::NotSupported {
+            detail: "apply_lora() not implemented for this architecture".to_string(),
+        })
+    }
+
+    /// Apply one LoRA adapter with an extra scale multiplier.
+    ///
+    /// This is the primitive [`apply_lora_stack`](Self::apply_lora_stack)
+    /// builds on.  The default delegates to [`apply_lora`](Self::apply_lora)
+    /// when `scale == 1.0` and otherwise reports that the architecture cannot
+    /// honour the multiplier — previously the multiplier was simply dropped.
+    ///
+    /// Architectures implement this by calling
+    /// [`QuantLinear::push_lora`](crate::common::linear::QuantLinear::push_lora)
+    /// (which **accumulates**) instead of
+    /// [`QuantLinear::set_lora`](crate::common::linear::QuantLinear::set_lora)
+    /// (which **replaces**).
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::NotSupported`] when the architecture cannot apply the
+    /// adapter or cannot honour a non-unit scale.
+    fn apply_lora_scaled(&mut self, lora: &LoadedLora, scale: f32) -> ArchResult<()> {
+        if (scale - 1.0).abs() <= f32::EPSILON {
+            self.apply_lora(lora)
+        } else {
+            Err(ArchError::NotSupported {
+                detail: format!(
+                    "apply_lora_scaled(scale = {scale}) not implemented for this architecture; \
+                     the per-entry LoRA scale would be silently discarded"
+                ),
+            })
+        }
     }
 
     /// Apply an ordered stack of LoRA adapters.
     ///
-    /// Default implementation: applies each adapter in the stack in order via
-    /// [`apply_lora`](Self::apply_lora), ignoring per-entry scale multipliers.
-    /// Override for architectures that support scaled stacking.
+    /// Each entry is applied through
+    /// [`apply_lora_scaled`](Self::apply_lora_scaled) so its scale multiplier
+    /// is honoured; the previous implementation discarded every `_scale`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first per-entry failure.
     fn apply_lora_stack(&mut self, stack: &LoraStack) -> ArchResult<()> {
-        for (lora, _scale) in stack.entries() {
-            self.apply_lora(lora)?;
+        for (lora, scale) in stack.entries() {
+            self.apply_lora_scaled(lora, *scale)?;
         }
         Ok(())
     }
@@ -286,20 +427,69 @@ pub trait ForwardPass: Send + Sync {
         None
     }
 
+    /// Offer every stored [`QuantKernel`](oxillama_quant::QuantKernel) binding
+    /// to `_f`, replacing each with whatever `_f` returns.
+    ///
+    /// This is how an out-of-tree backend (a GPU offloader, an instrumenting
+    /// proxy) swaps the kernels a loaded model dispatches through without this
+    /// crate depending on it: `_f` receives the [`QuantKernelSite`] describing
+    /// the binding plus the kernel currently stored there, and returns the
+    /// kernel to store instead — returning the argument unchanged leaves the
+    /// model exactly as it was.
+    ///
+    /// # Contract
+    ///
+    /// An implementation MUST visit every kernel binding the decode and
+    /// prefill paths actually read — the attention projections, the dense-FFN
+    /// projections and the LM head — passing the kernel stored at that site
+    /// together with the weight tensor it serves, and MUST store the returned
+    /// `Arc` back into that site.  The default visits nothing, which is the
+    /// correct answer for an architecture that does not support remapping.
+    ///
+    /// # Out of contract
+    ///
+    /// * MoE expert and router kernels.  They live in companion structs and no
+    ///   architecture exposes them here yet.
+    /// * Any path that re-dispatches a kernel per call from the model's
+    ///   `KernelDispatcher` instead of reading a stored `Arc` — the tiled
+    ///   multi-token prefill of `llama`/`qwen3` and the token-embedding row
+    ///   lookup both do this, so a remapped kernel does **not** apply to them.
+    ///   A caller that needs the remap to hold for prompt processing must
+    ///   drive prefill one token at a time.
+    fn remap_quant_kernels(&mut self, _f: &mut QuantKernelRemap<'_>) {}
+
     /// Set a persistent LoRA adapter stack that applies to all subsequent
     /// `forward()` calls.
     ///
-    /// Default implementation is a no-op — architectures that do not support
-    /// LoRA stacking silently ignore the call (compatible with the existing
-    /// `apply_lora_stack` interface).
+    /// The default delegates to [`apply_lora_stack`](Self::apply_lora_stack)
+    /// so that architectures which support LoRA at all also support the
+    /// persistent form.  It used to return `Ok(())` unconditionally, making the
+    /// call a no-op for every architecture except Jamba.
     ///
     /// # Errors
     ///
     /// Returns [`ArchError::LoraIncompatible`] if the adapter's rank or
-    /// dimensions are incompatible with this model.
-    fn with_lora_stack(&mut self, _stack: LoraStack) -> ArchResult<()> {
-        Ok(())
+    /// dimensions are incompatible with this model, or
+    /// [`ArchError::NotSupported`] when the architecture has no LoRA support.
+    fn with_lora_stack(&mut self, stack: LoraStack) -> ArchResult<()> {
+        self.apply_lora_stack(&stack)
     }
+
+    /// Reset all per-sequence state so the model can start a fresh request.
+    ///
+    /// The runtime **must** call this whenever a KV-cache slot is handed to a
+    /// new request (and the CLI must call it between prompts).  Without it:
+    ///
+    /// * DeepSeek's `MlaLatentCache` keeps growing until `append` errors, and
+    ///   before that leaks the previous request's tokens into `attend_len`;
+    /// * Mamba-2 / Jamba carry the previous sequence's `h` into the new one;
+    /// * DBRX / Grok never return `current_pos` to 0.
+    ///
+    /// The default is a no-op, which is correct for stateless architectures
+    /// whose only state is the externally-owned [`KvCacheAccess`].  Every
+    /// architecture that owns *internal* mutable state must override it — see
+    /// the per-architecture table in this crate's audit notes.
+    fn reset_sequence(&mut self) {}
 
     /// Remove all LoRA adapters from every `QuantLinear` in this model.
     ///
@@ -353,6 +543,107 @@ pub trait ForwardPass: Send + Sync {
         Err(ArchError::NotSupported {
             detail: "forward_batched() not implemented for this architecture".to_string(),
         })
+    }
+}
+
+/// Kernel decorator shared by the per-architecture `remap_quant_kernels` tests.
+#[cfg(all(test, any(feature = "llama", feature = "qwen3")))]
+pub(crate) mod remap_test_support {
+    use oxillama_quant::{QuantKernel, QuantResult, QuantTensor};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A [`QuantKernel`] that forwards every method to `inner` and counts the
+    /// matmul entry points it was actually driven through.
+    ///
+    /// The count is what keeps the parity test honest: identical logits prove
+    /// nothing unless the decorated kernels were on the path that produced
+    /// them.
+    pub(crate) struct CountingKernel {
+        inner: Arc<dyn QuantKernel>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingKernel {
+        /// Wrap `inner`, sharing `calls` across every wrapper of one model.
+        pub(crate) fn wrap(
+            inner: Arc<dyn QuantKernel>,
+            calls: Arc<AtomicUsize>,
+        ) -> Arc<dyn QuantKernel> {
+            Arc::new(Self { inner, calls })
+        }
+    }
+
+    impl QuantKernel for CountingKernel {
+        fn dequant_block(&self, block: &[u8], output: &mut [f32]) -> QuantResult<()> {
+            self.inner.dequant_block(block, output)
+        }
+
+        fn gemv(
+            &self,
+            quant_matrix: &QuantTensor,
+            input: &[f32],
+            output: &mut [f32],
+        ) -> QuantResult<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.gemv(quant_matrix, input, output)
+        }
+
+        fn gemm(
+            &self,
+            quant_matrix: &QuantTensor,
+            input: &[f32],
+            output: &mut [f32],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) -> QuantResult<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.gemm(quant_matrix, input, output, m, n, k)
+        }
+
+        fn matvec_q8_fused(
+            &self,
+            weights: &[u8],
+            acts_q8: &[u8],
+            out: &mut [f32],
+            n_rows: usize,
+            n_cols: usize,
+        ) -> QuantResult<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .matvec_q8_fused(weights, acts_q8, out, n_rows, n_cols)
+        }
+
+        fn matmul_q8_fused(
+            &self,
+            weights: &[u8],
+            acts_q8: &[u8],
+            out: &mut [f32],
+            n_rows: usize,
+            n_cols: usize,
+            m: usize,
+        ) -> QuantResult<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .matmul_q8_fused(weights, acts_q8, out, n_rows, n_cols, m)
+        }
+
+        fn q8_fused_acts_blocks(&self, n_cols: usize) -> Option<usize> {
+            self.inner.q8_fused_acts_blocks(n_cols)
+        }
+
+        fn block_size(&self) -> usize {
+            self.inner.block_size()
+        }
+
+        fn block_bytes(&self) -> usize {
+            self.inner.block_bytes()
+        }
+
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
     }
 }
 
@@ -427,6 +718,19 @@ mod tests {
         let view = EmptyKvView;
         let result = model.forward_batched(&[], &view, 1, 8, 1.0);
         assert!(result.is_err(), "default must return Err");
+    }
+
+    /// An architecture that does not override the visitor exposes no sites,
+    /// so a backend can tell "nothing to offload" from "offloaded nothing".
+    #[test]
+    fn remap_quant_kernels_default_visits_nothing() {
+        let mut model = StubModel;
+        let mut visited = 0usize;
+        model.remap_quant_kernels(&mut |_site, kernel| {
+            visited += 1;
+            kernel
+        });
+        assert_eq!(visited, 0, "the default implementation must visit no sites");
     }
 
     #[test]

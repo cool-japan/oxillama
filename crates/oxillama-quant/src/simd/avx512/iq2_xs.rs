@@ -38,6 +38,16 @@ const QS_OFFSET: usize = 2;
 const SCALES_OFFSET: usize = 66;
 
 /// AVX-512 accelerated IQ2_XS kernel.
+///
+/// Requires `avx512f`. [`crate::dispatch::KernelDispatcher`] is the single
+/// gate: it only constructs this kernel after confirming `avx512f` at
+/// runtime, so — matching every AVX2 kernel in this crate, none of which
+/// re-checks its own CPU feature either — the methods below trust that
+/// invariant instead of repeating the (already cached)
+/// `is_x86_feature_detected!` call on every `dequant_block`/`gemv`
+/// invocation. Constructing this struct directly on hardware without
+/// `avx512f` and calling a trait method is unsound; go through the
+/// dispatcher.
 pub struct Iq2XsAvx512;
 
 impl QuantKernel for Iq2XsAvx512 {
@@ -54,10 +64,7 @@ impl QuantKernel for Iq2XsAvx512 {
                 available: output.len(),
             });
         }
-        if !std::arch::is_x86_feature_detected!("avx512f") {
-            return scalar_dequant_block(block, output);
-        }
-        // SAFETY: bounds verified; avx512f confirmed.
+        // SAFETY: bounds verified above; avx512f guaranteed by KernelDispatcher.
         unsafe { dequant_block_avx512(block, output) }
         Ok(())
     }
@@ -91,21 +98,9 @@ impl QuantKernel for Iq2XsAvx512 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        if !std::arch::is_x86_feature_detected!("avx512f") {
-            return scalar_gemv(
-                &quant_matrix.data,
-                input,
-                output,
-                n_rows,
-                n_cols,
-                blocks_per_row,
-                row_bytes,
-            );
-        }
-
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
-            // SAFETY: bounds checked; avx512f confirmed.
+            // SAFETY: bounds checked above; avx512f guaranteed by KernelDispatcher.
             *out = unsafe {
                 gemv_row_avx512(
                     &quant_matrix.data[row_start..row_start + row_bytes],
@@ -114,7 +109,7 @@ impl QuantKernel for Iq2XsAvx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -147,68 +142,6 @@ impl QuantKernel for Iq2XsAvx512 {
     fn name(&self) -> &'static str {
         "IQ2_XS"
     }
-}
-
-// ---------------------------------------------------------------------------
-// Scalar fallback
-// ---------------------------------------------------------------------------
-
-fn scalar_dequant_block(block: &[u8], output: &mut [f32]) -> QuantResult<()> {
-    use crate::reference::iq2_xs::Iq2XsRef;
-    Iq2XsRef.dequant_block(block, output)
-}
-
-fn scalar_gemv(
-    data: &[u8],
-    input: &[f32],
-    output: &mut [f32],
-    n_rows: usize,
-    n_cols: usize,
-    blocks_per_row: usize,
-    row_bytes: usize,
-) -> QuantResult<()> {
-    for (row, out) in output.iter_mut().enumerate().take(n_rows) {
-        let row_start = row * row_bytes;
-        let mut sum = 0.0f32;
-        for blk in 0..blocks_per_row {
-            let bo = row_start + blk * BLOCK_BYTES;
-            let block = &data[bo..bo + BLOCK_BYTES];
-            let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-            let qs_bytes = &block[QS_OFFSET..SCALES_OFFSET];
-            let scales = &block[SCALES_OFFSET..BLOCK_BYTES];
-            let col_block_base = blk * BLOCK_SIZE;
-            for ib32 in 0..N_SUPERBLOCKS {
-                let scale_byte = scales[ib32];
-                let db0 = d * (0.5 + (scale_byte & 0x0f) as f32) * 0.25;
-                let db1 = d * (0.5 + (scale_byte >> 4) as f32) * 0.25;
-                for l in 0..QS_PER_SUPER {
-                    let byte_pos = 8 * ib32 + 2 * l;
-                    let qs_val =
-                        u16::from_le_bytes([qs_bytes[byte_pos], qs_bytes[byte_pos + 1]]) as usize;
-                    let grid_idx = qs_val & 511;
-                    let sign_idx = qs_val >> 9;
-                    let dl = if l < 2 { db0 } else { db1 };
-                    let col = col_block_base + ib32 * SUPER_BLOCK_SIZE + l * WEIGHTS_PER_GROUP;
-                    let mags = IQ2XS_GRID[grid_idx].to_le_bytes();
-                    let sign_byte = KSIGNS_IQ2XS[sign_idx];
-                    for j in 0..WEIGHTS_PER_GROUP {
-                        let c = col + j;
-                        if c < n_cols {
-                            let mag = mags[j] as f32;
-                            let sign = if sign_byte & KMASK_IQ2XS[j] != 0 {
-                                -1.0_f32
-                            } else {
-                                1.0_f32
-                            };
-                            sum += dl * mag * sign * input[c];
-                        }
-                    }
-                }
-            }
-        }
-        *out = sum;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -311,11 +244,19 @@ unsafe fn gemv_row_avx512(
                         vals[j] = dl * mags[j] as f32 * sign;
                     }
                     // Widen 8-wide to 16-wide ZMM, multiply with input.
+                    //
+                    // `_mm512_castps256_ps512` is a bit-reinterpret (shuffle
+                    // against `_mm256_undefined_ps()` per stdarch) — it does
+                    // NOT zero the upper 8 lanes. Those undefined lanes used
+                    // to flow into `_mm512_mul_ps`/`_mm512_add_ps`,
+                    // permanently poisoning `acc[8..16]`, which the final
+                    // horizontal reduction then sums into the scalar result.
+                    // `_mm512_zextps256_ps512` genuinely zero-extends.
                     let w8 = _mm256_loadu_ps(vals.as_ptr());
-                    let w16 = _mm512_castps256_ps512(w8);
+                    let w16 = _mm512_zextps256_ps512(w8);
                     // SAFETY: col + 8 <= n_cols <= input.len()
                     let i8 = _mm256_loadu_ps(input.as_ptr().add(col));
-                    let i16 = _mm512_castps256_ps512(i8);
+                    let i16 = _mm512_zextps256_ps512(i8);
                     let prod = _mm512_mul_ps(w16, i16);
                     acc = _mm512_add_ps(acc, prod);
                 } else {

@@ -122,7 +122,7 @@ impl QuantKernel for Q4_KAvx512 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row/block bounds verified above.
             // CPU avx512f support guaranteed by KernelDispatcher.
@@ -134,7 +134,7 @@ impl QuantKernel for Q4_KAvx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -154,6 +154,45 @@ impl QuantKernel for Q4_KAvx512 {
             self.gemv(quant_matrix, input_row, output_row)?;
         }
         Ok(())
+    }
+
+    /// Fused Q4_K weight × Q8_0 activation GEMV — **explicitly delegated** to
+    /// [`crate::simd::avx2::Q4_KAvx2`].
+    ///
+    /// This is a decision, not an oversight.  `dispatch.rs` picks the AVX-512
+    /// kernel before the AVX2 one, so without an override here the fused decode
+    /// path AVX2 has for Q4_K disappears the moment `simd-avx512` is enabled —
+    /// enabling the feature would *cost* performance.  Delegation restores it
+    /// at exactly the AVX2 tier's speed (every AVX-512F CPU also has AVX2+FMA).
+    ///
+    /// A native 512-bit Q4_K fused kernel was not written: its row body
+    /// interleaves eight per-sub-block `f32` scale/min combinations with the
+    /// integer dots (`(d·sc)·Σ(q·a) − (dmin·mn)·Σa`, per sub-block, times the
+    /// activation scale), and no AVX-512 hardware is available to validate a
+    /// re-derivation of that in 512-bit lanes.  Shipping an unvalidated rewrite
+    /// of the format that carries `Q4_K_M` models would be the worse trade.
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        crate::simd::avx512::fused::delegate_to_avx2(
+            &crate::simd::avx2::Q4_KAvx2,
+            weights,
+            acts_q8,
+            out,
+            n_rows,
+            n_cols,
+        )
+    }
+
+    /// `ceil(K/256) * 8` — bit-for-bit the gate `Q4_KAvx2` advertises, so the
+    /// fused path stays enabled when the AVX-512 tier is selected.
+    fn q8_fused_acts_blocks(&self, n_cols: usize) -> Option<usize> {
+        crate::simd::avx512::fused::delegated_acts_blocks_k(n_cols)
     }
 
     fn block_size(&self) -> usize {

@@ -396,7 +396,6 @@ mod tests {
     use super::*;
     use crate::queue::BatchRequest;
     use crate::queue::UsageStats;
-    use crate::state::AppState;
     use crate::threads::queue::new_run_queue;
     use crate::threads::store::ThreadStore;
     use crate::threads::worker::spawn_run_worker;
@@ -431,9 +430,9 @@ mod tests {
         });
 
         let state = Arc::new(
-            AppState::new(
+            crate::test_helpers::new_test_state(
                 tx,
-                "test-model".to_string(),
+                "test-model",
                 oxillama_runtime::sampling::SamplerConfig::default(),
                 None,
                 0,
@@ -457,6 +456,7 @@ mod tests {
                             completion_tokens: 4,
                             total_tokens: 9,
                         },
+                        oxillama_runtime::FinishReason::Eos,
                     )));
                 }
             }
@@ -465,9 +465,9 @@ mod tests {
         let (run_tx, run_rx) = new_run_queue();
         let store_c = Arc::clone(&store);
         let state = Arc::new(
-            AppState::new(
+            crate::test_helpers::new_test_state(
                 tx,
-                "test-model".to_string(),
+                "test-model",
                 oxillama_runtime::sampling::SamplerConfig::default(),
                 None,
                 0,
@@ -856,9 +856,9 @@ mod tests {
 
         let (run_tx, run_rx) = new_run_queue();
         let state = Arc::new(
-            AppState::new(
+            crate::test_helpers::new_test_state(
                 tx,
-                "test-model".to_string(),
+                "test-model",
                 oxillama_runtime::sampling::SamplerConfig::default(),
                 None,
                 0,

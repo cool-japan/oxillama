@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{
     collections::BTreeMap,
+    format,
     string::{String, ToString},
     vec::Vec,
 };
@@ -54,6 +55,54 @@ impl TensorInfo {
         let n_blocks = n_elements.div_ceil(block_size);
         n_blocks * block_bytes
     }
+
+    /// Fallible variant of [`Self::n_elements`].
+    ///
+    /// `dimensions` is parsed directly from an untrusted GGUF file, so a
+    /// naive `product()` over attacker-controlled `u64`s can overflow —
+    /// e.g. dims `[2^32, 2^32]` wrap to `0` in a release build (and panic
+    /// in debug). This returns a typed error instead of silently wrapping.
+    pub fn try_n_elements(&self) -> GgufResult<u64> {
+        if self.dimensions.is_empty() {
+            return Ok(0);
+        }
+        self.dimensions.iter().try_fold(1u64, |acc, &d| {
+            acc.checked_mul(d).ok_or_else(|| GgufError::IntegrityError {
+                tensor_name: self.name.clone(),
+                reason: format!(
+                    "tensor dimensions {:?} overflow u64 while computing element count",
+                    self.dimensions
+                ),
+            })
+        })
+    }
+
+    /// Fallible variant of [`Self::data_size`].
+    ///
+    /// Rejects overflow in the blocks-times-bytes-per-block multiplication
+    /// (and any overflow surfaced by [`Self::try_n_elements`]) instead of
+    /// silently wrapping to a small, attacker-influenced size — which is
+    /// what let a crafted file steer downstream offset arithmetic.
+    pub fn try_data_size(&self) -> GgufResult<u64> {
+        let n_elements = self.try_n_elements()?;
+        let block_size = self.tensor_type.block_size() as u64;
+        if block_size == 0 {
+            return Err(GgufError::IntegrityError {
+                tensor_name: self.name.clone(),
+                reason: "tensor type has a zero block size".to_string(),
+            });
+        }
+        let block_bytes = self.tensor_type.block_bytes() as u64;
+        let n_blocks = n_elements.div_ceil(block_size);
+        n_blocks
+            .checked_mul(block_bytes)
+            .ok_or_else(|| GgufError::IntegrityError {
+                tensor_name: self.name.clone(),
+                reason: format!(
+                    "tensor data size overflow: {n_blocks} blocks * {block_bytes} bytes/block"
+                ),
+            })
+    }
 }
 
 /// A collection of tensor infos and optional tensor data references.
@@ -87,9 +136,35 @@ impl TensorStore {
         self.data_section_offset
     }
 
-    /// Insert a tensor info entry.
+    /// Insert a tensor info entry, silently overwriting any existing entry
+    /// with the same name.
+    ///
+    /// Kept for callers (e.g. shard merging, on-load quantization bookkeeping)
+    /// that intentionally build a store from data that has already been
+    /// validated elsewhere. Parsing an *untrusted* GGUF file should use
+    /// [`Self::try_insert`] instead — see its docs for why.
     pub fn insert(&mut self, info: TensorInfo) {
         self.infos.insert(info.name.clone(), info);
+    }
+
+    /// Insert a tensor info entry, rejecting a name collision instead of
+    /// silently overwriting the previous entry.
+    ///
+    /// A GGUF file's tensor-info section is untrusted input: parsing it
+    /// with the plain [`Self::insert`] lets a file that declares, say,
+    /// 10,000 tensors all named `"x"` collapse to a single-entry store with
+    /// no error — silently dropping 9,999 tensors a loader would otherwise
+    /// expect to find. Use this method wherever tensor infos are read
+    /// directly off an untrusted byte source.
+    pub fn try_insert(&mut self, info: TensorInfo) -> GgufResult<()> {
+        if self.infos.contains_key(&info.name) {
+            return Err(GgufError::IntegrityError {
+                tensor_name: info.name,
+                reason: "duplicate tensor name in GGUF tensor-info section".to_string(),
+            });
+        }
+        self.infos.insert(info.name.clone(), info);
+        Ok(())
     }
 
     /// Look up a tensor by name.
@@ -267,5 +342,103 @@ mod tests {
         let mut store = TensorStore::new();
         store.set_data_offset(4096);
         assert_eq!(store.data_offset(), 4096);
+    }
+
+    // ── V3 regression: checked element-count / data-size arithmetic ────────
+
+    #[test]
+    fn test_try_n_elements_overflow_errors() {
+        // 2^32 * 2^32 = 2^64, overflows u64.
+        let info = make_info("huge", vec![1u64 << 32, 1u64 << 32], 0);
+        let err = info
+            .try_n_elements()
+            .expect_err("dims overflowing u64 must error, not wrap");
+        assert!(matches!(err, GgufError::IntegrityError { .. }));
+
+        // Contrast with the old infallible path — this is profile-dependent
+        // by design, matching the report's exact "panic in dev and wrap to
+        // 0 in release" description: debug builds have overflow checks on
+        // (`*.product()` panics), release builds do not (it silently wraps
+        // to 0). Assert whichever behavior this build profile actually
+        // exhibits, via `catch_unwind` so a debug-mode panic doesn't abort
+        // this test itself.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| info.n_elements()));
+        if cfg!(debug_assertions) {
+            assert!(
+                panicked.is_err(),
+                "sanity: infallible n_elements() should panic on overflow in a debug build"
+            );
+        } else {
+            assert_eq!(
+                panicked.expect("release build must not panic on overflow"),
+                0,
+                "sanity: infallible n_elements() should silently wrap to 0 in a release build"
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_n_elements_normal_case_matches_infallible() {
+        let info = make_info("w", vec![4, 8], 0);
+        assert_eq!(info.try_n_elements().expect("no overflow"), 32);
+        assert_eq!(
+            info.try_n_elements().expect("no overflow"),
+            info.n_elements()
+        );
+    }
+
+    #[test]
+    fn test_try_data_size_overflow_errors() {
+        let info = make_info("huge", vec![1u64 << 40, 1u64 << 40], 0);
+        assert!(info.try_data_size().is_err());
+    }
+
+    #[test]
+    fn test_try_data_size_normal_case_matches_infallible() {
+        let info = make_info("w", vec![8], 0); // F32: 8 * 4 = 32 bytes
+        assert_eq!(info.try_data_size().expect("no overflow"), 32);
+        assert_eq!(info.try_data_size().expect("no overflow"), info.data_size());
+    }
+
+    // ── V6 regression: duplicate tensor names must be rejected ─────────────
+
+    #[test]
+    fn test_try_insert_rejects_duplicate_name() {
+        let mut store = TensorStore::new();
+        store
+            .try_insert(make_info("x", vec![1], 0))
+            .expect("first insert must succeed");
+        let err = store
+            .try_insert(make_info("x", vec![1], 32))
+            .expect_err("duplicate name must be rejected");
+        assert!(matches!(err, GgufError::IntegrityError { .. }));
+        // The original entry must be left untouched (not silently
+        // overwritten by the rejected second insert).
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get("x").expect("still present").offset, 0);
+    }
+
+    #[test]
+    fn test_try_insert_distinct_names_all_succeed() {
+        let mut store = TensorStore::new();
+        for i in 0..5 {
+            store
+                .try_insert(make_info(&format!("t{i}"), vec![1], 0))
+                .expect("distinct names must all succeed");
+        }
+        assert_eq!(store.len(), 5);
+    }
+
+    #[test]
+    fn test_plain_insert_still_silently_overwrites() {
+        // `insert()` keeps its historical overwrite behavior for callers
+        // that intentionally rebuild entries (e.g. quantize-on-load type
+        // updates); only the untrusted-parse paths were switched over to
+        // `try_insert`.
+        let mut store = TensorStore::new();
+        store.insert(make_info("x", vec![1], 0));
+        store.insert(make_info("x", vec![1], 99));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get("x").expect("present").offset, 99);
     }
 }

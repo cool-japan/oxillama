@@ -12,21 +12,22 @@
 //!
 //! ## Tensor naming convention (GGUF)
 //!
-//! All tensors follow the LLaMA naming convention:
 //! - `token_embd.weight` — Token embedding matrix
-//! - `blk.{i}.attn_norm.weight` — Pre-attention RMSNorm
+//! - `blk.{i}.attn_norm.weight` — Pre-block LayerNorm (no bias; feeds BOTH
+//!   attention and FFN — Command-R has no `ffn_norm` tensor)
 //! - `blk.{i}.attn_q.weight` — Query projection
 //! - `blk.{i}.attn_k.weight` — Key projection
 //! - `blk.{i}.attn_v.weight` — Value projection
 //! - `blk.{i}.attn_output.weight` — Attention output projection
 //! - `blk.{i}.attn_q_norm.weight` — Q normalization (optional, Command-R+)
 //! - `blk.{i}.attn_k_norm.weight` — K normalization (optional, Command-R+)
-//! - `blk.{i}.ffn_norm.weight` — Pre-FFN RMSNorm
 //! - `blk.{i}.ffn_gate.weight` — FFN gate projection (SwiGLU)
 //! - `blk.{i}.ffn_up.weight` — FFN up projection
 //! - `blk.{i}.ffn_down.weight` — FFN down projection
-//! - `output_norm.weight` — Final RMSNorm
-//! - `output.weight` — LM head
+//! - `output_norm.weight` — Final LayerNorm
+//! - `output.weight` — LM head, always tied to `token_embd.weight` on real
+//!   checkpoints (llama.cpp never creates a standalone `output.weight` for
+//!   this architecture)
 
 mod model;
 
@@ -84,6 +85,14 @@ impl ModelArchitecture for CommandRArchitecture {
         })
     }
 
+    fn build_from_gguf(
+        &self,
+        model: &oxillama_gguf::GgufModel,
+        config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Ok(Box::new(model::load_command_r_from_gguf(model, config)?))
+    }
+
     fn tensor_names(&self) -> Vec<TensorNamePattern> {
         let mut patterns = vec![
             TensorNamePattern {
@@ -93,18 +102,24 @@ impl ModelArchitecture for CommandRArchitecture {
             },
             TensorNamePattern {
                 pattern: "output_norm.weight".to_string(),
-                description: "Final RMSNorm".to_string(),
+                description: "Final LayerNorm".to_string(),
                 required: true,
             },
             TensorNamePattern {
                 pattern: "output.weight".to_string(),
-                description: "LM head / unembedding".to_string(),
-                required: true,
+                // llama.cpp never creates a standalone `output.weight` for
+                // this architecture — it always duplicates `token_embd`.
+                description: "LM head / unembedding (always tied to token_embd.weight)".to_string(),
+                required: false,
             },
         ];
 
         let layer_tensors = [
-            ("blk.{i}.attn_norm.weight", "Pre-attention RMSNorm", true),
+            (
+                "blk.{i}.attn_norm.weight",
+                "Pre-block LayerNorm (feeds both attention and FFN)",
+                true,
+            ),
             ("blk.{i}.attn_q.weight", "Query projection", true),
             ("blk.{i}.attn_k.weight", "Key projection", true),
             ("blk.{i}.attn_v.weight", "Value projection", true),
@@ -115,15 +130,14 @@ impl ModelArchitecture for CommandRArchitecture {
             ),
             (
                 "blk.{i}.attn_q_norm.weight",
-                "Q normalization (Command-R+)",
+                "Per-head Q normalization (Command-R+ only)",
                 false,
             ),
             (
                 "blk.{i}.attn_k_norm.weight",
-                "K normalization (Command-R+)",
+                "Per-head K normalization (Command-R+ only)",
                 false,
             ),
-            ("blk.{i}.ffn_norm.weight", "Pre-FFN RMSNorm", true),
             ("blk.{i}.ffn_gate.weight", "FFN gate projection", true),
             ("blk.{i}.ffn_up.weight", "FFN up projection", true),
             ("blk.{i}.ffn_down.weight", "FFN down projection", true),
@@ -196,9 +210,17 @@ mod tests {
             required_patterns.contains(&"token_embd.weight"),
             "missing token_embd.weight"
         );
+
+        // `output.weight` is listed but NOT required: llama.cpp always ties
+        // it to `token_embd.weight` for this architecture and never creates
+        // a standalone tensor (see `load_lm_head` in `model.rs`).
+        let output = names
+            .iter()
+            .find(|p| p.pattern == "output.weight")
+            .expect("output.weight pattern should be present");
         assert!(
-            required_patterns.contains(&"output.weight"),
-            "missing output.weight"
+            !output.required,
+            "output.weight should be optional (tied-embedding fallback)"
         );
 
         // Optional Q/K norm tensors should be listed but not required.

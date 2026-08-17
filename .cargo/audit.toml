@@ -1,0 +1,16 @@
+[advisories]
+# RUSTSEC-2023-0071: Marvin Attack timing side-channel in rsa 0.9.10.
+# No upstream fix available. Used only behind the optional `jwt` feature
+# in oxillama-server. Acceptable risk for an optional server-side feature.
+#
+# RUSTSEC-2024-0436: `paste` 1.0.15 is unmaintained. Transitive via
+# tokenizers 0.23.1; proc-macro used only at build time, no runtime exposure.
+#
+# RUSTSEC-2026-0173: `proc-macro-error2` 2.0.1 is unmaintained. Transitive
+# via tabled_derive -> tabled 0.21.0, used only by oxillama-bench (dev/bench
+# tooling); proc-macro/build-time only, not shipped in any release artifact.
+ignore = [
+  "RUSTSEC-2023-0071",
+  "RUSTSEC-2024-0436",
+  "RUSTSEC-2026-0173",
+]

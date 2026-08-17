@@ -1,8 +1,31 @@
-//! Streaming / chunked GGUF loader.
+//! Minimal streaming / chunked GGUF *header probe*.
 //!
 //! Provides a stateful accumulator that JS can feed byte chunks into as they
-//! arrive from `fetch()` + `ReadableStream`. Once enough data is accumulated,
-//! the GGUF header (and eventually tensors) can be parsed incrementally.
+//! arrive from `fetch()` + `ReadableStream`. Once enough data is accumulated
+//! (24 bytes), the magic + version + tensor count are parsed and exposed —
+//! nothing else.
+//!
+//! ## Relationship to [`crate::streaming_loader`]
+//!
+//! This module and [`crate::streaming_loader`] both incrementally parse a
+//! GGUF header from fed byte chunks, but they solve different problems and
+//! are both intentionally kept:
+//!
+//! - **`streaming_load` (this module, [`GgufChunkLoader`]):** a tiny,
+//!   dependency-free probe. `feed()` returns `{bytes_received, header_ready,
+//!   n_tensors}` as soon as it can — no tensor index, no byte-range
+//!   fetching, no cache. Useful for a lightweight "is this a valid GGUF, and
+//!   how big is it" progress indicator while a download starts.
+//! - **`streaming_loader` ([`crate::streaming_loader::StreamingGgufLoader`]):**
+//!   the full solution — push-mode header/tensor-index parsing via
+//!   `oxillama_gguf::StreamingGgufParser`, pull-mode `read_tensor(name,
+//!   fetcher)` with an LRU tensor cache, and `progress()` reporting. This is
+//!   what a real model-loading UI should use.
+//!
+//! `GgufChunkLoader` is `#[wasm_bindgen]`-exported and therefore part of the
+//! public JS surface (`crates/oxillama-wasm/src/lib.rs` does not need to
+//! `pub use` it for wasm-bindgen to generate JS glue for it) — it is kept
+//! for source/back-compat rather than folded into `StreamingGgufLoader`.
 //!
 //! JavaScript usage:
 //! ```js

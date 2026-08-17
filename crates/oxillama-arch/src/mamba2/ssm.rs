@@ -1,26 +1,43 @@
-//! Selective-scan (SSM) primitive for Mamba-2 models.
+//! Selective-scan (SSM) primitives.
 //!
-//! Implements the sequential O(n) selective scan used in Mamba-2 blocks.
+//! This module holds **two** scans, because Mamba-1 and Mamba-2 parameterise
+//! `A` and `Δ` completely differently:
 //!
-//! ## Key mathematical detail
+//! | Function | `A` | `Δ` | Used by |
+//! |---|---|---|---|
+//! | [`selective_scan_sequential`] | `[d_state × d_inner]` | per channel | Mamba-1 / Jamba |
+//! | [`selective_scan_mamba2`] | one scalar per **head** | one scalar per **head** | Mamba-2 |
 //!
-//! The `A` matrix is stored in GGUF as `log(A)` (log of the absolute value of
-//! the negative diagonal). The discrete-time update rule is:
+//! ## Mamba-1 convention (`selective_scan_sequential`)
+//!
+//! The caller supplies `log_a` and the scan forms
 //!
 //! ```text
 //! A_discrete[t, s, i] = exp(-Δ[t, i] * exp(log_A[s, i]))
 //!                      ≠ exp(-Δ[t, i] * log_A[s, i])   ← WRONG
-//! ```
-//!
-//! Then:
-//! ```text
 //! B_discrete[t, s, i] = Δ[t, i] * B[t, s]
 //! h[s, i]             = A_discrete * h[s, i] + B_discrete * u[t, i]
 //! y[t, i]            += C[t, s] * h[s, i]
 //! y[t, i]            += D[i] * u[t, i]  (skip connection)
 //! ```
+//!
+//! ## Mamba-2 convention (`selective_scan_mamba2`)
+//!
+//! **`blk.N.ssm_a` in a GGUF file is `A` itself, already negative — not
+//! `log(A)`.**  `convert_hf_to_gguf.py::Mamba2Model.modify_tensors` writes
+//! `data_torch = -torch.exp(data_torch)` for every `.A_log` tensor, and
+//! `ggml_compute_forward_ssm_scan_f32` then consumes it verbatim:
+//!
+//! ```text
+//! const float dt_soft_plus = ggml_compute_softplus_f32(dt[h]);
+//! const float dA           = expf(dt_soft_plus * A[h]);
+//! ```
+//!
+//! So [`selective_scan_mamba2`] applies **no** `exp` and **no** negation to
+//! `a`.  Passing an `A_log` tensor to it would be a silent correctness bug.
 
 use crate::common::sequence_state::SsmLayerState;
+use crate::error::{ArchError, ArchResult};
 
 // ─── Public function ──────────────────────────────────────────────────────────
 
@@ -97,6 +114,199 @@ pub fn selective_scan_sequential(
     }
 
     y
+}
+
+// ─── Mamba-2 selective scan ───────────────────────────────────────────────────
+
+/// Geometry of one Mamba-2 selective scan.
+///
+/// Bundled into a struct because the scan otherwise needs eleven arguments and
+/// the indexing is easy to get wrong: `x` is head-major
+/// (`x[t][h][i1]`), while `B`/`C` are group-major (`B[t][g][i0]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mamba2ScanDims {
+    /// Number of tokens in this chunk.
+    pub seq_len: usize,
+    /// Number of SSM heads (`ssm.time_step_rank`).
+    pub n_head: usize,
+    /// Channels per head (`d_inner / n_head`).
+    pub head_dim: usize,
+    /// SSM state dimension.
+    pub d_state: usize,
+    /// Number of B/C groups (`ssm.group_count`).
+    pub n_group: usize,
+}
+
+impl Mamba2ScanDims {
+    /// Inner width, `n_head * head_dim`.
+    pub fn d_inner(&self) -> usize {
+        self.n_head * self.head_dim
+    }
+
+    /// Width of one token's `B` (or `C`) slice, `n_group * d_state`.
+    pub fn bc_width(&self) -> usize {
+        self.n_group * self.d_state
+    }
+}
+
+/// Softplus, matching `ggml_compute_softplus_f32` in `ggml/src/ggml-impl.h`:
+/// `(input > 20.0f) ? input : logf(1 + expf(input))`.
+#[inline]
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else {
+        (1.0f32 + x.exp()).ln()
+    }
+}
+
+/// Sequential Mamba-2 selective scan.
+///
+/// A direct transcription of the `src3->ne[0] == 1` branch of
+/// `ggml_compute_forward_ssm_scan_f32` (`ggml/src/ggml-cpu/ops.cpp`), which is
+/// the branch llama.cpp takes for Mamba-2 because `ssm_a` has shape
+/// `{1, n_head}`:
+///
+/// ```text
+/// dt_soft_plus = softplus(dt[h]);
+/// dA           = exp(dt_soft_plus * A[h]);
+/// g            = h / (nh / ng);            // repeat_interleave
+/// x_dt         = x[i1 + h*nr] * dt_soft_plus;
+/// state        = s0[i0 + ii*nc] * dA + B[i0 + g*nc] * x_dt;
+/// y[ii]       += state * C[i0 + g*nc];
+/// ```
+///
+/// The `D` skip (`y = ggml_add(y, ggml_mul(x, ssm_d))` in
+/// `build_mamba2_layer`) is folded in here; like `ssm_a`, `ssm_d` is
+/// **per head**, so channel `i1` of head `h` adds `d_skip[h] * x[..]`.
+///
+/// # Layouts
+///
+/// * `x`       – `[seq_len × d_inner]`, head-major: `x[t*d_inner + h*head_dim + i1]`.
+/// * `dt`      – `[seq_len × n_head]`, **raw** (bias and softplus applied here).
+/// * `dt_bias` – `[n_head]` (`blk.N.ssm_dt.bias`).
+/// * `a`       – `[n_head]` (`blk.N.ssm_a`), used verbatim; see the module docs.
+/// * `b`, `c`  – `[seq_len × n_group*d_state]`, group-major.
+/// * `d_skip`  – `[n_head]` (`blk.N.ssm_d`).
+/// * `state.h` – `[d_state × head_dim × n_head]` indexed
+///   `h[(h*head_dim + i1) * d_state + i0]`, matching ggml's
+///   `reshape_4d(states, d_state, head_dim, n_head, ...)`.
+///
+/// # Returns
+/// `y` of `[seq_len × d_inner]`, head-major.
+///
+/// # Errors
+///
+/// [`ArchError::InvalidShape`] when any slice disagrees with `dims`, or
+/// [`ArchError::InvalidConfig`] when `n_head` is not a multiple of `n_group`
+/// (an invariant `ggml_ssm_scan` asserts).
+#[allow(clippy::too_many_arguments)]
+pub fn selective_scan_mamba2(
+    x: &[f32],
+    dt: &[f32],
+    dt_bias: &[f32],
+    a: &[f32],
+    b: &[f32],
+    c: &[f32],
+    d_skip: &[f32],
+    dims: Mamba2ScanDims,
+    state: &mut SsmLayerState,
+) -> ArchResult<Vec<f32>> {
+    let Mamba2ScanDims {
+        seq_len,
+        n_head,
+        head_dim,
+        d_state,
+        n_group,
+    } = dims;
+
+    if n_head == 0 || n_group == 0 || d_state == 0 || head_dim == 0 {
+        return Err(ArchError::InvalidConfig {
+            detail: format!(
+                "mamba2.scan: n_head={n_head}, head_dim={head_dim}, d_state={d_state}, \
+                 n_group={n_group} must all be non-zero"
+            ),
+        });
+    }
+    if n_head % n_group != 0 {
+        return Err(ArchError::InvalidConfig {
+            detail: format!(
+                "mamba2.scan: n_head ({n_head}) must be divisible by n_group ({n_group})"
+            ),
+        });
+    }
+
+    let d_inner = dims.d_inner();
+    let bc_width = dims.bc_width();
+
+    let shape_err = |what: &str, expected: Vec<usize>, got: usize| ArchError::InvalidShape {
+        name: format!("mamba2.scan.{what}"),
+        expected,
+        got: vec![got],
+    };
+
+    if x.len() != seq_len * d_inner {
+        return Err(shape_err("x", vec![seq_len, d_inner], x.len()));
+    }
+    if dt.len() != seq_len * n_head {
+        return Err(shape_err("dt", vec![seq_len, n_head], dt.len()));
+    }
+    if dt_bias.len() != n_head {
+        return Err(shape_err("dt_bias", vec![n_head], dt_bias.len()));
+    }
+    if a.len() != n_head {
+        return Err(shape_err("a", vec![n_head], a.len()));
+    }
+    if d_skip.len() != n_head {
+        return Err(shape_err("d", vec![n_head], d_skip.len()));
+    }
+    if b.len() != seq_len * bc_width {
+        return Err(shape_err("b", vec![seq_len, bc_width], b.len()));
+    }
+    if c.len() != seq_len * bc_width {
+        return Err(shape_err("c", vec![seq_len, bc_width], c.len()));
+    }
+    if state.h.len() != d_state * d_inner {
+        return Err(shape_err("state", vec![d_state * d_inner], state.h.len()));
+    }
+
+    let heads_per_group = n_head / n_group;
+    let mut y = vec![0.0f32; seq_len * d_inner];
+
+    for t in 0..seq_len {
+        let b_t = &b[t * bc_width..(t + 1) * bc_width];
+        let c_t = &c[t * bc_width..(t + 1) * bc_width];
+        let x_t = &x[t * d_inner..(t + 1) * d_inner];
+        let y_t = &mut y[t * d_inner..(t + 1) * d_inner];
+
+        for h in 0..n_head {
+            let dt_soft_plus = softplus(dt[t * n_head + h] + dt_bias[h]);
+            // A is consumed verbatim: it is already `-exp(A_log)` in GGUF.
+            let d_a = (dt_soft_plus * a[h]).exp();
+            let g = h / heads_per_group;
+            let g_off = g * d_state;
+
+            for i1 in 0..head_dim {
+                let ii = i1 + h * head_dim;
+                let x_ii = x_t[ii];
+                let x_dt = x_ii * dt_soft_plus;
+                let h_off = ii * d_state;
+
+                let mut sumf = 0.0f32;
+                for i0 in 0..d_state {
+                    let prev = state.h[h_off + i0];
+                    let s = prev * d_a + b_t[g_off + i0] * x_dt;
+                    sumf += s * c_t[g_off + i0];
+                    state.h[h_off + i0] = s;
+                }
+
+                // Per-head D skip connection.
+                y_t[ii] = sumf + d_skip[h] * x_ii;
+            }
+        }
+    }
+
+    Ok(y)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -278,6 +488,322 @@ mod tests {
                 "output[{i}] must be bit-identical after reset"
             );
         }
+    }
+
+    // ─── Mamba-2 scan ─────────────────────────────────────────────────────
+
+    fn scan_dims(seq_len: usize) -> Mamba2ScanDims {
+        Mamba2ScanDims {
+            seq_len,
+            n_head: 4,
+            head_dim: 2,
+            d_state: 3,
+            n_group: 2,
+        }
+    }
+
+    /// `selective_scan_mamba2` reproduces the scalar loop in
+    /// `ggml_compute_forward_ssm_scan_f32` (the `src3->ne[0] == 1` branch).
+    #[test]
+    fn mamba2_scan_matches_ggml_reference() {
+        let dims = scan_dims(5);
+        let d_inner = dims.d_inner();
+        let bc = dims.bc_width();
+
+        let f = |i: usize, k: usize| ((i * 7 + k) % 11) as f32 * 0.11 - 0.5;
+        let x: Vec<f32> = (0..dims.seq_len * d_inner).map(|i| f(i, 1)).collect();
+        let dt: Vec<f32> = (0..dims.seq_len * dims.n_head).map(|i| f(i, 2)).collect();
+        let dt_bias: Vec<f32> = (0..dims.n_head).map(|i| f(i, 3)).collect();
+        let a: Vec<f32> = (0..dims.n_head).map(|i| -(0.3 + i as f32 * 0.2)).collect();
+        let b: Vec<f32> = (0..dims.seq_len * bc).map(|i| f(i, 4)).collect();
+        let c: Vec<f32> = (0..dims.seq_len * bc).map(|i| f(i, 5)).collect();
+        let d_skip: Vec<f32> = (0..dims.n_head).map(|i| f(i, 6)).collect();
+
+        // Scalar transcription of ops.cpp, written independently below.
+        let mut h_ref = vec![0.0f32; dims.d_state * d_inner];
+        let mut y_ref = vec![0.0f32; dims.seq_len * d_inner];
+        let heads_per_group = dims.n_head / dims.n_group;
+        for t in 0..dims.seq_len {
+            for head in 0..dims.n_head {
+                let raw = dt[t * dims.n_head + head] + dt_bias[head];
+                let sp = if raw > 20.0 {
+                    raw
+                } else {
+                    (1.0f32 + raw.exp()).ln()
+                };
+                let d_a = (sp * a[head]).exp();
+                let g = head / heads_per_group;
+                for i1 in 0..dims.head_dim {
+                    let ii = i1 + head * dims.head_dim;
+                    let x_dt = x[t * d_inner + ii] * sp;
+                    let mut acc = 0.0f32;
+                    for i0 in 0..dims.d_state {
+                        let hi = ii * dims.d_state + i0;
+                        let bi = t * bc + g * dims.d_state + i0;
+                        h_ref[hi] = h_ref[hi] * d_a + b[bi] * x_dt;
+                        acc += h_ref[hi] * c[bi];
+                    }
+                    y_ref[t * d_inner + ii] = acc + d_skip[head] * x[t * d_inner + ii];
+                }
+            }
+        }
+
+        let mut state = SsmLayerState::new(dims.d_state, d_inner);
+        let y = selective_scan_mamba2(&x, &dt, &dt_bias, &a, &b, &c, &d_skip, dims, &mut state)
+            .expect("scan");
+
+        assert_eq!(y.len(), y_ref.len());
+        for (i, (got, want)) in y.iter().zip(y_ref.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "y[{i}] = {got} != reference {want}"
+            );
+        }
+        for (i, (got, want)) in state.h.iter().zip(h_ref.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "state.h[{i}] = {got} != reference {want}"
+            );
+        }
+    }
+
+    /// `A` is used verbatim: no `exp`, no negation.
+    ///
+    /// `blk.N.ssm_a` already holds `-exp(A_log)` (see the module docs), so the
+    /// decay for one step must be exactly `exp(softplus(dt) * a)`.
+    #[test]
+    fn mamba2_scan_uses_a_verbatim() {
+        let dims = Mamba2ScanDims {
+            seq_len: 2,
+            n_head: 1,
+            head_dim: 1,
+            d_state: 1,
+            n_group: 1,
+        };
+        let a = vec![-2.0f32];
+        let dt = vec![0.0f32, 0.0];
+        let dt_bias = vec![0.0f32];
+        let x = vec![1.0f32, 0.0];
+        let b = vec![1.0f32, 1.0];
+        let c = vec![1.0f32, 1.0];
+        let d_skip = vec![0.0f32];
+
+        let mut state = SsmLayerState::new(1, 1);
+        let y = selective_scan_mamba2(&x, &dt, &dt_bias, &a, &b, &c, &d_skip, dims, &mut state)
+            .expect("scan");
+
+        // softplus(0) = ln 2.
+        let sp = 2.0f32.ln();
+        // t=0: h = 0*dA + 1*(1*sp) = sp ; y = sp.
+        assert!((y[0] - sp).abs() < 1e-6, "y[0] = {} != {sp}", y[0]);
+        // t=1: x = 0, so h = sp * exp(sp * a) and y = h.
+        let expected = sp * (sp * a[0]).exp();
+        assert!(
+            (y[1] - expected).abs() < 1e-6,
+            "y[1] = {} != {expected}; A must be used verbatim (dA = exp(softplus(dt)*A))",
+            y[1]
+        );
+        // Had the scan re-applied exp/negation it would use exp(-sp*exp(-2.0)).
+        let wrong = sp * (-sp * a[0].exp()).exp();
+        assert!(
+            (y[1] - wrong).abs() > 1e-6,
+            "y[1] matches the log-parameterised formula; A was not used verbatim"
+        );
+    }
+
+    /// `B`/`C` are shared across the heads of a group (`repeat_interleave`).
+    #[test]
+    fn mamba2_scan_maps_heads_to_groups() {
+        // 4 heads, 2 groups -> heads 0,1 use group 0 and heads 2,3 use group 1.
+        let dims = Mamba2ScanDims {
+            seq_len: 1,
+            n_head: 4,
+            head_dim: 1,
+            d_state: 1,
+            n_group: 2,
+        };
+        let x = vec![1.0f32; 4];
+        let dt = vec![0.0f32; 4];
+        let dt_bias = vec![0.0f32; 4];
+        let a = vec![-1.0f32; 4];
+        // Group 0 -> B = 1, group 1 -> B = 10.
+        let b = vec![1.0f32, 10.0];
+        let c = vec![1.0f32, 1.0];
+        let d_skip = vec![0.0f32; 4];
+
+        let mut state = SsmLayerState::new(1, 4);
+        let y = selective_scan_mamba2(&x, &dt, &dt_bias, &a, &b, &c, &d_skip, dims, &mut state)
+            .expect("scan");
+
+        assert!((y[0] - y[1]).abs() < 1e-6, "heads 0 and 1 share group 0");
+        assert!((y[2] - y[3]).abs() < 1e-6, "heads 2 and 3 share group 1");
+        assert!(
+            (y[2] - 10.0 * y[0]).abs() < 1e-5,
+            "group 1 has B = 10x group 0: {} vs {}",
+            y[2],
+            y[0]
+        );
+    }
+
+    /// `D` is per head, not per channel.
+    #[test]
+    fn mamba2_scan_d_skip_is_per_head() {
+        let dims = Mamba2ScanDims {
+            seq_len: 1,
+            n_head: 2,
+            head_dim: 2,
+            d_state: 1,
+            n_group: 1,
+        };
+        let x = vec![1.0f32; 4];
+        let dt = vec![-30.0f32; 2]; // softplus(-30) ~ 0 -> the scan term vanishes
+        let dt_bias = vec![0.0f32; 2];
+        let a = vec![-1.0f32; 2];
+        let b = vec![0.0f32];
+        let c = vec![0.0f32];
+        let d_skip = vec![0.25f32, 4.0];
+
+        let mut state = SsmLayerState::new(1, 4);
+        let y = selective_scan_mamba2(&x, &dt, &dt_bias, &a, &b, &c, &d_skip, dims, &mut state)
+            .expect("scan");
+
+        assert!((y[0] - 0.25).abs() < 1e-5, "head 0 channel 0: {}", y[0]);
+        assert!((y[1] - 0.25).abs() < 1e-5, "head 0 channel 1: {}", y[1]);
+        assert!((y[2] - 4.0).abs() < 1e-5, "head 1 channel 0: {}", y[2]);
+        assert!((y[3] - 4.0).abs() < 1e-5, "head 1 channel 1: {}", y[3]);
+    }
+
+    /// Streaming one token at a time equals scanning the whole chunk.
+    #[test]
+    fn mamba2_scan_state_carries_across_calls() {
+        let dims = scan_dims(4);
+        let d_inner = dims.d_inner();
+        let bc = dims.bc_width();
+
+        let f = |i: usize, k: usize| ((i * 5 + k) % 9) as f32 * 0.2 - 0.7;
+        let x: Vec<f32> = (0..dims.seq_len * d_inner).map(|i| f(i, 1)).collect();
+        let dt: Vec<f32> = (0..dims.seq_len * dims.n_head).map(|i| f(i, 2)).collect();
+        let dt_bias: Vec<f32> = (0..dims.n_head).map(|i| f(i, 3)).collect();
+        let a: Vec<f32> = (0..dims.n_head).map(|i| -(0.5 + i as f32 * 0.1)).collect();
+        let b: Vec<f32> = (0..dims.seq_len * bc).map(|i| f(i, 4)).collect();
+        let c: Vec<f32> = (0..dims.seq_len * bc).map(|i| f(i, 5)).collect();
+        let d_skip: Vec<f32> = (0..dims.n_head).map(|i| f(i, 6)).collect();
+
+        let mut batch_state = SsmLayerState::new(dims.d_state, d_inner);
+        let batch = selective_scan_mamba2(
+            &x,
+            &dt,
+            &dt_bias,
+            &a,
+            &b,
+            &c,
+            &d_skip,
+            dims,
+            &mut batch_state,
+        )
+        .expect("batch scan");
+
+        let mut step_state = SsmLayerState::new(dims.d_state, d_inner);
+        let mut streamed = Vec::new();
+        let one = Mamba2ScanDims { seq_len: 1, ..dims };
+        for t in 0..dims.seq_len {
+            let out = selective_scan_mamba2(
+                &x[t * d_inner..(t + 1) * d_inner],
+                &dt[t * dims.n_head..(t + 1) * dims.n_head],
+                &dt_bias,
+                &a,
+                &b[t * bc..(t + 1) * bc],
+                &c[t * bc..(t + 1) * bc],
+                &d_skip,
+                one,
+                &mut step_state,
+            )
+            .expect("step scan");
+            streamed.extend_from_slice(&out);
+        }
+
+        for (i, (a_v, b_v)) in batch.iter().zip(streamed.iter()).enumerate() {
+            assert!(
+                (a_v - b_v).abs() < 1e-5,
+                "y[{i}]: batch {a_v} != streamed {b_v}"
+            );
+        }
+    }
+
+    /// Shape mismatches are typed errors rather than panics.
+    #[test]
+    fn mamba2_scan_rejects_bad_shapes() {
+        let dims = scan_dims(1);
+        let d_inner = dims.d_inner();
+        let bc = dims.bc_width();
+        let ok_x = vec![0.0f32; d_inner];
+        let ok_dt = vec![0.0f32; dims.n_head];
+        let ok_head = vec![0.0f32; dims.n_head];
+        let ok_bc = vec![0.0f32; bc];
+        let mut state = SsmLayerState::new(dims.d_state, d_inner);
+
+        assert!(
+            selective_scan_mamba2(
+                &ok_x[..d_inner - 1],
+                &ok_dt,
+                &ok_head,
+                &ok_head,
+                &ok_bc,
+                &ok_bc,
+                &ok_head,
+                dims,
+                &mut state
+            )
+            .is_err(),
+            "short x must error"
+        );
+        assert!(
+            selective_scan_mamba2(
+                &ok_x,
+                &ok_dt,
+                &ok_head,
+                &ok_head[..dims.n_head - 1],
+                &ok_bc,
+                &ok_bc,
+                &ok_head,
+                dims,
+                &mut state
+            )
+            .is_err(),
+            "short a must error"
+        );
+        assert!(
+            selective_scan_mamba2(
+                &ok_x,
+                &ok_dt,
+                &ok_head,
+                &ok_head,
+                &ok_bc[..bc - 1],
+                &ok_bc,
+                &ok_head,
+                dims,
+                &mut state
+            )
+            .is_err(),
+            "short B must error"
+        );
+
+        let bad = Mamba2ScanDims { n_group: 3, ..dims };
+        assert!(
+            selective_scan_mamba2(
+                &ok_x,
+                &ok_dt,
+                &ok_head,
+                &ok_head,
+                &vec![0.0f32; 3 * dims.d_state],
+                &vec![0.0f32; 3 * dims.d_state],
+                &ok_head,
+                bad,
+                &mut state
+            )
+            .is_err(),
+            "n_head not divisible by n_group must error"
+        );
     }
 
     /// Verify the log(A) interpretation: the test fails if we use `log_a` directly

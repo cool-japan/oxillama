@@ -22,8 +22,14 @@ pub struct ConvertArgs {
 /// 1. Reads the input file as raw bytes.
 /// 2. Calls `SafetensorsConverter::from_bytes` to parse and produce an
 ///    in-memory `GgufModel`.
-/// 3. Uses `GgufWriter` to serialise the model back to a valid GGUF v3 file.
-///    Metadata KV pairs and tensor data are preserved verbatim.
+/// 3. Uses `GgufWriter`'s streaming API to serialise the model back to a
+///    valid GGUF v3 file: every tensor's shape/type is declared first (so
+///    every tensor's file offset is fixed before any data is written), then
+///    each tensor's bytes are streamed straight to the output file one at a
+///    time. Metadata KV pairs and tensor data are preserved verbatim. Peak
+///    memory is bounded by the largest single tensor, not by the whole
+///    model — unlike the old `add_tensor`/`write_to_file` path, this never
+///    buffers every tensor's bytes simultaneously.
 pub fn run_convert(args: &ConvertArgs) -> anyhow::Result<()> {
     // ── 1. Read input ─────────────────────────────────────────────────
     let input_bytes = std::fs::read(&args.input)
@@ -38,26 +44,43 @@ pub fn run_convert(args: &ConvertArgs) -> anyhow::Result<()> {
             )
         })?;
 
-    // ── 3. Re-serialise as GGUF v3 using GgufWriter ───────────────────
-    let mut writer = oxillama_gguf::GgufWriter::new();
+    // Materialize the tensor list once so the declare pass and the stream
+    // pass below iterate the identical order — relying on two separate
+    // `TensorStore::iter()` calls to agree would depend on `HashMap`
+    // iteration-order stability, which is not part of its API contract.
+    let tensors: Vec<_> = model.file.tensors.iter().collect();
 
-    // Copy all metadata KV pairs.
+    // ── 3. Declare every tensor's shape/type up front ──────────────────
+    let mut writer = oxillama_gguf::GgufWriter::new();
     for (key, value) in model.file.metadata.iter() {
         writer.add_metadata(key, value.clone());
     }
+    for (name, info) in &tensors {
+        writer
+            .declare_tensor(name, &info.dimensions, info.tensor_type)
+            .with_context(|| format!("failed to declare tensor '{name}'"))?;
+    }
 
-    // Copy all tensors (data + metadata).
-    for (name, info) in model.file.tensors.iter() {
+    // ── 4. Finalize the header, then stream each tensor's bytes ────────
+    let mut data_writer = writer
+        .into_file_data_writer(&args.output)
+        .with_context(|| {
+            format!(
+                "failed to open output GGUF file '{}'",
+                args.output.display()
+            )
+        })?;
+    for (name, _info) in &tensors {
         let raw = model
             .tensor_data(name)
             .with_context(|| format!("failed to read tensor data for '{name}'"))?;
-        writer.add_tensor(name, &info.dimensions, info.tensor_type, raw);
+        data_writer
+            .write_tensor(name, raw)
+            .with_context(|| format!("failed to write tensor '{name}'"))?;
     }
-
-    // ── 4. Write output file ──────────────────────────────────────────
-    writer
-        .write_to_file(&args.output)
-        .with_context(|| format!("failed to write GGUF file '{}'", args.output.display()))?;
+    data_writer
+        .finish()
+        .with_context(|| format!("failed to finalize GGUF file '{}'", args.output.display()))?;
 
     println!(
         "converted: '{}' → '{}' ({} tensors)",

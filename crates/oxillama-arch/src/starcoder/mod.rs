@@ -19,7 +19,7 @@
 //! - Per layer:
 //!   - `blk.{i}.attn_norm.weight`, `blk.{i}.attn_norm.bias`
 //!   - `blk.{i}.attn_qkv.weight`, `blk.{i}.attn_qkv.bias`
-//!   - `blk.{i}.attn_out.weight`, `blk.{i}.attn_out.bias`
+//!   - `blk.{i}.attn_output.weight`, `blk.{i}.attn_output.bias`
 //!   - `blk.{i}.ffn_norm.weight`, `blk.{i}.ffn_norm.bias`
 //!   - `blk.{i}.ffn_up.weight`, `blk.{i}.ffn_up.bias`
 //!   - `blk.{i}.ffn_down.weight`, `blk.{i}.ffn_down.bias`
@@ -80,6 +80,14 @@ impl ModelArchitecture for StarcoderArchitecture {
         })
     }
 
+    fn build_from_gguf(
+        &self,
+        model: &oxillama_gguf::GgufModel,
+        config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Ok(Box::new(load_starcoder_from_gguf(model, config)?))
+    }
+
     fn tensor_names(&self) -> Vec<TensorNamePattern> {
         let mut patterns = vec![
             TensorNamePattern {
@@ -104,8 +112,12 @@ impl ModelArchitecture for StarcoderArchitecture {
             },
             TensorNamePattern {
                 pattern: "output.weight".to_string(),
-                description: "LM head / unembedding".to_string(),
-                required: true,
+                // GPT-BigCode defaults `tie_word_embeddings=true`: most
+                // checkpoints omit this tensor and the loader falls back to
+                // `token_embd.weight` (see `load_starcoder_from_gguf`).
+                description: "LM head / unembedding (falls back to tied token_embd.weight)"
+                    .to_string(),
+                required: false,
             },
         ];
 
@@ -115,10 +127,13 @@ impl ModelArchitecture for StarcoderArchitecture {
             ("blk.{i}.attn_qkv.weight", "Fused QKV projection weight"),
             ("blk.{i}.attn_qkv.bias", "Fused QKV projection bias"),
             (
-                "blk.{i}.attn_out.weight",
+                "blk.{i}.attn_output.weight",
                 "Attention output projection weight",
             ),
-            ("blk.{i}.attn_out.bias", "Attention output projection bias"),
+            (
+                "blk.{i}.attn_output.bias",
+                "Attention output projection bias",
+            ),
             ("blk.{i}.ffn_norm.weight", "Pre-FFN LayerNorm scale"),
             ("blk.{i}.ffn_norm.bias", "Pre-FFN LayerNorm bias"),
             ("blk.{i}.ffn_up.weight", "FFN up projection weight"),

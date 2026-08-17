@@ -14,13 +14,13 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 - WebGPU async bridge: `initWebGpuDevice()`, `webgpuDequantQ4_0Async()`, `webgpuGemvAsync()`
 - IndexedDB model cache: `cacheModel()`, `loadCachedModel()`, `listCachedModels()`, `deleteCachedModel()`
 - Streaming GGUF load via `GgufChunkLoader` for incremental byte feeds
-- Web-worker message-passing API: `parseWorkerMessage()` / `workerTokenEvent()`
+- Web-worker message-passing API: `parseWorkerMessage()` / `workerTokenEvent()` — a stateless message-routing helper with no loaded model; its `Generate` dispatch returns a typed `WorkerOutMessage::Error` directing callers to `WasmEngine.generate()` or the top-level `generate()` export (clarified in v0.1.4, was a stub placeholder response before)
 - Pure-Rust tokenizer backend (`fancy-regex`, no Oniguruma C library) — safe for `wasm32-unknown-unknown`
 - No SIMD rayon threads — single-threaded, browser-compatible; SIMD128 proposal enabled at compile time
 
 ## Status
 
-**Version:** 0.1.2 — **Tests:** 51 passing
+**Version:** 0.1.4 — **Tests:** 59 passing
 
 ## Feature Flags
 

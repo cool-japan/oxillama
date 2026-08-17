@@ -5,6 +5,10 @@
 
 #![cfg(all(feature = "simd-neon", target_arch = "aarch64"))]
 
+/// Shared integer dot-product primitives for the fused Q8_0-activation path.
+#[cfg(all(feature = "simd-neon", target_arch = "aarch64"))]
+pub(crate) mod int_dot;
+
 #[cfg(all(feature = "simd-neon", target_arch = "aarch64"))]
 pub mod iq1_m;
 #[cfg(all(feature = "simd-neon", target_arch = "aarch64"))]

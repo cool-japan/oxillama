@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH oxillama 1  "oxillama 0.1.2" 
+.TH oxillama 1  "oxillama 0.1.4" 
 .SH NAME
 oxillama \- Pure Rust LLM inference engine — the sovereign alternative to llama.cpp
 .SH SYNOPSIS
@@ -28,14 +28,26 @@ Start the OpenAI\-compatible API server
 oxillama\-info(1)
 Print model information from a GGUF file
 .TP
-oxillama\-bench(1)
-Run inference benchmarks
-.TP
 oxillama\-chat(1)
 Interactive multi\-turn chat REPL
 .TP
 oxillama\-hub(1)
 HuggingFace Hub operations (pull, list, rm)
+.TP
+oxillama\-quantize(1)
+Re\-quantize a GGUF model to a different quantization format
+.TP
+oxillama\-convert(1)
+Convert a safetensors file to GGUF format
+.TP
+oxillama\-verify(1)
+Verify GGUF file integrity (magic, version, parse, optional SHA\-256)
+.TP
+oxillama\-tokenize(1)
+Tokenize a text string using the model\*(Aqs embedded tokenizer
+.TP
+oxillama\-detokenize(1)
+Decode token IDs back to text using the model\*(Aqs embedded tokenizer
 .TP
 oxillama\-completions(1)
 Generate shell completion scripts
@@ -45,8 +57,5 @@ Generate man pages for oxillama and write them to a directory
 .TP
 oxillama\-version(1)
 Print verbose version information
-.TP
-oxillama\-help(1)
-Print this message or the help of the given subcommand(s)
 .SH VERSION
-v0.1.2
+v0.1.4

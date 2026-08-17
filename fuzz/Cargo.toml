@@ -41,3 +41,15 @@ name = "gguf_metadata_arbitrary"
 path = "fuzz_targets/gguf_metadata_arbitrary.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "gguf_streaming_parse"
+path = "fuzz_targets/gguf_streaming_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gguf_reader_core_parse"
+path = "fuzz_targets/gguf_reader_core_parse.rs"
+test = false
+doc = false

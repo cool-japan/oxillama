@@ -284,13 +284,15 @@ impl SequencePool {
     ///
     /// # Errors
     ///
-    /// `PoolError::InvalidSlot` if called on an `Ssm` variant.
+    /// `PoolError::InvalidSlot` if called on an `Ssm` variant, if `page_idx`
+    /// is out of range, or if the page was already free — `KvCachePool::free`
+    /// now rejects a double free instead of pushing the index onto the free
+    /// list twice and handing one page to two owners.
     pub fn free_kv(&mut self, page_idx: usize) -> PoolResult<()> {
         match self {
-            SequencePool::KvBased(pool) => {
-                pool.free(page_idx);
-                Ok(())
-            }
+            SequencePool::KvBased(pool) => pool
+                .free(page_idx)
+                .map_err(|_| PoolError::InvalidSlot(page_idx)),
             SequencePool::Ssm(_) => Err(PoolError::InvalidSlot(page_idx)),
         }
     }

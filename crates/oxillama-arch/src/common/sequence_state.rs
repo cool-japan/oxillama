@@ -54,7 +54,33 @@ pub trait SequenceState {
     fn step_position(&self) -> usize;
 
     /// Advance the position by one token.
+    ///
+    /// Implementations **must not** advance past [`capacity`](Self::capacity):
+    /// every architecture sizes `buf_attn_scores` and its RoPE table from the
+    /// same bound and then indexes them with the raw position, so an unbounded
+    /// counter is an out-of-bounds write waiting for a long enough prompt.
+    /// Use [`try_advance`](Self::try_advance) when the caller wants the
+    /// overflow reported rather than clamped.
     fn advance(&mut self);
+
+    /// Advance by one token, reporting an overflow instead of clamping.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::ArchError::ConfigMismatch`] when the state is already at
+    /// [`capacity`](Self::capacity).
+    fn try_advance(&mut self) -> crate::error::ArchResult<()> {
+        let cap = self.capacity();
+        if self.step_position() >= cap {
+            return Err(crate::error::ArchError::ConfigMismatch {
+                param: "sequence_state.position".to_string(),
+                expected: format!("< capacity ({cap})"),
+                got: self.step_position().to_string(),
+            });
+        }
+        self.advance();
+        Ok(())
+    }
 
     /// Return the maximum capacity (tokens) before the state wraps or errors.
     fn capacity(&self) -> usize;
@@ -126,8 +152,14 @@ impl SequenceState for AttentionSequenceState {
         self.position
     }
 
+    /// Saturates at [`capacity`](SequenceState::capacity).
+    ///
+    /// The counter used to increment without bound, so a sequence longer than
+    /// the context indexed past the end of every position-keyed buffer.
     fn advance(&mut self) {
-        self.position += 1;
+        if self.position < self.max_capacity {
+            self.position += 1;
+        }
     }
 
     fn capacity(&self) -> usize {
@@ -226,8 +258,12 @@ impl SequenceState for Mamba2SequenceState {
         self.position
     }
 
+    /// Saturates at [`capacity`](SequenceState::capacity); see
+    /// [`AttentionSequenceState::advance`].
     fn advance(&mut self) {
-        self.position += 1;
+        if self.position < self.max_capacity {
+            self.position += 1;
+        }
     }
 
     fn capacity(&self) -> usize {

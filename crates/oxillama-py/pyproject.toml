@@ -18,6 +18,7 @@ classifiers = [
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "oxillama_py"
+python-source = "python"
 
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]

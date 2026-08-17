@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyCapsule};
 
-use oxillama_runtime::{EngineConfig as RustEngineConfig, InferenceEngine, SamplerConfig};
+use oxillama_runtime::{
+    EngineConfig as RustEngineConfig, GenerationConfig, InferenceEngine, SamplerConfig,
+};
 
 use crate::callback::{
     make_progress_bridge, ProgressBridge, DEFAULT_THROTTLE_MS, DEFAULT_THROTTLE_TOKENS,
@@ -22,6 +24,7 @@ use crate::callback::{
 use crate::cancel::PyCancellationToken;
 
 use crate::error::runtime_to_py;
+use crate::generation::{PyGenerationConfig, PyGenerationOutcome};
 use crate::sampler::PySamplerConfig;
 
 /// Configuration for the inference engine.
@@ -62,6 +65,12 @@ impl PyEngineConfig {
     /// Create a new `EngineConfig`.
     ///
     /// `model_path` is the only positional argument; all others are keyword-only.
+    ///
+    /// Raises:
+    ///     ValueError: if `model_path` is empty (or all whitespace), or if
+    ///         `context_size` is `0` — pass `None` (the default) to use the
+    ///         model's own default context length instead of explicitly
+    ///         requesting zero.
     #[new]
     #[pyo3(signature = (
         model_path,
@@ -71,6 +80,51 @@ impl PyEngineConfig {
         tokenizer_path = None,
         sampler = None,
     ))]
+    pub fn py_new(
+        model_path: String,
+        context_size: Option<usize>,
+        num_threads: usize,
+        tokenizer_path: Option<String>,
+        sampler: Option<PySamplerConfig>,
+    ) -> PyResult<Self> {
+        if model_path.trim().is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "model_path must not be empty",
+            ));
+        }
+        if context_size == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "context_size must be > 0 (got 0); pass None to use the model's default \
+                 context length instead of explicitly requesting zero",
+            ));
+        }
+        Ok(Self::new(
+            model_path,
+            context_size,
+            num_threads,
+            tokenizer_path,
+            sampler,
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "EngineConfig(model_path={:?}, context_size={:?}, num_threads={})",
+            self.model_path, self.context_size, self.num_threads,
+        )
+    }
+}
+
+impl PyEngineConfig {
+    /// Construct a config without validation.
+    ///
+    /// Internal, infallible constructor used by Rust callers that already
+    /// know their arguments are valid (this module's own tests,
+    /// [`PyEngine::from_hub`]'s default-config fallback). Python code always
+    /// goes through [`PyEngineConfig::py_new`] (the `#[new]` / `__new__`
+    /// entry point), which validates `model_path` and `context_size` first
+    /// and raises `ValueError` on failure — this function does not repeat
+    /// those checks, so it must never be reachable directly from Python.
     pub fn new(
         model_path: String,
         context_size: Option<usize>,
@@ -87,15 +141,6 @@ impl PyEngineConfig {
         }
     }
 
-    fn __repr__(&self) -> String {
-        format!(
-            "EngineConfig(model_path={:?}, context_size={:?}, num_threads={})",
-            self.model_path, self.context_size, self.num_threads,
-        )
-    }
-}
-
-impl PyEngineConfig {
     /// Convert to the Rust `EngineConfig`.
     pub fn to_rust(&self) -> RustEngineConfig {
         RustEngineConfig {
@@ -106,6 +151,16 @@ impl PyEngineConfig {
             sampler: self.sampler.to_rust(),
             prefill_chunk_size: 512,
             offload_policy: oxillama_runtime::OffloadPolicy::None,
+            // The Python surface does not expose a KV dtype knob yet; keep the
+            // lossless default so bindings never change output silently.
+            kv_dtype: oxillama_runtime::KvCacheDtype::F32,
+            // The Python surface does not expose GPU offload knobs yet; keep
+            // offload off so bindings stay on the CPU path. `GpuPolicy::On` is
+            // a hard requirement upstream (load fails outright if no device
+            // binds), so defaulting to anything else here would risk turning
+            // an opt-in feature into a surprise hard failure for callers who
+            // never asked for GPU offload.
+            gpu: oxillama_runtime::GpuPolicy::Off,
         }
     }
 }
@@ -287,12 +342,16 @@ impl PyEngine {
         let bridge_arc: Option<Arc<Mutex<ProgressBridge>>> =
             bridge.map(|b| Arc::new(Mutex::new(b)));
         let make_cb = || {
-            let cancelled = cancelled.clone();
+            // The cancellation flag is *not* read here any more. It used to
+            // be — `flag.load(Ordering::Relaxed);` with no `if`, a dead read
+            // whose result was discarded — which looked like a cancellation
+            // check but could not stop anything, because this callback is
+            // infallible and has no way to signal the decode loop. The flag
+            // is now handed to the decode loop itself via
+            // `GenerationConfig::cancel_flag`, which breaks out at the next
+            // token boundary.
             let bridge_inner = bridge_arc.clone();
             move |tok: &str| {
-                if let Some(ref flag) = cancelled {
-                    flag.load(Ordering::Relaxed);
-                }
                 if let Some(ref bridge) = bridge_inner {
                     Python::attach(|py| {
                         if let Ok(mut b) = bridge.lock() {
@@ -305,15 +364,19 @@ impl PyEngine {
                 }
             }
         };
-        let result =
-            if temperature.is_some() || top_p.is_some() || top_k.is_some() || seed.is_some() {
-                let config = build_override_config(inner, temperature, top_p, top_k, seed);
-                py.detach(|| inner.generate_with_config(prompt, max_tokens, config, make_cb()))
-                    .map_err(runtime_to_py)
-            } else {
-                py.detach(|| inner.generate(prompt, max_tokens, make_cb()))
-                    .map_err(runtime_to_py)
-            };
+        let gen_config = build_generation_config(
+            inner,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            seed,
+            cancelled.clone(),
+        );
+        let result = py
+            .detach(|| inner.generate_detailed(prompt, &gen_config, make_cb()))
+            .map(|outcome| outcome.text)
+            .map_err(runtime_to_py);
         let was_cancelled = cancelled
             .as_ref()
             .map(|f| f.load(Ordering::Relaxed))
@@ -416,9 +479,6 @@ impl PyEngine {
         let cancelled = cancel_token
             .as_ref()
             .map(|ct| Python::attach(|py| ct.borrow(py).cancelled.clone()));
-        let has_overrides =
-            temperature.is_some() || top_p.is_some() || top_k.is_some() || seed.is_some();
-
         // Shared slot for propagating Python callback errors when strict_callback=true.
         let error_slot: Arc<Mutex<Option<pyo3::PyErr>>> = Arc::new(Mutex::new(None));
         let error_slot_inner = error_slot.clone();
@@ -436,12 +496,26 @@ impl PyEngine {
         let bridge_arc: Option<Arc<Mutex<ProgressBridge>>> =
             bridge.map(|b| Arc::new(Mutex::new(b)));
 
+        let gen_config = build_generation_config(
+            inner,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            seed,
+            cancelled.clone(),
+        );
+
         let result = py
             .detach(|| {
                 let cancelled_inner = cancelled.clone();
                 let bridge_inner = bridge_arc.clone();
                 let cb = move |tok: &str| {
-                    // Check cancellation before invoking user callback.
+                    // Belt-and-braces: the decode loop already stops at the
+                    // next token boundary via `GenerationConfig::cancel_flag`,
+                    // so at most one more chunk can arrive after `cancel()`.
+                    // Suppressing it keeps the user's callback from being
+                    // handed output produced after they asked to stop.
                     if let Some(ref flag) = cancelled_inner {
                         if flag.load(Ordering::Relaxed) {
                             return;
@@ -469,13 +543,9 @@ impl PyEngine {
                         });
                     }
                 };
-                if has_overrides {
-                    let config = build_override_config(inner, temperature, top_p, top_k, seed);
-                    inner.generate_with_config(prompt, max_tokens, config, cb)
-                } else {
-                    inner.generate(prompt, max_tokens, cb)
-                }
+                inner.generate_detailed(prompt, &gen_config, cb)
             })
+            .map(|outcome| outcome.text)
             .map_err(runtime_to_py);
 
         // If strict_callback captured a Python error, propagate it now.
@@ -520,6 +590,120 @@ impl PyEngine {
             }
         }
         final_result
+    }
+
+    /// Generate from `prompt`, reporting why generation stopped.
+    ///
+    /// Unlike `generate()`/`generate_streaming()` (bare `str` return), this
+    /// is the entry point for building an OpenAI-compatible response: the
+    /// returned `GenerationOutcome` distinguishes natural completion from
+    /// truncation (`finish_reason`), names the stop sequence that matched
+    /// (when any), and reports prompt/completion token counts.  Stop
+    /// sequences (`GenerationConfig.stop`) are only reachable through this
+    /// method.
+    ///
+    /// Releases the GIL during inference; `callback` (if given) re-acquires
+    /// it for each decoded chunk of text.
+    ///
+    /// Args:
+    ///     prompt:       Input text.
+    ///     config:       A `GenerationConfig` describing `max_tokens`,
+    ///                   `sampler`, `stop` sequences, and special-token
+    ///                   handling.
+    ///     callback:     Optional callable invoked with each decoded token
+    ///                   chunk as it is produced.
+    ///     cancel_token: Cooperative cancellation handle (keyword-only).
+    ///
+    /// Returns:
+    ///     GenerationOutcome: `text`, `finish_reason`, `generated_tokens`,
+    ///     `prompt_tokens`, `stop_sequence`, plus the `completion_tokens()`
+    ///     / `total_tokens()` helper methods.
+    ///
+    /// Raises:
+    ///     RuntimeError: if no model is loaded.
+    #[pyo3(signature = (
+        prompt,
+        config,
+        callback = None,
+        *,
+        cancel_token = None,
+    ))]
+    pub fn generate_detailed(
+        &mut self,
+        py: Python<'_>,
+        prompt: &str,
+        config: &PyGenerationConfig,
+        callback: Option<Py<PyAny>>,
+        cancel_token: Option<Py<PyCancellationToken>>,
+    ) -> PyResult<PyGenerationOutcome> {
+        let inner = &mut self.inner;
+        let cancelled = cancel_token
+            .as_ref()
+            .map(|ct| Python::attach(|py| ct.borrow(py).cancelled.clone()));
+        let rust_config = GenerationConfig {
+            // `PyGenerationConfig` has no cancellation field of its own; the
+            // token arrives as a separate kwarg and is bound to the decode
+            // loop here.
+            cancel_flag: cancelled.clone(),
+            ..config.to_rust()
+        };
+
+        // Shared slot for propagating a Python callback error raised while
+        // the GIL is released (mirrors `generate_streaming`'s strict-error
+        // plumbing, minus the opt-out — a callback error here always
+        // propagates since there is no `strict_callback` flag to suppress it).
+        let error_slot: Arc<Mutex<Option<pyo3::PyErr>>> = Arc::new(Mutex::new(None));
+        let error_slot_inner = error_slot.clone();
+
+        let result = py
+            .detach(|| {
+                let cancelled_inner = cancelled.clone();
+                let cb = move |tok: &str| {
+                    if let Some(ref flag) = cancelled_inner {
+                        if flag.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                    if let Some(ref cb) = callback {
+                        let call_result = Python::attach(|py| cb.call1(py, (tok,)));
+                        if let Err(err) = call_result {
+                            if let Ok(mut slot) = error_slot_inner.lock() {
+                                if slot.is_none() {
+                                    *slot = Some(err);
+                                }
+                            }
+                        }
+                    }
+                };
+                inner.generate_detailed(prompt, &rust_config, cb)
+            })
+            .map_err(runtime_to_py);
+
+        if let Ok(mut slot) = error_slot.lock() {
+            if let Some(py_err) = slot.take() {
+                return Err(py_err);
+            }
+        }
+
+        let was_cancelled = cancelled
+            .as_ref()
+            .map(|f| f.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        if was_cancelled {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "generation cancelled",
+            ));
+        }
+
+        result.map(Into::into)
+    }
+
+    /// Return the end-of-generation token IDs known to the tokenizer (e.g.
+    /// `</s>`, `<|im_end|>`, `<|endoftext|>`).
+    ///
+    /// Returns an empty list when no model is loaded.
+    pub fn eog_token_ids(&self) -> Vec<u32> {
+        self.inner.eog_token_ids()
     }
 
     /// Compute a semantic embedding vector for `text`.
@@ -969,22 +1153,29 @@ impl PyEngine {
     ///     ImportError: if the ``oxillama_py`` package cannot be imported.
     ///     RuntimeError: if :class:`AsyncEngine` cannot be instantiated.
     ///
-    /// Example::
+    /// # Python example
     ///
-    ///     import asyncio
-    ///     from oxillama_py import EngineConfig, Engine
+    /// Fenced as `text`, not left as a bare reST `Example::` indented block:
+    /// rustdoc compiles an *indented* block inside a doc comment as Rust, so
+    /// the Python below was a failing doctest under `cargo test --doc` (which
+    /// `cargo nextest` does not run, so nothing reported it).
     ///
-    ///     cfg = EngineConfig("model.gguf")
-    ///     engine = Engine(cfg)
-    ///     engine.load_model()
+    /// ```text
+    /// import asyncio
+    /// from oxillama_py import EngineConfig, Engine
     ///
-    ///     ae = engine.async_engine()
+    /// cfg = EngineConfig("model.gguf")
+    /// engine = Engine(cfg)
+    /// engine.load_model()
     ///
-    ///     async def main():
-    ///         text = await ae.generate("Hello", max_tokens=64)
-    ///         print(text)
+    /// ae = engine.async_engine()
     ///
-    ///     asyncio.run(main())
+    /// async def main():
+    ///     text = await ae.generate("Hello", max_tokens=64)
+    ///     print(text)
+    ///
+    /// asyncio.run(main())
+    /// ```
     #[pyo3(signature = ())]
     pub fn async_engine<'py>(
         slf: &Bound<'py, PyEngine>,
@@ -1032,6 +1223,38 @@ fn build_override_config(
         cfg.seed = Some(s);
     }
     cfg
+}
+
+/// Build the [`GenerationConfig`] for a `generate()` / `generate_streaming()`
+/// call, including the cooperative cancellation hook.
+///
+/// This replaces the old split between `InferenceEngine::generate` and
+/// `generate_with_config`: both of those build a `GenerationConfig` internally
+/// and give the caller no way to attach a `cancel_flag`, which is why
+/// `cancel_token=` used to be unable to shorten a generation by a single
+/// forward pass. Everything else matches those wrappers exactly — the engine's
+/// own sampler when no override is given, `GenerationConfig::default()` for
+/// the remaining fields.
+fn build_generation_config(
+    engine: &InferenceEngine,
+    max_tokens: usize,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    seed: Option<u64>,
+    cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> GenerationConfig {
+    let sampler = if temperature.is_some() || top_p.is_some() || top_k.is_some() || seed.is_some() {
+        build_override_config(engine, temperature, top_p, top_k, seed)
+    } else {
+        engine.config().sampler.clone()
+    };
+    GenerationConfig {
+        max_tokens,
+        sampler,
+        cancel_flag,
+        ..GenerationConfig::default()
+    }
 }
 
 #[cfg(test)]
@@ -1256,5 +1479,57 @@ mod tests {
         assert!((sampler.top_p - 0.95).abs() < 1e-6);
         assert_eq!(sampler.top_k, 50);
         assert_eq!(sampler.seed, Some(99));
+    }
+
+    // ── `py_new` validation (the pyo3-facing constructor) ─────────────────
+
+    /// `py_new` with a valid config must succeed and match `new`'s output.
+    #[test]
+    fn test_py_new_accepts_valid_config() {
+        let cfg = PyEngineConfig::py_new("model.gguf".to_string(), Some(2048), 4, None, None)
+            .expect("valid config must not raise");
+        assert_eq!(cfg.model_path, "model.gguf");
+        assert_eq!(cfg.context_size, Some(2048));
+    }
+
+    /// `py_new` with `context_size = None` (the "use the model's default"
+    /// spelling) must succeed — only `Some(0)` is rejected.
+    #[test]
+    fn test_py_new_accepts_none_context_size() {
+        PyEngineConfig::py_new("model.gguf".to_string(), None, 4, None, None)
+            .expect("None context_size must not raise");
+    }
+
+    /// `context_size = 0` must raise `ValueError` — this is the exact
+    /// pre-existing pytest gap Mission B closes (`context_size=0` used to
+    /// silently mean "auto" with no validation).
+    #[test]
+    fn test_py_new_rejects_zero_context_size() {
+        let result = PyEngineConfig::py_new("model.gguf".to_string(), Some(0), 4, None, None);
+        assert!(result.is_err(), "context_size=0 must raise, not succeed");
+    }
+
+    /// An empty `model_path` must raise `ValueError`.
+    #[test]
+    fn test_py_new_rejects_empty_model_path() {
+        let result = PyEngineConfig::py_new(String::new(), None, 4, None, None);
+        assert!(result.is_err(), "empty model_path must raise");
+    }
+
+    /// A whitespace-only `model_path` must also raise (`.trim().is_empty()`,
+    /// not a bare `.is_empty()` check).
+    #[test]
+    fn test_py_new_rejects_whitespace_only_model_path() {
+        let result = PyEngineConfig::py_new("   ".to_string(), None, 4, None, None);
+        assert!(result.is_err(), "whitespace-only model_path must raise");
+    }
+
+    /// `num_threads = 0` is documented as "auto" on the Rust `EngineConfig`
+    /// and must remain accepted — this is not one of the validated fields.
+    #[test]
+    fn test_py_new_accepts_zero_num_threads_as_auto() {
+        let cfg = PyEngineConfig::py_new("model.gguf".to_string(), None, 0, None, None)
+            .expect("num_threads=0 (auto) must not raise");
+        assert_eq!(cfg.num_threads, 0);
     }
 }

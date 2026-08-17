@@ -87,3 +87,93 @@ def test_sampler_config_repr():
     sc = _NATIVE.SamplerConfig(temperature=0.5)
     r = repr(sc)
     assert "SamplerConfig" in r or "0.5" in r
+
+
+# ---------------------------------------------------------------------------
+# Audit: adjacent parameters. `top_k` is unsigned at the FFI boundary, so a
+# negative Python int is already rejected before any Rust validation code
+# runs. `top_p`, `min_p`, `repetition_penalty`, and `mirostat` have no such
+# built-in guard (any float/int in the field's raw type range converts
+# cleanly), and each one has a concrete way to corrupt the sampler chain
+# rather than just producing a "weird" result — see py_new()'s doc comment
+# and the per-check comments in sampler.rs for the mechanism.
+# ---------------------------------------------------------------------------
+
+
+@_SKIP
+def test_sampler_config_negative_top_k_raises():
+    """top_k is unsigned in Rust; pyo3 itself rejects a negative Python int
+    at the argument-conversion boundary (independent of py_new's own checks)."""
+    with pytest.raises(Exception):
+        _NATIVE.SamplerConfig(top_k=-1)
+
+
+@_SKIP
+def test_sampler_config_nan_temperature_raises():
+    with pytest.raises(Exception):
+        _NATIVE.SamplerConfig(temperature=float("nan"))
+
+
+@_SKIP
+def test_sampler_config_top_p_above_one_raises():
+    with pytest.raises(Exception):
+        _NATIVE.SamplerConfig(top_p=1.5)
+
+
+@_SKIP
+def test_sampler_config_negative_top_p_raises():
+    with pytest.raises(Exception):
+        _NATIVE.SamplerConfig(top_p=-0.1)
+
+
+@_SKIP
+def test_sampler_config_min_p_above_one_raises():
+    with pytest.raises(Exception):
+        _NATIVE.SamplerConfig(min_p=1.5)
+
+
+@_SKIP
+def test_sampler_config_negative_min_p_raises():
+    with pytest.raises(Exception):
+        _NATIVE.SamplerConfig(min_p=-0.1)
+
+
+@_SKIP
+def test_sampler_config_zero_repetition_penalty_raises():
+    with pytest.raises(Exception):
+        _NATIVE.SamplerConfig(repetition_penalty=0.0)
+
+
+@_SKIP
+def test_sampler_config_negative_repetition_penalty_raises():
+    with pytest.raises(Exception):
+        _NATIVE.SamplerConfig(repetition_penalty=-1.0)
+
+
+@_SKIP
+def test_sampler_config_invalid_mirostat_raises():
+    with pytest.raises(Exception):
+        _NATIVE.SamplerConfig(mirostat=3)
+
+
+@_SKIP
+def test_sampler_config_boundary_values_are_valid():
+    """top_p / min_p at the closed-interval boundaries, and every documented
+    mirostat mode, must not raise."""
+    _NATIVE.SamplerConfig(top_p=0.0)
+    _NATIVE.SamplerConfig(top_p=1.0)
+    _NATIVE.SamplerConfig(min_p=0.0)
+    _NATIVE.SamplerConfig(min_p=1.0)
+    _NATIVE.SamplerConfig(mirostat=0)
+    _NATIVE.SamplerConfig(mirostat=1)
+    _NATIVE.SamplerConfig(mirostat=2)
+
+
+@_SKIP
+def test_sampler_config_negative_frequency_and_presence_penalty_are_valid():
+    """Unlike the checks above, negative frequency/presence penalty is a
+    deliberate, valid use case (OpenAI-style semantics: negative encourages
+    repetition) — must not raise."""
+    sc = _NATIVE.SamplerConfig(frequency_penalty=-0.5, presence_penalty=-0.5)
+    assert sc.frequency_penalty == pytest.approx(-0.5, abs=1e-5)
+    assert sc.presence_penalty == pytest.approx(-0.5, abs=1e-5)

@@ -10,6 +10,22 @@
 //! 8 sub-blocks of 32 weights each.
 //! Weight formula: `w = d * scale_i * q_5bit - dmin * min_i`
 //!
+//! # `qh` bit assignment
+//!
+//! Upstream `dequantize_row_q5_K` walks the block in four 64-weight groups
+//! carrying `u1 = 1`, `u2 = 2`, each shifted left by **two** at the end of
+//! every group:
+//!
+//! ```text
+//! group g:  low-nibble half  takes its 5th bit from qh[l] bit 2g
+//!           high-nibble half takes its 5th bit from qh[l] bit 2g + 1
+//! ```
+//!
+//! so the eight bits of `qh[0]` feed weights 0, 32, 64, 96, 128, 160, 192,
+//! 224 in bit order.  Reading `bit g` / `bit g + 4` instead (which agrees only
+//! on bits 0 and 7) silently corrupts six of every eight 5th bits — and Q5_K_M
+//! is one of the most widely distributed GGUF quantizations.
+//!
 //! Effective: 5.5 bits/weight.
 
 use crate::error::{QuantError, QuantResult};
@@ -84,14 +100,14 @@ impl QuantKernel for Q5KRef {
 
             // Low nibbles → first 32 weights (sub-block `is`)
             for l in 0..32 {
-                let qh_bit = (qh[l] >> group) & 1;
+                let qh_bit = (qh[l] >> (2 * group)) & 1;
                 let q = ((qs[qs_offset + l] & 0x0F) | (qh_bit << 4)) as f32;
                 output[out_offset + l] = d1 * q - m1;
             }
 
             // High nibbles → next 32 weights (sub-block `is+1`)
             for l in 0..32 {
-                let qh_bit = (qh[l] >> (group + 4)) & 1;
+                let qh_bit = (qh[l] >> (2 * group + 1)) & 1;
                 let q = (((qs[qs_offset + l] >> 4) & 0x0F) | (qh_bit << 4)) as f32;
                 output[out_offset + 32 + l] = d2 * q - m2;
             }
@@ -133,7 +149,7 @@ impl QuantKernel for Q5KRef {
         let blocks_per_row = n_cols.div_ceil(Q5_K_BLOCK_SIZE);
         let row_bytes = blocks_per_row * Q5_K_BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -166,7 +182,7 @@ impl QuantKernel for Q5KRef {
                         if col >= cols_in_block {
                             break;
                         }
-                        let qh_bit = (qh[l] >> group) & 1;
+                        let qh_bit = (qh[l] >> (2 * group)) & 1;
                         let q = ((qs[qs_offset + l] & 0x0F) | (qh_bit << 4)) as f32;
                         sum += (d1 * q - m1) * inp[col];
                     }
@@ -175,7 +191,7 @@ impl QuantKernel for Q5KRef {
                         if col >= cols_in_block {
                             break;
                         }
-                        let qh_bit = (qh[l] >> (group + 4)) & 1;
+                        let qh_bit = (qh[l] >> (2 * group + 1)) & 1;
                         let q = (((qs[qs_offset + l] >> 4) & 0x0F) | (qh_bit << 4)) as f32;
                         sum += (d2 * q - m2) * inp[col];
                     }
@@ -187,7 +203,7 @@ impl QuantKernel for Q5KRef {
             }
 
             *out = sum;
-        }
+        });
 
         Ok(())
     }
@@ -267,7 +283,7 @@ impl QuantKernel for Q5KRef {
             });
         }
 
-        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(out, n_rows, n_cols, |row, out_val| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -315,7 +331,7 @@ impl QuantKernel for Q5KRef {
                     for l in 0..32 {
                         let col = w_off + l;
                         if col < cols_in_block {
-                            let qh_bit = (qh[l] >> group) & 1;
+                            let qh_bit = (qh[l] >> (2 * group)) & 1;
                             let q_w = ((qs[qs_off + l] & 0x0F) | (qh_bit << 4)) as f32;
                             let q_a = q8_lo[l] as i8 as f32;
                             dot_lo += q_w * q_a;
@@ -330,7 +346,7 @@ impl QuantKernel for Q5KRef {
                     for l in 0..32 {
                         let col = w_off + 32 + l;
                         if col < cols_in_block {
-                            let qh_bit = (qh[l] >> (group + 4)) & 1;
+                            let qh_bit = (qh[l] >> (2 * group + 1)) & 1;
                             let q_w = (((qs[qs_off + l] >> 4) & 0x0F) | (qh_bit << 4)) as f32;
                             let q_a = q8_hi[l] as i8 as f32;
                             dot_hi += q_w * q_a;
@@ -346,7 +362,7 @@ impl QuantKernel for Q5KRef {
             }
 
             *out_val += sum;
-        }
+        });
 
         Ok(())
     }

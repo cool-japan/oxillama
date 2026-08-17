@@ -21,7 +21,7 @@
 pub mod model;
 pub mod tiler;
 
-pub use model::LlavaNextModel;
+pub use model::{load_llava_next_from_gguf, unpad_extent, LlavaNextModel};
 pub use tiler::AnyresTileConfig;
 
 use crate::config::ModelConfig;

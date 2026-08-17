@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
 
-use crate::queue::BatchRequest;
+use crate::queue::{BatchRequest, GenerateReply};
 use crate::state::AppState;
 use crate::threads::queue::RunQueueReceiver;
 use crate::threads::store::ThreadStore;
@@ -26,6 +26,7 @@ use crate::threads::types::{
     MessageRole, Run, RunError, RunStatus, RunStep, RunStepStatus, ThreadMessage,
 };
 use oxillama_runtime::sampling::SamplerConfig;
+use oxillama_runtime::{ChatTemplate, Turn};
 
 /// Spawn the background run worker task.
 ///
@@ -150,7 +151,7 @@ async fn process_run(
             .map_err(|e| format!("list_messages: {e}"))?
     };
 
-    let prompt = format_thread_prompt(instructions, &messages);
+    let prompt = format_thread_prompt(instructions, &messages, state.chat_template);
 
     if prompt.is_empty() {
         warn!(
@@ -175,8 +176,7 @@ async fn process_run(
     }
 
     // Step 3 — send to the inference engine.
-    let (reply_tx, reply_rx) =
-        tokio::sync::oneshot::channel::<Result<(String, crate::queue::UsageStats), String>>();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<GenerateReply>();
 
     let sampler = SamplerConfig::default();
 
@@ -188,13 +188,14 @@ async fn process_run(
             config: sampler,
             cache_prompt: true,
             lora_selection: vec![],
+            add_special: !state.chat_template.emits_literal_bos(),
             reply: reply_tx,
         })
         .await
         .map_err(|_| "inference queue closed during run".to_string())?;
 
     let generated_text = match reply_rx.await {
-        Ok(Ok((text, _usage))) => text,
+        Ok(Ok((text, _usage, _finish_reason))) => text,
         Ok(Err(e)) => return Err(format!("inference engine error: {e}")),
         Err(e) => return Err(format!("reply channel closed: {e}")),
     };
@@ -247,7 +248,7 @@ async fn process_run(
             let mut step = store_c.get_step(&tid, &rid, &sid)?;
             step.step_details =
                 Some(crate::threads::types::MessageCreationStepDetails { message_id: msg_id });
-            let steps_dir = store_c.steps_dir(&tid, &rid);
+            let steps_dir = store_c.steps_dir(&tid, &rid)?;
             let filename = format!("{sid}.json");
             let json = serde_json::to_string_pretty(&step)
                 .map_err(crate::error::ServerError::Serialization)?;
@@ -310,39 +311,39 @@ async fn process_run(
     Ok(())
 }
 
-/// Format the thread's messages as a single prompt string.
+/// Render the thread's messages through the loaded model's own chat template.
 ///
-/// Mirrors the chat-template logic from `routes/chat.rs::format_chat_prompt`.
-/// If `instructions` is provided it is prepended as a `system` message.
-fn format_thread_prompt(instructions: Option<&str>, messages: &[ThreadMessage]) -> String {
-    let mut prompt = String::new();
+/// Same renderer as `routes/chat.rs::format_chat_prompt` — this used to be a
+/// third hand-rolled copy of the fabricated `<|system|>…<|end|>` skeleton, so
+/// the Assistants API reproduced the identical defect independently.
+/// If `instructions` is provided it is prepended as a `system` turn.
+fn format_thread_prompt(
+    instructions: Option<&str>,
+    messages: &[ThreadMessage],
+    template: ChatTemplate,
+) -> String {
+    let mut turns: Vec<Turn<'_>> = Vec::with_capacity(messages.len() + 1);
 
     if let Some(sys) = instructions {
         if !sys.is_empty() {
-            prompt.push_str("<|system|>\n");
-            prompt.push_str(sys);
-            prompt.push_str("\n<|end|>\n");
+            turns.push(Turn {
+                role: "system",
+                content: sys,
+            });
         }
     }
 
     for msg in messages {
-        let content = msg.text_content();
-        match msg.role {
-            MessageRole::User => {
-                prompt.push_str("<|user|>\n");
-                prompt.push_str(content);
-                prompt.push_str("\n<|end|>\n");
-            }
-            MessageRole::Assistant => {
-                prompt.push_str("<|assistant|>\n");
-                prompt.push_str(content);
-                prompt.push_str("\n<|end|>\n");
-            }
-        }
+        turns.push(Turn {
+            role: match msg.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+            },
+            content: msg.text_content(),
+        });
     }
 
-    prompt.push_str("<|assistant|>\n");
-    prompt
+    template.render(&turns, true)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -375,14 +376,15 @@ mod tests {
                             completion_tokens: 4,
                             total_tokens: 9,
                         },
+                        oxillama_runtime::FinishReason::Eos,
                     )));
                 }
             }
         });
 
-        let state = Arc::new(AppState::new(
+        let state = Arc::new(crate::test_helpers::new_test_state(
             tx,
-            "test-model".to_string(),
+            "test-model",
             oxillama_runtime::sampling::SamplerConfig::default(),
             None,
             0,
@@ -391,6 +393,11 @@ mod tests {
         (state, handle)
     }
 
+    // These three used to assert the fabricated `<|system|>`/`<|user|>`/
+    // `<|end|>` markers the Assistants worker hardcoded. They now assert the
+    // markers of the model's *real* template — the whole point of the fix is
+    // that the fabricated ones never reach a model again.
+
     #[test]
     fn format_thread_prompt_with_instructions() {
         let msgs = vec![ThreadMessage::new_user(
@@ -398,12 +405,17 @@ mod tests {
             "t1".into(),
             "hi there".into(),
         )];
-        let prompt = format_thread_prompt(Some("Be helpful."), &msgs);
-        assert!(prompt.contains("<|system|>"), "should have system block");
-        assert!(prompt.contains("Be helpful."));
-        assert!(prompt.contains("<|user|>"));
-        assert!(prompt.contains("hi there"));
-        assert!(prompt.ends_with("<|assistant|>\n"));
+        let prompt = format_thread_prompt(Some("Be helpful."), &msgs, ChatTemplate::ChatMl);
+        assert!(
+            prompt.contains("<|im_start|>system\nBe helpful.<|im_end|>"),
+            "instructions must become a real system turn: {prompt}"
+        );
+        assert!(prompt.contains("<|im_start|>user\nhi there<|im_end|>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+        assert!(
+            !prompt.contains("<|end|>"),
+            "the fabricated marker must be gone: {prompt}"
+        );
     }
 
     #[test]
@@ -413,10 +425,10 @@ mod tests {
             "t1".into(),
             "question".into(),
         )];
-        let prompt = format_thread_prompt(None, &msgs);
-        assert!(!prompt.contains("<|system|>"));
+        let prompt = format_thread_prompt(None, &msgs, ChatTemplate::ChatMl);
+        assert!(!prompt.contains("system"));
         assert!(prompt.contains("question"));
-        assert!(prompt.ends_with("<|assistant|>\n"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
     }
 
     #[test]
@@ -426,10 +438,28 @@ mod tests {
             ThreadMessage::new_assistant("m2".into(), "t1".into(), "run_1".into(), "hi".into()),
             ThreadMessage::new_user("m3".into(), "t1".into(), "follow up".into()),
         ];
-        let prompt = format_thread_prompt(None, &msgs);
+        let prompt = format_thread_prompt(None, &msgs, ChatTemplate::ChatMl);
         // All three messages + trailing assistant prompt.
-        assert_eq!(prompt.matches("<|user|>").count(), 2);
-        assert_eq!(prompt.matches("<|assistant|>").count(), 2); // 1 from history + 1 trailing
+        assert_eq!(prompt.matches("<|im_start|>user").count(), 2);
+        assert_eq!(prompt.matches("<|im_start|>assistant").count(), 2); // 1 history + 1 trailing
+    }
+
+    /// The template family actually changes the rendered markers — proof the
+    /// worker renders per-model rather than through one fixed skeleton.
+    #[test]
+    fn format_thread_prompt_follows_the_detected_family() {
+        let msgs = vec![ThreadMessage::new_user(
+            "m1".into(),
+            "t1".into(),
+            "hi".into(),
+        )];
+        let llama3 = format_thread_prompt(None, &msgs, ChatTemplate::Llama3);
+        assert!(llama3.starts_with("<|begin_of_text|>"));
+        assert!(llama3.contains("<|start_header_id|>user<|end_header_id|>"));
+        assert!(!llama3.contains("<|im_start|>"));
+
+        let mistral = format_thread_prompt(None, &msgs, ChatTemplate::Mistral);
+        assert!(mistral.contains("[INST] hi [/INST]"));
     }
 
     #[tokio::test]

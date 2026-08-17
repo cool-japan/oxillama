@@ -4,7 +4,9 @@
 //! (zero-copy, recommended for large models) or full file reads.
 
 use std::path::Path;
+use std::sync::Arc;
 
+use crate::bytes::{ByteOwner, SharedBytes};
 use crate::error::{GgufError, GgufResult};
 use crate::parser::GgufFile;
 use crate::quantize_on_load::OverrideMap;
@@ -22,7 +24,11 @@ pub struct GgufModel {
     /// Parsed GGUF metadata and tensor registry.
     pub file: GgufFile,
     /// Backing data (either mmap or `Vec<u8>`).
-    data: GgufData,
+    ///
+    /// Held behind an `Arc` so that [`Self::tensor_bytes`] can hand out
+    /// [`SharedBytes`] views that outlive a borrow of `self` while still
+    /// pointing straight at the mapping — no per-tensor copy.
+    data: Arc<GgufData>,
     /// In-memory quantization overrides set by [`crate::quantize_on_load`].
     pub(crate) quant_overrides: OverrideMap,
 }
@@ -45,6 +51,16 @@ impl GgufData {
     }
 }
 
+// SAFETY: a `GgufData` is built once at load time and never mutated — the
+// `Mmap` keeps a fixed mapping and the `Vec<u8>` is never resized — so
+// `owned_bytes` returns a stable address and length for the value's whole
+// life, which is what `ByteOwner` requires.
+unsafe impl ByteOwner for GgufData {
+    fn owned_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 impl GgufModel {
     /// Load a GGUF file using memory mapping (zero-copy).
     ///
@@ -63,7 +79,7 @@ impl GgufModel {
 
         Ok(Self {
             file: parsed,
-            data: GgufData::Mmap(mmap),
+            data: Arc::new(GgufData::Mmap(mmap)),
             quant_overrides: OverrideMap::new(),
         })
     }
@@ -78,7 +94,7 @@ impl GgufModel {
 
         Ok(Self {
             file: parsed,
-            data: GgufData::Owned(data),
+            data: Arc::new(GgufData::Owned(data)),
             quant_overrides: OverrideMap::new(),
         })
     }
@@ -102,7 +118,7 @@ impl GgufModel {
         let parsed = GgufFile::parse(&data)?;
         Ok(Self {
             file: parsed,
-            data: GgufData::Owned(data),
+            data: Arc::new(GgufData::Owned(data)),
             quant_overrides: OverrideMap::new(),
         })
     }
@@ -117,6 +133,31 @@ impl GgufModel {
             return Ok(&ovr.data);
         }
         self.file.tensor_data(self.data.as_bytes(), name)
+    }
+
+    /// Get a named tensor's payload as a reference-counted view.
+    ///
+    /// Unlike [`Self::tensor_data`] the result does not borrow `self`: it
+    /// keeps the backing store (the `Mmap`, or the owned buffer) alive on its
+    /// own.  Consumers that only ever *read* the block bytes — every
+    /// quantization kernel — should hold one of these instead of copying the
+    /// tensor into a `Vec<u8>`.  On a 2.38 GB `Q4_K_M` checkpoint that is the
+    /// difference between weights costing file-backed clean pages and costing
+    /// an extra 2.38 GB of anonymous RSS.
+    ///
+    /// Quantized-on-load overrides are honoured exactly as in
+    /// [`Self::tensor_data`], and are likewise shared rather than copied.
+    pub fn tensor_bytes(&self, name: &str) -> GgufResult<SharedBytes> {
+        if let Some(ovr) = self.quant_overrides.get(name) {
+            return Ok(ovr.data.clone());
+        }
+        let total_len = self.data.as_bytes().len();
+        let (offset, len) = self.file.tensor_data_range(total_len, name)?;
+        SharedBytes::from_owner(Arc::clone(&self.data) as Arc<dyn ByteOwner>, offset, len).ok_or(
+            GgufError::UnexpectedEof {
+                offset: offset as u64,
+            },
+        )
     }
 
     /// Get the full backing data buffer.
@@ -373,6 +414,7 @@ mod tests {
         assert!(out.contains("llama"), "summary missing arch");
     }
 
+    #[cfg_attr(miri, ignore)] // memmap2 file-backed mappings not supported in Miri
     #[test]
     fn test_load_uses_fallback_read() {
         // Write a minimal GGUF to a temp file and load it
@@ -385,6 +427,7 @@ mod tests {
         assert!(result.is_ok(), "load from temp file should succeed");
     }
 
+    #[cfg_attr(miri, ignore)] // memmap2 file-backed mappings not supported in Miri
     #[test]
     fn test_load_read_from_temp_file() {
         let dir = std::env::temp_dir();

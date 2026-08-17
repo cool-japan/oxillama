@@ -9,8 +9,10 @@
 //!
 //! IQ4_NL block layout (18 bytes per 32 weights):
 //! - bytes  0-1: d (f16 little-endian scale)
-//! - bytes  2-17: 16 nibble-bytes encoding 32 four-bit weight indices
-//!   Low nibble  = `weight[2i]`, High nibble = `weight[2i+1]`
+//! - bytes  2-17: 16 nibble-bytes encoding 32 four-bit weight indices,
+//!   GGML split-half packed (NOT interleaved pairs): byte `i` (`i` in
+//!   `0..16`) holds `weight[i]` in its low nibble and `weight[i+16]` in its
+//!   high nibble.
 //!
 //! Dequantisation: `w = d * KVALUES_IQ4NL[nibble]`
 //!
@@ -65,7 +67,11 @@ const KVALUES_IQ4NL: [i8; 16] = [
 
 /// Dequantise all IQ4_NL blocks to a flat f32 buffer.
 #[cfg(any(feature = "gpu", test))]
-fn dequant_iq4_nl_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuResult<Vec<f32>> {
+pub(crate) fn dequant_iq4_nl_to_f32(
+    weight_bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> GpuResult<Vec<f32>> {
     let blocks_per_row = cols.div_ceil(IQ4_NL_BLOCK_SIZE);
     let expected_bytes = rows * blocks_per_row * IQ4_NL_BLOCK_BYTES;
     if weight_bytes.len() < expected_bytes {
@@ -86,12 +92,16 @@ fn dequant_iq4_nl_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuRe
             let nibbles = &block[2..IQ4_NL_BLOCK_BYTES];
             let weight_base = blk * IQ4_NL_BLOCK_SIZE;
 
+            // Split-half layout, matching Q4_0/Q4_1: byte `i` carries weight
+            // `i` in its low nibble and weight `i + 16` in its high nibble
+            // (see `dequantize_row_iq4_nl` in
+            // `llama.cpp/ggml/src/ggml-quants.c`).
             for (i, &byte) in nibbles.iter().enumerate().take(IQ4_NL_BLOCK_SIZE / 2) {
                 let lo = (byte & 0x0F) as usize;
                 let hi = ((byte >> 4) & 0x0F) as usize;
 
-                let col0 = weight_base + i * 2;
-                let col1 = col0 + 1;
+                let col0 = weight_base + i;
+                let col1 = col0 + 16;
 
                 if col0 < cols {
                     f32_weights[row * cols + col0] = d * KVALUES_IQ4NL[lo] as f32;

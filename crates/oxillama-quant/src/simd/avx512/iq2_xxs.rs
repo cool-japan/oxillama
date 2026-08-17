@@ -43,7 +43,15 @@ const WEIGHTS_PER_GROUP: usize = 8;
 
 /// AVX-512 accelerated IQ2_XXS kernel.
 ///
-/// Falls back to scalar if `avx512f` is not available at runtime.
+/// Requires `avx512f`. [`crate::dispatch::KernelDispatcher`] is the single
+/// gate: it only constructs this kernel after confirming `avx512f` at
+/// runtime (see `dispatch.rs`), so — matching every AVX2 kernel in this
+/// crate, none of which re-checks its own CPU feature either — the methods
+/// below trust that invariant rather than repeating the (already cached)
+/// `is_x86_feature_detected!` call on every `dequant_block`/`gemv`
+/// invocation. Constructing this struct directly on hardware without
+/// `avx512f` and calling a trait method is unsound; go through the
+/// dispatcher.
 pub struct Iq2XxsAvx512;
 
 impl QuantKernel for Iq2XxsAvx512 {
@@ -60,10 +68,7 @@ impl QuantKernel for Iq2XxsAvx512 {
                 available: output.len(),
             });
         }
-        if !std::arch::is_x86_feature_detected!("avx512f") {
-            return scalar_dequant_block(block, output);
-        }
-        // SAFETY: bounds verified above; avx512f confirmed by runtime check.
+        // SAFETY: bounds verified above; avx512f guaranteed by KernelDispatcher.
         unsafe { dequant_block_avx512(block, output) }
         Ok(())
     }
@@ -97,21 +102,9 @@ impl QuantKernel for Iq2XxsAvx512 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        if !std::arch::is_x86_feature_detected!("avx512f") {
-            return scalar_gemv(
-                &quant_matrix.data,
-                input,
-                output,
-                n_rows,
-                n_cols,
-                blocks_per_row,
-                row_bytes,
-            );
-        }
-
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
-            // SAFETY: bounds checked above; avx512f confirmed.
+            // SAFETY: bounds checked above; avx512f guaranteed by KernelDispatcher.
             *out = unsafe {
                 gemv_row_avx512(
                     &quant_matrix.data[row_start..row_start + row_bytes],
@@ -120,7 +113,7 @@ impl QuantKernel for Iq2XxsAvx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -153,68 +146,6 @@ impl QuantKernel for Iq2XxsAvx512 {
     fn name(&self) -> &'static str {
         "IQ2_XXS"
     }
-}
-
-// ---------------------------------------------------------------------------
-// Scalar fallback paths (no SIMD required)
-// ---------------------------------------------------------------------------
-
-fn scalar_dequant_block(block: &[u8], output: &mut [f32]) -> QuantResult<()> {
-    use crate::reference::iq2_xxs::Iq2XxsRef;
-    Iq2XxsRef.dequant_block(block, output)
-}
-
-fn scalar_gemv(
-    data: &[u8],
-    input: &[f32],
-    output: &mut [f32],
-    n_rows: usize,
-    n_cols: usize,
-    blocks_per_row: usize,
-    row_bytes: usize,
-) -> QuantResult<()> {
-    use crate::reference::iq_grids::{IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
-    for (row, out) in output.iter_mut().enumerate().take(n_rows) {
-        let row_start = row * row_bytes;
-        let mut sum = 0.0f32;
-        for blk in 0..blocks_per_row {
-            let block_off = row_start + blk * BLOCK_BYTES;
-            let block = &data[block_off..block_off + BLOCK_BYTES];
-            let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-            let qs = &block[2..BLOCK_BYTES];
-            for ib32 in 0..N_SUPERBLOCKS {
-                let base = ib32 * 8;
-                let aux32_0 =
-                    u32::from_le_bytes([qs[base], qs[base + 1], qs[base + 2], qs[base + 3]]);
-                let aux32_1 =
-                    u32::from_le_bytes([qs[base + 4], qs[base + 5], qs[base + 6], qs[base + 7]]);
-                let db = d * (0.5 + (aux32_1 >> 28) as f32) * 0.25;
-                let aux8 = aux32_0.to_le_bytes();
-                let col_base = blk * BLOCK_SIZE + ib32 * SUPER_BLOCK_SIZE;
-                for l in 0..GROUPS_PER_SUPER {
-                    let col = col_base + l * WEIGHTS_PER_GROUP;
-                    let grid_idx = aux8[l] as usize;
-                    let sign_idx = ((aux32_1 >> (7 * l)) & 0x7F) as usize;
-                    let sign_byte = KSIGNS_IQ2XS[sign_idx];
-                    let mags = IQ2XXS_GRID[grid_idx].to_le_bytes();
-                    for j in 0..WEIGHTS_PER_GROUP {
-                        let c = col + j;
-                        if c < n_cols {
-                            let mag = mags[j] as f32;
-                            let sign = if sign_byte & KMASK_IQ2XS[j] != 0 {
-                                -1.0_f32
-                            } else {
-                                1.0_f32
-                            };
-                            sum += db * mag * sign * input[c];
-                        }
-                    }
-                }
-            }
-        }
-        *out = sum;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -302,12 +233,20 @@ unsafe fn dot_group_avx512(grid_idx: u8, sign_byte: u8, db: f32, input_ptr: *con
         vals[j] = db * mags[j] as f32 * sign;
     }
     // Load weights into lower 8 lanes of a ZMM (upper 8 lanes = 0).
-    // We use a 256-bit load and cast to 512-bit with zero-extension.
+    //
+    // `_mm512_castps256_ps512` is a bit-reinterpret (shuffle against
+    // `_mm256_undefined_ps()` per stdarch's definition) — it does NOT
+    // guarantee the upper 8 lanes are zero, despite what the old comment
+    // here claimed. Those undefined lanes flowed into `_mm512_mul_ps` and
+    // then `_mm512_add_ps(acc, ...)`, permanently poisoning `acc[8..16]`,
+    // which `_mm512_reduce_add_ps`/`hsum_f32_avx512` then sums into the
+    // scalar result. `_mm512_zextps256_ps512` is the intrinsic that actually
+    // zero-extends, so the upper lanes contribute 0 to the reduction.
     let w8 = _mm256_loadu_ps(vals.as_ptr());
-    let w16 = _mm512_castps256_ps512(w8);
+    let w16 = _mm512_zextps256_ps512(w8);
     // Load 8 input floats similarly.
     let i8 = _mm256_loadu_ps(input_ptr);
-    let i16 = _mm512_castps256_ps512(i8);
+    let i16 = _mm512_zextps256_ps512(i8);
     _mm512_mul_ps(w16, i16)
 }
 

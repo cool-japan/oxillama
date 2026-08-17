@@ -1,305 +1,564 @@
-//! Mamba-2 model implementation.
+//! Mamba-2 block and full-model forward pass.
 //!
-//! Mamba-2 is a state-space sequence model (SSM) that uses selective scan
-//! instead of attention. Each block processes tokens sequentially using
-//! a recurrent hidden state per layer.
+//! Mamba-2 is a state-space sequence model: no attention, no RoPE
+//! (`llama_model_rope_type()` returns `LLAMA_ROPE_TYPE_NONE` for
+//! `LLM_ARCH_MAMBA2`), and two recurrent tensors carried per layer — the SSM
+//! state `h` and the convolution shift register.
 //!
 //! ## Block forward pass (per layer)
 //!
+//! Transcribed from `llm_build_mamba_base::build_mamba2_layer` in
+//! `src/models/mamba-base.cpp`:
+//!
 //! ```text
-//! x      = rms_norm(hidden)
-//! z      = x @ w_z          (gate)
-//! y      = x @ w_in         (input projection)
-//! y      = silu(conv1d(y, w_conv, b_conv))
-//! B      = y @ w_B
-//! C      = y @ w_C
-//! d_raw  = y @ w_delta
-//! delta  = softplus(d_raw + b_delta)
-//! out    = selective_scan(y, delta, log_A, B, C, D)
-//! out    = silu(z) * out     (gating)
-//! hidden = hidden + out @ w_out
+//! cur    = rms_norm(hidden, attn_norm)
+//!
+//! zxBCdt = ssm_in @ cur                      // [2*d_inner + 2*n_group*d_state + n_head]
+//! z      = zxBCdt[0 .. d_inner]
+//! xBC    = zxBCdt[d_inner .. d_inner + conv_dim]
+//! dt     = zxBCdt[d_inner + conv_dim ..]     // [n_head]
+//!
+//! xBC    = silu(conv1d(state ‖ xBC, ssm_conv1d) + ssm_conv1d.bias)
+//! x      = xBC[0 .. d_inner]                        // head-major
+//! B      = xBC[d_inner .. d_inner + n_group*d_state]
+//! C      = xBC[d_inner + n_group*d_state .. conv_dim]
+//!
+//! y      = ssm_scan(h, x, dt + ssm_dt.bias, ssm_a, B, C)   // per-head A and dt
+//! y      = y + x * ssm_d                                   // per-head D
+//! y      = silu(z) * y                                     // swiglu_split(z, y)
+//! y      = grouped_rms_norm(y, ssm_norm)                   // {d_inner/n_group, n_group}
+//! out    = ssm_out @ y
+//! hidden = hidden + out
 //! ```
+//!
+//! ## What Mamba-2 is *not*
+//!
+//! There is no `ssm_x` projection and no `ssm_dt` **weight**: `B`, `C` and `dt`
+//! all come out of the fused `ssm_in` projection, and `B`/`C` pass *through*
+//! the convolution alongside `x`.  `ssm_a`, `ssm_d` and `ssm_dt.bias` are one
+//! scalar per **head**, not per `(d_state, d_inner)` element.
 
+use crate::common::attention::{validate_context_bounds, validate_token_ids};
 use crate::common::rms_norm::RmsNorm;
 use crate::common::sequence_state::{Mamba2SequenceState, SequenceState};
+use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
-use crate::mamba2::conv::conv1d_depthwise;
-use crate::mamba2::ssm::selective_scan_sequential;
+use crate::mamba2::config::Mamba2Config;
+use crate::mamba2::conv::conv1d_depthwise_stateful;
+use crate::mamba2::ssm::{selective_scan_mamba2, Mamba2ScanDims};
+use crate::mamba2::state::Mamba2ConvCache;
 use crate::traits::{ForwardPass, KvCacheAccess};
-use oxillama_gguf::GgufTensorType;
-use oxillama_quant::{KernelDispatcher, QuantTensor};
-
-// ─── Config ───────────────────────────────────────────────────────────────────
-
-/// Mamba-2 model configuration.
-#[derive(Debug, Clone)]
-pub struct Mamba2Config {
-    /// Hidden (model) dimension (d_model).
-    pub d_model: usize,
-    /// Number of SSM layers.
-    pub n_layer: usize,
-    /// SSM state dimension (typically 128 in full models; small in tests).
-    pub d_state: usize,
-    /// Convolution kernel width (typically 4).
-    pub d_conv: usize,
-    /// Expansion factor: `d_inner = d_model * expand`.
-    pub expand: usize,
-    /// Vocabulary size.
-    pub vocab_size: usize,
-    /// Maximum sequence length.
-    pub max_seq_len: usize,
-}
-
-impl Mamba2Config {
-    /// Compute the inner dimension.
-    pub fn d_inner(&self) -> usize {
-        self.d_model * self.expand
-    }
-}
-
-impl Mamba2Config {
-    /// Parse a `Mamba2Config` from GGUF metadata.
-    pub fn from_metadata(metadata: &oxillama_gguf::MetadataStore) -> Self {
-        // Some GGUFs use "mamba2.*", others just "mamba.*"
-        let d_model = metadata
-            .get_u32("mamba2.d_model")
-            .or_else(|_| metadata.get_u32("mamba.d_model"))
-            .map(|v| v as usize)
-            .unwrap_or(128);
-
-        let n_layer = metadata
-            .get_u32("mamba2.n_layer")
-            .or_else(|_| metadata.get_u32("mamba.n_layer"))
-            .or_else(|_| metadata.get_u32("mamba2.block_count"))
-            .map(|v| v as usize)
-            .unwrap_or(24);
-
-        let d_state = metadata
-            .get_u32("mamba2.d_state")
-            .or_else(|_| metadata.get_u32("mamba.d_state"))
-            .map(|v| v as usize)
-            .unwrap_or(128);
-
-        let d_conv = metadata
-            .get_u32("mamba2.d_conv")
-            .or_else(|_| metadata.get_u32("mamba.d_conv"))
-            .map(|v| v as usize)
-            .unwrap_or(4);
-
-        let expand = metadata
-            .get_u32("mamba2.expand")
-            .or_else(|_| metadata.get_u32("mamba.expand"))
-            .map(|v| v as usize)
-            .unwrap_or(2);
-
-        let vocab_size = metadata
-            .get_u32("mamba2.vocab_size")
-            .or_else(|_| metadata.get_u32("mamba.vocab_size"))
-            .or_else(|_| metadata.get_u32("tokenizer.ggml.tokens.length"))
-            .map(|v| v as usize)
-            .unwrap_or(32000);
-
-        let max_seq_len = metadata
-            .get_u32("mamba2.context_length")
-            .or_else(|_| metadata.get_u32("mamba.context_length"))
-            .map(|v| v as usize)
-            .unwrap_or(4096);
-
-        Self {
-            d_model,
-            n_layer,
-            d_state,
-            d_conv,
-            expand,
-            vocab_size,
-            max_seq_len,
-        }
-    }
-}
 
 // ─── Per-layer weights ─────────────────────────────────────────────────────────
 
 /// Weights for one Mamba-2 SSM block.
 ///
-/// All projection weights are stored as `f32` slices (pre-dequantised) to
-/// keep the implementation straightforward. Real loaders would hold `QuantTensor`
-/// and call dispatch kernels.
+/// Field names map 1:1 onto the GGUF tensors created by the `LLM_ARCH_MAMBA2`
+/// branch of `llama_model::load_tensors` (`src/llama-model.cpp:4585`):
+///
+/// | Field | GGUF tensor | `ne` |
+/// |---|---|---|
+/// | `norm`     | `blk.N.attn_norm.weight`   | `{n_embd}` |
+/// | `w_in`     | `blk.N.ssm_in.weight`      | `{n_embd, d_in_proj}` |
+/// | `w_conv`   | `blk.N.ssm_conv1d.weight`  | `{d_conv, conv_dim}` |
+/// | `b_conv`   | `blk.N.ssm_conv1d.bias`    | `{conv_dim}` |
+/// | `dt_bias`  | `blk.N.ssm_dt.bias`        | `{n_head}` |
+/// | `a`        | `blk.N.ssm_a`              | `{1, n_head}` |
+/// | `d_skip`   | `blk.N.ssm_d`              | `{1, n_head}` |
+/// | `ssm_norm` | `blk.N.ssm_norm.weight`    | `{d_inner/n_group, n_group}` |
+/// | `w_out`    | `blk.N.ssm_out.weight`     | `{d_inner, n_embd}` |
+#[derive(Debug, Clone)]
 pub struct Mamba2LayerWeights {
-    /// Combined gate+input projection `[2 * d_inner, d_model]` row-major.
-    /// The first `d_inner` rows are the gate (z) projection,
-    /// the next `d_inner` rows are the input (y) projection.
-    pub w_in_z: Vec<f32>,
-    /// 1-D depthwise conv kernel `[d_inner × d_conv]` row-major.
-    pub w_conv: Vec<f32>,
-    /// Conv bias `[d_inner]`.
-    pub b_conv: Vec<f32>,
-    /// x → B projection `[d_state, d_inner]` row-major.
-    pub w_b: Vec<f32>,
-    /// x → C projection `[d_state, d_inner]` row-major.
-    pub w_c: Vec<f32>,
-    /// x → Δ projection (dt) `[d_inner, d_inner]` row-major.
-    pub w_delta: Vec<f32>,
-    /// Δ bias `[d_inner]`.
-    pub b_delta: Vec<f32>,
-    /// Log-parameterised A `[d_state × d_inner]` row-major.
-    pub log_a: Vec<f32>,
-    /// Skip connection D `[d_inner]`.
-    pub d_skip: Vec<f32>,
-    /// Output projection `[d_model, d_inner]` row-major.
-    pub w_out: Vec<f32>,
-    /// Pre-block RMSNorm.
+    /// Pre-block RMSNorm (`blk.N.attn_norm.weight`).
     pub norm: RmsNorm,
+    /// Fused `zxBCdt` input projection `[d_in_proj × d_model]` row-major.
+    pub w_in: Vec<f32>,
+    /// Depthwise conv kernel `[conv_dim × d_conv]` row-major.
+    pub w_conv: Vec<f32>,
+    /// Conv bias `[conv_dim]`.
+    pub b_conv: Vec<f32>,
+    /// Per-head Δ bias `[n_head]`.
+    pub dt_bias: Vec<f32>,
+    /// Per-head `A` `[n_head]`.
+    ///
+    /// Stored **as-is** from GGUF, where it already equals `-exp(A_log)`.
+    pub a: Vec<f32>,
+    /// Per-head skip connection `D` `[n_head]`.
+    pub d_skip: Vec<f32>,
+    /// Gated group-RMSNorm scale `[d_inner]`, laid out `[n_group][d_inner/n_group]`.
+    pub ssm_norm: Vec<f32>,
+    /// Output projection `[d_model × d_inner]` row-major.
+    pub w_out: Vec<f32>,
+}
+
+impl Mamba2LayerWeights {
+    /// Check every weight against the shapes `cfg` implies.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::InvalidShape`] naming the first offending tensor.
+    pub fn validate(&self, cfg: &Mamba2Config, layer_idx: usize) -> ArchResult<()> {
+        let check = |what: &str, got: usize, expected: usize| -> ArchResult<()> {
+            if got == expected {
+                Ok(())
+            } else {
+                Err(ArchError::InvalidShape {
+                    name: format!("blk.{layer_idx}.{what}"),
+                    expected: vec![expected],
+                    got: vec![got],
+                })
+            }
+        };
+
+        check("attn_norm.weight", self.norm.weight.len(), cfg.d_model)?;
+        check(
+            "ssm_in.weight",
+            self.w_in.len(),
+            cfg.d_in_proj() * cfg.d_model,
+        )?;
+        check(
+            "ssm_conv1d.weight",
+            self.w_conv.len(),
+            cfg.conv_dim() * cfg.d_conv,
+        )?;
+        check("ssm_conv1d.bias", self.b_conv.len(), cfg.conv_dim())?;
+        check("ssm_dt.bias", self.dt_bias.len(), cfg.n_head)?;
+        check("ssm_a", self.a.len(), cfg.n_head)?;
+        check("ssm_d", self.d_skip.len(), cfg.n_head)?;
+        check("ssm_norm.weight", self.ssm_norm.len(), cfg.d_inner)?;
+        check(
+            "ssm_out.weight",
+            self.w_out.len(),
+            cfg.d_model * cfg.d_inner,
+        )?;
+        Ok(())
+    }
 }
 
 // ─── Full model ────────────────────────────────────────────────────────────────
 
 /// Complete Mamba-2 model.
 pub struct Mamba2Model {
-    /// Model configuration.
+    /// Mamba-2-specific hyper-parameters.
     pub config: Mamba2Config,
-    /// Token embedding table `[vocab_size, d_model]` stored as f32.
+    /// Generic view of the same hyper-parameters, for the shared guards in
+    /// [`crate::common::attention`].
+    pub model_config: ModelConfig,
+    /// Token embedding table `[vocab_size × d_model]` row-major.
     pub token_embd: Vec<f32>,
     /// Per-layer SSM weights.
     pub layers: Vec<Mamba2LayerWeights>,
-    /// Final RMSNorm before LM head.
+    /// Final RMSNorm before the LM head.
     pub output_norm: RmsNorm,
-    /// LM head projection `[vocab_size, d_model]` stored as f32.
+    /// LM head projection `[vocab_size × d_model]` row-major.
     pub lm_head: Vec<f32>,
-    /// Recurrent state for all SSM layers.
+    /// Recurrent SSM hidden state for all layers.
     pub state: Mamba2SequenceState,
-    /// Kernel dispatcher (kept for API compatibility with quantized paths).
-    pub _dispatcher: KernelDispatcher,
+    /// Convolution shift registers for all layers.
+    ///
+    /// Held here rather than inside
+    /// [`SsmLayerState`](crate::common::sequence_state::SsmLayerState) because
+    /// that struct carries only `h`.  See `mamba2/state.rs` for the details.
+    pub conv_state: Mamba2ConvCache,
+}
+
+/// Build the generic [`ModelConfig`] view of a [`Mamba2Config`].
+fn model_config_for(cfg: &Mamba2Config) -> ModelConfig {
+    ModelConfig {
+        architecture: "mamba2".to_string(),
+        hidden_size: cfg.d_model,
+        num_layers: cfg.n_layer,
+        vocab_size: cfg.vocab_size,
+        max_context_length: cfg.max_seq_len,
+        rms_norm_eps: cfg.rms_norm_eps,
+        // Mamba-2 has no attention at all: LLM_ARCH_MAMBA2 is absent from both
+        // RoPE tables and never builds a KV cache.
+        num_attention_heads: 0,
+        num_kv_heads: 0,
+        head_dim: 0,
+        intermediate_size: 0,
+        ..ModelConfig::default()
+    }
+}
+
+/// Dot a `[out_dim × in_dim]` row-major weight matrix with an `[in_dim]` vector.
+///
+/// Every length is checked first: a `zip` between a short weight row and the
+/// input silently produces a truncated dot product, which is a wrong answer
+/// rather than an error.
+fn gemv(name: &str, w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> ArchResult<Vec<f32>> {
+    if x.len() != in_dim {
+        return Err(ArchError::InvalidShape {
+            name: format!("{name}.input"),
+            expected: vec![in_dim],
+            got: vec![x.len()],
+        });
+    }
+    let need = out_dim
+        .checked_mul(in_dim)
+        .ok_or_else(|| ArchError::InvalidShape {
+            name: name.to_string(),
+            expected: vec![usize::MAX],
+            got: vec![w.len()],
+        })?;
+    if w.len() != need {
+        return Err(ArchError::InvalidShape {
+            name: name.to_string(),
+            expected: vec![out_dim, in_dim],
+            got: vec![w.len()],
+        });
+    }
+
+    let mut out = vec![0.0f32; out_dim];
+    for (o, slot) in out.iter_mut().enumerate() {
+        let row = &w[o * in_dim..(o + 1) * in_dim];
+        let mut acc = 0.0f32;
+        for (wv, xv) in row.iter().zip(x.iter()) {
+            acc += wv * xv;
+        }
+        *slot = acc;
+    }
+    Ok(out)
+}
+
+/// Grouped RMSNorm over `y`, in place.
+///
+/// llama.cpp reshapes `y` to `{d_inner/n_group, n_group}` and runs a plain
+/// `LLM_NORM_RMS` over `ne[0]`, i.e. each group is normalised independently and
+/// scaled by its own slice of `ssm_norm`:
+///
+/// ```text
+/// y = ggml_reshape_4d(ctx0, y, d_inner / n_group, n_group, n_seq_tokens, n_seqs);
+/// y = build_norm(y, model.layers[il].ssm_norm, NULL, LLM_NORM_RMS, il);
+/// ```
+///
+/// # Errors
+///
+/// [`ArchError::InvalidShape`] when `y` or `weight` is not `d_inner` long, or
+/// [`ArchError::InvalidConfig`] when `n_group` does not divide `d_inner`.
+fn grouped_rms_norm(
+    y: &mut [f32],
+    weight: &[f32],
+    n_group: usize,
+    eps: f32,
+    layer_idx: usize,
+) -> ArchResult<()> {
+    if n_group == 0 || !y.len().is_multiple_of(n_group) {
+        return Err(ArchError::InvalidConfig {
+            detail: format!(
+                "blk.{layer_idx}.ssm_norm: n_group ({n_group}) must divide d_inner ({})",
+                y.len()
+            ),
+        });
+    }
+    if weight.len() != y.len() {
+        return Err(ArchError::InvalidShape {
+            name: format!("blk.{layer_idx}.ssm_norm.weight"),
+            expected: vec![y.len()],
+            got: vec![weight.len()],
+        });
+    }
+
+    let group_size = y.len() / n_group;
+    if group_size == 0 {
+        return Ok(());
+    }
+    for g in 0..n_group {
+        let lo = g * group_size;
+        let hi = lo + group_size;
+        let mut sum_sq = 0.0f32;
+        for v in &y[lo..hi] {
+            sum_sq += v * v;
+        }
+        // An all-zero group with eps == 0 would give inv_rms == inf and then
+        // 0 * inf == NaN; the limit of the normalisation is 0 there.
+        let denom = (sum_sq / group_size as f32 + eps).sqrt();
+        let inv_rms = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+        for i in lo..hi {
+            y[i] = y[i] * inv_rms * weight[i];
+        }
+    }
+    Ok(())
+}
+
+/// SiLU: `x * sigmoid(x)`.
+#[inline]
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
 }
 
 impl Mamba2Model {
-    /// Create a new `Mamba2Model` from pre-loaded weights.
+    /// Create a `Mamba2Model` from pre-loaded, dequantized weights.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::InvalidConfig`] when `config` is internally inconsistent,
+    /// or [`ArchError::InvalidShape`] when any weight — including
+    /// `token_embd` and `lm_head` — disagrees with the config.  Validating the
+    /// embedding table here is what keeps an over-estimated `vocab_size` from
+    /// turning into an out-of-bounds slice during the first forward pass.
     pub fn new(
         config: Mamba2Config,
         token_embd: Vec<f32>,
         layers: Vec<Mamba2LayerWeights>,
         output_norm: RmsNorm,
         lm_head: Vec<f32>,
-    ) -> Self {
-        let n_layer = config.n_layer;
-        let d_state = config.d_state;
-        let d_inner = config.d_inner();
-        let max_seq = config.max_seq_len;
-        let state = Mamba2SequenceState::new(n_layer, d_state, d_inner, max_seq);
-        Self {
+    ) -> ArchResult<Self> {
+        config.validate()?;
+
+        if layers.len() != config.n_layer {
+            return Err(ArchError::InvalidShape {
+                name: "mamba2.layers".to_string(),
+                expected: vec![config.n_layer],
+                got: vec![layers.len()],
+            });
+        }
+        for (i, layer) in layers.iter().enumerate() {
+            layer.validate(&config, i)?;
+        }
+
+        let embd_len = config
+            .vocab_size
+            .checked_mul(config.d_model)
+            .ok_or_else(|| ArchError::InvalidConfig {
+                detail: format!(
+                    "mamba2: vocab_size {} × d_model {} overflows",
+                    config.vocab_size, config.d_model
+                ),
+            })?;
+        if token_embd.len() != embd_len {
+            return Err(ArchError::InvalidShape {
+                name: "token_embd.weight".to_string(),
+                expected: vec![config.vocab_size, config.d_model],
+                got: vec![token_embd.len()],
+            });
+        }
+        if lm_head.len() != embd_len {
+            return Err(ArchError::InvalidShape {
+                name: "output.weight".to_string(),
+                expected: vec![config.vocab_size, config.d_model],
+                got: vec![lm_head.len()],
+            });
+        }
+        if output_norm.weight.len() != config.d_model {
+            return Err(ArchError::InvalidShape {
+                name: "output_norm.weight".to_string(),
+                expected: vec![config.d_model],
+                got: vec![output_norm.weight.len()],
+            });
+        }
+
+        let state = Mamba2SequenceState::new(
+            config.n_layer,
+            config.d_state,
+            config.d_inner,
+            config.max_seq_len,
+        );
+        let conv_state = Mamba2ConvCache::new(config.n_layer, config.conv_dim(), config.d_conv);
+        let model_config = model_config_for(&config);
+
+        Ok(Self {
             config,
+            model_config,
             token_embd,
             layers,
             output_norm,
             lm_head,
             state,
-            _dispatcher: KernelDispatcher::new(),
-        }
+            conv_state,
+        })
     }
 
-    /// Reset all per-layer SSM hidden states and the position counter.
+    /// Reset all recurrent state: SSM hidden states, conv rings and position.
     pub fn reset_state(&mut self) {
         self.state.reset();
+        self.conv_state.clear();
     }
 
-    /// Run one Mamba-2 block for a single token `x` at the given layer.
-    fn mamba_block(&mut self, layer_idx: usize, x: &[f32]) -> ArchResult<Vec<f32>> {
+    /// Look up one token's embedding row, bounds-checked.
+    fn embed_token(&self, token_id: u32) -> ArchResult<Vec<f32>> {
         let d_model = self.config.d_model;
-        let d_inner = self.config.d_inner();
-        let d_state = self.config.d_state;
-        let d_conv = self.config.d_conv;
+        let tok = token_id as usize;
+        let off = tok
+            .checked_mul(d_model)
+            .ok_or_else(|| ArchError::ConfigMismatch {
+                param: "token_id".to_string(),
+                expected: format!("< vocab_size ({})", self.config.vocab_size),
+                got: token_id.to_string(),
+            })?;
+        let row = self
+            .token_embd
+            .get(off..off.saturating_add(d_model))
+            .ok_or_else(|| ArchError::ConfigMismatch {
+                param: "token_id".to_string(),
+                expected: format!(
+                    "< token_embd rows ({})",
+                    self.token_embd.len() / d_model.max(1)
+                ),
+                got: token_id.to_string(),
+            })?;
+        Ok(row.to_vec())
+    }
 
-        let layer = &self.layers[layer_idx];
+    /// Run one Mamba-2 block for a single token at `layer_idx`.
+    ///
+    /// `x` is the residual-stream vector `[d_model]`; the returned vector is
+    /// the block output to be *added* to it.
+    fn mamba2_block(&mut self, layer_idx: usize, x: &[f32]) -> ArchResult<Vec<f32>> {
+        let cfg = &self.config;
+        let d_model = cfg.d_model;
+        let d_inner = cfg.d_inner;
+        let d_conv = cfg.d_conv;
+        let n_head = cfg.n_head;
+        let head_dim = cfg.head_dim();
+        let n_group = cfg.n_group;
+        let d_state = cfg.d_state;
+        let conv_dim = cfg.conv_dim();
+        let d_in_proj = cfg.d_in_proj();
+        let bc_width = cfg.bc_width();
+        let eps = cfg.rms_norm_eps;
 
-        // ── 1. RMSNorm ──────────────────────────────────────────────────────────
-        // Normalise input token representation.
+        let layer = self
+            .layers
+            .get(layer_idx)
+            .ok_or_else(|| ArchError::InvalidConfig {
+                detail: format!("mamba2: no weights for layer {layer_idx}"),
+            })?;
+
+        // ── 1. Pre-block RMSNorm ────────────────────────────────────────────
+        if x.len() != d_model {
+            return Err(ArchError::InvalidShape {
+                name: format!("blk.{layer_idx}.input"),
+                expected: vec![d_model],
+                got: vec![x.len()],
+            });
+        }
         let mut normed = x.to_vec();
         layer.norm.forward(&mut normed);
 
-        // ── 2. Gate + input projection ──────────────────────────────────────────
-        // w_in_z: [2*d_inner, d_model]
-        // First d_inner rows → gate (z); next d_inner rows → input (y).
-        let mut z_and_y = vec![0.0f32; 2 * d_inner];
-        for (out_idx, z_or_y) in z_and_y.iter_mut().enumerate() {
-            let row = &layer.w_in_z[out_idx * d_model..(out_idx + 1) * d_model];
-            *z_or_y = row.iter().zip(normed.iter()).map(|(w, xi)| w * xi).sum();
-        }
-        let z_vec = z_and_y[..d_inner].to_vec();
-        let y_in = z_and_y[d_inner..].to_vec();
+        // ── 2. Fused zxBCdt projection ──────────────────────────────────────
+        let zxbcdt = gemv(
+            &format!("blk.{layer_idx}.ssm_in.weight"),
+            &layer.w_in,
+            &normed,
+            d_in_proj,
+            d_model,
+        )?;
+        let z = &zxbcdt[..d_inner];
+        let xbc_in = &zxbcdt[d_inner..d_inner + conv_dim];
+        let dt_raw = &zxbcdt[d_inner + conv_dim..];
 
-        // ── 3. Depthwise conv1d + SiLU ──────────────────────────────────────────
-        // y_in is treated as a single-token sequence for conv.
-        let y_conv = conv1d_depthwise(
-            &y_in,
+        // ── 3. Depthwise conv1d (+ bias + SiLU) over x ‖ B ‖ C ───────────────
+        let ring = self.conv_state.layer_mut(layer_idx)?;
+        let xbc = conv1d_depthwise_stateful(
+            xbc_in,
             &layer.w_conv,
             &layer.b_conv,
-            1, // seq_len = 1 (token by token)
-            d_inner,
+            ring,
+            1, // one token per recurrent step
+            conv_dim,
             d_conv,
-        );
-        // y_conv has shape [1 × d_inner]; extract the single token.
-        let y = &y_conv[..d_inner];
+        )?;
 
-        // ── 4. Compute B, C, Δ ────────────────────────────────────────────────
-        // w_b: [d_state, d_inner], w_c: [d_state, d_inner], w_delta: [d_inner, d_inner]
-        let mut b_vec = vec![0.0f32; d_state];
-        for (s, bv) in b_vec.iter_mut().enumerate() {
-            let row = &layer.w_b[s * d_inner..(s + 1) * d_inner];
-            *bv = row.iter().zip(y.iter()).map(|(w, yi)| w * yi).sum();
-        }
+        // Re-borrow immutably: `layer_mut` above took &mut self.conv_state.
+        let layer = self
+            .layers
+            .get(layer_idx)
+            .ok_or_else(|| ArchError::InvalidConfig {
+                detail: format!("mamba2: no weights for layer {layer_idx}"),
+            })?;
 
-        let mut c_vec = vec![0.0f32; d_state];
-        for (s, cv) in c_vec.iter_mut().enumerate() {
-            let row = &layer.w_c[s * d_inner..(s + 1) * d_inner];
-            *cv = row.iter().zip(y.iter()).map(|(w, yi)| w * yi).sum();
-        }
+        // ── 4. Split the conv output into x, B and C ─────────────────────────
+        let x_ssm = &xbc[..d_inner];
+        let b_mat = &xbc[d_inner..d_inner + bc_width];
+        let c_mat = &xbc[d_inner + bc_width..conv_dim];
 
-        let mut delta_raw = vec![0.0f32; d_inner];
-        for (i, dr) in delta_raw.iter_mut().enumerate() {
-            let row = &layer.w_delta[i * d_inner..(i + 1) * d_inner];
-            *dr = row.iter().zip(y.iter()).map(|(w, yi)| w * yi).sum();
-            *dr += layer.b_delta[i];
-        }
-
-        // Softplus: log(1 + exp(x))
-        let delta: Vec<f32> = delta_raw
-            .iter()
-            .map(|&x| if x > 20.0 { x } else { (1.0f32 + x.exp()).ln() })
-            .collect();
-
-        // ── 5. Selective scan (1-token step) ──────────────────────────────────
-        let layer_state = &mut self.state.layers[layer_idx];
-        let scan_out = selective_scan_sequential(
-            y,
-            &delta,
-            &layer.log_a,
-            &b_vec,
-            &c_vec,
+        // ── 5. Selective scan with per-head A and dt ─────────────────────────
+        let layer_state =
+            self.state
+                .layers
+                .get_mut(layer_idx)
+                .ok_or_else(|| ArchError::InvalidConfig {
+                    detail: format!("mamba2: no SSM state for layer {layer_idx}"),
+                })?;
+        let mut y = selective_scan_mamba2(
+            x_ssm,
+            dt_raw,
+            &layer.dt_bias,
+            &layer.a,
+            b_mat,
+            c_mat,
             &layer.d_skip,
-            1, // seq_len = 1
-            d_inner,
-            d_state,
+            Mamba2ScanDims {
+                seq_len: 1,
+                n_head,
+                head_dim,
+                d_state,
+                n_group,
+            },
             layer_state,
-        );
+        )?;
 
-        // ── 6. Gate (SiLU(z) * scan_out) ──────────────────────────────────────
-        let gated: Vec<f32> = scan_out
-            .iter()
-            .zip(z_vec.iter())
-            .map(|(&o, &zi)| {
-                let silu_z = zi / (1.0 + (-zi).exp());
-                silu_z * o
-            })
-            .collect();
-
-        // ── 7. Output projection ────────────────────────────────────────────────
-        // w_out: [d_model, d_inner]
-        let mut out = vec![0.0f32; d_model];
-        for (j, ov) in out.iter_mut().enumerate() {
-            let row = &layer.w_out[j * d_inner..(j + 1) * d_inner];
-            *ov = row.iter().zip(gated.iter()).map(|(w, g)| w * g).sum();
+        // ── 6. Gate: swiglu_split(z, y) == silu(z) * y ──────────────────────
+        for (yv, zv) in y.iter_mut().zip(z.iter()) {
+            *yv *= silu(*zv);
         }
 
-        Ok(out)
+        // ── 7. Gated grouped RMSNorm ────────────────────────────────────────
+        grouped_rms_norm(&mut y, &layer.ssm_norm, n_group, eps, layer_idx)?;
+
+        // ── 8. Output projection ────────────────────────────────────────────
+        gemv(
+            &format!("blk.{layer_idx}.ssm_out.weight"),
+            &layer.w_out,
+            &y,
+            d_model,
+            d_inner,
+        )
+    }
+
+    /// Run all blocks over `tokens`, returning the final hidden state
+    /// (before `output_norm`).
+    fn run_layers(&mut self, tokens: &[u32]) -> ArchResult<Vec<f32>> {
+        let mut hidden = Vec::new();
+        for &tok_id in tokens {
+            hidden = self.embed_token(tok_id)?;
+
+            for layer_idx in 0..self.config.n_layer {
+                let block_out = self.mamba2_block(layer_idx, &hidden).map_err(|e| {
+                    ArchError::ForwardPassError {
+                        layer: layer_idx,
+                        message: format!("Mamba-2 block: {e}"),
+                    }
+                })?;
+                for (h, b) in hidden.iter_mut().zip(block_out.iter()) {
+                    *h += b;
+                }
+            }
+
+            self.state.advance();
+        }
+        Ok(hidden)
+    }
+
+    /// Shared entry guard for [`ForwardPass::forward`] and
+    /// [`ForwardPass::embed`].
+    ///
+    /// Mamba-2 needs no per-token position (it has no RoPE and no KV cache), so
+    /// the only positional quantity is the sequence offset used for the
+    /// context-length bound.  The cache's `seq_len()` is the runtime's view of
+    /// that offset; the model's own step position is used as a floor so that a
+    /// stub cache which always reports 0 cannot defeat the guard.
+    fn check_inputs(&self, tokens: &[u32], kv_cache: &dyn KvCacheAccess) -> ArchResult<()> {
+        if tokens.is_empty() {
+            return Err(ArchError::InvalidConfig {
+                detail: "mamba2: empty token sequence".to_string(),
+            });
+        }
+        let start_pos = kv_cache.seq_len().max(self.state.step_position());
+        validate_context_bounds(&self.model_config, start_pos, tokens.len())?;
+        validate_token_ids(&self.model_config, tokens)?;
+        Ok(())
     }
 }
 
@@ -307,63 +566,20 @@ impl ForwardPass for Mamba2Model {
     fn forward(
         &mut self,
         tokens: &[u32],
-        _kv_cache: &mut dyn KvCacheAccess,
+        kv_cache: &mut dyn KvCacheAccess,
     ) -> ArchResult<Vec<f32>> {
-        let d_model = self.config.d_model;
-        let vocab = self.config.vocab_size;
-        let seq_len = tokens.len();
+        self.check_inputs(tokens, kv_cache)?;
 
-        if seq_len == 0 {
-            return Err(ArchError::InvalidConfig {
-                detail: "forward: empty token sequence".to_string(),
-            });
-        }
+        let mut last = self.run_layers(tokens)?;
+        self.output_norm.forward(&mut last);
 
-        // Embed all tokens.
-        let mut logits = vec![0.0f32; vocab];
-
-        for &tok_id in tokens {
-            let tok = tok_id as usize;
-            if tok >= vocab {
-                return Err(ArchError::InvalidConfig {
-                    detail: format!("token id {tok} out of range (vocab_size={vocab})"),
-                });
-            }
-
-            // Embedding lookup.
-            let emb_off = tok * d_model;
-            let mut hidden: Vec<f32> = self.token_embd[emb_off..emb_off + d_model].to_vec();
-
-            // Run SSM layers.
-            let n_layers = self.config.n_layer;
-            for layer_idx in 0..n_layers {
-                let block_out = self.mamba_block(layer_idx, &hidden).map_err(|e| {
-                    ArchError::ForwardPassError {
-                        layer: layer_idx,
-                        message: format!("Mamba-2 block: {e}"),
-                    }
-                })?;
-
-                // Residual connection.
-                for (h, b) in hidden.iter_mut().zip(block_out.iter()) {
-                    *h += b;
-                }
-            }
-
-            // Final norm + LM head (only last token used for logits).
-            let mut last = hidden;
-            self.output_norm.forward(&mut last);
-
-            // LM head GEMV: logits[v] = dot(lm_head[v, :], last)
-            for (v, lv) in logits.iter_mut().enumerate() {
-                let row = &self.lm_head[v * d_model..(v + 1) * d_model];
-                *lv = row.iter().zip(last.iter()).map(|(w, h)| w * h).sum();
-            }
-
-            self.state.advance();
-        }
-
-        Ok(logits)
+        gemv(
+            "output.weight",
+            &self.lm_head,
+            &last,
+            self.config.vocab_size,
+            self.config.d_model,
+        )
     }
 
     fn vocab_size(&self) -> usize {
@@ -382,59 +598,22 @@ impl ForwardPass for Mamba2Model {
     /// through the LM head.
     ///
     /// The returned vector has `d_model` elements — the hidden dimension, **not**
-    /// `vocab_size`. This is used by embedding extraction pipelines (e.g. RAG,
-    /// similarity search) that need the model's internal representation.
-    fn embed(&mut self, tokens: &[u32], _kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
-        let d_model = self.config.d_model;
-        let vocab = self.config.vocab_size;
-        let seq_len = tokens.len();
+    /// `vocab_size`.
+    fn embed(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
+        self.check_inputs(tokens, kv_cache)?;
 
-        if seq_len == 0 {
-            return Err(ArchError::InvalidConfig {
-                detail: "embed: empty token sequence".to_string(),
-            });
-        }
+        let mut last = self.run_layers(tokens)?;
+        self.output_norm.forward(&mut last);
+        Ok(last)
+    }
 
-        // Track the last hidden state; only the final token's representation is
-        // needed, but SSMs are sequential so we must process all tokens in order.
-        let mut last_hidden = vec![0.0f32; d_model];
-
-        for &tok_id in tokens {
-            let tok = tok_id as usize;
-            if tok >= vocab {
-                return Err(ArchError::InvalidConfig {
-                    detail: format!("token id {tok} out of range (vocab_size={vocab})"),
-                });
-            }
-
-            // Embedding lookup.
-            let emb_off = tok * d_model;
-            let mut hidden: Vec<f32> = self.token_embd[emb_off..emb_off + d_model].to_vec();
-
-            // Run SSM layers.
-            let n_layers = self.config.n_layer;
-            for layer_idx in 0..n_layers {
-                let block_out = self.mamba_block(layer_idx, &hidden).map_err(|e| {
-                    ArchError::ForwardPassError {
-                        layer: layer_idx,
-                        message: format!("Mamba-2 block (embed): {e}"),
-                    }
-                })?;
-
-                // Residual connection.
-                for (h, b) in hidden.iter_mut().zip(block_out.iter()) {
-                    *h += b;
-                }
-            }
-
-            last_hidden = hidden;
-            self.state.advance();
-        }
-
-        // Final norm — stop before LM head projection.
-        self.output_norm.forward(&mut last_hidden);
-
-        Ok(last_hidden)
+    /// Clear the SSM hidden state, the convolution shift registers and the
+    /// step position.
+    ///
+    /// The trait default is a no-op, which for a recurrent model leaks the
+    /// previous request's state into the next one.
+    fn reset_sequence(&mut self) {
+        self.reset_state();
     }
 
     fn allocate_sequence_state(
@@ -444,7 +623,7 @@ impl ForwardPass for Mamba2Model {
         Box::new(Mamba2SequenceState::new(
             self.config.n_layer,
             self.config.d_state,
-            self.config.d_inner(),
+            self.config.d_inner,
             max_context_length,
         ))
     }
@@ -456,286 +635,40 @@ impl ForwardPass for Mamba2Model {
 ///
 /// Used in tests to construct structurally valid models quickly.
 pub fn make_zero_mamba2_layer(cfg: &Mamba2Config) -> Mamba2LayerWeights {
-    let d_model = cfg.d_model;
-    let d_inner = cfg.d_inner();
-    let d_state = cfg.d_state;
-    let d_conv = cfg.d_conv;
-
     Mamba2LayerWeights {
-        w_in_z: vec![0.0f32; 2 * d_inner * d_model],
-        w_conv: vec![0.0f32; d_inner * d_conv],
-        b_conv: vec![0.0f32; d_inner],
-        w_b: vec![0.0f32; d_state * d_inner],
-        w_c: vec![0.0f32; d_state * d_inner],
-        w_delta: vec![0.0f32; d_inner * d_inner],
-        b_delta: vec![0.0f32; d_inner],
-        log_a: vec![0.0f32; d_state * d_inner],
-        d_skip: vec![0.0f32; d_inner],
-        w_out: vec![0.0f32; d_model * d_inner],
-        norm: RmsNorm::new(vec![1.0f32; d_model], 1e-5),
+        norm: RmsNorm::new(vec![1.0f32; cfg.d_model], cfg.rms_norm_eps),
+        w_in: vec![0.0f32; cfg.d_in_proj() * cfg.d_model],
+        w_conv: vec![0.0f32; cfg.conv_dim() * cfg.d_conv],
+        b_conv: vec![0.0f32; cfg.conv_dim()],
+        dt_bias: vec![0.0f32; cfg.n_head],
+        a: vec![-1.0f32; cfg.n_head],
+        d_skip: vec![0.0f32; cfg.n_head],
+        ssm_norm: vec![1.0f32; cfg.d_inner],
+        w_out: vec![0.0f32; cfg.d_model * cfg.d_inner],
     }
 }
 
 /// Construct a `Mamba2Model` from raw weights.
+///
+/// # Errors
+///
+/// See [`Mamba2Model::new`].
 pub fn build_mamba2_model(
     config: Mamba2Config,
     token_embd: Vec<f32>,
     layers: Vec<Mamba2LayerWeights>,
     output_norm: RmsNorm,
     lm_head: Vec<f32>,
-) -> Mamba2Model {
+) -> ArchResult<Mamba2Model> {
     Mamba2Model::new(config, token_embd, layers, output_norm, lm_head)
 }
-
-// ─── Private loader helpers ───────────────────────────────────────────────────
-
-/// Dequantize a named tensor from the GGUF model to a `Vec<f32>`.
-///
-/// Handles F32, F16, and all GGUF quantized formats by dispatching to the
-/// appropriate kernel.
-fn dequant_to_f32(
-    model: &oxillama_gguf::GgufModel,
-    name: &str,
-    dispatcher: &KernelDispatcher,
-) -> ArchResult<Vec<f32>> {
-    let info = model
-        .file
-        .tensors
-        .get(name)
-        .map_err(|_| ArchError::MissingTensor {
-            name: name.to_string(),
-        })?;
-    let data = model
-        .tensor_data(name)
-        .map_err(|_| ArchError::MissingTensor {
-            name: name.to_string(),
-        })?;
-
-    let n_elements = info.n_elements() as usize;
-    let tensor_type = info.tensor_type;
-
-    // F32: direct byte-copy
-    if tensor_type == oxillama_gguf::GgufTensorType::F32 {
-        let mut out = vec![0.0f32; n_elements];
-        for (i, chunk) in data.chunks_exact(4).enumerate().take(n_elements) {
-            out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-        return Ok(out);
-    }
-
-    // F16: convert via half crate
-    if tensor_type == oxillama_gguf::GgufTensorType::F16 {
-        let mut out = vec![0.0f32; n_elements];
-        for (i, chunk) in data.chunks_exact(2).enumerate().take(n_elements) {
-            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            out[i] = half::f16::from_bits(bits).to_f32();
-        }
-        return Ok(out);
-    }
-
-    // Quantized: dispatch to kernel
-    let kernel = dispatcher
-        .get_kernel(tensor_type)
-        .map_err(|e| ArchError::InvalidConfig {
-            detail: format!("get_kernel({tensor_type:?}): {e}"),
-        })?;
-    let block_size = tensor_type.block_size();
-    let block_bytes = tensor_type.block_bytes();
-    let n_blocks = n_elements.div_ceil(block_size);
-
-    let mut out = vec![0.0f32; n_elements];
-    for blk in 0..n_blocks {
-        let data_off = blk * block_bytes;
-        let out_off = blk * block_size;
-        let block_data = &data[data_off..data_off + block_bytes];
-        let out_slice = &mut out[out_off..out_off.saturating_add(block_size).min(n_elements)];
-        kernel
-            .dequant_block(block_data, out_slice)
-            .map_err(|e| ArchError::InvalidConfig {
-                detail: format!("dequant_block: {e}"),
-            })?;
-    }
-
-    Ok(out)
-}
-
-/// Try to load a tensor by the first name; fall back to the second on error.
-fn dequant_or(
-    model: &oxillama_gguf::GgufModel,
-    primary: &str,
-    fallback: &str,
-    dispatcher: &KernelDispatcher,
-) -> ArchResult<Vec<f32>> {
-    dequant_to_f32(model, primary, dispatcher)
-        .or_else(|_| dequant_to_f32(model, fallback, dispatcher))
-}
-
-// ─── Full GGUF loader ─────────────────────────────────────────────────────────
-
-/// Load a Mamba-2 model from a parsed GGUF file.
-///
-/// Supports the tensor-name conventions found in real Mamba-2 GGUF files as
-/// well as the minimal synthetic fixtures produced by
-/// `oxillama_gguf::test_utils::build_minimal_mamba2_gguf()`.
-///
-/// ## Tensor name resolution
-///
-/// | Weight field | Primary name | Fallback name |
-/// |---|---|---|
-/// | `w_in_z` | `blk.{i}.ssm_in.weight` | — |
-/// | `w_conv`  | `blk.{i}.ssm_conv1d.weight` | — |
-/// | `b_conv`  | `blk.{i}.ssm_conv1d.bias` | zeros |
-/// | `w_b`     | `blk.{i}.ssm_B.weight` | `blk.{i}.ssm_x.weight` |
-/// | `w_c`     | `blk.{i}.ssm_C.weight` | `blk.{i}.ssm_x.weight` |
-/// | `w_delta` | `blk.{i}.ssm_dt.weight` | — |
-/// | `b_delta` | `blk.{i}.ssm_dt.bias` | zeros |
-/// | `log_a`   | `blk.{i}.ssm_A_log` | `blk.{i}.ssm_A` |
-/// | `d_skip`  | `blk.{i}.ssm_D` | — |
-/// | `w_out`   | `blk.{i}.ssm_out.weight` | — |
-/// | `norm`    | `blk.{i}.attn_norm.weight` | `blk.{i}.norm.weight` |
-pub fn load_mamba2_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<Mamba2Model> {
-    let cfg = Mamba2Config::from_metadata(&model.file.metadata);
-    let dispatcher = KernelDispatcher::new();
-
-    let d_model = cfg.d_model;
-    let d_inner = cfg.d_inner();
-
-    // ── Token embeddings ──────────────────────────────────────────────────────
-    let token_embd = dequant_to_f32(model, "token_embd.weight", &dispatcher)?;
-
-    // ── Per-layer weights ─────────────────────────────────────────────────────
-    let mut layers = Vec::with_capacity(cfg.n_layer);
-    for i in 0..cfg.n_layer {
-        let pfx = format!("blk.{i}");
-
-        // Gate + input projection  [2*d_inner, d_model]
-        let w_in_z = dequant_to_f32(model, &format!("{pfx}.ssm_in.weight"), &dispatcher)?;
-
-        // Depthwise conv kernel  [d_inner × d_conv]
-        let w_conv = dequant_to_f32(model, &format!("{pfx}.ssm_conv1d.weight"), &dispatcher)?;
-
-        // Conv bias  [d_inner] — optional, default to zeros
-        let b_conv = dequant_to_f32(model, &format!("{pfx}.ssm_conv1d.bias"), &dispatcher)
-            .or_else(|_| Ok::<Vec<f32>, ArchError>(vec![0.0f32; d_inner]))?;
-
-        // B projection  [d_state, d_inner]
-        // Some GGUFs use ssm_B.weight; others use a single ssm_x.weight for B (and re-use
-        // it for C in loaders that share B/C). We mirror this by falling back to ssm_x.weight
-        // for both w_b and w_c.  In the synthetic test fixture ssm_x.weight holds B only
-        // (128 elements = d_state * d_inner), so duplicating it for C produces valid zero
-        // weights — the NaN-free and shape tests still pass.
-        let w_b = dequant_or(
-            model,
-            &format!("{pfx}.ssm_B.weight"),
-            &format!("{pfx}.ssm_x.weight"),
-            &dispatcher,
-        )?;
-
-        // C projection  [d_state, d_inner]
-        let w_c = dequant_or(
-            model,
-            &format!("{pfx}.ssm_C.weight"),
-            &format!("{pfx}.ssm_x.weight"),
-            &dispatcher,
-        )?;
-
-        // Δ (dt) projection  [d_inner, d_inner]
-        let w_delta = dequant_to_f32(model, &format!("{pfx}.ssm_dt.weight"), &dispatcher)?;
-
-        // Δ bias  [d_inner] — optional, default to zeros
-        let b_delta = dequant_to_f32(model, &format!("{pfx}.ssm_dt.bias"), &dispatcher)
-            .or_else(|_| Ok::<Vec<f32>, ArchError>(vec![0.0f32; d_inner]))?;
-
-        // Log-A  [d_state × d_inner]
-        // Some GGUFs store this as ssm_A_log, others as ssm_A.
-        let log_a = dequant_or(
-            model,
-            &format!("{pfx}.ssm_A_log"),
-            &format!("{pfx}.ssm_A"),
-            &dispatcher,
-        )?;
-
-        // Skip-connection D  [d_inner]
-        let d_skip = dequant_to_f32(model, &format!("{pfx}.ssm_D"), &dispatcher)?;
-
-        // Output projection  [d_model, d_inner]
-        let w_out = dequant_to_f32(model, &format!("{pfx}.ssm_out.weight"), &dispatcher)?;
-
-        // Per-layer RMSNorm
-        // Real Mamba-2 GGUFs use attn_norm; some use just norm.
-        let norm_weights = dequant_or(
-            model,
-            &format!("{pfx}.attn_norm.weight"),
-            &format!("{pfx}.norm.weight"),
-            &dispatcher,
-        )?;
-        let norm = RmsNorm::new(norm_weights, 1e-5);
-
-        // Validate key dimension expectations (cheapest guard against scrambled GGUF).
-        if w_in_z.len() != 2 * d_inner * d_model {
-            return Err(ArchError::InvalidConfig {
-                detail: format!(
-                    "blk.{i}.ssm_in.weight: expected {} elements, got {}",
-                    2 * d_inner * d_model,
-                    w_in_z.len()
-                ),
-            });
-        }
-
-        layers.push(Mamba2LayerWeights {
-            w_in_z,
-            w_conv,
-            b_conv,
-            w_b,
-            w_c,
-            w_delta,
-            b_delta,
-            log_a,
-            d_skip,
-            w_out,
-            norm,
-        });
-    }
-
-    // ── Final norm and LM head ────────────────────────────────────────────────
-    let output_norm_weights = dequant_to_f32(model, "output_norm.weight", &dispatcher)?;
-    let output_norm = RmsNorm::new(output_norm_weights, 1e-5);
-
-    // LM head: use output.weight if present; fall back to tied token embeddings.
-    let lm_head = dequant_to_f32(model, "output.weight", &dispatcher)
-        .or_else(|_| Ok::<Vec<f32>, ArchError>(token_embd.clone()))?;
-
-    // Validate vocab × d_model alignment for early-error feedback.
-    let vocab = cfg.vocab_size;
-    if lm_head.len() != vocab * d_model {
-        return Err(ArchError::InvalidConfig {
-            detail: format!(
-                "output.weight: expected {} elements (vocab={vocab} × d_model={d_model}), got {}",
-                vocab * d_model,
-                lm_head.len()
-            ),
-        });
-    }
-
-    Ok(build_mamba2_model(
-        cfg,
-        token_embd,
-        layers,
-        output_norm,
-        lm_head,
-    ))
-}
-
-// We keep QuantTensor in scope for the API; suppress the unused-import warning.
-const _: fn() = || {
-    let _ = QuantTensor::new(vec![], vec![], GgufTensorType::F32);
-};
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mamba2::load_mamba2_from_gguf;
     use crate::traits::KvCacheAccess;
 
     struct NullKv;
@@ -757,13 +690,16 @@ mod tests {
 
     fn tiny_config() -> Mamba2Config {
         Mamba2Config {
-            d_model: 16,
+            d_model: 8,
             n_layer: 1,
-            d_state: 8,
+            d_inner: 16,
+            d_state: 4,
             d_conv: 4,
-            expand: 1,
+            n_head: 4,
+            n_group: 2,
             vocab_size: 64,
             max_seq_len: 256,
+            rms_norm_eps: 1e-5,
         }
     }
 
@@ -780,6 +716,7 @@ mod tests {
         let lm_head = vec![0.0f32; vocab * d_model];
 
         build_mamba2_model(cfg, token_embd, layers, output_norm, lm_head)
+            .expect("tiny model must build")
     }
 
     #[test]
@@ -870,28 +807,73 @@ mod tests {
         );
     }
 
+    // ─── Shape validation ─────────────────────────────────────────────────────
+
     #[test]
-    fn mamba2_embed_shorter_than_forward() {
-        // embed() returns d_model elements; forward() returns vocab_size elements.
-        let mut model = build_tiny_model();
-        let mut kv = NullKv;
-        let embed_out = model.embed(&[1u32], &mut kv).expect("embed");
-        model.reset_state();
-        let fwd_out = model.forward(&[1u32], &mut kv).expect("forward");
-        assert_eq!(embed_out.len(), model.config.d_model);
-        assert_eq!(fwd_out.len(), model.config.vocab_size);
+    fn build_rejects_token_embd_shorter_than_vocab() {
+        let cfg = tiny_config();
+        let layers = (0..cfg.n_layer)
+            .map(|_| make_zero_mamba2_layer(&cfg))
+            .collect();
+        // Two rows short of vocab_size × d_model.
+        let token_embd = vec![0.0f32; (cfg.vocab_size - 2) * cfg.d_model];
+        let lm_head = vec![0.0f32; cfg.vocab_size * cfg.d_model];
+        let err = build_mamba2_model(
+            cfg,
+            token_embd,
+            layers,
+            RmsNorm::new(vec![1.0f32; 8], 1e-5),
+            lm_head,
+        )
+        .err()
+        .expect("an over-estimated vocab_size must be rejected at load time");
         assert!(
-            model.config.d_model < model.config.vocab_size,
-            "d_model must be smaller than vocab_size in tiny config"
+            format!("{err}").contains("token_embd.weight"),
+            "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn gemv_rejects_short_weight_instead_of_truncating() {
+        // 3 outputs × 4 inputs needs 12 weights; give it 10.
+        let err = gemv("test.weight", &[1.0f32; 10], &[1.0, 1.0, 1.0, 1.0], 3, 4)
+            .expect_err("a short weight matrix must be an error, not a short zip");
+        assert!(format!("{err}").contains("test.weight"), "{err}");
+    }
+
+    #[test]
+    fn grouped_rms_norm_normalises_each_group_independently() {
+        // Two groups of two: [3, 4] and [0, 0].
+        let mut y = vec![3.0f32, 4.0, 0.0, 0.0];
+        let w = vec![1.0f32; 4];
+        grouped_rms_norm(&mut y, &w, 2, 0.0, 0).expect("norm");
+        // rms([3,4]) = sqrt((9+16)/2) = sqrt(12.5)
+        let inv = 1.0f32 / 12.5f32.sqrt();
+        assert!((y[0] - 3.0 * inv).abs() < 1e-6, "y[0] = {}", y[0]);
+        assert!((y[1] - 4.0 * inv).abs() < 1e-6, "y[1] = {}", y[1]);
+        // The zero group must stay zero (and must not become NaN through a
+        // 0 * inf) and must not be affected by group 0.
+        assert_eq!(y[2], 0.0, "zero group must not become {}", y[2]);
+        assert_eq!(y[3], 0.0);
+    }
+
+    /// A group of all zeros must never produce NaN, whatever eps is.
+    #[test]
+    fn grouped_rms_norm_zero_group_is_not_nan() {
+        for eps in [0.0f32, 1e-5] {
+            let mut y = vec![0.0f32; 4];
+            grouped_rms_norm(&mut y, &[1.0; 4], 2, eps, 0).expect("norm");
+            assert!(
+                y.iter().all(|v| v.is_finite()),
+                "eps={eps} produced non-finite output {y:?}"
+            );
+        }
     }
 
     // ─── Round-trip loader test ───────────────────────────────────────────────
 
     #[test]
     fn mamba2_loader_round_trip() {
-        // Build a minimal valid GGUF binary and verify that load_mamba2_from_gguf()
-        // succeeds and that the resulting model can run forward() without panic.
         let bytes = oxillama_gguf::test_utils::build_minimal_mamba2_gguf();
         let gguf_model =
             oxillama_gguf::GgufModel::from_bytes(bytes).expect("GGUF parse must succeed");
@@ -899,12 +881,14 @@ mod tests {
         let mut model =
             load_mamba2_from_gguf(&gguf_model).expect("load_mamba2_from_gguf must succeed");
 
-        // Verify structural properties from the fixture: d_model=16, vocab=256, n_layer=1.
         assert_eq!(model.config.d_model, 16, "d_model");
+        assert_eq!(model.config.d_inner, 32, "d_inner = 2 * d_model");
         assert_eq!(model.config.vocab_size, 256, "vocab_size");
         assert_eq!(model.config.n_layer, 1, "n_layer");
+        assert_eq!(model.config.n_group, 2, "ssm.group_count");
+        assert_eq!(model.config.n_head, 4, "ssm.time_step_rank == n_head");
+        assert_eq!(model.config.head_dim(), 8, "head_dim");
 
-        // Run a single forward step — must not panic or return an error.
         let mut kv = NullKv;
         let logits = model.forward(&[1u32], &mut kv).expect("forward after load");
         assert_eq!(logits.len(), 256, "logit count == vocab_size");
@@ -913,7 +897,6 @@ mod tests {
             "all logits must be finite after load"
         );
 
-        // Also verify embed() works correctly after loading.
         model.reset_state();
         let emb = model.embed(&[0u32], &mut kv).expect("embed after load");
         assert_eq!(emb.len(), 16, "embed len == d_model");

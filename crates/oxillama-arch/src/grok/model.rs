@@ -1,29 +1,120 @@
-//! Grok-1 transformer model implementation.
+//! Grok-1 transformer block and forward pass.
 //!
-//! Grok-1 is a MoE decoder-only transformer with:
-//! - Standard grouped-query attention with RoPE (theta = 1e6).
-//! - 8 routed experts, top-2 activation per token.
-//! - RMSNorm + SwiGLU FFN per expert.
+//! ```text
+//! embedding × embedding_scale
+//!   → N×( RMSNorm(attn_norm) → GQA+RoPE(NeoX) with a tanh-softcapped score
+//!         → RMSNorm(attn_out_norm) → +residual
+//!         → RMSNorm(ffn_norm) → MoE(GELU) [+ optional parallel dense FFN × √2/2]
+//!         → RMSNorm(ffn_post_norm) → +residual )
+//!   → RMSNorm(output_norm) → LM head × logit_scale [→ tanh soft-cap]
+//! ```
 //!
-//! Forward per layer: `RMSNorm → MHA → residual → RMSNorm → MoE → residual`.
+//! Every element above was verified against `llm_build_grok`
+//! (`src/models/grok.cpp`), the `LLM_ARCH_GROK` hparams block and tensor-creation
+//! block in `src/llama-model.cpp`, the `LLM_ARCH_GROK` tensor table in
+//! `src/llama-arch.cpp`, and `llm_graph_context::build_attn_mha` in
+//! `src/llama-graph.cpp`.
 //!
-//! This implementation mirrors DBRX closely — only config defaults differ.
+//! # What was missing
+//!
+//! * **`embedding_scale = 78.38367176906169`** (`= sqrt(6144)`), applied to the
+//!   token embedding.  Absent, every hidden state entered layer 0 ~78× too small.
+//! * **`logit_scale = 0.5773502691896257`** (`= 1/sqrt(3)`) on the final logits.
+//! * **`attn_out_norm` and `ffn_post_norm`.**  `GrokLayer` carried only
+//!   `attn_norm`/`ffn_norm`; `build_grok` normalises the attention output
+//!   *before* the residual add and the FFN output *before* its residual add.
+//!   Both tensors are required by llama.cpp's loader
+//!   (`ffn_post_norm` comes from `LLM_TENSOR_LAYER_OUT_NORM` =
+//!   `blk.%d.layer_output_norm`, falling back to `LLM_TENSOR_FFN_POST_NORM` =
+//!   `blk.%d.post_ffw_norm`).
+//! * **GELU experts.**  `build_grok` passes `LLM_FFN_GELU`; the experts ran the
+//!   hard-coded SiLU of `DeepSeekExpert::forward`.  See [`crate::grok::moe`].
+//! * **The attention soft-cap.**  `build_attn_mha` does, for `LLM_ARCH_GROK`
+//!   only, `kq = cap · tanh(kq · attn_out_scale / cap)` with `cap = 30`, and
+//!   then `soft_max_ext(kq, mask, kq_scale = 1.0f)`.  The `1/sqrt(128)` factor
+//!   in the old code *is* `f_attn_out_scale` and is kept — but it is a
+//!   **constant** in llama.cpp, not `1/sqrt(head_dim)`, and the `tanh` around it
+//!   was missing entirely.
+//! * **`kv_cache.advance()` once per token** rather than once per layer.
+//!
+//! # Deliberately not implemented
+//!
+//! `grok.router_logit_softcapping` is parsed into
+//! [`GrokConfig::router_logit_softcapping`] but **not applied**: in the
+//! reference, `f_router_logit_softcapping` appears only in the hparams loader
+//! and `llama-model-saver.cpp` — `build_moe_ffn` never reads it.  Applying it
+//! would diverge from llama.cpp.
 
+use oxillama_quant::{KernelDispatcher, QuantKernel};
+
+use crate::common::attention::validate_context_bounds;
+use crate::common::gelu::gelu;
 use crate::common::linear::QuantLinear;
+use crate::common::moe::MoeScratch;
 use crate::common::rms_norm::RmsNorm;
-use crate::common::rope::RopeTable;
+use crate::common::rope::{RopeStyle, RopeTable};
 use crate::config::ModelConfig;
-use crate::deepseek::moe::{moe_forward, DeepSeekExpert, MoeConfig, MoeWeights, ScoringMode};
 use crate::error::{ArchError, ArchResult};
 use crate::grok::config::GrokConfig;
+use crate::grok::moe::GrokMoe;
 use crate::traits::{ForwardPass, KvCacheAccess};
-use oxillama_quant::{KernelDispatcher, QuantTensor};
+
+/// Grok's soft-capped pre-softmax attention score.
+///
+/// `llm_graph_context::build_attn_mha`, `LLM_ARCH_GROK` branch:
+///
+/// ```text
+/// kq = ggml_tanh(ggml_scale(kq, f_attn_out_scale / f_attn_logit_softcapping));
+/// kq = ggml_scale(kq, f_attn_logit_softcapping);
+/// ...
+/// kq = ggml_soft_max_ext(kq, kq_mask, /* kq_scale = */ 1.0f, ...);
+/// ```
+///
+/// i.e. `cap · tanh(raw · scale / cap)`, and the softmax then applies a scale of
+/// exactly 1.  `scale` is a **constant** `1/sqrt(128)` in the reference, not
+/// `1/sqrt(head_dim)`.  A non-positive `cap` disables the tanh and leaves the
+/// bare `raw · scale`.
+#[inline]
+fn softcap_score(raw: f32, scale: f32, cap: f32) -> f32 {
+    if cap > 0.0 {
+        cap * (raw * scale / cap).tanh()
+    } else {
+        raw * scale
+    }
+}
 
 // ─── Per-layer weights ─────────────────────────────────────────────────────────
 
+/// The optional dense FFN Grok runs **in parallel** with the MoE branch.
+///
+/// `build_grok`:
+///
+/// ```text
+/// if (model.layers[il].ffn_up) {
+///     ffn_out = build_ffn(cur, ffn_up, ffn_gate, ffn_down, LLM_FFN_GELU, LLM_FFN_PAR);
+///     cur = ggml_scale(ggml_add(ffn_out, moe_out), sqrt(2) / 2);
+/// } else {
+///     cur = moe_out;
+/// }
+/// ```
+pub struct GrokDenseFfn {
+    /// Gate projection `[intermediate, hidden]`.
+    pub gate: QuantLinear,
+    /// Up projection `[intermediate, hidden]`.
+    pub up: QuantLinear,
+    /// Down projection `[hidden, intermediate]`.
+    pub down: QuantLinear,
+    /// Kernel for [`Self::gate`].
+    pub gate_kernel: Box<dyn QuantKernel>,
+    /// Kernel for [`Self::up`].
+    pub up_kernel: Box<dyn QuantKernel>,
+    /// Kernel for [`Self::down`].
+    pub down_kernel: Box<dyn QuantKernel>,
+}
+
 /// One Grok-1 transformer layer.
 pub struct GrokLayer {
-    /// Pre-attention RMSNorm.
+    /// Pre-attention RMSNorm (`blk.N.attn_norm.weight`).
     pub attn_norm: RmsNorm,
     /// Query projection `[num_heads * head_dim, hidden_size]`.
     pub attn_q: QuantLinear,
@@ -33,12 +124,26 @@ pub struct GrokLayer {
     pub attn_v: QuantLinear,
     /// Output projection `[hidden_size, num_heads * head_dim]`.
     pub attn_output: QuantLinear,
-    /// Pre-FFN RMSNorm.
+    /// Post-attention RMSNorm applied **before** the residual add
+    /// (`blk.N.attn_output_norm.weight`).
+    pub attn_out_norm: RmsNorm,
+    /// Pre-FFN RMSNorm (`blk.N.ffn_norm.weight`).
     pub ffn_norm: RmsNorm,
-    /// MoE FFN weights.
-    pub moe_weights: MoeWeights,
-    /// MoE configuration.
-    pub moe_config: MoeConfig,
+    /// Post-FFN RMSNorm applied **before** the residual add
+    /// (`blk.N.layer_output_norm.weight`, or `blk.N.post_ffw_norm.weight`).
+    pub ffn_post_norm: RmsNorm,
+    /// Sparse MoE FFN with GELU experts.
+    pub moe: GrokMoe,
+    /// Optional dense FFN run in parallel with the MoE branch.
+    pub dense_ffn: Option<GrokDenseFfn>,
+    /// Kernel for [`Self::attn_q`].
+    pub attn_q_kernel: Box<dyn QuantKernel>,
+    /// Kernel for [`Self::attn_k`].
+    pub attn_k_kernel: Box<dyn QuantKernel>,
+    /// Kernel for [`Self::attn_v`].
+    pub attn_v_kernel: Box<dyn QuantKernel>,
+    /// Kernel for [`Self::attn_output`].
+    pub attn_output_kernel: Box<dyn QuantKernel>,
 }
 
 // ─── Full model ────────────────────────────────────────────────────────────────
@@ -47,31 +152,42 @@ pub struct GrokLayer {
 pub struct GrokModel {
     /// Common model config.
     pub config: ModelConfig,
-    /// Grok-specific config (MoE layout, rope_theta, etc.).
+    /// Grok-specific config (MoE layout, rope_theta, and the four scalars).
     pub grok_config: GrokConfig,
     /// Token embedding table `[vocab_size, hidden_size]`.
     pub token_embd: Vec<f32>,
+    /// Number of embedding rows actually present in `token_embd`.
+    embd_rows: usize,
     /// Transformer layers.
     pub layers: Vec<GrokLayer>,
-    /// Final RMSNorm before LM head.
+    /// Final RMSNorm before the LM head.
     pub output_norm: RmsNorm,
     /// LM head projection `[vocab_size, hidden_size]`.
     pub output: QuantLinear,
-    /// Precomputed RoPE frequency table.
+    /// Precomputed RoPE frequency table (NeoX pairing).
     pub rope: RopeTable,
     /// Kernel dispatcher for quantized ops.
     pub dispatcher: KernelDispatcher,
-    /// Current token position.
-    current_pos: usize,
-    // Scratch buffers.
     buf_q: Vec<f32>,
     buf_k: Vec<f32>,
     buf_v: Vec<f32>,
+    buf_attn_out: Vec<f32>,
+    buf_proj: Vec<f32>,
     buf_attn_scores: Vec<f32>,
+    buf_norm: Vec<f32>,
+    buf_moe_out: Vec<f32>,
+    buf_dense: Vec<f32>,
+    buf_dense_act: Vec<f32>,
+    moe_scratch: MoeScratch,
 }
 
 impl GrokModel {
     /// Create a new `GrokModel` from pre-loaded weights.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::InvalidShape`] when `token_embd` holds fewer than
+    /// `vocab_size × hidden_size` values.
     pub fn new(
         config: ModelConfig,
         grok_config: GrokConfig,
@@ -79,120 +195,136 @@ impl GrokModel {
         layers: Vec<GrokLayer>,
         output_norm: RmsNorm,
         output: QuantLinear,
-    ) -> Self {
-        let rope = RopeTable::new_standard(
+    ) -> ArchResult<Self> {
+        // GROK is NEOX in llama.cpp's `llama_model_rope_type` table.
+        let rope = RopeTable::new_standard_with_style(
             config.head_dim,
             config.max_context_length,
             config.rope_freq_base,
+            RopeStyle::Neox,
         );
-        let dispatcher = KernelDispatcher::new();
+        let hidden = config.hidden_size;
+        if hidden == 0 || config.vocab_size == 0 {
+            return Err(ArchError::InvalidConfig {
+                detail: "Grok requires hidden_size > 0 and vocab_size > 0".to_string(),
+            });
+        }
+        let embd_rows = token_embd.len() / hidden;
+        if embd_rows < config.vocab_size {
+            return Err(ArchError::InvalidShape {
+                name: "token_embd.weight".to_string(),
+                expected: vec![config.vocab_size, hidden],
+                got: vec![embd_rows, hidden],
+            });
+        }
+
         let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_kv_heads * config.head_dim;
-        let max_ctx = config.max_context_length;
-        Self {
-            dispatcher,
+        let inter = grok_config.ffn_hidden_size;
+        let moe_scratch = layers
+            .first()
+            .map(|l| l.moe.make_scratch())
+            .unwrap_or_default();
+
+        Ok(Self {
+            dispatcher: KernelDispatcher::new(),
             rope,
-            current_pos: 0,
             buf_q: vec![0.0f32; q_dim],
             buf_k: vec![0.0f32; kv_dim],
             buf_v: vec![0.0f32; kv_dim],
-            buf_attn_scores: vec![0.0f32; max_ctx],
+            buf_attn_out: vec![0.0f32; q_dim],
+            buf_proj: vec![0.0f32; hidden],
+            buf_attn_scores: vec![0.0f32; config.max_context_length],
+            buf_norm: vec![0.0f32; hidden],
+            buf_moe_out: vec![0.0f32; hidden],
+            buf_dense: vec![0.0f32; hidden],
+            buf_dense_act: vec![0.0f32; inter],
+            moe_scratch,
+            embd_rows,
             config,
             grok_config,
             token_embd,
             layers,
             output_norm,
             output,
-        }
+        })
     }
 
-    /// Reset sequence position.
-    pub fn reset_position(&mut self) {
-        self.current_pos = 0;
-    }
-
-    /// Run grouped-query attention for a single token at position `pos`.
-    fn attention_single_token(
+    /// Attention for one token at `pos`, leaving the projection in `buf_proj`.
+    ///
+    /// **Does not** call [`KvCacheAccess::advance`].
+    fn attention(
         &mut self,
         layer_idx: usize,
-        x: &[f32],
         pos: usize,
         kv_cache: &mut dyn KvCacheAccess,
-    ) -> ArchResult<Vec<f32>> {
+    ) -> ArchResult<()> {
         let num_heads = self.config.num_attention_heads;
         let num_kv = self.config.num_kv_heads;
         let hd = self.config.head_dim;
-        let hidden = self.config.hidden_size;
         let heads_per_kv = num_heads.checked_div(num_kv).unwrap_or(1);
+        let kv_dim = num_kv * hd;
+        let q_dim = num_heads * hd;
 
-        let q_kernel = self
-            .dispatcher
-            .get_kernel(self.layers[layer_idx].attn_q.weight.tensor_type)
-            .map_err(ArchError::from)?;
-        let k_kernel = self
-            .dispatcher
-            .get_kernel(self.layers[layer_idx].attn_k.weight.tensor_type)
-            .map_err(ArchError::from)?;
-        let v_kernel = self
-            .dispatcher
-            .get_kernel(self.layers[layer_idx].attn_v.weight.tensor_type)
-            .map_err(ArchError::from)?;
+        {
+            let layer = &self.layers[layer_idx];
+            layer
+                .attn_q
+                .forward(&*layer.attn_q_kernel, &self.buf_norm, &mut self.buf_q)?;
+            layer
+                .attn_k
+                .forward(&*layer.attn_k_kernel, &self.buf_norm, &mut self.buf_k)?;
+            layer
+                .attn_v
+                .forward(&*layer.attn_v_kernel, &self.buf_norm, &mut self.buf_v)?;
+        }
 
-        self.layers[layer_idx]
-            .attn_q
-            .forward(&*q_kernel, x, &mut self.buf_q)?;
-        self.layers[layer_idx]
-            .attn_k
-            .forward(&*k_kernel, x, &mut self.buf_k)?;
-        self.layers[layer_idx]
-            .attn_v
-            .forward(&*v_kernel, x, &mut self.buf_v)?;
-
-        // Apply RoPE to Q and K.
         for h in 0..num_heads {
-            let q_head = &mut self.buf_q[h * hd..(h + 1) * hd];
-            self.rope.apply(q_head, pos);
+            self.rope.apply(&mut self.buf_q[h * hd..(h + 1) * hd], pos);
         }
         for h in 0..num_kv {
-            let k_head = &mut self.buf_k[h * hd..(h + 1) * hd];
-            self.rope.apply(k_head, pos);
+            self.rope.apply(&mut self.buf_k[h * hd..(h + 1) * hd], pos);
         }
 
-        // Store KV.
-        kv_cache.store_kv(layer_idx, &self.buf_k.clone(), &self.buf_v.clone())?;
+        kv_cache.store_kv(layer_idx, &self.buf_k[..kv_dim], &self.buf_v[..kv_dim])?;
 
-        let cached_keys = kv_cache.get_keys(layer_idx)?;
-        let cached_values = kv_cache.get_values(layer_idx)?;
-        let seq_len = kv_cache.seq_len();
+        let cached_keys = crate::common::fetch_keys(&*kv_cache, layer_idx)?;
+        let cached_values = crate::common::fetch_values(&*kv_cache, layer_idx)?;
+        let cached_keys: &[f32] = &cached_keys;
+        let cached_values: &[f32] = &cached_values;
+        let n_tokens = pos + 1;
+        let needed = n_tokens * kv_dim;
+        if cached_keys.len() < needed || cached_values.len() < needed {
+            return Err(ArchError::ForwardPassError {
+                layer: layer_idx,
+                message: format!(
+                    "kv cache exposes {} key / {} value floats, attention at position {pos} \
+                     needs {needed}",
+                    cached_keys.len(),
+                    cached_values.len()
+                ),
+            });
+        }
 
-        let scale = 1.0 / (hd as f32).sqrt();
-        let mut attn_out = vec![0.0f32; hidden];
-        let kv_stride = num_kv * hd;
-        let n_tokens = (seq_len + 1).min(self.config.max_context_length);
+        self.buf_attn_out[..q_dim].fill(0.0);
+        let scale = self.grok_config.attn_output_scale;
+        let cap = self.grok_config.attn_logit_softcapping;
 
         for h in 0..num_heads {
             let kv_head = h / heads_per_kv;
             let q_head = &self.buf_q[h * hd..(h + 1) * hd];
+            let scores = &mut self.buf_attn_scores[..n_tokens];
 
-            // Compute attention scores.
-            for t in 0..n_tokens {
-                let k_off = t * kv_stride + kv_head * hd;
-                if k_off + hd <= cached_keys.len() {
-                    let k_head_t = &cached_keys[k_off..k_off + hd];
-                    let score: f32 = q_head
-                        .iter()
-                        .zip(k_head_t.iter())
-                        .map(|(q, k)| q * k)
-                        .sum::<f32>()
-                        * scale;
-                    self.buf_attn_scores[t] = score;
-                } else {
-                    self.buf_attn_scores[t] = f32::NEG_INFINITY;
-                }
+            for (t, score) in scores.iter_mut().enumerate() {
+                let off = t * kv_dim + kv_head * hd;
+                let raw: f32 = q_head
+                    .iter()
+                    .zip(cached_keys[off..off + hd].iter())
+                    .map(|(a, b)| a * b)
+                    .sum();
+                *score = softcap_score(raw, scale, cap);
             }
 
-            // Softmax.
-            let scores = &mut self.buf_attn_scores[..n_tokens];
             let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut exp_sum = 0.0f32;
             for s in scores.iter_mut() {
@@ -205,31 +337,152 @@ impl GrokModel {
                 }
             }
 
-            // Accumulate V.
-            for (t, &weight) in scores[..n_tokens].iter().enumerate() {
-                let v_off = t * kv_stride + kv_head * hd;
-                if v_off + hd <= cached_values.len() {
-                    let v_head_t = &cached_values[v_off..v_off + hd];
-                    let out_start = h * hd;
-                    for (i, &v) in v_head_t.iter().enumerate() {
-                        attn_out[out_start + i] += weight * v;
-                    }
+            let out_head = &mut self.buf_attn_out[h * hd..(h + 1) * hd];
+            for (t, &w) in scores.iter().enumerate() {
+                let off = t * kv_dim + kv_head * hd;
+                for (o, &val) in out_head.iter_mut().zip(cached_values[off..off + hd].iter()) {
+                    *o += w * val;
                 }
             }
         }
 
-        // Output projection.
-        let out_kernel = self
-            .dispatcher
-            .get_kernel(self.layers[layer_idx].attn_output.weight.tensor_type)
-            .map_err(ArchError::from)?;
-        let mut projected = vec![0.0f32; hidden];
-        self.layers[layer_idx]
-            .attn_output
-            .forward(&*out_kernel, &attn_out, &mut projected)?;
+        let layer = &self.layers[layer_idx];
+        layer.attn_output.forward(
+            &*layer.attn_output_kernel,
+            &self.buf_attn_out[..q_dim],
+            &mut self.buf_proj,
+        )?;
+        Ok(())
+    }
 
-        kv_cache.advance();
-        Ok(projected)
+    /// The optional parallel dense FFN, GELU-gated like the experts.
+    fn dense_ffn(&mut self, layer_idx: usize) -> ArchResult<bool> {
+        let Some(ffn) = self.layers[layer_idx].dense_ffn.as_ref() else {
+            return Ok(false);
+        };
+        let inter = ffn.gate.out_features;
+        if self.buf_dense_act.len() < inter {
+            self.buf_dense_act.resize(inter, 0.0);
+        }
+        let mut gate_act = std::mem::take(&mut self.buf_dense_act);
+        let run = (|| -> ArchResult<()> {
+            let ffn = self.layers[layer_idx].dense_ffn.as_ref().ok_or_else(|| {
+                ArchError::ForwardPassError {
+                    layer: layer_idx,
+                    message: "dense FFN vanished between checks".to_string(),
+                }
+            })?;
+            ffn.gate
+                .forward(&*ffn.gate_kernel, &self.buf_norm, &mut gate_act[..inter])?;
+            for g in gate_act[..inter].iter_mut() {
+                *g = gelu(*g);
+            }
+            let mut up = vec![0.0f32; inter];
+            ffn.up.forward(&*ffn.up_kernel, &self.buf_norm, &mut up)?;
+            for (g, u) in gate_act[..inter].iter_mut().zip(up.iter()) {
+                *g *= u;
+            }
+            ffn.down
+                .forward(&*ffn.down_kernel, &gate_act[..inter], &mut self.buf_dense)?;
+            Ok(())
+        })();
+        self.buf_dense_act = gate_act;
+        run?;
+        Ok(true)
+    }
+
+    /// Run every token through all layers.
+    fn run_layers(
+        &mut self,
+        tokens: &[u32],
+        kv_cache: &mut dyn KvCacheAccess,
+    ) -> ArchResult<Vec<f32>> {
+        let hidden = self.config.hidden_size;
+        let seq_len = tokens.len();
+        if seq_len == 0 {
+            return Err(ArchError::InvalidConfig {
+                detail: "forward: empty token sequence".to_string(),
+            });
+        }
+        let start_pos = kv_cache.seq_len();
+        validate_context_bounds(&self.config, start_pos, seq_len)?;
+
+        // `build_inp_embd`: `cur = ggml_scale(cur, hparams.f_embedding_scale)`.
+        let embedding_scale = self.grok_config.embedding_scale;
+        let mut hidden_states = vec![0.0f32; seq_len * hidden];
+        for (t, &tok_id) in tokens.iter().enumerate() {
+            let tok = tok_id as usize;
+            if tok >= self.embd_rows.min(self.config.vocab_size) {
+                return Err(ArchError::ConfigMismatch {
+                    param: "token_id".to_string(),
+                    expected: format!(
+                        "< vocab_size ({}) and < token_embd rows ({})",
+                        self.config.vocab_size, self.embd_rows
+                    ),
+                    got: tok.to_string(),
+                });
+            }
+            let off = tok * hidden;
+            for (dst, &src) in hidden_states[t * hidden..(t + 1) * hidden]
+                .iter_mut()
+                .zip(self.token_embd[off..off + hidden].iter())
+            {
+                *dst = src * embedding_scale;
+            }
+        }
+
+        let sqrt2_over_2 = std::f32::consts::SQRT_2 / 2.0;
+        let n_layers = self.layers.len();
+        for t in 0..seq_len {
+            let pos = start_pos + t;
+            for layer_idx in 0..n_layers {
+                let row = t * hidden..(t + 1) * hidden;
+
+                self.layers[layer_idx]
+                    .attn_norm
+                    .forward_to(&hidden_states[row.clone()], &mut self.buf_norm);
+
+                self.attention(layer_idx, pos, kv_cache)?;
+
+                // `cur = build_norm(cur, attn_out_norm)` BEFORE the residual.
+                self.layers[layer_idx]
+                    .attn_out_norm
+                    .forward(&mut self.buf_proj);
+                for (h, p) in hidden_states[row.clone()]
+                    .iter_mut()
+                    .zip(self.buf_proj.iter())
+                {
+                    *h += p;
+                }
+
+                self.layers[layer_idx]
+                    .ffn_norm
+                    .forward_to(&hidden_states[row.clone()], &mut self.buf_norm);
+
+                self.layers[layer_idx].moe.forward(
+                    &self.buf_norm,
+                    &mut self.buf_moe_out,
+                    &mut self.moe_scratch,
+                )?;
+
+                if self.dense_ffn(layer_idx)? {
+                    for (m, d) in self.buf_moe_out.iter_mut().zip(self.buf_dense.iter()) {
+                        *m = (*m + *d) * sqrt2_over_2;
+                    }
+                }
+
+                // `cur = build_norm(cur, ffn_post_norm)` BEFORE the residual.
+                self.layers[layer_idx]
+                    .ffn_post_norm
+                    .forward(&mut self.buf_moe_out);
+                for (h, m) in hidden_states[row].iter_mut().zip(self.buf_moe_out.iter()) {
+                    *h += m;
+                }
+            }
+            // Exactly once per token, after every layer has written its K/V.
+            kv_cache.advance();
+        }
+        Ok(hidden_states)
     }
 }
 
@@ -242,77 +495,8 @@ impl ForwardPass for GrokModel {
         let hidden = self.config.hidden_size;
         let vocab = self.config.vocab_size;
         let seq_len = tokens.len();
+        let mut hidden_states = self.run_layers(tokens, kv_cache)?;
 
-        if seq_len == 0 {
-            return Err(ArchError::InvalidConfig {
-                detail: "forward: empty token sequence".to_string(),
-            });
-        }
-
-        // ── Token embedding lookup ──────────────────────────────────────────────
-        let mut hidden_states = vec![0.0f32; seq_len * hidden];
-        for (t, &tok_id) in tokens.iter().enumerate() {
-            let tok = tok_id as usize;
-            if tok >= self.config.vocab_size {
-                return Err(ArchError::InvalidConfig {
-                    detail: format!(
-                        "token id {tok} out of range (vocab_size={})",
-                        self.config.vocab_size
-                    ),
-                });
-            }
-            let off = tok * hidden;
-            hidden_states[t * hidden..(t + 1) * hidden]
-                .copy_from_slice(&self.token_embd[off..off + hidden]);
-        }
-
-        // ── Transformer layers ──────────────────────────────────────────────────
-        let n_layers = self.layers.len();
-        for layer_idx in 0..n_layers {
-            for t in 0..seq_len {
-                let pos = self.current_pos + t;
-
-                // ─ Pre-attention norm ──────────────────────────────────────────
-                let mut normed: Vec<f32> = hidden_states[t * hidden..(t + 1) * hidden].to_vec();
-                self.layers[layer_idx].attn_norm.forward(&mut normed);
-
-                // ─ MHA ────────────────────────────────────────────────────────
-                let attn_out = self.attention_single_token(layer_idx, &normed, pos, kv_cache)?;
-
-                // ─ Residual ────────────────────────────────────────────────────
-                for (h, a) in hidden_states[t * hidden..(t + 1) * hidden]
-                    .iter_mut()
-                    .zip(attn_out.iter())
-                {
-                    *h += a;
-                }
-
-                // ─ Pre-FFN norm ────────────────────────────────────────────────
-                let mut ffn_normed: Vec<f32> = hidden_states[t * hidden..(t + 1) * hidden].to_vec();
-                self.layers[layer_idx].ffn_norm.forward(&mut ffn_normed);
-
-                // ─ MoE FFN ────────────────────────────────────────────────────
-                let ffn_out = {
-                    let layer = &self.layers[layer_idx];
-                    moe_forward(&ffn_normed, &layer.moe_weights, &layer.moe_config).map_err(
-                        |e| ArchError::ForwardPassError {
-                            layer: layer_idx,
-                            message: format!("MoE: {e}"),
-                        },
-                    )?
-                };
-
-                // ─ Residual after FFN ──────────────────────────────────────────
-                for (h, f) in hidden_states[t * hidden..(t + 1) * hidden]
-                    .iter_mut()
-                    .zip(ffn_out.iter())
-                {
-                    *h += f;
-                }
-            }
-        }
-
-        // ── Final norm + LM head (last token only) ──────────────────────────────
         let last = &mut hidden_states[(seq_len - 1) * hidden..seq_len * hidden];
         self.output_norm.forward(last);
 
@@ -323,97 +507,29 @@ impl ForwardPass for GrokModel {
         let mut logits = vec![0.0f32; vocab];
         self.output.forward(&*lm_kernel, last, &mut logits)?;
 
-        self.current_pos += seq_len;
-
+        // `cur = ggml_scale(cur, hparams.f_logit_scale)`.
+        let logit_scale = self.grok_config.logit_scale;
+        if logit_scale != 1.0 {
+            for l in logits.iter_mut() {
+                *l *= logit_scale;
+            }
+        }
+        // Optional final soft-cap (0.0 for grok-1).
+        let cap = self.grok_config.final_logit_softcapping;
+        if cap > 0.0 {
+            for l in logits.iter_mut() {
+                *l = cap * (*l / cap).tanh();
+            }
+        }
         Ok(logits)
     }
 
-    /// Extract the post-output-norm hidden state for embedding.
-    ///
-    /// Runs all transformer layers (token embedding → N×(attn norm → MHA → residual
-    /// → FFN norm → MoE → residual)) and the final `output_norm`, then returns the
-    /// normalised last-token hidden state *without* projecting through the LM head.
-    ///
-    /// The returned vector has length `hidden_size`, not `vocab_size`.
     fn embed(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
         let hidden = self.config.hidden_size;
         let seq_len = tokens.len();
-
-        if seq_len == 0 {
-            return Err(ArchError::InvalidConfig {
-                detail: "embed: empty token sequence".to_string(),
-            });
-        }
-
-        // ── Token embedding lookup ──────────────────────────────────────────────
-        let mut hidden_states = vec![0.0f32; seq_len * hidden];
-        for (t, &tok_id) in tokens.iter().enumerate() {
-            let tok = tok_id as usize;
-            if tok >= self.config.vocab_size {
-                return Err(ArchError::InvalidConfig {
-                    detail: format!(
-                        "token id {tok} out of range (vocab_size={})",
-                        self.config.vocab_size
-                    ),
-                });
-            }
-            let off = tok * hidden;
-            hidden_states[t * hidden..(t + 1) * hidden]
-                .copy_from_slice(&self.token_embd[off..off + hidden]);
-        }
-
-        // ── Transformer layers ──────────────────────────────────────────────────
-        let n_layers = self.layers.len();
-        for layer_idx in 0..n_layers {
-            for t in 0..seq_len {
-                let pos = self.current_pos + t;
-
-                // ─ Pre-attention norm ──────────────────────────────────────────
-                let mut normed: Vec<f32> = hidden_states[t * hidden..(t + 1) * hidden].to_vec();
-                self.layers[layer_idx].attn_norm.forward(&mut normed);
-
-                // ─ MHA ────────────────────────────────────────────────────────
-                let attn_out = self.attention_single_token(layer_idx, &normed, pos, kv_cache)?;
-
-                // ─ Residual ────────────────────────────────────────────────────
-                for (h, a) in hidden_states[t * hidden..(t + 1) * hidden]
-                    .iter_mut()
-                    .zip(attn_out.iter())
-                {
-                    *h += a;
-                }
-
-                // ─ Pre-FFN norm ────────────────────────────────────────────────
-                let mut ffn_normed: Vec<f32> = hidden_states[t * hidden..(t + 1) * hidden].to_vec();
-                self.layers[layer_idx].ffn_norm.forward(&mut ffn_normed);
-
-                // ─ MoE FFN ────────────────────────────────────────────────────
-                let ffn_out = {
-                    let layer = &self.layers[layer_idx];
-                    moe_forward(&ffn_normed, &layer.moe_weights, &layer.moe_config).map_err(
-                        |e| ArchError::ForwardPassError {
-                            layer: layer_idx,
-                            message: format!("MoE: {e}"),
-                        },
-                    )?
-                };
-
-                // ─ Residual after FFN ──────────────────────────────────────────
-                for (h, f) in hidden_states[t * hidden..(t + 1) * hidden]
-                    .iter_mut()
-                    .zip(ffn_out.iter())
-                {
-                    *h += f;
-                }
-            }
-        }
-
-        // ── Final norm on last token (stop before LM head) ──────────────────────
+        let mut hidden_states = self.run_layers(tokens, kv_cache)?;
         let last = &mut hidden_states[(seq_len - 1) * hidden..seq_len * hidden];
         self.output_norm.forward(last);
-
-        self.current_pos += seq_len;
-
         Ok(last.to_vec())
     }
 
@@ -428,71 +544,28 @@ impl ForwardPass for GrokModel {
     fn hidden_size(&self) -> usize {
         self.config.hidden_size
     }
-}
 
-// ─── Builder helpers ──────────────────────────────────────────────────────────
-
-/// Build a `GrokLayer` with zero-weight experts (for testing).
-pub fn make_grok_layer(
-    hidden: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    n_experts: usize,
-    top_k: usize,
-    expert_inter: usize,
-) -> GrokLayer {
-    use oxillama_gguf::GgufTensorType;
-
-    let make_ql = |rows: usize, cols: usize| -> QuantLinear {
-        let data = vec![0u8; rows * cols * 4];
-        let weight = QuantTensor::new(data, vec![rows, cols], GgufTensorType::F32);
-        QuantLinear::new(weight, None)
-    };
-
-    let make_expert = |h: usize, inter: usize| -> DeepSeekExpert {
-        DeepSeekExpert {
-            gate: vec![0.0f32; inter * h],
-            up: vec![0.0f32; inter * h],
-            down: vec![0.0f32; h * inter],
-            hidden_size: h,
-            intermediate_size: inter,
-        }
-    };
-
-    let router = vec![0.0f32; n_experts * hidden];
-    let moe_weights = MoeWeights {
-        router,
-        routed_experts: (0..n_experts)
-            .map(|_| make_expert(hidden, expert_inter))
-            .collect(),
-        shared_experts: vec![],
-        expert_bias: None,
-    };
-    let moe_config = MoeConfig {
-        hidden_size: hidden,
-        expert_intermediate_size: expert_inter,
-        n_shared_experts: 0,
-        n_routed_experts: n_experts,
-        top_k,
-        routed_scaling_factor: 1.0,
-        scoring_mode: ScoringMode::Softmax,
-        shared_expert_intermediate_size: expert_inter,
-    };
-
-    GrokLayer {
-        attn_norm: RmsNorm::new(vec![1.0f32; hidden], 1e-5),
-        attn_q: make_ql(num_heads * head_dim, hidden),
-        attn_k: make_ql(num_kv_heads * head_dim, hidden),
-        attn_v: make_ql(num_kv_heads * head_dim, hidden),
-        attn_output: make_ql(hidden, num_heads * head_dim),
-        ffn_norm: RmsNorm::new(vec![1.0f32; hidden], 1e-5),
-        moe_weights,
-        moe_config,
+    /// Grok keeps no internal per-sequence state: positions come from
+    /// [`KvCacheAccess::seq_len`].  The model used to carry a monotonic
+    /// `current_pos` that was never reset.
+    fn reset_sequence(&mut self) {
+        self.buf_attn_scores.fill(0.0);
+        self.buf_q.fill(0.0);
+        self.buf_k.fill(0.0);
+        self.buf_v.fill(0.0);
+        self.buf_attn_out.fill(0.0);
+        self.buf_proj.fill(0.0);
+        self.buf_norm.fill(0.0);
+        self.buf_moe_out.fill(0.0);
+        self.buf_dense.fill(0.0);
     }
 }
 
 /// Construct a `GrokModel` from raw weights.
+///
+/// # Errors
+///
+/// See [`GrokModel::new`].
 pub fn build_grok_model(
     config: ModelConfig,
     grok_config: GrokConfig,
@@ -500,363 +573,28 @@ pub fn build_grok_model(
     layers: Vec<GrokLayer>,
     output_norm: RmsNorm,
     output: QuantLinear,
-) -> GrokModel {
+) -> ArchResult<GrokModel> {
     GrokModel::new(config, grok_config, token_embd, layers, output_norm, output)
 }
-
-// ─── Local GGUF helper functions (duplicated from llama; do not import from there) ─
-
-/// Dequantize tensor data to f32.
-fn dequant_to_f32(
-    info: &oxillama_gguf::TensorInfo,
-    data: &[u8],
-    dispatcher: &KernelDispatcher,
-) -> ArchResult<Vec<f32>> {
-    let n_elements = info.n_elements() as usize;
-    let tensor_type = info.tensor_type;
-
-    // F32 tensors — direct copy.
-    if tensor_type == oxillama_gguf::GgufTensorType::F32 {
-        let mut out = vec![0.0f32; n_elements];
-        for (i, chunk) in data.chunks_exact(4).enumerate().take(n_elements) {
-            out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-        return Ok(out);
-    }
-
-    // F16 tensors — convert via half crate.
-    if tensor_type == oxillama_gguf::GgufTensorType::F16 {
-        let mut out = vec![0.0f32; n_elements];
-        for (i, chunk) in data.chunks_exact(2).enumerate().take(n_elements) {
-            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            out[i] = half::f16::from_bits(bits).to_f32();
-        }
-        return Ok(out);
-    }
-
-    // Quantized tensors — use kernel dequant.
-    let kernel = dispatcher.get_kernel(tensor_type)?;
-    let block_size = tensor_type.block_size();
-    let block_bytes = tensor_type.block_bytes();
-    let n_blocks = n_elements.div_ceil(block_size);
-
-    let mut out = vec![0.0f32; n_elements];
-    for blk in 0..n_blocks {
-        let data_offset = blk * block_bytes;
-        let out_offset = blk * block_size;
-        let block_data = &data[data_offset..data_offset + block_bytes];
-        let out_slice = &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
-        kernel.dequant_block(block_data, out_slice)?;
-    }
-
-    Ok(out)
-}
-
-/// Load and dequantize a tensor to f32, looking it up by name.
-fn load_dequant_tensor(
-    model: &oxillama_gguf::GgufModel,
-    dispatcher: &KernelDispatcher,
-    name: &str,
-) -> ArchResult<Vec<f32>> {
-    let info = model
-        .file
-        .tensors
-        .get(name)
-        .map_err(|_| ArchError::MissingTensor {
-            name: name.to_string(),
-        })?;
-    let data = model.tensor_data(name)?;
-    dequant_to_f32(info, data, dispatcher)
-}
-
-/// Load a quantized linear layer from GGUF.
-fn load_quant_linear(model: &oxillama_gguf::GgufModel, name: &str) -> ArchResult<QuantLinear> {
-    let info = model
-        .file
-        .tensors
-        .get(name)
-        .map_err(|_| ArchError::MissingTensor {
-            name: name.to_string(),
-        })?;
-    let data = model.tensor_data(name)?;
-
-    let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
-    let tensor = QuantTensor::new(data.to_vec(), shape, info.tensor_type);
-
-    Ok(QuantLinear::new(tensor, None))
-}
-
-/// Load an RMSNorm weight vector from GGUF (always dequantized to F32).
-fn load_rms_norm_weight(model: &oxillama_gguf::GgufModel, name: &str) -> ArchResult<Vec<f32>> {
-    let dispatcher = KernelDispatcher::new();
-    let info = model
-        .file
-        .tensors
-        .get(name)
-        .map_err(|_| ArchError::MissingTensor {
-            name: name.to_string(),
-        })?;
-    let data = model.tensor_data(name)?;
-    dequant_to_f32(info, data, &dispatcher)
-}
-
-/// Load the stacked MoE expert tensors for one Grok-1 layer and return `MoeWeights`.
-///
-/// Grok-1 GGUF layout per layer:
-/// - `{prefix}.ffn_gate_inp.weight`  (fallback: `{prefix}.output_router.weight`)
-///   Router matrix `[n_experts, hidden_size]`
-/// - `{prefix}.ffn_gate_exps.weight` Stacked gate `[n_experts, ffn_hidden, hidden]`
-/// - `{prefix}.ffn_up_exps.weight`   Stacked up   `[n_experts, ffn_hidden, hidden]`
-/// - `{prefix}.ffn_down_exps.weight` Stacked down `[n_experts, hidden, ffn_hidden]`
-fn load_grok_moe(
-    model: &oxillama_gguf::GgufModel,
-    dispatcher: &KernelDispatcher,
-    prefix: &str,
-    n_experts: usize,
-    hidden: usize,
-    intermediate: usize,
-) -> ArchResult<MoeWeights> {
-    // --- Router: try primary name, fall back to alternate Grok variant ---
-    let primary_router = format!("{prefix}.ffn_gate_inp.weight");
-    let fallback_router = format!("{prefix}.output_router.weight");
-
-    let router_name = if model.file.tensors.get(&primary_router).is_ok() {
-        primary_router
-    } else {
-        fallback_router
-    };
-
-    let router = load_dequant_tensor(model, dispatcher, &router_name)?;
-
-    // Validate: router must hold n_experts * hidden floats.
-    let expected_router = n_experts * hidden;
-    if router.len() != expected_router {
-        return Err(ArchError::TensorShapeMismatch {
-            tensor: router_name,
-            expected: vec![n_experts, hidden],
-            got: vec![router.len()],
-        });
-    }
-
-    // --- Stacked expert tensors ---
-    let gate_stacked =
-        load_dequant_tensor(model, dispatcher, &format!("{prefix}.ffn_gate_exps.weight"))?;
-    let up_stacked =
-        load_dequant_tensor(model, dispatcher, &format!("{prefix}.ffn_up_exps.weight"))?;
-    let down_stacked =
-        load_dequant_tensor(model, dispatcher, &format!("{prefix}.ffn_down_exps.weight"))?;
-
-    let gate_up_stride = intermediate * hidden;
-    let down_stride = hidden * intermediate;
-
-    if gate_stacked.len() != n_experts * gate_up_stride {
-        return Err(ArchError::TensorShapeMismatch {
-            tensor: format!("{prefix}.ffn_gate_exps.weight"),
-            expected: vec![n_experts, intermediate, hidden],
-            got: vec![gate_stacked.len()],
-        });
-    }
-    if up_stacked.len() != n_experts * gate_up_stride {
-        return Err(ArchError::TensorShapeMismatch {
-            tensor: format!("{prefix}.ffn_up_exps.weight"),
-            expected: vec![n_experts, intermediate, hidden],
-            got: vec![up_stacked.len()],
-        });
-    }
-    if down_stacked.len() != n_experts * down_stride {
-        return Err(ArchError::TensorShapeMismatch {
-            tensor: format!("{prefix}.ffn_down_exps.weight"),
-            expected: vec![n_experts, hidden, intermediate],
-            got: vec![down_stacked.len()],
-        });
-    }
-
-    // Split stacked tensors into per-expert weight vectors.
-    let routed_experts: Vec<DeepSeekExpert> = (0..n_experts)
-        .map(|e| {
-            let gate_start = e * gate_up_stride;
-            let up_start = e * gate_up_stride;
-            let down_start = e * down_stride;
-            DeepSeekExpert {
-                gate: gate_stacked[gate_start..gate_start + gate_up_stride].to_vec(),
-                up: up_stacked[up_start..up_start + gate_up_stride].to_vec(),
-                down: down_stacked[down_start..down_start + down_stride].to_vec(),
-                hidden_size: hidden,
-                intermediate_size: intermediate,
-            }
-        })
-        .collect();
-
-    Ok(MoeWeights {
-        router,
-        routed_experts,
-        shared_experts: vec![],
-        expert_bias: None,
-    })
-}
-
-/// Load a Grok-1 model from a parsed GGUF file.
-///
-/// Parses `grok.*` metadata to build `GrokConfig` and `ModelConfig`, then loads
-/// all tensors layer-by-layer.  Expert tensors are stored in GGUF as stacked
-/// slabs (`ffn_gate_exps.weight`, `ffn_up_exps.weight`, `ffn_down_exps.weight`);
-/// this function splits them into per-expert `DeepSeekExpert` structs and wraps
-/// them in the standard `MoeWeights` / `MoeConfig` used by `moe_forward`.
-pub fn load_grok_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<GrokModel> {
-    let metadata = &model.file.metadata;
-
-    // --- Parse architecture configs ---
-    let grok_config = crate::grok::config::GrokConfig::from_metadata(metadata);
-
-    let hidden = grok_config.hidden_size;
-    let n_layers = grok_config.num_layers;
-    let n_heads = grok_config.num_heads;
-    let n_kv_heads = grok_config.num_kv_heads;
-    let head_dim = grok_config.head_dim;
-    let vocab = grok_config.vocab_size;
-    let max_ctx = grok_config.max_seq_len;
-    let n_experts = grok_config.expert_count;
-    let top_k = grok_config.expert_used_count.max(1);
-    let intermediate = grok_config.ffn_hidden_size;
-    let rope_theta = grok_config.rope_theta;
-    let norm_eps = grok_config.rms_norm_eps;
-
-    // Build a ModelConfig from the parsed grok config values.
-    let model_config = crate::config::ModelConfig {
-        architecture: "grok".to_string(),
-        model_name: metadata
-            .get_string("general.name")
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| "grok".to_string()),
-        hidden_size: hidden,
-        intermediate_size: intermediate,
-        num_layers: n_layers,
-        num_attention_heads: n_heads,
-        num_kv_heads: n_kv_heads,
-        head_dim,
-        vocab_size: vocab,
-        max_context_length: max_ctx,
-        rms_norm_eps: norm_eps,
-        rope_freq_base: rope_theta,
-        num_experts: n_experts,
-        num_experts_used: top_k,
-        ..crate::config::ModelConfig::default()
-    };
-
-    let dispatcher = KernelDispatcher::new();
-
-    // --- Token embedding ---
-    let token_embd = load_dequant_tensor(model, &dispatcher, "token_embd.weight")?;
-    if token_embd.len() != vocab * hidden {
-        return Err(ArchError::TensorShapeMismatch {
-            tensor: "token_embd.weight".to_string(),
-            expected: vec![vocab, hidden],
-            got: vec![token_embd.len()],
-        });
-    }
-
-    // --- Transformer layers ---
-    let mut layers: Vec<GrokLayer> = Vec::with_capacity(n_layers);
-    for i in 0..n_layers {
-        let prefix = format!("blk.{i}");
-
-        // Pre-attention RMSNorm.
-        let attn_norm_w = load_rms_norm_weight(model, &format!("{prefix}.attn_norm.weight"))?;
-        let attn_norm = RmsNorm::new(attn_norm_w, norm_eps);
-
-        // Attention projections (quantized, kept as-is).
-        let attn_q = load_quant_linear(model, &format!("{prefix}.attn_q.weight"))?;
-        let attn_k = load_quant_linear(model, &format!("{prefix}.attn_k.weight"))?;
-        let attn_v = load_quant_linear(model, &format!("{prefix}.attn_v.weight"))?;
-        let attn_output = load_quant_linear(model, &format!("{prefix}.attn_output.weight"))?;
-
-        // Pre-FFN RMSNorm.
-        let ffn_norm_w = load_rms_norm_weight(model, &format!("{prefix}.ffn_norm.weight"))?;
-        let ffn_norm = RmsNorm::new(ffn_norm_w, norm_eps);
-
-        // MoE FFN.
-        let moe_weights =
-            load_grok_moe(model, &dispatcher, &prefix, n_experts, hidden, intermediate)?;
-        let moe_config = MoeConfig {
-            hidden_size: hidden,
-            expert_intermediate_size: intermediate,
-            n_shared_experts: 0,
-            n_routed_experts: n_experts,
-            top_k,
-            routed_scaling_factor: 1.0,
-            scoring_mode: ScoringMode::Softmax,
-            shared_expert_intermediate_size: intermediate,
-        };
-
-        layers.push(GrokLayer {
-            attn_norm,
-            attn_q,
-            attn_k,
-            attn_v,
-            attn_output,
-            ffn_norm,
-            moe_weights,
-            moe_config,
-        });
-    }
-
-    // --- Output norm and LM head ---
-    let output_norm_w = load_rms_norm_weight(model, "output_norm.weight")?;
-    let output_norm = RmsNorm::new(output_norm_w, norm_eps);
-    let output = load_quant_linear(model, "output.weight")?;
-
-    Ok(GrokModel::new(
-        model_config,
-        grok_config,
-        token_embd,
-        layers,
-        output_norm,
-        output,
-    ))
-}
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::KvCacheAccess;
-    use oxillama_gguf::GgufTensorType;
+    use crate::grok::testkit::{TestKvCache, TinyWeights};
 
-    struct NullKv;
-    impl KvCacheAccess for NullKv {
-        fn seq_len(&self) -> usize {
-            0
-        }
-        fn store_kv(&mut self, _: usize, _: &[f32], _: &[f32]) -> ArchResult<()> {
-            Ok(())
-        }
-        fn get_keys(&self, _: usize) -> ArchResult<&[f32]> {
-            Ok(&[])
-        }
-        fn get_values(&self, _: usize) -> ArchResult<&[f32]> {
-            Ok(&[])
-        }
-        fn advance(&mut self) {}
-    }
+    const H: usize = 16;
+    const VOCAB: usize = 32;
+    const N_HEADS: usize = 2;
+    const HEAD_DIM: usize = 8;
+    const N_LAYERS: usize = 2;
+    const N_EXPERTS: usize = 4;
+    const TOP_K: usize = 2;
+    const INTER: usize = 8;
 
-    fn make_f32_ql(rows: usize, cols: usize) -> QuantLinear {
-        let data = vec![0u8; rows * cols * 4];
-        let weight = QuantTensor::new(data, vec![rows, cols], GgufTensorType::F32);
-        QuantLinear::new(weight, None)
-    }
-
-    fn build_tiny_model() -> GrokModel {
-        const H: usize = 16;
-        const VOCAB: usize = 32;
-        const N_HEADS: usize = 2;
-        const HEAD_DIM: usize = 8;
-        const N_LAYERS: usize = 1;
-        const N_EXPERTS: usize = 8;
-        const TOP_K: usize = 2;
-        const EXPERT_INTER: usize = 8;
-
-        let grok_cfg = GrokConfig {
+    fn tiny_model() -> GrokModel {
+        let mut w = TinyWeights::new(11);
+        let grok_config = GrokConfig::from_metadata(&oxillama_gguf::MetadataStore::new());
+        let grok_config = GrokConfig {
             hidden_size: H,
             num_layers: N_LAYERS,
             num_heads: N_HEADS,
@@ -866,248 +604,168 @@ mod tests {
             max_seq_len: 64,
             expert_count: N_EXPERTS,
             expert_used_count: TOP_K,
-            ffn_hidden_size: EXPERT_INTER,
-            rope_theta: 1_000_000.0,
-            rms_norm_eps: 1e-5,
+            ffn_hidden_size: INTER,
+            ..grok_config
         };
-
-        let model_cfg = ModelConfig {
+        let config = ModelConfig {
             architecture: "grok".to_string(),
             model_name: "test-grok".to_string(),
             hidden_size: H,
-            intermediate_size: EXPERT_INTER,
+            intermediate_size: INTER,
             num_layers: N_LAYERS,
             num_attention_heads: N_HEADS,
             num_kv_heads: N_HEADS,
             head_dim: HEAD_DIM,
             vocab_size: VOCAB,
             max_context_length: 64,
-            rms_norm_eps: 1e-5,
             rope_freq_base: 1_000_000.0,
             ..ModelConfig::default()
         };
-
+        let kv_dim = N_HEADS * HEAD_DIM;
         let layers = (0..N_LAYERS)
             .map(|_| {
-                make_grok_layer(
-                    H,
-                    N_HEADS,
-                    N_HEADS,
-                    HEAD_DIM,
-                    N_EXPERTS,
-                    TOP_K,
-                    EXPERT_INTER,
-                )
+                let attn_q = w.linear(N_HEADS * HEAD_DIM, H);
+                let attn_k = w.linear(kv_dim, H);
+                let attn_v = w.linear(kv_dim, H);
+                let attn_output = w.linear(H, N_HEADS * HEAD_DIM);
+                GrokLayer {
+                    attn_norm: RmsNorm::new(vec![1.0; H], 1e-5),
+                    attn_q_kernel: w.kernel(&attn_q),
+                    attn_k_kernel: w.kernel(&attn_k),
+                    attn_v_kernel: w.kernel(&attn_v),
+                    attn_output_kernel: w.kernel(&attn_output),
+                    attn_q,
+                    attn_k,
+                    attn_v,
+                    attn_output,
+                    attn_out_norm: RmsNorm::new(vec![1.0; H], 1e-5),
+                    ffn_norm: RmsNorm::new(vec![1.0; H], 1e-5),
+                    ffn_post_norm: RmsNorm::new(vec![1.0; H], 1e-5),
+                    moe: w.grok_moe(H, INTER, N_EXPERTS, TOP_K),
+                    dense_ffn: None,
+                }
             })
             .collect();
+        GrokModel::new(
+            config,
+            grok_config,
+            w.embedding(VOCAB, H),
+            layers,
+            RmsNorm::new(vec![1.0; H], 1e-5),
+            w.linear(VOCAB, H),
+        )
+        .expect("tiny Grok model builds")
+    }
 
-        let token_embd = vec![0.0f32; VOCAB * H];
-        let output_norm = RmsNorm::new(vec![1.0f32; H], 1e-5);
-        let output = make_f32_ql(VOCAB, H);
-
-        build_grok_model(model_cfg, grok_cfg, token_embd, layers, output_norm, output)
+    fn cache(model: &GrokModel) -> TestKvCache {
+        TestKvCache::new(
+            model.layers.len(),
+            model.config.num_kv_heads * model.config.head_dim,
+            model.config.max_context_length,
+        )
     }
 
     #[test]
-    fn forward_shape_correct() {
-        let mut model = build_tiny_model();
-        let mut kv = NullKv;
-        let logits = model
-            .forward(&[1u32], &mut kv)
-            .expect("forward must succeed");
-        assert_eq!(logits.len(), 32, "logits must have vocab_size=32 elements");
-    }
-
-    #[test]
-    fn forward_all_finite() {
-        let mut model = build_tiny_model();
-        let mut kv = NullKv;
-        let logits = model
-            .forward(&[0u32], &mut kv)
-            .expect("forward must succeed");
-        assert!(
-            logits.iter().all(|v| v.is_finite()),
-            "all logits must be finite"
-        );
-    }
-
-    #[test]
-    fn empty_tokens_returns_error() {
-        let mut model = build_tiny_model();
-        let mut kv = NullKv;
-        let result = model.forward(&[], &mut kv);
-        assert!(result.is_err(), "empty token sequence must return an error");
+    fn forward_shape_and_finiteness() {
+        let mut model = tiny_model();
+        let mut kv = cache(&model);
+        let logits = model.forward(&[1u32, 2], &mut kv).expect("forward");
+        assert_eq!(logits.len(), VOCAB);
+        assert!(logits.iter().all(|v| v.is_finite()));
     }
 
     #[test]
     fn embed_returns_hidden_size() {
-        let mut model = build_tiny_model();
-        let mut kv = NullKv;
-        let embedding = model.embed(&[1u32], &mut kv).expect("embed must succeed");
-        assert_eq!(
-            embedding.len(),
-            16,
-            "embed output must have hidden_size=16 elements, got {}",
-            embedding.len()
+        let mut model = tiny_model();
+        let mut kv = cache(&model);
+        assert_eq!(model.embed(&[1u32], &mut kv).expect("embed").len(), H);
+    }
+
+    /// `advance()` is per-token, not per-layer.
+    #[test]
+    fn advance_is_called_once_per_token() {
+        let mut model = tiny_model();
+        let mut kv = cache(&model);
+        model.forward(&[1u32, 2, 3], &mut kv).expect("forward");
+        assert_eq!(kv.seq_len(), 3, "3 tokens must advance the cache 3 times");
+        for l in 0..model.layers.len() {
+            assert_eq!(kv.writes(l), 3, "layer {l} writes one row per token");
+            for pos in 3..6 {
+                assert!(
+                    kv.key_row(l, pos).iter().all(|v| *v == 0.0),
+                    "layer {l} wrote past position 2 (row {pos})"
+                );
+            }
+        }
+    }
+
+    /// The embedding multiplier is real: doubling it must change the logits.
+    #[test]
+    fn embedding_scale_reaches_the_output() {
+        let mut a = tiny_model();
+        let mut b = tiny_model();
+        b.grok_config.embedding_scale *= 2.0;
+        let mut kv_a = cache(&a);
+        let mut kv_b = cache(&b);
+        let la = a.forward(&[1u32], &mut kv_a).expect("a");
+        let lb = b.forward(&[1u32], &mut kv_b).expect("b");
+        assert!(
+            la.iter().zip(lb.iter()).any(|(x, y)| (x - y).abs() > 1e-4),
+            "doubling embedding_scale must change the logits"
         );
     }
 
+    /// The logit multiplier scales the output linearly.
     #[test]
-    fn embed_all_finite() {
-        let mut model = build_tiny_model();
-        let mut kv = NullKv;
-        let embedding = model.embed(&[0u32], &mut kv).expect("embed must succeed");
-        assert!(
-            embedding.iter().all(|v| v.is_finite()),
-            "all embedding values must be finite"
-        );
+    fn logit_scale_multiplies_the_logits() {
+        let mut a = tiny_model();
+        let mut b = tiny_model();
+        b.grok_config.logit_scale = a.grok_config.logit_scale * 2.0;
+        let mut kv_a = cache(&a);
+        let mut kv_b = cache(&b);
+        let la = a.forward(&[1u32], &mut kv_a).expect("a");
+        let lb = b.forward(&[1u32], &mut kv_b).expect("b");
+        for (i, (x, y)) in la.iter().zip(lb.iter()).enumerate() {
+            assert!(
+                (2.0 * x - y).abs() < 1e-3,
+                "logit {i}: doubling logit_scale must double the logit ({x} → {y})"
+            );
+        }
+    }
+
+    /// The tanh soft-cap bounds every pre-softmax score by `cap`.
+    #[test]
+    fn attention_score_is_soft_capped() {
+        let model = tiny_model();
+        let cap = model.grok_config.attn_logit_softcapping;
+        let scale = model.grok_config.attn_output_scale;
+        assert!(cap > 0.0);
+        for raw in [-1e6f32, -1000.0, 0.0, 1000.0, 1e6] {
+            let s = softcap_score(raw, scale, cap);
+            assert!(
+                s.abs() <= cap + 1e-3,
+                "score {s} for raw {raw} exceeds the {cap} soft-cap"
+            );
+        }
+        // Small scores pass through as `raw * attn_output_scale`.
+        assert!((softcap_score(1.0, scale, cap) - scale).abs() < 1e-4);
+        // With the cap disabled the bare multiplier survives.
+        assert!((softcap_score(4.0, scale, 0.0) - 4.0 * scale).abs() < 1e-6);
     }
 
     #[test]
-    fn embed_empty_tokens_returns_error() {
-        let mut model = build_tiny_model();
-        let mut kv = NullKv;
-        let result = model.embed(&[], &mut kv);
-        assert!(
-            result.is_err(),
-            "embed with empty token sequence must return an error"
-        );
+    fn context_overflow_is_reported() {
+        let mut model = tiny_model();
+        let max = model.config.max_context_length;
+        let mut kv = cache(&model);
+        let tokens: Vec<u32> = (0..=max as u32).map(|t| t % 4).collect();
+        assert!(model.forward(&tokens, &mut kv).is_err());
     }
 
     #[test]
-    fn rope_theta_is_1e6() {
-        let mut store = oxillama_gguf::MetadataStore::new();
-        // No key → should default to 1e6
-        let cfg = crate::grok::config::GrokConfig::from_metadata(&store);
-        assert!(
-            (cfg.rope_theta - 1_000_000.0).abs() < 1.0,
-            "Grok-1 default rope_theta must be 1e6"
-        );
-
-        // Explicit override should be respected.
-        store.insert(
-            "grok.rope.freq_base".to_string(),
-            oxillama_gguf::MetadataValue::Float32(500_000.0),
-        );
-        let cfg2 = crate::grok::config::GrokConfig::from_metadata(&store);
-        assert!(
-            (cfg2.rope_theta - 500_000.0).abs() < 1.0,
-            "explicit rope_theta override must be respected"
-        );
-    }
-
-    // ─── GGUF loader tests ─────────────────────────────────────────────────────
-
-    /// Load a model from the minimal Grok GGUF fixture and verify the call succeeds.
-    #[test]
-    fn grok_loader_round_trip() {
-        let bytes = oxillama_gguf::test_utils::build_minimal_grok_gguf();
-        let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("GGUF parse must succeed");
-        let model = load_grok_from_gguf(&gguf).expect("load_grok_from_gguf must succeed");
-
-        // Config sanity: hidden=32, vocab=32, 2 layers, 2 experts.
-        assert_eq!(model.config.hidden_size, 32, "hidden_size must be 32");
-        assert_eq!(model.config.vocab_size, 32, "vocab_size must be 32");
-        assert_eq!(model.layers.len(), 2, "must have 2 layers");
-        assert_eq!(model.config.num_experts, 2, "must have 2 MoE experts");
-    }
-
-    /// Build a model directly with `num_kv_heads=1` (MQA) and verify forward pass.
-    #[test]
-    fn grok_loader_handles_mqa() {
-        const H: usize = 16;
-        const VOCAB: usize = 32;
-        const N_HEADS: usize = 4;
-        const N_KV_HEADS: usize = 1; // MQA
-        const HEAD_DIM: usize = 4;
-        const N_LAYERS: usize = 1;
-        const N_EXPERTS: usize = 2;
-        const TOP_K: usize = 2;
-        const EXPERT_INTER: usize = 8;
-
-        let grok_cfg = GrokConfig {
-            hidden_size: H,
-            num_layers: N_LAYERS,
-            num_heads: N_HEADS,
-            num_kv_heads: N_KV_HEADS,
-            head_dim: HEAD_DIM,
-            vocab_size: VOCAB,
-            max_seq_len: 64,
-            expert_count: N_EXPERTS,
-            expert_used_count: TOP_K,
-            ffn_hidden_size: EXPERT_INTER,
-            rope_theta: 1_000_000.0,
-            rms_norm_eps: 1e-5,
-        };
-
-        let model_cfg = crate::config::ModelConfig {
-            architecture: "grok".to_string(),
-            model_name: "mqa-test".to_string(),
-            hidden_size: H,
-            intermediate_size: EXPERT_INTER,
-            num_layers: N_LAYERS,
-            num_attention_heads: N_HEADS,
-            num_kv_heads: N_KV_HEADS,
-            head_dim: HEAD_DIM,
-            vocab_size: VOCAB,
-            max_context_length: 64,
-            rms_norm_eps: 1e-5,
-            rope_freq_base: 1_000_000.0,
-            num_experts: N_EXPERTS,
-            num_experts_used: TOP_K,
-            ..crate::config::ModelConfig::default()
-        };
-
-        let layers = (0..N_LAYERS)
-            .map(|_| {
-                make_grok_layer(
-                    H,
-                    N_HEADS,
-                    N_KV_HEADS,
-                    HEAD_DIM,
-                    N_EXPERTS,
-                    TOP_K,
-                    EXPERT_INTER,
-                )
-            })
-            .collect();
-        let token_embd = vec![0.0f32; VOCAB * H];
-        let output_norm = RmsNorm::new(vec![1.0f32; H], 1e-5);
-        let output = make_f32_ql(VOCAB, H);
-
-        let mut model =
-            build_grok_model(model_cfg, grok_cfg, token_embd, layers, output_norm, output);
-        let mut kv = NullKv;
-
-        let logits = model
-            .forward(&[0u32], &mut kv)
-            .expect("MQA forward must succeed");
-        assert_eq!(logits.len(), VOCAB, "logits must have vocab_size elements");
-        assert!(
-            logits.iter().all(|v| v.is_finite()),
-            "all MQA logits must be finite"
-        );
-    }
-
-    /// Load from GGUF, run forward with token [0], assert all logits are finite.
-    #[test]
-    fn grok_loader_forward_no_nan() {
-        let bytes = oxillama_gguf::test_utils::build_minimal_grok_gguf();
-        let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("GGUF parse must succeed");
-        let mut model = load_grok_from_gguf(&gguf).expect("load_grok_from_gguf must succeed");
-        let mut kv = NullKv;
-
-        let logits = model
-            .forward(&[0u32], &mut kv)
-            .expect("forward must succeed");
-        assert_eq!(
-            logits.len(),
-            model.config.vocab_size,
-            "logit count must equal vocab_size"
-        );
-        assert!(
-            logits.iter().all(|v| v.is_finite()),
-            "all logits must be finite (no NaN / Inf)"
-        );
+    fn out_of_vocab_token_is_reported() {
+        let mut model = tiny_model();
+        let mut kv = cache(&model);
+        assert!(model.forward(&[999u32], &mut kv).is_err());
     }
 }

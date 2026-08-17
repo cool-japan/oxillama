@@ -13,6 +13,7 @@
 //!   (at least 1 token is always preserved).
 
 use super::chain::SamplerStage;
+use super::rng::Xorshift64;
 
 // ── Shared utilities ─────────────────────────────────────────────────────────
 
@@ -56,22 +57,47 @@ fn entropy(probs: &[f32]) -> f32 {
 /// n-gram suffixes, making the model strongly avoid verbatim repetition
 /// while leaving novel continuations unaffected.
 ///
-/// # Algorithm
+/// # Algorithm (defect S3: was O(vocab × history × match-length))
 ///
-/// For each candidate token `t`, DRY scans backwards through
-/// `context.token_history` for occurrences of `t` that were preceded by the
-/// same suffix of recent tokens as the current generation context. Formally:
+/// The naive approach iterates every VOCABULARY token and, for each one,
+/// scans the full history for occurrences — for a 152k-token vocabulary
+/// against a 1k-token history that is ~150M operations per generated token.
+/// But the vast majority of vocabulary entries never occur in the history at
+/// all, so that outer loop does no useful work for them.
 ///
-/// 1. Build the current "generation suffix" of length `n`:
-///    `suffix = recent_tokens[max(0, len-n)..]`.
-/// 2. For each position `i` in history where `history[i] == t`:
-///    - Walk backward from `i-1` and from `suffix[end]` counting how many
-///      tokens match.
-///    - Call this `match_len`.
-///    - If `match_len >= allowed_length`, apply a penalty
-///      `multiplier * base^(match_len - allowed_length)` to `logit[t]`.
+/// This implementation instead iterates the (short) **history** directly:
+/// for each history position `pos`, the only token that could possibly need
+/// a penalty *because of* that position is `recent_tokens[pos]` itself, so
+/// we compute its backward-match length once and keep a running best-per-token
+/// map (`HashMap<token_id, usize>`, bounded by `min(history_len, vocab_len)`
+/// entries) instead of visiting the entire vocabulary. This is an exact
+/// re-derivation of the same aggregation the old code computed — not an
+/// approximation — verified against the pre-existing behavioural tests.
+///
+/// Complexity: O(history) candidate positions, each with an O(history)
+/// worst-case (but typically much shorter, since the inner backward walk
+/// breaks at the first mismatch) backward-match walk — i.e. O(H) usually,
+/// O(H²) worst case for pathologically repetitive history, and **entirely
+/// independent of vocabulary size**. A true O(H) Z-algorithm (as used by
+/// llama.cpp) is possible as a further optimization; this version was
+/// chosen to eliminate the reported bottleneck (the vocab-size factor) with
+/// minimal risk of introducing a subtle correctness regression in the
+/// backward-match arithmetic.
+///
+/// # Original algorithm description (still accurate, restated per-position)
+///
+/// 1. Build the current "generation suffix" implicitly: `recent_tokens` IS
+///    the context, and its own tail is the suffix we compare against.
+/// 2. For each position `pos` in history:
+///    - Walk backward from `pos-1` and from the context tail, counting how
+///      many tokens match. Call this `match_len` (starts at 1 for `pos`
+///      itself).
+///    - Track the longest `match_len` seen per distinct token value.
 /// 3. Tokens whose ID is in `sequence_breakers` are never penalised
-///    regardless of repetition.
+///    regardless of repetition, and a breaker encountered mid-walk stops
+///    that particular backward match (matches the pre-existing semantics).
+/// 4. For every token with `best_match_len >= allowed_length`, apply
+///    `multiplier * base^(match_len - allowed_length)` to its logit.
 ///
 /// When `multiplier == 0.0` or the history is empty the stage is a no-op.
 pub struct DryStage {
@@ -104,7 +130,7 @@ impl DryStage {
 }
 
 impl SamplerStage for DryStage {
-    fn apply(&self, logits: &mut Vec<f32>, recent_tokens: &[u32]) {
+    fn apply(&self, logits: &mut Vec<f32>, recent_tokens: &[u32], _rng: &mut Xorshift64) {
         // Fast-path: disabled or nothing to penalise.
         if self.multiplier == 0.0 || logits.is_empty() || recent_tokens.is_empty() {
             return;
@@ -115,63 +141,48 @@ impl SamplerStage for DryStage {
 
         let hist_len = recent_tokens.len();
 
-        // For every candidate token t, find the longest n-gram match in history.
-        // We iterate over vocab tokens that have a finite logit (no point penalising
-        // already-banned tokens).
-        for (t_idx, logit) in logits.iter_mut().enumerate() {
-            if !logit.is_finite() {
-                continue;
-            }
-            let t = t_idx as u32;
+        // O(history) instead of O(vocab * history * match) — see doc comment.
+        let mut best_match: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
 
-            // Sequence breakers are never penalised.
+        for pos in 0..hist_len {
+            let t = recent_tokens[pos];
             if breaker_set.contains(&t) {
                 continue;
             }
 
-            // Walk through history looking for positions where t appears.
-            // At each such position `pos`, measure how long the backward match is.
-            let mut best_match = 0usize;
+            let mut match_len = 1usize; // t itself counts as length 1
+            let max_back = pos.min(hist_len - 1);
+            for k in 1..=max_back {
+                let hist_token = recent_tokens[pos - k];
+                let ctx_token = recent_tokens[hist_len - k];
 
-            for pos in 0..hist_len {
-                if recent_tokens[pos] != t {
-                    continue;
+                // A sequence breaker along the compared path stops the match.
+                if breaker_set.contains(&hist_token) || breaker_set.contains(&ctx_token) {
+                    break;
                 }
-
-                // Found t at history[pos]. Now measure backward match length:
-                // history[pos-1..] vs recent_tokens[hist_len-1..] (context suffix).
-                let mut match_len = 1usize; // t itself counts as length 1
-
-                // Walk backward: history[pos-k] must equal recent_tokens[hist_len-k]
-                // for k = 1, 2, …
-                let max_back = pos.min(hist_len - 1); // can't go past start of history
-                                                      // or past start of available context (excluding the "next token" position)
-                for k in 1..=max_back {
-                    let hist_token = recent_tokens[pos - k];
-                    let ctx_token = recent_tokens[hist_len - k];
-
-                    // A sequence breaker in history stops the match.
-                    if breaker_set.contains(&hist_token) || breaker_set.contains(&ctx_token) {
-                        break;
-                    }
-
-                    if hist_token == ctx_token {
-                        match_len += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                if match_len > best_match {
-                    best_match = match_len;
+                if hist_token == ctx_token {
+                    match_len += 1;
+                } else {
+                    break;
                 }
             }
 
-            // Apply penalty if match is long enough.
-            if best_match >= self.allowed_length {
-                let excess = (best_match - self.allowed_length) as f32;
-                let penalty = self.multiplier * self.base.powf(excess);
-                *logit -= penalty;
+            let entry = best_match.entry(t).or_insert(0);
+            if match_len > *entry {
+                *entry = match_len;
+            }
+        }
+
+        for (t, match_len) in best_match {
+            if match_len < self.allowed_length {
+                continue;
+            }
+            if let Some(logit) = logits.get_mut(t as usize) {
+                if logit.is_finite() {
+                    let excess = (match_len - self.allowed_length) as f32;
+                    *logit -= self.multiplier * self.base.powf(excess);
+                }
             }
         }
     }
@@ -202,28 +213,34 @@ impl SamplerStage for DryStage {
 ///
 /// When `threshold >= 1.0` (always keep everything) or `probability == 0.0`
 /// (never trigger), the stage is a no-op.
+///
+/// # Randomness (defect S3)
+///
+/// The coin flip used to previously be derived from a *fixed* `seed` field
+/// via a one-shot xorshift draw (`xorshift64_f32(self.seed)`), so a given
+/// `XtcStage` instance either **always** fired or **never** fired — every
+/// call with the same seed produces the same single draw. `apply` now takes
+/// the pipeline's shared, continuously-advancing RNG instead, so the coin
+/// flip is genuinely per-token stochastic.
 pub struct XtcStage {
     /// Cumulative-probability threshold that defines the "top set". Range (0, 1).
     pub threshold: f32,
     /// Probability of applying the exclusion. Range [0, 1].
     pub probability: f32,
-    /// RNG seed for the trigger coin flip.
-    pub seed: u64,
 }
 
 impl XtcStage {
     /// Construct an `XtcStage`.
-    pub fn new(threshold: f32, probability: f32, seed: u64) -> Self {
+    pub fn new(threshold: f32, probability: f32) -> Self {
         Self {
             threshold,
             probability,
-            seed,
         }
     }
 }
 
 impl SamplerStage for XtcStage {
-    fn apply(&self, logits: &mut Vec<f32>, _recent_tokens: &[u32]) {
+    fn apply(&self, logits: &mut Vec<f32>, _recent_tokens: &[u32], rng: &mut Xorshift64) {
         // Fast-path passthrough conditions.
         if self.threshold >= 1.0 || self.probability == 0.0 || logits.is_empty() {
             return;
@@ -255,9 +272,9 @@ impl SamplerStage for XtcStage {
             return;
         }
 
-        // Coin flip: apply exclusion with probability `self.probability`.
-        // Use a simple xorshift64 seeded with self.seed.
-        let rand_val = xorshift64_f32(self.seed);
+        // Coin flip: apply exclusion with probability `self.probability`,
+        // drawing from the pipeline's shared RNG (see doc comment above).
+        let rand_val = rng.next_f32();
         if rand_val >= self.probability {
             return;
         }
@@ -311,7 +328,7 @@ impl TypicalPStage {
 }
 
 impl SamplerStage for TypicalPStage {
-    fn apply(&self, logits: &mut Vec<f32>, _recent_tokens: &[u32]) {
+    fn apply(&self, logits: &mut Vec<f32>, _recent_tokens: &[u32], _rng: &mut Xorshift64) {
         if self.p >= 1.0 || logits.is_empty() {
             return;
         }
@@ -403,7 +420,7 @@ impl TopAStage {
 }
 
 impl SamplerStage for TopAStage {
-    fn apply(&self, logits: &mut Vec<f32>, _recent_tokens: &[u32]) {
+    fn apply(&self, logits: &mut Vec<f32>, _recent_tokens: &[u32], _rng: &mut Xorshift64) {
         if self.a == 0.0 || logits.is_empty() {
             return;
         }
@@ -468,7 +485,7 @@ impl EtaStage {
 }
 
 impl SamplerStage for EtaStage {
-    fn apply(&self, logits: &mut Vec<f32>, _recent_tokens: &[u32]) {
+    fn apply(&self, logits: &mut Vec<f32>, _recent_tokens: &[u32], _rng: &mut Xorshift64) {
         if self.eta == 0.0 && self.epsilon == 0.0 || logits.is_empty() {
             return;
         }
@@ -516,30 +533,15 @@ fn ensure_at_least_one_finite(logits: &mut [f32]) {
     }
 }
 
-// ── Minimal PRNG ─────────────────────────────────────────────────────────────
-
-/// One-shot xorshift64 producing a uniform f32 in [0, 1) from a seed.
-///
-/// Used by `XtcStage` for the coin flip. Not cryptographically secure, but
-/// sufficient for sampling decisions.
-fn xorshift64_f32(seed: u64) -> f32 {
-    let seed = if seed == 0 {
-        0x517c_c1b7_2722_0a95
-    } else {
-        seed
-    };
-    let mut x = seed;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    (x >> 40) as f32 / (1u64 << 24) as f32
-}
-
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rng() -> Xorshift64 {
+        Xorshift64::new(42)
+    }
 
     // ── Passthrough (disabled) tests ──────────────────────────────────────────
 
@@ -549,22 +551,22 @@ mod tests {
         let stage = DryStage::new(0.0, 1.75, 2, vec![]);
         let original = vec![1.0f32, 2.0, 3.0, 0.5];
         let mut logits = original.clone();
-        stage.apply(&mut logits, &[0, 1, 0, 1]);
+        stage.apply(&mut logits, &[0, 1, 0, 1], &mut rng());
         assert_eq!(logits, original, "DRY(multiplier=0) must be a no-op");
     }
 
     /// XTC with threshold=0 (or probability=0) must leave logits unchanged.
     #[test]
     fn xtc_disabled_passthrough() {
-        let stage = XtcStage::new(1.0, 0.5, 42); // threshold >= 1.0 → passthrough
+        let stage = XtcStage::new(1.0, 0.5); // threshold >= 1.0 → passthrough
         let original = vec![1.0f32, 2.0, 3.0, 0.5];
         let mut logits = original.clone();
-        stage.apply(&mut logits, &[]);
+        stage.apply(&mut logits, &[], &mut rng());
         assert_eq!(logits, original, "XTC(threshold>=1.0) must be a no-op");
 
-        let stage2 = XtcStage::new(0.5, 0.0, 42); // probability=0 → passthrough
+        let stage2 = XtcStage::new(0.5, 0.0); // probability=0 → passthrough
         let mut logits2 = original.clone();
-        stage2.apply(&mut logits2, &[]);
+        stage2.apply(&mut logits2, &[], &mut rng());
         assert_eq!(logits2, original, "XTC(probability=0) must be a no-op");
     }
 
@@ -574,7 +576,7 @@ mod tests {
         let stage = TypicalPStage::new(1.0);
         let original = vec![1.0f32, 2.0, 3.0, 0.5];
         let mut logits = original.clone();
-        stage.apply(&mut logits, &[]);
+        stage.apply(&mut logits, &[], &mut rng());
         assert_eq!(logits, original, "TypicalP(p=1.0) must be a no-op");
     }
 
@@ -584,7 +586,7 @@ mod tests {
         let stage = TopAStage::new(0.0);
         let original = vec![1.0f32, 2.0, 3.0, 0.5];
         let mut logits = original.clone();
-        stage.apply(&mut logits, &[]);
+        stage.apply(&mut logits, &[], &mut rng());
         assert_eq!(logits, original, "TopA(a=0.0) must be a no-op");
     }
 
@@ -594,7 +596,7 @@ mod tests {
         let stage = EtaStage::new(0.0, 0.0);
         let original = vec![1.0f32, 2.0, 3.0, 0.5];
         let mut logits = original.clone();
-        stage.apply(&mut logits, &[]);
+        stage.apply(&mut logits, &[], &mut rng());
         assert_eq!(logits, original, "Eta(eta=0, epsilon=0) must be a no-op");
     }
 
@@ -620,7 +622,7 @@ mod tests {
         let recent = vec![0u32, 1, 2, 0, 1]; // history ending with A, B
         let original_c = logits[2];
         let original_d = logits[3];
-        stage.apply(&mut logits, &recent);
+        stage.apply(&mut logits, &recent, &mut rng());
         // C should be penalised (logit reduced), D should not.
         assert!(
             logits[2] < original_c,
@@ -632,6 +634,72 @@ mod tests {
             "token D should NOT be penalised by DRY; was {original_d}, now {}",
             logits[3]
         );
+    }
+
+    /// The new O(history) DRY implementation must agree exactly with a
+    /// brute-force O(vocab * history * match) reference on random inputs —
+    /// this is a direct algebraic re-derivation, not an approximation, and
+    /// this test locks that equivalence in.
+    #[test]
+    fn dry_matches_brute_force_reference() {
+        fn brute_force(
+            vocab_size: usize,
+            recent_tokens: &[u32],
+            allowed_length: usize,
+            multiplier: f32,
+            base: f32,
+        ) -> Vec<f32> {
+            let mut logits = vec![0.0f32; vocab_size];
+            let hist_len = recent_tokens.len();
+            for (t_idx, logit) in logits.iter_mut().enumerate() {
+                let t = t_idx as u32;
+                let mut best_match = 0usize;
+                for pos in 0..hist_len {
+                    if recent_tokens[pos] != t {
+                        continue;
+                    }
+                    let mut match_len = 1usize;
+                    let max_back = pos.min(hist_len - 1);
+                    for k in 1..=max_back {
+                        if recent_tokens[pos - k] == recent_tokens[hist_len - k] {
+                            match_len += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    best_match = best_match.max(match_len);
+                }
+                if best_match >= allowed_length {
+                    let excess = (best_match - allowed_length) as f32;
+                    *logit -= multiplier * base.powf(excess);
+                }
+            }
+            logits
+        }
+
+        // A handful of pseudo-random-ish histories with repeats.
+        let histories: Vec<Vec<u32>> = vec![
+            vec![0, 1, 2, 0, 1, 2, 0, 1],
+            vec![5, 5, 5, 5, 5],
+            vec![1, 2, 3, 4, 5, 1, 2, 3, 4, 6],
+            vec![7],
+            vec![],
+            vec![0, 0, 1, 0, 0, 1, 0, 0],
+        ];
+        let vocab_size = 10usize;
+        for history in histories {
+            let expected = brute_force(vocab_size, &history, 2, 1.5, 1.75);
+            let mut actual = vec![0.0f32; vocab_size];
+            DryStage::new(1.5, 1.75, 2, vec![]).apply(&mut actual, &history, &mut rng());
+            for i in 0..vocab_size {
+                assert!(
+                    (expected[i] - actual[i]).abs() < 1e-4,
+                    "mismatch at token {i} for history {history:?}: expected {}, got {}",
+                    expected[i],
+                    actual[i]
+                );
+            }
+        }
     }
 
     /// XTC with high probability must exclude top tokens (leaving only the best).
@@ -651,9 +719,9 @@ mod tests {
         // With threshold=0.7, top set = {0, 1} (cumprob ≈ 0.644+0.237 = 0.881 > 0.7).
         //
         // probability=1.0: always trigger (coin flip always fires).
-        let stage = XtcStage::new(0.7, 1.0, 1);
+        let stage = XtcStage::new(0.7, 1.0);
         let mut logits = vec![3.0f32, 2.0, 1.0, 0.0];
-        stage.apply(&mut logits, &[]);
+        stage.apply(&mut logits, &[], &mut rng());
         // After XTC:
         // - token 0 (best in top set) must remain finite.
         // - token 1 (second-best in top set) should be set to -inf.
@@ -668,6 +736,30 @@ mod tests {
         );
     }
 
+    /// XTC's coin flip must vary across successive calls sharing one RNG
+    /// stream (defect S3: previously derived from a fixed seed, so it either
+    /// always or never fired for a given `XtcStage` instance).
+    #[test]
+    fn xtc_coin_flip_varies_with_shared_rng() {
+        let stage = XtcStage::new(0.7, 0.5);
+        let mut shared_rng = Xorshift64::new(1);
+        let mut fired = 0;
+        let mut skipped = 0;
+        for _ in 0..200 {
+            let mut logits = vec![3.0f32, 2.0, 1.0, 0.0];
+            stage.apply(&mut logits, &[], &mut shared_rng);
+            if logits[1] == f32::NEG_INFINITY {
+                fired += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        assert!(
+            fired > 0 && skipped > 0,
+            "XTC coin flip must sometimes fire and sometimes not over 200 draws from a shared RNG (fired={fired}, skipped={skipped})"
+        );
+    }
+
     /// TypicalP with low p must reduce the number of finite-logit tokens.
     #[test]
     fn typical_p_active_reduces_distribution() {
@@ -676,7 +768,7 @@ mod tests {
         // All are equally "typical" → p=0.3 should keep only ~1 token (25% each).
         let stage = TypicalPStage::new(0.3);
         let mut logits = vec![0.0f32; 8]; // 8 tokens, all equal logits
-        stage.apply(&mut logits, &[]);
+        stage.apply(&mut logits, &[], &mut rng());
         let finite_count = logits.iter().filter(|&&v| v.is_finite()).count();
         assert!(
             finite_count < 8,
@@ -697,7 +789,7 @@ mod tests {
         // threshold ≈ 1.0 * 1.0^2 = 1.0; tokens with prob < 1.0 are excluded.
         let stage = TopAStage::new(1.0);
         let mut logits = vec![10.0f32, -10.0, -10.0, -10.0];
-        stage.apply(&mut logits, &[]);
+        stage.apply(&mut logits, &[], &mut rng());
         // Token 0 should survive; tokens 1-3 should be -inf.
         assert!(logits[0].is_finite(), "dominant token must survive TopA");
         for (i, &v) in logits[1..].iter().enumerate() {
@@ -719,7 +811,7 @@ mod tests {
         // Tokens with prob < 0.1 should be excluded.
         let stage = EtaStage::new(0.1, 0.0);
         let mut logits = vec![10.0f32, -10.0, -10.0, -10.0];
-        stage.apply(&mut logits, &[]);
+        stage.apply(&mut logits, &[], &mut rng());
         // Token 0 (prob ≈ 1) should survive; others (prob ≈ 0) should be -inf.
         assert!(
             logits[0].is_finite(),
@@ -736,11 +828,11 @@ mod tests {
     #[test]
     fn all_stages_handle_empty_logits() {
         let mut logits: Vec<f32> = Vec::new();
-        DryStage::new(1.0, 1.75, 2, vec![]).apply(&mut logits, &[]);
-        XtcStage::new(0.5, 1.0, 42).apply(&mut logits, &[]);
-        TypicalPStage::new(0.5).apply(&mut logits, &[]);
-        TopAStage::new(1.0).apply(&mut logits, &[]);
-        EtaStage::new(0.1, 0.0).apply(&mut logits, &[]);
+        DryStage::new(1.0, 1.75, 2, vec![]).apply(&mut logits, &[], &mut rng());
+        XtcStage::new(0.5, 1.0).apply(&mut logits, &[], &mut rng());
+        TypicalPStage::new(0.5).apply(&mut logits, &[], &mut rng());
+        TopAStage::new(1.0).apply(&mut logits, &[], &mut rng());
+        EtaStage::new(0.1, 0.0).apply(&mut logits, &[], &mut rng());
         assert!(logits.is_empty()); // still empty, no panic
     }
 
@@ -751,7 +843,7 @@ mod tests {
         let mut logits = vec![5.0f32, 4.9, 4.8, 4.7];
 
         // Very aggressive TopA (a=100 → threshold > any individual prob → keep argmax)
-        TopAStage::new(100.0).apply(&mut logits, &[]);
+        TopAStage::new(100.0).apply(&mut logits, &[], &mut rng());
         let finite = logits.iter().filter(|&&v| v.is_finite()).count();
         assert!(
             finite >= 1,
@@ -760,7 +852,7 @@ mod tests {
 
         // Reset and try TypicalP with p=0 (edge-case: keep at least 1)
         let mut logits2 = vec![5.0f32, 4.9, 4.8, 4.7];
-        TypicalPStage::new(0.0).apply(&mut logits2, &[]);
+        TypicalPStage::new(0.0).apply(&mut logits2, &[], &mut rng());
         let finite2 = logits2.iter().filter(|&&v| v.is_finite()).count();
         assert!(
             finite2 >= 1,

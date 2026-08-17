@@ -1,31 +1,40 @@
 //! Falcon model architecture plugin.
 //!
-//! Supports both:
-//! * **Falcon-1** (7B / 40B): parallel attention + FFN, ALiBi positional bias,
-//!   fused QKV with MHA (1 K/V head), old GGUF tensor naming.
-//! * **Falcon-2** (11B): Group-Query Attention, RoPE, sequential attention then
-//!   FFN, updated GGUF tensor naming.
+//! Covers every checkpoint llama.cpp maps onto `LLM_ARCH_FALCON`:
+//! * **Falcon-7B**: MQA (1 K/V head), single per-layer LayerNorm.
+//! * **Falcon-40B**: GQA plus a *second* per-layer LayerNorm (`attn_norm_2`)
+//!   that feeds the attention branch.
+//! * **Falcon-2-11B**: GQA, single per-layer LayerNorm.
+//!
+//! All three run the same graph — `src/models/falcon.cpp`'s
+//! `llm_build_falcon` — which is unconditionally RoPE (neox pairing) and
+//! unconditionally *parallel*: `x' = ffn(attn_norm(x)) + attn(...) + x`.
+//! There is no ALiBi path and no `ffn_norm` anywhere in the architecture.
 //!
 //! ## Tensor naming (GGUF, llama.cpp convention)
 //!
-//! | Tensor | Description |
-//! |--------|-------------|
-//! | `token_embd.weight` | Token embedding |
-//! | `blk.{i}.attn_norm.weight/bias` | Pre-attention LayerNorm |
-//! | `blk.{i}.ffn_norm.weight/bias` | Pre-FFN LayerNorm (Falcon-2 only) |
-//! | `blk.{i}.attn_qkv.weight` | Fused Q,K,V projection |
-//! | `blk.{i}.attn_output.weight` | Attention output projection |
-//! | `blk.{i}.ffn_up.weight` | FFN up-projection |
-//! | `blk.{i}.ffn_down.weight` | FFN down-projection |
-//! | `output_norm.weight/bias` | Final LayerNorm |
-//! | `output.weight` | LM head |
+//! | Tensor | Required | Description |
+//! |--------|----------|-------------|
+//! | `token_embd.weight` | yes | Token embedding |
+//! | `blk.{i}.attn_norm.weight/bias` | yes | Pre-attention LayerNorm; also the FFN's input norm |
+//! | `blk.{i}.attn_norm_2.weight/bias` | no | Second pre-attention LayerNorm (Falcon-40B) |
+//! | `blk.{i}.attn_qkv.weight` | yes | Fused Q,K,V projection `[n_embd, n_embd + 2*n_embd_gqa]` |
+//! | `blk.{i}.attn_output.weight` | yes | Attention output projection |
+//! | `blk.{i}.ffn_up.weight` | yes | FFN up-projection (GELU, no gate) |
+//! | `blk.{i}.ffn_down.weight` | yes | FFN down-projection |
+//! | `output_norm.weight/bias` | yes | Final LayerNorm |
+//! | `output.weight` | no | LM head; tied to `token_embd.weight` when absent |
+//!
+//! Falcon has no linear bias tensors at all — only the LayerNorm shifts.
 
 pub mod config;
 pub mod forward;
+pub mod loader;
 pub mod tensor_names;
 
 pub use config::FalconConfig;
 pub use forward::{FalconForward, FalconLayer};
+pub use loader::load_falcon_from_gguf;
 pub use tensor_names::falcon_tensor_name_patterns;
 
 use crate::config::ModelConfig;
@@ -80,12 +89,26 @@ impl ModelArchitecture for FalconArchitecture {
         // Validate that a Falcon-specific config can be derived from metadata.
         let _falcon_cfg = FalconConfig::from_model_config(config)?;
 
-        // Full tensor loading requires a GgufModel (use load_falcon_from_gguf).
-        // The build() path through TensorStore alone cannot access raw data;
-        // this is a validation + config-check path only.
+        // Full tensor loading requires a `GgufModel`: `TensorStore` carries the
+        // tensor *descriptors* but not the payload, so no weight can be read
+        // from here.  Use [`Self::build_from_gguf`] (or
+        // [`load_falcon_from_gguf`] directly); this path stays a validation +
+        // config-check path, matching starcoder and qwen3.
         Err(ArchError::MissingTensor {
-            name: "token_embd.weight (use FalconForward::from_gguf for full loading)".to_string(),
+            name: "token_embd.weight (use load_falcon_from_gguf for full loading)".to_string(),
         })
+    }
+
+    /// Route the registry straight at [`load_falcon_from_gguf`].
+    ///
+    /// Unlike [`Self::build`], this entry point receives the tensor payload, so
+    /// it can produce a real model instead of the `MissingTensor` sentinel.
+    fn build_from_gguf(
+        &self,
+        model: &oxillama_gguf::GgufModel,
+        config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Ok(Box::new(load_falcon_from_gguf(model, config)?))
     }
 
     fn tensor_names(&self) -> Vec<TensorNamePattern> {
@@ -209,6 +232,10 @@ mod tests {
         );
         let req_pats: Vec<&str> = required.iter().map(|p| p.pattern.as_str()).collect();
         assert!(req_pats.contains(&"token_embd.weight"));
-        assert!(req_pats.contains(&"output.weight"));
+        assert!(req_pats.contains(&"output_norm.weight"));
+        // `output.weight` is deliberately NOT required: llama.cpp declares it
+        // `TENSOR_NOT_REQUIRED` and duplicates `token_embd.weight` into it on
+        // tied checkpoints.
+        assert!(!req_pats.contains(&"output.weight"));
     }
 }

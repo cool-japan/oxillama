@@ -19,6 +19,71 @@ use crate::reader::BinaryReader;
 use crate::tensor_info::{TensorInfo, TensorStore};
 use crate::types::{GgufTensorType, GgufValueType, GGUF_DEFAULT_ALIGNMENT};
 
+/// Maximum nesting depth allowed for `Array`-of-`Array` metadata values.
+/// See the identical constant in `parser.rs` for the full rationale.
+const MAX_METADATA_ARRAY_DEPTH: u32 = 8;
+
+/// Maximum number of tensor dimensions accepted (mirrors `parser.rs`).
+const MAX_TENSOR_DIMS: u32 = 4;
+
+/// Minimum number of encoded bytes a single metadata value of `value_type`
+/// can possibly occupy (mirrors `parser.rs::min_encoded_value_size`).
+fn min_encoded_value_size(value_type: GgufValueType, version: u32) -> u64 {
+    match value_type {
+        GgufValueType::Uint8 | GgufValueType::Int8 | GgufValueType::Bool => 1,
+        GgufValueType::Uint16 | GgufValueType::Int16 => 2,
+        GgufValueType::Uint32 | GgufValueType::Int32 | GgufValueType::Float32 => 4,
+        GgufValueType::Uint64 | GgufValueType::Int64 | GgufValueType::Float64 => 8,
+        GgufValueType::String => {
+            if version >= 3 {
+                8
+            } else {
+                4
+            }
+        }
+        GgufValueType::Array => {
+            if version >= 3 {
+                12
+            } else {
+                8
+            }
+        }
+    }
+}
+
+/// Maximum alignment value accepted from `general.alignment` metadata
+/// (mirrors `parser.rs::MAX_GGUF_ALIGNMENT`).
+const MAX_GGUF_ALIGNMENT: u64 = 1 << 30;
+
+/// Validate a `general.alignment` metadata value before it is used to
+/// compute the tensor data-section offset. See `parser.rs::validate_alignment`
+/// for the full rationale.
+fn validate_alignment(alignment: u64) -> GgufResult<()> {
+    if alignment == 0 {
+        return Ok(());
+    }
+    if !alignment.is_power_of_two() || alignment > MAX_GGUF_ALIGNMENT {
+        return Err(GgufError::InvalidMetadata {
+            key: "general.alignment".to_string(),
+            reason: format!(
+                "alignment must be a power of two no greater than {MAX_GGUF_ALIGNMENT}, got {alignment}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a tensor's declared dimension count.
+fn validate_n_dims(name: &str, n_dims: u32) -> GgufResult<()> {
+    if n_dims == 0 || n_dims > MAX_TENSOR_DIMS {
+        return Err(GgufError::IntegrityError {
+            tensor_name: name.to_string(),
+            reason: format!("tensor declares {n_dims} dimensions, expected 1..={MAX_TENSOR_DIMS}"),
+        });
+    }
+    Ok(())
+}
+
 /// A streaming GGUF parser that lazily reads tensor data.
 ///
 /// Unlike `GgufFile::parse()` which reads everything at once, this parser:
@@ -48,6 +113,7 @@ use crate::types::{GgufTensorType, GgufValueType, GGUF_DEFAULT_ALIGNMENT};
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct StreamingGgufParser<'a> {
     data: &'a [u8],
     header: GgufHeader,
@@ -79,6 +145,7 @@ impl<'a> StreamingGgufParser<'a> {
             .get("general.alignment")
             .and_then(|v| v.as_u64())
             .unwrap_or(GGUF_DEFAULT_ALIGNMENT);
+        validate_alignment(alignment)?;
 
         let tensor_info_offset = reader.position();
 
@@ -151,12 +218,32 @@ impl<'a> StreamingGgufParser<'a> {
     ///
     /// Returns a zero-copy slice into the original data buffer.
     pub fn tensor_data(&self, info: &TensorInfo) -> GgufResult<&'a [u8]> {
-        let abs_offset = self.data_section_offset + info.offset;
-        let size = info.data_size();
+        // `data_section_offset + info.offset` used to be a plain `+`: with
+        // `info.offset` (read straight off the file, fully
+        // attacker-controlled) near `u64::MAX`, this wraps to a small
+        // value that then passes the `end > self.data.len()` check below
+        // and hands back bytes from *inside* the GGUF header — see
+        // `parser.rs::tensor_data_range` for the identical fix and a more
+        // detailed comment.
+        let abs_offset =
+            self.data_section_offset
+                .checked_add(info.offset)
+                .ok_or(GgufError::UnexpectedEof {
+                    offset: self.data_section_offset,
+                })?;
+        // `try_data_size()` rejects the dimension-product overflow instead
+        // of silently wrapping to a small size.
+        let size = info.try_data_size()?;
 
-        let start = abs_offset as usize;
+        // Validate in `u64` and convert with `try_from`, not `as`, so an
+        // out-of-range offset cannot reappear in-bounds via a truncating
+        // cast on 32-bit/wasm32 targets.
+        let start = usize::try_from(abs_offset)
+            .map_err(|_| GgufError::UnexpectedEof { offset: abs_offset })?;
+        let size_usize =
+            usize::try_from(size).map_err(|_| GgufError::UnexpectedEof { offset: abs_offset })?;
         let end = start
-            .checked_add(size as usize)
+            .checked_add(size_usize)
             .ok_or(GgufError::UnexpectedEof { offset: abs_offset })?;
 
         if end > self.data.len() {
@@ -179,7 +266,7 @@ impl<'a> StreamingGgufParser<'a> {
         for result in self.tensor_infos() {
             let info = result?;
             if name_set.contains(info.name.as_str()) {
-                store.insert(info);
+                store.try_insert(info)?;
             }
         }
 
@@ -192,7 +279,18 @@ impl<'a> StreamingGgufParser<'a> {
         tensors.set_data_offset(self.data_section_offset);
 
         for result in self.tensor_infos() {
-            tensors.insert(result?);
+            tensors.try_insert(result?)?;
+        }
+
+        if tensors.len() as u64 != self.header.tensor_count {
+            return Err(GgufError::IntegrityError {
+                tensor_name: "<tensor_infos>".to_string(),
+                reason: format!(
+                    "expected {} tensors, parsed {}",
+                    self.header.tensor_count,
+                    tensors.len()
+                ),
+            });
         }
 
         Ok(GgufFile {
@@ -225,6 +323,7 @@ impl<'a> TensorInfoIter<'a> {
         };
 
         let n_dims = self.reader.read_u32()?;
+        validate_n_dims(&name, n_dims)?;
 
         let mut dimensions = Vec::with_capacity(n_dims as usize);
         for _ in 0..n_dims {
@@ -308,7 +407,7 @@ fn parse_metadata_streaming(
                 reason: format!("unknown value type: {value_type_id}"),
             })?;
 
-        let value = read_metadata_value(reader, value_type, header.version)?;
+        let value = read_metadata_value(reader, value_type, header.version, 0)?;
         store.insert(key, value);
     }
 
@@ -316,12 +415,23 @@ fn parse_metadata_streaming(
 }
 
 /// Read a single metadata value based on its type.
+///
+/// `depth` counts `Array`-of-`Array` nesting levels; see
+/// `MAX_METADATA_ARRAY_DEPTH` for why this is bounded.
 fn read_metadata_value(
     reader: &mut BinaryReader<'_>,
     value_type: GgufValueType,
     version: u32,
+    depth: u32,
 ) -> GgufResult<crate::metadata::MetadataValue> {
     use crate::metadata::MetadataValue;
+
+    if depth > MAX_METADATA_ARRAY_DEPTH {
+        return Err(GgufError::InvalidMetadata {
+            key: "<array>".to_string(),
+            reason: format!("array nesting depth exceeds the limit of {MAX_METADATA_ARRAY_DEPTH}"),
+        });
+    }
 
     match value_type {
         GgufValueType::Uint8 => Ok(MetadataValue::Uint8(reader.read_u8()?)),
@@ -352,15 +462,32 @@ fn read_metadata_value(
                 }
             })?;
 
-            let count = if version >= 3 {
-                reader.read_u64()? as usize
+            let count_u64 = if version >= 3 {
+                reader.read_u64()?
             } else {
-                reader.read_u32()? as usize
+                u64::from(reader.read_u32()?)
             };
 
-            let mut elements = Vec::with_capacity(count.min(1_000_000));
+            // Bound `count` by the bytes actually remaining before trusting
+            // it enough to preallocate — see `parser.rs`'s identical check
+            // for the full rationale. `remaining()` is exact here since
+            // `BinaryReader` wraps the whole in-memory file.
+            let min_elem_size = min_encoded_value_size(elem_type, version);
+            let max_count = reader.remaining() as u64 / min_elem_size;
+            if count_u64 > max_count {
+                return Err(GgufError::InvalidMetadata {
+                    key: "<array>".to_string(),
+                    reason: format!(
+                        "array count {count_u64} cannot fit in the {} bytes remaining (min {min_elem_size} bytes/element)",
+                        reader.remaining()
+                    ),
+                });
+            }
+            let count = count_u64 as usize; // safe: count_u64 <= max_count <= remaining() (a usize)
+
+            let mut elements = Vec::with_capacity(count.min(4096));
             for _ in 0..count {
-                elements.push(read_metadata_value(reader, elem_type, version)?);
+                elements.push(read_metadata_value(reader, elem_type, version, depth + 1)?);
             }
             Ok(MetadataValue::Array(elements))
         }
@@ -374,17 +501,38 @@ fn read_metadata_value(
 /// constructing `TensorInfo` structs and allocating name strings.
 fn skip_tensor_infos(reader: &mut BinaryReader<'_>, header: &GgufHeader) -> GgufResult<()> {
     for _ in 0..header.tensor_count {
-        // Skip name string
-        if header.version >= 3 {
-            let len = reader.read_u64()? as usize;
-            reader.skip(len)?;
+        // Skip name string. Length is validated (via `remaining()`) before
+        // narrowing to `usize` and before calling `skip()` — `skip()`'s own
+        // `check()` already rejects an out-of-bounds skip, but doing the
+        // `u64`-domain comparison here too keeps a huge declared length
+        // from truncating into a small, in-bounds `usize` on 32-bit/wasm32
+        // targets and silently desyncing the rest of the parse.
+        let name_len_u64 = if header.version >= 3 {
+            reader.read_u64()?
         } else {
-            let len = reader.read_u32()? as usize;
-            reader.skip(len)?;
+            u64::from(reader.read_u32()?)
+        };
+        if name_len_u64 > reader.remaining() as u64 {
+            return Err(GgufError::UnexpectedEof {
+                offset: reader.position() as u64,
+            });
         }
+        reader.skip(name_len_u64 as usize)?;
 
-        // Skip n_dims + dimension values
+        // Skip n_dims + dimension values. Bounding `n_dims` before the
+        // multiply below both matches the real tensor-dimension cap
+        // (GGML never exceeds 4) and makes `n_dims as usize * 8` provably
+        // overflow-free (max `4 * 8 = 32`) instead of an unchecked
+        // multiply that could desync the parse on 32-bit targets.
         let n_dims = reader.read_u32()?;
+        if n_dims == 0 || n_dims > MAX_TENSOR_DIMS {
+            return Err(GgufError::IntegrityError {
+                tensor_name: "<tensor_infos>".to_string(),
+                reason: format!(
+                    "tensor declares {n_dims} dimensions, expected 1..={MAX_TENSOR_DIMS}"
+                ),
+            });
+        }
         let dim_bytes = if header.version >= 3 {
             n_dims as usize * 8 // u64 per dim
         } else {
@@ -412,10 +560,13 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     }
     let rem = value % alignment;
     if rem == 0 {
-        value
-    } else {
-        value + alignment - rem
+        return value;
     }
+    // See `parser.rs::align_up` for why this is `checked_add` rather than
+    // the original `value + alignment - rem`, which overflows `u64` for
+    // large attacker-controlled `alignment`.
+    let pad = alignment - rem;
+    value.saturating_add(pad)
 }
 
 #[cfg(test)]
@@ -866,5 +1017,169 @@ mod tests {
             streaming.tensor_infos().data_offset(),
             full.tensors.data_offset()
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Vulnerability regression tests (V1-V6) — streaming/lazy parse path.
+    // Mirrors parser.rs's regression tests; see that module for the full
+    // rationale behind each one.
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn build_nested_array_kv_gguf(nesting: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // 0 tensors
+        data.extend_from_slice(&1u64.to_le_bytes()); // 1 KV
+
+        write_string_v3(&mut data, "deep");
+        data.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+        for _ in 0..nesting {
+            data.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+            data.extend_from_slice(&1u64.to_le_bytes());
+        }
+        data.extend_from_slice(&(GgufValueType::Uint8 as u32).to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn test_v2_moderate_nested_array_depth_rejected() {
+        let data = build_nested_array_kv_gguf(20);
+        let err =
+            StreamingGgufParser::new(&data).expect_err("nesting beyond the depth limit must error");
+        assert!(matches!(err, GgufError::InvalidMetadata { .. }));
+    }
+
+    #[test]
+    fn test_v2_shallow_nested_array_still_parses() {
+        let data = build_nested_array_kv_gguf(3);
+        let parser = StreamingGgufParser::new(&data).expect("shallow nesting must still parse");
+        assert!(parser.metadata().get("deep").is_some());
+    }
+
+    /// Exact-repro regression matching the auditor's ~2.4 MB / 200,000-level
+    /// file; see `parser.rs`'s identical test for the full rationale.
+    #[test]
+    fn test_v2_deeply_nested_array_200k_levels_does_not_abort() {
+        let data = build_nested_array_kv_gguf(200_000);
+        assert!(data.len() > 2_000_000);
+        let err = StreamingGgufParser::new(&data)
+            .expect_err("200,000 levels of nesting must be rejected fast");
+        assert!(matches!(err, GgufError::InvalidMetadata { .. }));
+    }
+
+    /// n_dims is validated inside `skip_tensor_infos`, which runs eagerly
+    /// during `StreamingGgufParser::new()` to compute the data-section
+    /// offset — so an invalid tensor shape is rejected at construction
+    /// time, before any lazy tensor-info iteration even begins.
+    #[test]
+    fn test_v4_n_dims_exceeds_max_rejected_at_construction() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes()); // 1 tensor
+        data.extend_from_slice(&0u64.to_le_bytes()); // 0 KV
+
+        write_string_v3(&mut data, "w");
+        data.extend_from_slice(&5u32.to_le_bytes()); // n_dims = 5, exceeds the cap of 4
+        for _ in 0..5 {
+            data.extend_from_slice(&2u64.to_le_bytes());
+        }
+        data.extend_from_slice(&(GgufTensorType::F32 as u32).to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let err = StreamingGgufParser::new(&data).expect_err("n_dims > 4 must be rejected");
+        assert!(matches!(err, GgufError::IntegrityError { .. }));
+    }
+
+    #[test]
+    fn test_v4_n_dims_zero_rejected_via_tensor_info_iter() {
+        // Force the TensorInfoIter::parse_one path directly (rather than
+        // the skip_tensor_infos path exercised above) by building a file
+        // with 0 metadata KVs and checking `tensor_infos()` iteration.
+        let mut data = Vec::new();
+        data.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes()); // 1 tensor
+        data.extend_from_slice(&0u64.to_le_bytes()); // 0 KV
+
+        write_string_v3(&mut data, "w");
+        data.extend_from_slice(&0u32.to_le_bytes()); // n_dims = 0
+        data.extend_from_slice(&(GgufTensorType::F32 as u32).to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        // `new()` itself already rejects this via `skip_tensor_infos`.
+        let err = StreamingGgufParser::new(&data).expect_err("n_dims == 0 must be rejected");
+        assert!(matches!(err, GgufError::IntegrityError { .. }));
+    }
+
+    #[test]
+    fn test_v6_duplicate_tensor_names_rejected_via_into_full() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&2u64.to_le_bytes()); // declares 2 tensors
+        data.extend_from_slice(&0u64.to_le_bytes()); // 0 KV
+
+        for offset in [0u64, 4u64] {
+            write_string_v3(&mut data, "x");
+            data.extend_from_slice(&1u32.to_le_bytes());
+            data.extend_from_slice(&1u64.to_le_bytes());
+            data.extend_from_slice(&(GgufTensorType::F32 as u32).to_le_bytes());
+            data.extend_from_slice(&offset.to_le_bytes());
+        }
+
+        // `new()` succeeds — duplicate names aren't visible to the
+        // lightweight skip scan — but materializing the store (`into_full`,
+        // `load_tensors`) must reject the collision instead of silently
+        // collapsing to one entry despite the header declaring 2 tensors.
+        let parser = StreamingGgufParser::new(&data).expect("header-level parse succeeds");
+        let err = parser
+            .into_full()
+            .expect_err("duplicate tensor name must be rejected");
+        assert!(matches!(err, GgufError::IntegrityError { .. }));
+    }
+
+    #[test]
+    fn test_v3_tensor_offset_overflow_rejected_not_wrong_data() {
+        // Exercise `StreamingGgufParser::tensor_data` directly against a
+        // hand-built `TensorInfo` whose offset is chosen to wrap the old
+        // unchecked `data_section_offset + info.offset` addition back
+        // in-bounds — see `parser.rs`'s identical test for the exact
+        // arithmetic.
+        let data = build_test_gguf_v3();
+        let mut parser = StreamingGgufParser::new(&data).expect("parse");
+        parser.data_section_offset = 32;
+
+        let evil = TensorInfo {
+            name: "evil".to_string(),
+            n_dims: 1,
+            dimensions: vec![1],
+            tensor_type: GgufTensorType::F32,
+            offset: u64::MAX - 16,
+        };
+
+        let err = parser
+            .tensor_data(&evil)
+            .expect_err("offset overflow must be rejected, never wrap to an in-bounds start");
+        assert!(matches!(err, GgufError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn test_alignment_overflow_value_rejected_not_panicking() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // 0 tensors
+        data.extend_from_slice(&1u64.to_le_bytes()); // 1 KV
+
+        write_string_v3(&mut data, "general.alignment");
+        data.extend_from_slice(&(GgufValueType::Uint64 as u32).to_le_bytes());
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+
+        let err = StreamingGgufParser::new(&data)
+            .expect_err("astronomically large alignment must be rejected, not panic");
+        assert!(matches!(err, GgufError::InvalidMetadata { .. }));
     }
 }

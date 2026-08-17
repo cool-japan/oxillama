@@ -123,7 +123,6 @@ mod tests {
     use super::*;
     use crate::queue::BatchRequest;
     use crate::queue::UsageStats;
-    use crate::state::AppState;
     use crate::threads::queue::new_run_queue;
     use crate::threads::store::ThreadStore;
     use crate::threads::types::{Run, RunStatus, RunStep, RunStepStatus, RunStepType, Thread};
@@ -156,6 +155,7 @@ mod tests {
                             completion_tokens: 5,
                             total_tokens: 8,
                         },
+                        oxillama_runtime::FinishReason::Eos,
                     )));
                 }
             }
@@ -164,9 +164,9 @@ mod tests {
         let (run_tx, run_rx) = new_run_queue();
         let store_c = Arc::clone(&store);
         let state = Arc::new(
-            AppState::new(
+            crate::test_helpers::new_test_state(
                 tx,
-                "test-model".to_string(),
+                "test-model",
                 oxillama_runtime::sampling::SamplerConfig::default(),
                 None,
                 0,
@@ -313,9 +313,9 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<BatchRequest>(1);
         let (run_tx, _run_rx) = new_run_queue();
         let state = Arc::new(
-            AppState::new(
+            crate::test_helpers::new_test_state(
                 tx,
-                "test-model".to_string(),
+                "test-model",
                 oxillama_runtime::sampling::SamplerConfig::default(),
                 None,
                 0,
@@ -373,9 +373,9 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<BatchRequest>(1);
         let (run_tx, _run_rx) = new_run_queue();
         let state = Arc::new(
-            AppState::new(
+            crate::test_helpers::new_test_state(
                 tx,
-                "test-model".to_string(),
+                "test-model",
                 oxillama_runtime::sampling::SamplerConfig::default(),
                 None,
                 0,
@@ -417,9 +417,9 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<BatchRequest>(1);
         let (run_tx, _run_rx) = new_run_queue();
         let state = Arc::new(
-            AppState::new(
+            crate::test_helpers::new_test_state(
                 tx,
-                "test-model".to_string(),
+                "test-model",
                 oxillama_runtime::sampling::SamplerConfig::default(),
                 None,
                 0,

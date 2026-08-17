@@ -1,0 +1,216 @@
+# cargo-deny configuration for OxiLLaMa.
+#
+# Enforces the COOLJAPAN banned-crate substitution table (see CLAUDE.md /
+# ~/.claude/CLAUDE.md "Dependency Replacements") plus the Pure-Rust and
+# license/advisory policies. Run:
+#
+#   cargo deny check bans
+#   cargo deny check licenses advisories
+#
+# Before this file existed, `cargo deny check bans` reported "bans ok" but
+# that was VACUOUS: with no config, cargo-deny has an empty deny list and
+# passes trivially. This file makes the check actually mean something.
+
+[graph]
+# Evaluate the graph the same way `cargo build --workspace --all-features`
+# would, so opt-in features (http, hub, gpu, jwt, ...) are covered too —
+# several banned-crate and license findings only appear under those features.
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ──────────────────────────────────────────────────────────────────────────
+# Security advisories (RUSTSEC). Mirrors .cargo/audit.toml's ignore list so
+# `cargo deny check advisories` and `cargo audit` agree; update both files
+# together.
+# ──────────────────────────────────────────────────────────────────────────
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "Marvin Attack timing side-channel in rsa 0.9.10. No upstream fix available (rsa 0.10 is RC-only; see the rand_core pin comment in Cargo.toml). Used only behind the optional `jwt` feature in oxillama-server." },
+    { id = "RUSTSEC-2024-0436", reason = "`paste` 1.0.15 is unmaintained (author archived the repo). Pulled in transitively via tokenizers 0.23.1; it is a proc-macro used only at build time, no runtime exposure." },
+    { id = "RUSTSEC-2026-0173", reason = "`proc-macro-error2` 2.0.1 is unmaintained. Pulled in transitively via tabled_derive -> tabled 0.21.0, used only by oxillama-bench (dev/bench tooling); proc-macro/build-time only, not shipped in any release artifact." },
+]
+
+# ──────────────────────────────────────────────────────────────────────────
+# Licenses. OxiLLaMa is Apache-2.0; only permissive licenses compatible with
+# that are allowed. Every SPDX atom below was confirmed present in the
+# resolved graph via `cargo metadata --all-features` before being added —
+# keep this list minimal rather than pre-allowing licenses nothing uses.
+#
+# NOTE: `cargo metadata --all-features` also lists finl_unicode / wezterm-bidi
+# (Unicode-DFS-2016) and terminfo (WTFPL) — these ship in Cargo.lock behind
+# ratatui's optional `termwiz` backend, which this workspace never enables
+# (only `crossterm`). cargo-deny's own feature-aware graph correctly excludes
+# them ("license was not encountered" if added here) — the same phantom-entry
+# pattern as the stale `thiserror 1.0.69` Cargo.lock row noted in the P1
+# report. Add "Unicode-DFS-2016" / "WTFPL" back here only if the termwiz
+# backend is ever actually enabled.
+# ──────────────────────────────────────────────────────────────────────────
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+# ──────────────────────────────────────────────────────────────────────────
+# Bans: the COOLJAPAN never-use -> oxi* substitution table.
+#
+#   openblas          -> oxiblas
+#   bincode           -> oxicode
+#   rustfft           -> oxifft
+#   Z3                -> oxiz
+#   rusqlite          -> oxisql-sqlite-compat
+#   zip/flate2/zstd/
+#   bzip2/lz4/tar/
+#   snap/brotli/
+#   miniz_oxide       -> oxiarc-*
+#
+# "Most -sys (FFI) crates -> the corresponding cool-japan/oxi* crate" from
+# the same table is a case-by-case review principle, not an automatable
+# blanket rule (`-sys` also covers legitimate, non-substitutable crates like
+# `windows-sys` or `libc`); it is enforced by manual review, not this file.
+# ──────────────────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Intra-workspace [dev-dependencies] are deliberately version-less `{ path =
+# "../<crate>" }` (see release-check §2.16 Check 1): a sibling dev-dep with a
+# `version` too gets packaged into the published manifest, and cargo publish
+# then fails because that sibling's new version isn't on crates.io yet.
+# Dropping `version` is what makes cargo strip the entry from the published
+# crate — dev-dependencies are never used by downstream consumers anyway. The
+# `wildcards` lint still catches an actual `"*"` version requirement from
+# crates.io (the real risk this lint protects against); this only opts out
+# path/git deps with no version, which cargo-deny's own docs describe as the
+# standard exception for exactly this monorepo pattern. All 7 current
+# instances are `[dev-dependencies]` only — never `[dependencies]` — verified
+# via `cargo deny check bans` (0 wildcard errors) plus a manual grep confirming
+# none of the 7 crate names appear path-only under any `[dependencies]` block.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow-workspace = true
+
+deny = [
+    { crate = "openblas-src", reason = "COOLJAPAN policy: use oxiblas (Pure Rust BLAS) instead of OpenBLAS FFI." },
+    { crate = "bincode", reason = "COOLJAPAN policy: use oxicode instead of bincode." },
+    { crate = "rustfft", reason = "COOLJAPAN policy: use oxifft instead of rustfft." },
+    { crate = "z3", reason = "COOLJAPAN policy: use oxiz instead of Z3." },
+    { crate = "z3-sys", reason = "COOLJAPAN policy: use oxiz instead of Z3." },
+    { crate = "rusqlite", reason = "COOLJAPAN policy: use oxisql-sqlite-compat instead of rusqlite." },
+    { crate = "libsqlite3-sys", reason = "COOLJAPAN policy: use oxisql-sqlite-compat instead of rusqlite/libsqlite3-sys." },
+    { crate = "zip", reason = "COOLJAPAN policy: use oxiarc-* instead of zip." },
+    { crate = "zstd", reason = "COOLJAPAN policy: use oxiarc-* instead of zstd." },
+    { crate = "zstd-safe", reason = "COOLJAPAN policy: use oxiarc-* instead of zstd." },
+    { crate = "zstd-sys", reason = "COOLJAPAN policy: use oxiarc-* instead of zstd." },
+    { crate = "bzip2", reason = "COOLJAPAN policy: use oxiarc-* instead of bzip2." },
+    { crate = "bzip2-sys", reason = "COOLJAPAN policy: use oxiarc-* instead of bzip2." },
+    { crate = "lz4", reason = "COOLJAPAN policy: use oxiarc-* instead of lz4." },
+    { crate = "lz4-sys", reason = "COOLJAPAN policy: use oxiarc-* instead of lz4." },
+    # lz4_flex: banned per the table, but hf-hub 1.0.0 depends on `hf-xet`
+    # unconditionally (a plain `[dependencies]` entry in hf-hub's manifest, not
+    # optional and not feature-gated), and hf-xet's `xet-core-structures` uses
+    # lz4_flex to compress chunks for HuggingFace's Xet transfer protocol.
+    # hf-hub exposes no feature that removes the Xet backend, so the only way
+    # to drop lz4_flex is to drop the HF Hub client entirely. Reachable ONLY
+    # through the opt-in `hub` feature of oxillama-cli / oxillama-py, which is
+    # in NEITHER crate's `default = [...]` list, so a stock build never links
+    # it. lz4_flex is itself Pure Rust (a from-scratch LZ4 implementation, no
+    # C), so this is a substitution-table deviation, not a Pure-Rust one.
+    # `wrappers` records exactly that: lz4_flex is tolerated ONLY when pulled
+    # in directly by xet-core-structures (verified via
+    # `cargo tree -i lz4_flex --all-features`); a direct dependency on lz4_flex
+    # from any OxiLLaMa crate, or a path through any other crate, still fails
+    # this check. Tracked, not eliminated — revisit if hf-hub ever gains a
+    # Xet-free backend.
+    { crate = "lz4_flex", reason = "COOLJAPAN policy: use oxiarc-* instead of lz4. Currently reached only as xet-core-structures' chunk-compression dependency, itself pulled in transitively by hf-hub 1.0.0's mandatory `hf-xet` backend behind the opt-in `hub` feature; hf-hub has no feature that disables Xet, so this workspace cannot suppress it without dropping the HF Hub client. Pure Rust (no C), so the deviation is from the substitution table only. Tracked, not eliminated — revisit when hf-hub exposes a Xet-free backend.", wrappers = ["xet-core-structures"] },
+    { crate = "tar", reason = "COOLJAPAN policy: use oxiarc-* instead of tar." },
+    { crate = "snap", reason = "COOLJAPAN policy: use oxiarc-* instead of snap." },
+    { crate = "brotli", reason = "COOLJAPAN policy: use oxiarc-* instead of brotli." },
+    { crate = "brotli-decompressor", reason = "COOLJAPAN policy: use oxiarc-* instead of brotli." },
+    # flate2 / miniz_oxide: these two used to carry a `wrappers = ["ureq"]`
+    # exception, because hf-hub 0.5.0 requested `ureq` WITHOUT
+    # `default-features = false` and ureq's own `default = ["rustls", "gzip"]`
+    # therefore dragged flate2 (and its `miniz_oxide` DEFLATE backend) in
+    # behind the opt-in `hub` feature — something this workspace could not
+    # suppress from its own manifest. That exception was explicitly scoped to
+    # "revisit when hf-hub is bumped past 0.5.0"; hf-hub 1.0.0 did exactly
+    # that, dropping ureq altogether for a reqwest/tokio core. With this
+    # workspace's own `ureq` entry already at `default-features = false` (see
+    # root Cargo.toml), neither crate is in the graph on ANY build path any
+    # more: `cargo tree -i flate2 --all-features` and
+    # `cargo tree -i miniz_oxide --all-features` both report "did not match
+    # any packages". The exception is gone and the plain bans are back in
+    # force — matching every other never-use entry above (openblas-src,
+    # bincode, zip, tar, snap, ... are likewise absent from the graph and
+    # denied preventively, so a future dependency cannot reintroduce them
+    # silently).
+    { crate = "flate2", reason = "COOLJAPAN policy: use oxiarc-* instead of flate2." },
+    { crate = "miniz_oxide", reason = "COOLJAPAN policy: use oxiarc-* instead of miniz_oxide (flate2's own DEFLATE backend)." },
+]
+
+# ──────────────────────────────────────────────────────────────────────────
+# NOT banned, but recorded: aws-lc-sys / aws-lc-rs (C compiled at build time).
+#
+# hf-hub 1.0.0 declares `reqwest = { version = "0.13", features = [...] }`
+# WITHOUT `default-features = false`, and reqwest 0.13's own
+# `default = ["default-tls", ...]` → `default-tls = ["rustls"]` →
+# `rustls = ["__rustls-aws-lc-rs", ...]` selects aws-lc-rs as rustls 0.23's
+# crypto provider. Its `aws-lc-sys` companion COMPILES C (AWS-LC) from a
+# build script. This is new versus hf-hub 0.5.0, which used ureq + native-tls
+# and built no C here. Per those manifests the selection does not depend on
+# the `rustls-tls` feature this workspace enables on hf-hub — reqwest's own
+# `default = [...]` reaches `__rustls-aws-lc-rs` on its own, the same shape as
+# ureq's defaults formerly reaching flate2 (chain read from reqwest 0.13.4's
+# manifest, not re-verified by a build with `rustls-tls` switched off).
+#
+# It is deliberately absent from the `deny` list above: that list names the
+# specific COOLJAPAN substitution-table crates (openblas-src, bincode,
+# rustfft, z3*, rusqlite/libsqlite3-sys, zip, zstd*, bzip2*, lz4*, tar, snap,
+# brotli*, flate2, miniz_oxide), and aws-lc-sys has no oxi* substitute to
+# point at.
+#
+# What makes it tolerable under "Pure Rust: default features must be
+# C/C++/Fortran-free. If FFI is unavoidable, feature-gate it (off by
+# default)" is that it is reachable ONLY through hf-hub, itself reachable
+# ONLY through the optional `hub` feature of oxillama-cli / oxillama-py —
+# and `hub` is in NEITHER crate's `default = [...]` list (oxillama-cli
+# defaults to server/tui/simd-neon/simd-avx2; oxillama-py defaults to
+# nothing). Verified with `cargo tree -i aws-lc-sys --all-features`: every
+# root of that tree is hf-hub. A stock `cargo build` compiles no C.
+#
+# If aws-lc-sys ever becomes reachable WITHOUT `hub`, that is a Pure-Rust
+# policy violation to fix (point rustls at a provider-free feature set, or
+# drop the `hub` feature), not to document away.
+# ──────────────────────────────────────────────────────────────────────────
+
+skip = [
+]
+
+skip-tree = [
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

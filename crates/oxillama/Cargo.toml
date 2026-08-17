@@ -18,13 +18,27 @@ rustdoc-args = ["--cfg", "docsrs"]
 targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
-default = ["server", "bench"]
+# P4: `default` must name at least one architecture feature. Before this fix,
+# a caller selecting features without `server` (e.g. `default-features =
+# false, features = ["bench"]`) got a crate that compiled cleanly and then
+# failed at *runtime* with "unsupported architecture: 'llama'" on any model,
+# because `oxillama-runtime::build_forward_pass` gates every forward-pass arm
+# on a runtime architecture feature and `server` was the only thing that
+# happened to enable one transitively (via `oxillama-server`).
+# See crates/oxillama/tests/feature_matrix.rs::test_default_features_include_at_least_one_architecture.
+#
+# P6: `bench` was dropped from `default` — it pulled the full Criterion stack
+# (plotters, rayon, regex) plus `tabled` and `sysinfo` into every downstream
+# `cargo add oxillama`, even for consumers who only want inference. Depend on
+# `oxillama-bench` directly, or enable the `bench` feature explicitly, to get
+# the benchmark suite.
+default = ["server", "llama", "simd-neon", "simd-avx2"]
 server = ["dep:oxillama-server"]
 bench = ["dep:oxillama-bench"]
 gpu = ["dep:oxillama-gpu", "oxillama-gpu/gpu"]
-simd-avx2 = ["oxillama-quant/simd-avx2"]
-simd-avx512 = ["oxillama-quant/simd-avx512"]
-simd-neon = ["oxillama-quant/simd-neon"]
+simd-avx2 = ["oxillama-quant/simd-avx2", "oxillama-runtime/simd-avx2"]
+simd-avx512 = ["oxillama-quant/simd-avx512", "oxillama-runtime/simd-avx512"]
+simd-neon = ["oxillama-quant/simd-neon", "oxillama-runtime/simd-neon"]
 # Architecture feature flags
 llama = ["oxillama-arch/llama", "oxillama-runtime/llama"]
 qwen3 = ["oxillama-arch/qwen3", "oxillama-runtime/qwen3"]

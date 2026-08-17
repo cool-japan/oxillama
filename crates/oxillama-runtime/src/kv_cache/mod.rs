@@ -10,21 +10,29 @@
 
 pub mod paged;
 pub mod prefix;
+pub mod storage;
 
 use oxicode::{Decode, Encode};
 use oxillama_arch::traits::KvCacheAccess;
-use oxillama_arch::ArchResult;
+use oxillama_arch::{ArchError, ArchResult};
+
+use crate::error::{RuntimeError, RuntimeResult};
+use storage::LayerBuf;
 
 pub use oxillama_arch::traits::{BatchedKvView, KvSlot};
 pub use paged::PagedKvCache;
 pub use prefix::{PrefixCacheConfig, PrefixKvCache};
+pub use storage::{KvCacheDtype, DEFAULT_BLOCK_TOKENS};
 
 /// A point-in-time snapshot of a [`KvCache`] state.
 ///
 /// Created by [`KvCache::snapshot`] and restored via
-/// [`KvCache::restore_from_snapshot`].  Used by
-/// [`crate::speculative::SpeculativeDeltaSync`] to roll back the KV cache
-/// after a draft token is rejected.
+/// [`KvCache::restore_from_snapshot`].  Used to checkpoint and restore KV state,
+/// for example by the engine's `kv_snapshot` / `kv_restore` helpers.
+///
+/// Speculative decoding instead rolls the draft cache back with the cheaper
+/// `O(1)` [`KvCache::truncate`] primitive (see
+/// [`crate::speculative::SpeculativeDeltaSync`]).
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct KvCacheSnapshot {
     /// Per-layer key vectors, each of length `seq_len * kv_dim`.
@@ -89,14 +97,32 @@ impl BatchedKvView for VecBatchedKvView {
 
 /// Simple contiguous KV cache implementation.
 ///
-/// Stores key and value tensors for all layers in contiguous FP32 buffers.
-/// Each layer has a separate key buffer and value buffer, sized for the
-/// maximum context length.
+/// Stores key and value tensors for all layers in contiguous per-layer buffers.
+///
+/// # Growth
+///
+/// Buffers start **empty** and grow one [`DEFAULT_BLOCK_TOKENS`]-sized block at
+/// a time, up to `max_seq_len`.  Before 0.1.4 the constructor allocated the
+/// full trained context immediately — 1 GiB for Llama-3-8B at a 4096-token
+/// context, paid whether the conversation ran to 20 tokens or 4096.  A cache
+/// never shrinks, so a long conversation allocates once and every subsequent
+/// [`clear`](Self::clear) reuses the same memory.
+///
+/// # Element type
+///
+/// FP32 by default.  [`KvCacheDtype::F16`] halves the footprint.  It cannot
+/// serve [`KvCacheAccess::get_keys`], which hands out a borrowed `&[f32]`, but
+/// every architecture reads through `oxillama_arch::common::fetch_keys` /
+/// `fetch_values`, which fall back to [`for_each_key`](KvCacheAccess::for_each_key)
+/// when a borrow is impossible — so FP16 is selectable end-to-end via
+/// [`EngineConfig::kv_dtype`](crate::engine::EngineConfig::kv_dtype) or
+/// `oxillama run --kv-dtype f16`.  See [`storage`] for the full rationale.
 pub struct KvCache {
-    /// Key buffers: one per layer, each of size [max_seq_len * kv_dim].
-    keys: Vec<Vec<f32>>,
-    /// Value buffers: one per layer, each of size [max_seq_len * kv_dim].
-    values: Vec<Vec<f32>>,
+    /// Key buffers, one per layer.  Each holds `capacity_tokens * kv_dim`
+    /// elements, which grows towards `max_seq_len * kv_dim`.
+    keys: Vec<LayerBuf>,
+    /// Value buffers, one per layer, sized exactly like `keys`.
+    values: Vec<LayerBuf>,
     /// Current sequence length (number of fully-committed tokens).
     seq_len: usize,
     /// Number of token positions that have had K/V data written.
@@ -106,49 +132,146 @@ pub struct KvCache {
     /// seq_len + 1` so that attention can immediately read the just-written
     /// entry without requiring `advance()` to have been called first.
     stored_len: usize,
+    /// Token positions currently backed by allocated buffer space.
+    ///
+    /// Invariant: `capacity_tokens >= stored_len` and
+    /// `capacity_tokens <= max_seq_len`.
+    capacity_tokens: usize,
+    /// Token positions added per growth step.
+    block_tokens: usize,
     /// Maximum sequence length.
     max_seq_len: usize,
     /// KV dimension per token (num_kv_heads * head_dim).
     kv_dim: usize,
     /// Number of layers.
     num_layers: usize,
+    /// Element type of the backing buffers.
+    dtype: KvCacheDtype,
 }
 
 impl KvCache {
-    /// Allocate a new KV cache.
+    /// Allocate a new FP32 KV cache.
+    ///
+    /// No token storage is allocated up front — buffers grow on demand, see
+    /// the type-level docs.
     ///
     /// # Arguments
     /// * `num_layers` - Number of transformer layers.
     /// * `max_seq_len` - Maximum context length.
     /// * `kv_dim` - KV dimension per token (num_kv_heads * head_dim).
     pub fn new(num_layers: usize, max_seq_len: usize, kv_dim: usize) -> Self {
-        let keys = (0..num_layers)
-            .map(|_| vec![0.0f32; max_seq_len * kv_dim])
-            .collect();
-        let values = (0..num_layers)
-            .map(|_| vec![0.0f32; max_seq_len * kv_dim])
-            .collect();
+        Self::with_dtype(num_layers, max_seq_len, kv_dim, KvCacheDtype::F32)
+    }
+
+    /// Allocate a new KV cache with an explicit element type.
+    ///
+    /// See [`KvCacheDtype`] for the trade-off; [`KvCacheDtype::F16`] halves the
+    /// footprint but makes [`KvCacheAccess::get_keys`] return an error.
+    pub fn with_dtype(
+        num_layers: usize,
+        max_seq_len: usize,
+        kv_dim: usize,
+        dtype: KvCacheDtype,
+    ) -> Self {
+        let keys = (0..num_layers).map(|_| LayerBuf::new(dtype)).collect();
+        let values = (0..num_layers).map(|_| LayerBuf::new(dtype)).collect();
+        let block_tokens = DEFAULT_BLOCK_TOKENS.clamp(1, max_seq_len.max(1));
 
         Self {
             keys,
             values,
             seq_len: 0,
             stored_len: 0,
+            capacity_tokens: 0,
+            block_tokens,
             max_seq_len,
             kv_dim,
             num_layers,
+            dtype,
         }
     }
 
-    /// Reset the cache, clearing all stored KV pairs.
+    /// The element type of the backing buffers.
+    pub fn dtype(&self) -> KvCacheDtype {
+        self.dtype
+    }
+
+    /// Token positions currently backed by allocated memory.
+    ///
+    /// Grows in [`DEFAULT_BLOCK_TOKENS`] steps as the sequence lengthens and
+    /// never shrinks, so this is the high-water mark of the cache.
+    pub fn capacity_tokens(&self) -> usize {
+        self.capacity_tokens
+    }
+
+    /// Bytes currently held by the key and value buffers across all layers.
+    ///
+    /// This is what the process actually owns, not what `max_seq_len` would
+    /// eventually require.
+    pub fn memory_bytes(&self) -> usize {
+        self.keys
+            .iter()
+            .chain(self.values.iter())
+            .map(|b| b.memory_bytes())
+            .sum()
+    }
+
+    /// Bytes this cache would hold once the full context is reached.
+    pub fn max_memory_bytes(&self) -> usize {
+        self.num_layers * self.max_seq_len * self.kv_dim * self.dtype.size_of() * 2
+    }
+
+    /// Ensure every layer buffer covers at least `tokens` positions.
+    ///
+    /// Rounds up to the next block so growth happens `max_seq_len /
+    /// block_tokens` times at most over the life of the cache.
+    fn ensure_capacity(&mut self, tokens: usize) {
+        if tokens <= self.capacity_tokens {
+            return;
+        }
+        let blocks = tokens.div_ceil(self.block_tokens);
+        let target = (blocks * self.block_tokens)
+            .min(self.max_seq_len)
+            .max(tokens);
+        let elems = target * self.kv_dim;
+        for buf in self.keys.iter_mut().chain(self.values.iter_mut()) {
+            buf.grow_to(elems);
+        }
+        self.capacity_tokens = target;
+        tracing::trace!(
+            tokens,
+            capacity_tokens = target,
+            bytes = self.memory_bytes(),
+            "KV cache grown"
+        );
+    }
+
+    /// Reset the cache, invalidating all stored KV pairs.
+    ///
+    /// This is an `O(1)` bookkeeping reset: the buffers are **not** zeroed.
+    /// Zeroing them was pure waste — [`get_keys`](KvCacheAccess::get_keys) and
+    /// [`get_values`](KvCacheAccess::get_values) are bounded by `stored_len`,
+    /// so nothing past the reset point is reachable, yet `clear()` was
+    /// memsetting the whole pre-allocated region (~1 GiB for Llama-3-8B at a
+    /// 4096-token context) on every request and on every beam-search step.
+    ///
+    /// The allocation itself is retained so the next sequence reuses it.
     pub fn clear(&mut self) {
         self.seq_len = 0;
         self.stored_len = 0;
-        for k in &mut self.keys {
-            k.fill(0.0);
-        }
-        for v in &mut self.values {
-            v.fill(0.0);
+    }
+
+    /// Reset the cache **and** release its buffers back to the allocator.
+    ///
+    /// [`clear`](Self::clear) deliberately keeps the allocation for reuse; this
+    /// is the variant for a caller that is done with a model and wants the
+    /// memory back without dropping the cache itself.
+    pub fn clear_and_release(&mut self) {
+        self.seq_len = 0;
+        self.stored_len = 0;
+        self.capacity_tokens = 0;
+        for buf in self.keys.iter_mut().chain(self.values.iter_mut()) {
+            *buf = LayerBuf::new(self.dtype);
         }
     }
 
@@ -179,30 +302,69 @@ impl KvCache {
 
     /// Restore from a prefix cache snapshot.
     ///
-    /// Copies the provided per-layer key/value data into internal buffers
-    /// and sets `seq_len` to the snapshot's length.  The caller must ensure
-    /// that `keys.len() == values.len() == num_layers` and that each inner
-    /// vec has `seq_len * kv_dim` elements.
+    /// Copies the provided per-layer key/value data into internal buffers and
+    /// sets `seq_len` to the snapshot's length.
+    ///
+    /// # Errors
+    ///
+    /// * [`RuntimeError::KvCacheFull`] when `seq_len` exceeds `max_seq_len`.
+    /// * [`RuntimeError::SnapshotIncompatible`] when the snapshot has fewer
+    ///   layers than the cache, or when any layer carries fewer than
+    ///   `seq_len * kv_dim` elements.
+    ///
+    /// That second check is the whole point of this returning a `Result`.  The
+    /// old signature copied `min(seq_len * kv_dim, src.len())` elements and then
+    /// set `self.seq_len = seq_len` regardless, so a short snapshot marked
+    /// positions **valid** that had never been written.  While `clear()` still
+    /// memset the buffers those positions read as zeros; now that `clear()` is
+    /// an `O(1)` reset they would read the *previous sequence's* keys, which is
+    /// cross-request contamination rather than merely wrong logits.
     pub fn restore_from_snapshot(
         &mut self,
         keys: &[Vec<f32>],
         values: &[Vec<f32>],
         seq_len: usize,
-    ) {
-        let layers = keys.len().min(values.len()).min(self.num_layers);
-        let copy_len = seq_len * self.kv_dim;
-
-        for layer in 0..layers {
-            let src_k = &keys[layer];
-            let src_v = &values[layer];
-            let n = copy_len.min(src_k.len()).min(self.keys[layer].len());
-            self.keys[layer][..n].copy_from_slice(&src_k[..n]);
-            let n = copy_len.min(src_v.len()).min(self.values[layer].len());
-            self.values[layer][..n].copy_from_slice(&src_v[..n]);
+    ) -> RuntimeResult<()> {
+        if seq_len > self.max_seq_len {
+            return Err(RuntimeError::KvCacheFull {
+                max_ctx: self.max_seq_len,
+            });
+        }
+        if keys.len() < self.num_layers || values.len() < self.num_layers {
+            return Err(RuntimeError::SnapshotIncompatible {
+                detail: format!(
+                    "snapshot has {} key / {} value layers, cache has {}",
+                    keys.len(),
+                    values.len(),
+                    self.num_layers
+                ),
+            });
         }
 
-        self.seq_len = seq_len.min(self.max_seq_len);
-        self.stored_len = self.seq_len;
+        let copy_len = seq_len * self.kv_dim;
+        for layer in 0..self.num_layers {
+            if keys[layer].len() < copy_len || values[layer].len() < copy_len {
+                return Err(RuntimeError::SnapshotIncompatible {
+                    detail: format!(
+                        "layer {layer} of the snapshot holds {} key / {} value floats but \
+                         restoring {seq_len} tokens at kv_dim {} needs {copy_len}",
+                        keys[layer].len(),
+                        values[layer].len(),
+                        self.kv_dim
+                    ),
+                });
+            }
+        }
+
+        self.ensure_capacity(seq_len);
+        for layer in 0..self.num_layers {
+            self.keys[layer].write_at(0, &keys[layer][..copy_len]);
+            self.values[layer].write_at(0, &values[layer][..copy_len]);
+        }
+
+        self.seq_len = seq_len;
+        self.stored_len = seq_len;
+        Ok(())
     }
 
     /// Truncate the KV cache to `n` tokens.
@@ -227,21 +389,33 @@ impl KvCache {
     /// Only the data up to `seq_len * kv_dim` is copied per layer, keeping
     /// the snapshot compact.
     pub fn snapshot(&self) -> KvCacheSnapshot {
-        let copy_len = self.seq_len * self.kv_dim;
+        self.snapshot_truncated(self.seq_len)
+    }
+
+    /// Capture a snapshot covering only the first `n` token positions.
+    ///
+    /// `n` is clamped to the current `seq_len`.  This is what a prefix cache
+    /// wants: the trie key is the *prompt*, so retaining the completion's KV
+    /// alongside it wastes memory and breaks the "snapshot length == key
+    /// length" invariant that [`restore_from_snapshot`](Self::restore_from_snapshot)
+    /// now enforces.
+    pub fn snapshot_truncated(&self, n: usize) -> KvCacheSnapshot {
+        let seq_len = n.min(self.seq_len);
+        let copy_len = seq_len * self.kv_dim;
         let keys = self
             .keys
             .iter()
-            .map(|k| k[..copy_len.min(k.len())].to_vec())
+            .map(|k| k.to_f32_prefix_vec(copy_len))
             .collect();
         let values = self
             .values
             .iter()
-            .map(|v| v[..copy_len.min(v.len())].to_vec())
+            .map(|v| v.to_f32_prefix_vec(copy_len))
             .collect();
         KvCacheSnapshot {
             keys,
             values,
-            seq_len: self.seq_len,
+            seq_len,
         }
     }
 
@@ -251,12 +425,12 @@ impl KvCache {
         let keys = self
             .keys
             .iter()
-            .map(|k| k[..copy_len.min(k.len())].to_vec())
+            .map(|k| k.to_f32_prefix_vec(copy_len))
             .collect();
         let values = self
             .values
             .iter()
-            .map(|v| v[..copy_len.min(v.len())].to_vec())
+            .map(|v| v.to_f32_prefix_vec(copy_len))
             .collect();
         crate::snapshot::KvStatePayload {
             keys,
@@ -276,7 +450,6 @@ impl KvCache {
         &mut self,
         payload: &crate::snapshot::KvStatePayload,
     ) -> crate::error::RuntimeResult<()> {
-        use crate::error::RuntimeError;
         if payload.num_layers != self.num_layers {
             return Err(RuntimeError::SnapshotIncompatible {
                 detail: format!(
@@ -293,8 +466,101 @@ impl KvCache {
                 ),
             });
         }
-        self.restore_from_snapshot(&payload.keys, &payload.values, payload.seq_len);
+        self.restore_from_snapshot(&payload.keys, &payload.values, payload.seq_len)
+    }
+
+    /// Copy every cached key for `layer` into `dst` as `f32`.
+    ///
+    /// Works in **both** dtypes, unlike
+    /// [`get_keys`](KvCacheAccess::get_keys), which can only hand out a borrow
+    /// when the storage is already FP32.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::ForwardPassError`] when `layer` is out of range.
+    pub fn copy_keys_into(&self, layer: usize, dst: &mut Vec<f32>) -> ArchResult<()> {
+        if layer >= self.num_layers {
+            return Err(ArchError::ForwardPassError {
+                layer,
+                message: format!("layer index {layer} out of range (max {})", self.num_layers),
+            });
+        }
+        self.keys[layer].copy_f32_prefix_into(self.stored_len * self.kv_dim, dst);
         Ok(())
+    }
+
+    /// Copy every cached value for `layer` into `dst` as `f32`.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::ForwardPassError`] when `layer` is out of range.
+    pub fn copy_values_into(&self, layer: usize, dst: &mut Vec<f32>) -> ArchResult<()> {
+        if layer >= self.num_layers {
+            return Err(ArchError::ForwardPassError {
+                layer,
+                message: format!("layer index {layer} out of range (max {})", self.num_layers),
+            });
+        }
+        self.values[layer].copy_f32_prefix_into(self.stored_len * self.kv_dim, dst);
+        Ok(())
+    }
+
+    /// Shared body of `for_each_key` / `for_each_value`.
+    ///
+    /// One reusable `kv_dim`-sized row buffer is allocated per call rather than
+    /// one per position, and FP16 storage is converted into it on the way out.
+    fn for_each_row(
+        &self,
+        layer: usize,
+        keys: bool,
+        f: &mut dyn FnMut(usize, &[f32]),
+    ) -> ArchResult<()> {
+        if layer >= self.num_layers {
+            return Err(ArchError::ForwardPassError {
+                layer,
+                message: format!("layer index {layer} out of range (max {})", self.num_layers),
+            });
+        }
+        if self.kv_dim == 0 {
+            return Ok(());
+        }
+        let buf = if keys {
+            &self.keys[layer]
+        } else {
+            &self.values[layer]
+        };
+        // FP32 storage can hand the caller the real slice with no copy at all.
+        if let Some(all) = buf.as_f32_prefix(self.stored_len * self.kv_dim) {
+            for (pos, row) in all.chunks_exact(self.kv_dim).enumerate() {
+                f(pos, row);
+            }
+            return Ok(());
+        }
+        let mut row = vec![0.0f32; self.kv_dim];
+        for pos in 0..self.stored_len {
+            buf.read_row_into(pos * self.kv_dim, &mut row);
+            f(pos, &row);
+        }
+        Ok(())
+    }
+}
+
+/// The error returned when a borrowed `&[f32]` is requested from non-FP32
+/// storage.
+///
+/// Deliberately verbose: it names the dtype, the accessor that failed, and the
+/// two APIs that do work, because this is the error an architecture author will
+/// hit the first time they run against an FP16 cache.
+fn dtype_borrow_error(layer: usize, dtype: KvCacheDtype, accessor: &str, what: &str) -> ArchError {
+    ArchError::ForwardPassError {
+        layer,
+        message: format!(
+            "KV cache stores {what} as {} — `{accessor}()` can only borrow `&[f32]` from f32 \
+             storage; use `for_each_{}()` or `copy_{}_into(&mut buf)` instead",
+            dtype.as_str(),
+            if what == "keys" { "key" } else { "value" },
+            what,
+        ),
     }
 }
 
@@ -303,27 +569,56 @@ impl KvCacheAccess for KvCache {
         self.seq_len
     }
 
+    /// Store one token's K/V for `layer` at the current position.
+    ///
+    /// # Errors
+    ///
+    /// * The position is at or past `max_seq_len`.  This used to be silent: the
+    ///   body was guarded by `if end <= buffer.len()` and fell through to
+    ///   `Ok(())`, so once the context filled up every subsequent token's K/V
+    ///   was **discarded** while generation carried on producing logits from a
+    ///   frozen cache.
+    /// * `key` or `value` is shorter than `kv_dim`.  That used to panic inside
+    ///   `copy_from_slice`, taking the process down on an architecture bug
+    ///   instead of surfacing one.
     fn store_kv(&mut self, layer: usize, key: &[f32], value: &[f32]) -> ArchResult<()> {
         if layer >= self.num_layers {
-            return Err(oxillama_arch::ArchError::ForwardPassError {
+            return Err(ArchError::ForwardPassError {
                 layer,
                 message: format!("layer index {layer} out of range (max {})", self.num_layers),
             });
         }
+        if self.seq_len >= self.max_seq_len {
+            return Err(ArchError::ForwardPassError {
+                layer,
+                message: format!(
+                    "KV cache full: position {} reaches the maximum context length {}",
+                    self.seq_len, self.max_seq_len
+                ),
+            });
+        }
+        if key.len() < self.kv_dim || value.len() < self.kv_dim {
+            return Err(ArchError::ForwardPassError {
+                layer,
+                message: format!(
+                    "store_kv received a {}-element key and a {}-element value, but kv_dim is {}",
+                    key.len(),
+                    value.len(),
+                    self.kv_dim
+                ),
+            });
+        }
 
+        self.ensure_capacity(self.seq_len + 1);
         let offset = self.seq_len * self.kv_dim;
-        let end = offset + self.kv_dim;
-
-        if end <= self.keys[layer].len() {
-            self.keys[layer][offset..end].copy_from_slice(&key[..self.kv_dim]);
-            self.values[layer][offset..end].copy_from_slice(&value[..self.kv_dim]);
-            // Ensure get_keys/get_values can see the entry we just wrote even
-            // before advance() is called (advance is called once per token
-            // after ALL layers have written their K/V, but attention reads
-            // back during the same forward pass).
-            if self.stored_len <= self.seq_len {
-                self.stored_len = self.seq_len + 1;
-            }
+        self.keys[layer].write_at(offset, &key[..self.kv_dim]);
+        self.values[layer].write_at(offset, &value[..self.kv_dim]);
+        // Ensure get_keys/get_values can see the entry we just wrote even
+        // before advance() is called (advance is called once per token
+        // after ALL layers have written their K/V, but attention reads
+        // back during the same forward pass).
+        if self.stored_len <= self.seq_len {
+            self.stored_len = self.seq_len + 1;
         }
 
         Ok(())
@@ -331,24 +626,36 @@ impl KvCacheAccess for KvCache {
 
     fn get_keys(&self, layer: usize) -> ArchResult<&[f32]> {
         if layer >= self.num_layers {
-            return Err(oxillama_arch::ArchError::ForwardPassError {
+            return Err(ArchError::ForwardPassError {
                 layer,
                 message: format!("layer index {layer} out of range (max {})", self.num_layers),
             });
         }
         let end = self.stored_len * self.kv_dim;
-        Ok(&self.keys[layer][..end])
+        self.keys[layer]
+            .as_f32_prefix(end)
+            .ok_or_else(|| dtype_borrow_error(layer, self.dtype, "get_keys", "keys"))
     }
 
     fn get_values(&self, layer: usize) -> ArchResult<&[f32]> {
         if layer >= self.num_layers {
-            return Err(oxillama_arch::ArchError::ForwardPassError {
+            return Err(ArchError::ForwardPassError {
                 layer,
                 message: format!("layer index {layer} out of range (max {})", self.num_layers),
             });
         }
         let end = self.stored_len * self.kv_dim;
-        Ok(&self.values[layer][..end])
+        self.values[layer]
+            .as_f32_prefix(end)
+            .ok_or_else(|| dtype_borrow_error(layer, self.dtype, "get_values", "values"))
+    }
+
+    fn for_each_key(&self, layer: usize, f: &mut dyn FnMut(usize, &[f32])) -> ArchResult<()> {
+        self.for_each_row(layer, true, f)
+    }
+
+    fn for_each_value(&self, layer: usize, f: &mut dyn FnMut(usize, &[f32])) -> ArchResult<()> {
+        self.for_each_row(layer, false, f)
     }
 
     fn advance(&mut self) {
@@ -428,8 +735,10 @@ mod tests {
         assert_eq!(cache.seq_len(), 0);
     }
 
+    /// `clear()` no longer zeroes the buffers — it is an `O(1)` bookkeeping
+    /// reset — so what is asserted here is *unreachability*, not zeroing.
     #[test]
-    fn test_clear_zeros_stored_data() {
+    fn test_clear_makes_stored_data_unreachable() {
         let kv_dim = 4;
         let mut cache = KvCache::new(1, 8, kv_dim);
 

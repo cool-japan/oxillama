@@ -125,4 +125,19 @@ pub enum RuntimeError {
     /// Cannot pool an empty sequence (seq_len = 0).
     #[error("cannot pool empty sequence")]
     EmptySequence,
+
+    /// GPU offload was requested but no usable device could be bound.
+    ///
+    /// Raised by [`crate::gpu_backend`] when the engine is configured with
+    /// [`GpuPolicy::On`](crate::GpuPolicy::On) and either the `gpu` feature is
+    /// absent or the requested adapter does not exist.  Never raised for a
+    /// device that exists but holds no tensors — that is a successful load with
+    /// an idle GPU, reported through
+    /// [`GpuStatus`](crate::GpuStatus) instead.
+    #[error("GPU unavailable: {reason}")]
+    GpuUnavailable {
+        /// Why no device could be bound, including the available devices when
+        /// the caller named one that does not exist.
+        reason: String,
+    },
 }

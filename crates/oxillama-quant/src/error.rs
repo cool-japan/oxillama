@@ -68,4 +68,24 @@ pub enum QuantError {
     /// Float GEMM (F16/BF16/F32) computation failure.
     #[error("float GEMM failed: {0}")]
     FloatGemmFailed(String),
+
+    /// A row handed to an encoder is not a whole number of blocks.
+    ///
+    /// ggml's `quantize_row_*_ref` functions all begin with
+    /// `assert(k % QK == 0)`, so a K-quant row must be a multiple of 256 and a
+    /// legacy row a multiple of 32. This is *not* something a caller can pad
+    /// its way out of: padding the flattened tensor only pads the last row,
+    /// and a quantized tensor's rows must each start on a block boundary for
+    /// the decoder to find them. Model-level callers handle the situation the
+    /// way llama.cpp does — by falling back to a type whose block size does
+    /// divide the row (see `oxillama-cli`'s `fallback_for_incompatible_row`).
+    #[error("row length {row_len} is not a multiple of the {quant_type} block size {block_size}")]
+    RowNotBlockAligned {
+        /// Display name of the target quantization type.
+        quant_type: &'static str,
+        /// Required block size in weights.
+        block_size: usize,
+        /// The offending row length in weights.
+        row_len: usize,
+    },
 }

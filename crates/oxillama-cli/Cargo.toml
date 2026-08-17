@@ -17,22 +17,31 @@ name = "oxillama"
 path = "src/main.rs"
 
 [features]
-default = ["server"]
+default = ["server", "tui", "simd-neon", "simd-avx2"]
 server = ["dep:oxillama-server", "dep:axum"]
-bench = ["dep:oxillama-bench"]
-simd-avx2 = ["oxillama-quant/simd-avx2"]
-simd-avx512 = ["oxillama-quant/simd-avx512"]
-simd-neon = ["oxillama-quant/simd-neon"]
+bench = []
+simd-avx2 = ["oxillama-quant/simd-avx2", "oxillama-runtime/simd-avx2"]
+simd-avx512 = ["oxillama-quant/simd-avx512", "oxillama-runtime/simd-avx512"]
+simd-neon = ["oxillama-quant/simd-neon", "oxillama-runtime/simd-neon"]
 hub = ["dep:hf-hub"]
 tui = ["dep:ratatui", "dep:crossterm"]
+# Device-resident weights via wgpu, exposed as `--gpu` on run/serve/chat.
+# Off by default: it pulls the whole wgpu stack into the build, and only the
+# Q4_0 resident GEMV currently beats the CPU kernel.
+gpu = ["oxillama-runtime/gpu"]
 
 [dependencies]
 oxillama-gguf = { workspace = true, features = ["mmap"] }
 oxillama-quant = { workspace = true, features = ["parallel"] }
-oxillama-arch.workspace = true
+# The shipping binary must be able to load any GGUF the user hands it, so it
+# names the full architecture set explicitly rather than inheriting it from
+# `oxillama-runtime` (the workspace table pins `default-features = false`).
+# A missing architecture here is invisible until run time: it disappears from
+# `ArchitectureRegistry::with_builtins()` and the model is rejected with
+# "unsupported architecture".
+oxillama-arch = { workspace = true, features = ["all-architectures"] }
 oxillama-runtime = { workspace = true, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi", "parallel", "native-async", "mmap"] }
 oxillama-server = { workspace = true, optional = true }
-oxillama-bench = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 clap.workspace = true
 colored.workspace = true
@@ -59,6 +68,7 @@ crossterm = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+oxillama-gguf = { path = "../oxillama-gguf", default-features = false, features = ["mmap", "test-utils"] }
 
 [[bench]]
 name = "inference"

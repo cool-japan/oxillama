@@ -86,6 +86,30 @@ impl Metrics {
         }
     }
 
+    /// Record token usage from a completed generation (D14 fix).
+    ///
+    /// Previously nothing ever called into `tokens_generated_total` /
+    /// `prompt_tokens_total`, so `/metrics` always reported zero for both
+    /// regardless of how much traffic the server actually served.
+    pub fn record_usage(&self, prompt_tokens: u64, completion_tokens: u64) {
+        self.prompt_tokens_total
+            .fetch_add(prompt_tokens, Ordering::Relaxed);
+        self.tokens_generated_total
+            .fetch_add(completion_tokens, Ordering::Relaxed);
+    }
+
+    /// Total request count across every endpoint/status bucket (D14 fix).
+    ///
+    /// Used by `GET /admin/stats`'s `requests_total` field, which
+    /// previously (incorrectly) reported `active_requests` — an
+    /// in-flight gauge, not a cumulative total — under that name.
+    pub fn total_requests(&self) -> u64 {
+        self.request_counts
+            .iter()
+            .map(|entry| entry.value.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// Render all metrics in Prometheus text exposition format.
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(1024);
@@ -264,5 +288,29 @@ mod tests {
         assert!(
             rendered.contains(r#"oxillama_requests_total{endpoint="/health",status="2xx"} 800"#)
         );
+    }
+
+    /// D14 regression: `record_usage` must update both the prompt and
+    /// completion token counters — previously nothing called this at all,
+    /// so `/metrics` always reported zero token counts.
+    #[test]
+    fn test_record_usage_updates_both_counters() {
+        let m = Metrics::new();
+        m.record_usage(10, 3);
+        m.record_usage(5, 2);
+        assert_eq!(m.prompt_tokens_total.load(Ordering::Relaxed), 15);
+        assert_eq!(m.tokens_generated_total.load(Ordering::Relaxed), 5);
+    }
+
+    /// D14 regression: `total_requests` sums every endpoint/status bucket,
+    /// not just one — and must differ from `active_requests`, which is an
+    /// in-flight gauge, not a cumulative counter.
+    #[test]
+    fn test_total_requests_sums_all_buckets() {
+        let m = Metrics::new();
+        m.inc_request("/health", 200);
+        m.inc_request("/v1/chat/completions", 200);
+        m.inc_request("/v1/chat/completions", 500);
+        assert_eq!(m.total_requests(), 3);
     }
 }

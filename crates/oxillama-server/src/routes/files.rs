@@ -59,6 +59,16 @@ fn server_error_response(message: &str) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
 }
 
+fn bad_request_response(message: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+        }
+    });
+    (StatusCode::BAD_REQUEST, Json(body)).into_response()
+}
+
 fn payload_too_large_response(message: &str) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -225,6 +235,7 @@ pub async fn get_file_handler(
         Ok(Err(ServerError::FileNotFound(_))) => {
             not_found_response(&format!("File '{}' not found", file_id))
         }
+        Ok(Err(ServerError::InvalidRequest { message })) => bad_request_response(&message),
         Ok(Err(e)) => server_error_response(&e.to_string()),
         Err(e) => server_error_response(&format!("task join: {e}")),
     }
@@ -256,6 +267,7 @@ pub async fn get_file_content_handler(
         Ok(Err(ServerError::FileNotFound(_))) => {
             not_found_response(&format!("File '{}' not found", file_id))
         }
+        Ok(Err(ServerError::InvalidRequest { message })) => bad_request_response(&message),
         Ok(Err(e)) => server_error_response(&e.to_string()),
         Err(e) => server_error_response(&format!("task join: {e}")),
     }
@@ -288,6 +300,7 @@ pub async fn delete_file_handler(
         Ok(Err(ServerError::FileNotFound(_))) => {
             not_found_response(&format!("File '{}' not found", file_id))
         }
+        Ok(Err(ServerError::InvalidRequest { message })) => bad_request_response(&message),
         Ok(Err(e)) => server_error_response(&e.to_string()),
         Err(e) => server_error_response(&format!("task join: {e}")),
     }

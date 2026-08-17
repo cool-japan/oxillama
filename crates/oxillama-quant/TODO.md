@@ -42,18 +42,18 @@ re-quantizes activations internally.
 
 | Field | Value |
 |---|---|
-| Version | 0.1.1 |
+| Version | 0.1.4 |
 | Completion | ~99% |
-| Source files | ~67 under `src/` |
-| Top-level modules | `dispatch`, `error`, `lora`, `parallel`, `quantize`, `reference`, `simd`, `traits`, `types` |
+| Source files | 134 under `src/` |
+| Top-level modules | `dispatch`, `error`, `kquant`, `lora`, `parallel`, `quantize`, `reference`, `simd`, `traits`, `types` |
 | Default features | `parallel` (Rayon) |
 | Optional features | `simd-avx2`, `simd-avx512`, `simd-neon` |
 | Dispatch pyramid | AVX-512F → AVX2+FMA → AArch64 NEON → scalar reference |
 | Detection | `SimdCapabilities::detect()` cached via `OnceLock` in `simd::cached_capabilities()` |
 | Production `unwrap()` | 0 |
-| Bench harness | Criterion (`benches/quant_kernels.rs`) |
+| Bench harness | Criterion (`benches/quant_kernels.rs`, `benches/quant_shapes.rs`) |
 
-SIMD coverage matrix (v0.1.3):
+SIMD coverage matrix (v0.1.4):
 
 | Type | Scalar | AVX2 | AVX-512 | NEON |
 |---|:-:|:-:|:-:|:-:|
@@ -69,16 +69,18 @@ SIMD coverage matrix (v0.1.3):
 | Q5_0 | yes | yes | yes ✅ v0.1.1 | yes ✅ v0.1.1 |
 | Q5_1 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.3 | yes ✅ v0.1.1 |
 | Q8_1 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.3 | yes ✅ v0.1.1 |
-| Q8_K | yes (dequant only) | — | yes ✅ v0.1.1 | yes |
+| Q8_K | yes | yes | yes ✅ v0.1.1 | yes |
 | TQ1_0 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.1 | yes ✅ v0.1.1 |
 | TQ2_0 | yes | yes ✅ v0.1.1 | yes ✅ v0.1.1 | yes ✅ v0.1.1 |
-| IQ1_S, IQ1_M | yes | — | — | yes ✅ v0.1.1 |
-| IQ2_XXS, IQ2_XS, IQ2_S | yes | IQ2_XXS ✅ | — | all ✅ v0.1.1 |
-| IQ3_XXS, IQ3_S | yes | IQ3_S ✅ | — | both ✅ v0.1.1 |
-| IQ4_NL, IQ4_XS | yes | IQ4_XS ✅ | — | both ✅ v0.1.1 |
+| IQ1_S, IQ1_M | yes | yes | — | yes ✅ v0.1.1 |
+| IQ2_XXS, IQ2_XS, IQ2_S | yes | all ✅ | IQ2_XXS/IQ2_XS ✅ | all ✅ v0.1.1 |
+| IQ3_XXS, IQ3_S | yes | both ✅ | IQ3_S ✅ | both ✅ v0.1.1 |
+| IQ4_NL, IQ4_XS | yes | both ✅ | IQ4_XS ✅ | both ✅ v0.1.1 |
 | F16, BF16, F32 | yes (passthrough) | — | — | — |
 
-Eight block formats have a full four-tier SIMD ladder (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q1_0_G128, Q2_K, Q3_K). Q8_K has scalar + NEON + AVX-512. IQ2_XXS has scalar + AVX2. TQ1_0/TQ2_0 have full AVX2+AVX-512+NEON coverage. All IQ* types have NEON acceleration. NEON covers Q4_1/Q5_0/Q5_1/Q8_1. AVX-512 gaps remain for Q4_1/Q5_1/Q8_1 (deferred).
+Nineteen of the 24 quantized block formats now have a full four-tier SIMD
+ladder (scalar + AVX2 + AVX-512 + NEON); the remaining five — IQ1_S, IQ1_M,
+IQ2_S, IQ3_XXS, IQ4_NL — have scalar + AVX2 + NEON but no AVX-512 kernel yet.
 
 Feature flag behaviour:
 
@@ -127,14 +129,24 @@ Scalar reference kernels (`src/reference/`):
 Platform SIMD kernels (`src/simd/`):
 
 - `simd/mod.rs` — `cached_capabilities()` + platform gates
-- `simd/avx2/` — `q4_0.rs`, `q5_0.rs`, `q4_k.rs`, `q5_k.rs`, `q6_k.rs`, `q8_0.rs`,
-  `q1_0_g128.rs`, `q2_k.rs`, `q3_k.rs`, `util.rs`
-- `simd/avx512/` — `q4_0.rs`, `q4_k.rs`, `q5_k.rs`, `q6_k.rs`, `q8_0.rs`, `q1_0_g128.rs`, `util.rs`
-- `simd/neon/` — `q4_0.rs`, `q4_k.rs`, `q5_k.rs`, `q6_k.rs`, `q8_0.rs`, `q1_0_g128.rs`
+- `simd/avx2/` — 24 kernel files: legacy (`q4_0.rs`, `q4_1.rs`, `q5_0.rs`, `q5_1.rs`,
+  `q8_0.rs`, `q8_1.rs`), K-quants (`q2_k.rs`, `q3_k.rs`, `q4_k.rs`, `q5_k.rs`,
+  `q6_k.rs`, `q8_k.rs`), I-quants (all 9 `iq*.rs`), ternary (`tq1_0.rs`, `tq2_0.rs`),
+  Bonsai (`q1_0_g128.rs`) — plus `util.rs`
+- `simd/avx512/` — 19 kernel files covering the same families minus the five
+  I-quant gaps (IQ1_S, IQ1_M, IQ2_S, IQ3_XXS, IQ4_NL — see §2); plus `int_dot.rs`
+  (AVX-512BW / AVX-512F-only integer lane primitives) and `fused.rs` (the
+  32-weight formats' `matvec_q8_fused` bodies and the K-quant delegations to AVX2)
+- `simd/neon/` — 24 kernel files, the same family coverage as AVX2, plus
+  `int_dot.rs` (SDOT/UDOT integer dot-product primitives)
 
 Quantize API:
 
-- `quantize.rs` — Quantize-on-the-fly conversion (F32/F16 → Q4_0/Q8_0, generic dequant)
+- `quantize.rs` — legacy 32-weight encoders (F32/F16 → Q4_0/Q5_0/Q5_1/Q8_0),
+  the `quantize_f32_row`/`quantize_f32_rows` dispatchers, and generic dequant
+- `kquant/` — K-quant encoders (`helpers.rs`, `q2_k.rs`, `q3_k.rs`, `q4_k.rs`,
+  `q5_k.rs`, `q6_k.rs`): FP32 → Q2_K/Q3_K/Q4_K/Q5_K/Q6_K super-blocks, byte-for-byte
+  ports of llama.cpp's `quantize_row_*_K_ref`
 
 No single source file exceeds the 2000-line splitrs ceiling; the largest
 (`iq1s_grid/data_*.rs`) are mechanical grid tables and were pre-split at
@@ -154,8 +166,11 @@ Kernels and formats:
 Runtime SIMD dispatch:
 
 - Three-tier selection in `dispatch.rs`: AVX-512F → AVX2+FMA → NEON → scalar
-- `SimdCapabilities { avx2, avx512f, fma, neon }` with per-target
-  `detect_*` functions gated by `#[cfg(target_arch = …)]`
+- `SimdCapabilities { avx2, avx512f, avx512bw, fma, neon, dotprod }` with
+  per-target `detect_*` functions gated by `#[cfg(target_arch = …)]`.
+  `avx512bw` is probed independently of `avx512f` (they are separate CPUID
+  bits, and every `epi8`/`epi16` instruction lives in BW); the fused AVX-512
+  kernels select their lane width from it.
 - Result cached through `simd::cached_capabilities()` (`OnceLock`), so the
   dispatcher pays the CPUID cost exactly once per process
 - `best_tier()` returns a stable display string for `oxillama info`
@@ -193,8 +208,19 @@ Ternary quantization:
 
 Quantize-on-the-fly:
 
-- `quantize_f32_to_q4_0`, `quantize_f32_to_q8_0`,
-  `quantize_f16_to_q4_0`, `quantize_f16_to_q8_0`, `dequantize_to_f32`
+- `quantize_f32_to_q4_0`, `quantize_f32_to_q5_0`, `quantize_f32_to_q5_1`,
+  `quantize_f32_to_q8_0`, `quantize_f16_to_q4_0`, `quantize_f16_to_q8_0`,
+  `dequantize_to_f32`
+- K-quant encoders: `quantize_f32_to_q2_k`, `quantize_f32_to_q3_k`,
+  `quantize_f32_to_q4_k`, `quantize_f32_to_q5_k`, `quantize_f32_to_q6_k` —
+  byte-for-byte with llama.cpp `ba7e817ee`, golden-tested against expected
+  bytes produced by executing the C reference (`tests/golden_kquant_encoders.rs`,
+  fixture `tests/data/kquant_golden.txt`)
+- Row-level dispatch: `quantize_f32_row` (single row), `quantize_f32_rows`
+  (whole 2-D tensor, rayon-parallel over rows), `can_encode`
+- Still decode-only, i.e. **not** encodable: Q4_1, Q8_1, Q8_K, Q1_0_G128,
+  TQ1_0, TQ2_0 and every I-quant. `quantize_f32_row` reports
+  `QuantError::UnsupportedType` for these rather than guessing.
 
 Benchmarks and tests:
 
@@ -209,13 +235,38 @@ Benchmarks and tests:
 
 Tracked against the remaining ~1% to 100%:
 
-- **SIMD coverage breadth:** ~2 of 27 types still lack AVX-512 (Q4_1, Q5_1). All IQ* types have full AVX2+NEON coverage; TQ1_0/TQ2_0/Q5_0/Q8_K have AVX-512+NEON. Q2_K/Q3_K now have full AVX-512 coverage (v0.1.3). Q4_1/Q8_1/Q5_1 AVX-512 deferred.
+- **SIMD coverage breadth:** 5 of the 24 quantized block formats still lack AVX-512 — IQ1_S, IQ1_M,
+  IQ2_S, IQ3_XXS, IQ4_NL — all five already have full AVX2+NEON coverage.
+  Every other block format (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1, all six K-quants,
+  Q1_0_G128, TQ1_0/TQ2_0, and IQ2_XXS/IQ2_XS/IQ3_S/IQ4_XS) now has a full
+  four-tier ladder, including AVX-512 for Q4_1/Q5_1/Q8_1.
+- **AVX-512 hardware verification is pending.** The AVX-512 fused
+  Q8_0-activation kernels (`simd/avx512/{int_dot,fused}.rs`, added for Q4_0,
+  Q5_0, Q5_1, Q8_0, Q8_1) have never been *executed*: this workspace is
+  developed on aarch64.  What exists today is (a) cross-compilation and Clippy
+  for `x86_64-unknown-linux-gnu` / `x86_64-apple-darwin` under `simd-avx512`
+  alone and combined with `simd-avx2`, (b) golden tests
+  (`tests/avx512_fused_goldens.rs`) that hold a scalar model of the lane
+  arithmetic against constants produced by executing llama.cpp's C reference
+  kernels, including a negative control, and (c) `is_x86_feature_detected!`-gated
+  unit tests that skip on this host.  **First job on an AVX-512 machine:** run
+  `cargo nextest run -p oxillama-quant --features simd-avx512` and confirm the
+  skipped tests actually execute.  No AVX-512 throughput number in this file or
+  the README has been measured.
+- **AVX-512 K-quants delegate their fused GEMV to AVX2 by design.** Q2_K, Q3_K,
+  Q4_K, Q5_K and Q6_K route `matvec_q8_fused` to their AVX2 kernels rather than
+  re-deriving the per-sub-block scale/min arithmetic in 512-bit lanes, which
+  could not be validated here.  This is a correctness-motivated pause, not an
+  omission — it removes the regression (AVX-512 previously had *no* fused path)
+  without adding an unverifiable rewrite.  Native 512-bit K-quant fused kernels
+  are the natural follow-up once AVX-512 hardware is available.
 - ~~**No IQ SIMD beyond IQ2_XXS:**~~ ✅ IQ2_XS, IQ3_S, IQ4_XS, and Q4_1 AVX2 kernels now ship; IQ2_XXS was already done.
 - ~~**Q8_K is dequant-only:** there is no `matvec_q8` fast path. The
   activation-side Q8_K is currently materialized via dequant→Q8_0 GEMV.~~ ✅ Fixed: Q8_K now has a true fused GEMV in scalar, AVX2, and NEON tiers.
-- **No fused dequant+GEMM:** every matmul performs dequant into a scratch
-  buffer and then hands off to GEMV, doubling the memory traffic of the hot
-  path on large models.
+- ~~**No fused dequant+GEMM:**~~ ✅ Partially fixed: Q4_0 and Q4_K (AVX2 + NEON)
+  are the formats verified register-fused here — dequant+dot with no
+  intermediate f32 scratch buffer (§9 B1/B2, done 2026-04-20 — matches the
+  README claim). Other formats' fused status was not audited.
 - **No group-calibrated (activation-aware) quantization.** The kernels
   consume GGUF blocks as-shipped and assume calibration was done upstream.
 - **No WASM or RISC-V SIMD.** Both targets currently run scalar-only.
@@ -240,7 +291,7 @@ Ordered by production impact.
   for TQ1_0/TQ2_0, lifting them from scalar to hardware-accelerated popcount
   paths.~~ ✅ Fully shipped: TQ1_0 and TQ2_0 AVX2 kernels (previous run), plus NEON kernels (`src/simd/neon/tq1_0.rs`, `tq2_0.rs`) and AVX-512 kernels (`src/simd/avx512/tq1_0.rs`, `tq2_0.rs`) — all registered in the dispatcher. Also added AVX-512 Q5_0 (`avx512/q5_0.rs`) and Q8_K (`avx512/q8_k.rs`).
 - ~~**AVX-512 Q2_K / Q3_K:**~~ ✅ Shipped in v0.1.3: `Q2_KAvx512` (`simd/avx512/q2_k.rs`, ~700 LoC) and `Q3_KAvx512` (`simd/avx512/q3_k.rs`, ~830 LoC) registered in `dispatch.rs`. Closes the Q2_K/Q3_K AVX-512 gap; ~2× throughput vs AVX2 on AVX-512 hosts.
-- ~~**Complete IQ SIMD matrix:**~~ ✅ All 11 IQ types have full AVX2 + NEON coverage: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS all have NEON AArch64 kernels in `src/simd/neon/`. Wired into `dispatch.rs` NEON branch.
+- ~~**Complete IQ SIMD matrix:**~~ ✅ All 9 IQ types have full AVX2 + NEON coverage: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS all have NEON AArch64 kernels in `src/simd/neon/`. Wired into `dispatch.rs` NEON branch.
 - **Activation-aware weights:** per-group calibrated quantization where the
   group scale absorbs activation statistics (AWQ / GPTQ-style). Requires a
   calibration pass and a compatible block layout extension in `oxillama-gguf`.
@@ -262,7 +313,10 @@ Ordered by production impact.
   route GEMM through `oxiblas` instead of the passthrough path. Moves the
   float tier from a dequant-shaped contract to a true BLAS integration.
 
-*Last updated: 2026-05-03 (v0.1.3 — AVX-512 Q2_K/Q3_K shipped; 1873 workspace tests)*
+*Last updated: 2026-08-17 (v0.1.4 — seven-format quantization weight-layout correctness fixes
+across scalar/AVX2/AVX-512/NEON tiers, K-quant encoders unlocking `quantize --target Q4_K_M`,
+`QuantTensor::data` changed to `SharedBytes` for zero-copy mmap loading, threaded GEMV via a
+dedicated rayon pool, NEON SDOT integer dot products; 502 tests in this crate)*
 
 ## 8. Planned Kernels (A1–A8)
 

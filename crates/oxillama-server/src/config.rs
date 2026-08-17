@@ -74,6 +74,26 @@ pub struct ServerConfig {
     ///
     /// `None` (the default) disables per-key rate limiting entirely.
     pub per_key_rate_limits: Option<HashMap<String, (f64, f64)>>,
+
+    // ── Admin path allow-listing (D1) ───────────────────────────────────────
+    /// Directories that `path` fields in admin requests
+    /// (`POST /admin/models/load`'s model path, `POST /admin/loras`'s
+    /// adapter path) are allowed to resolve into.
+    ///
+    /// A supplied path is rejected (400) unless its canonicalized form is
+    /// contained in at least one of these directories (after they are
+    /// themselves canonicalized). This closes off the admin API as a path
+    /// traversal / arbitrary-file-read primitive — without it, an admin
+    /// caller (which may be less trusted than "the operator who started
+    /// the process", e.g. behind a shared bearer token) can ask the server
+    /// to `mmap`/read any file on disk the process has permission to open.
+    ///
+    /// **Empty (the default) disables this check** — no allow-list is
+    /// enforced, matching the pre-fix behavior, so existing deployments
+    /// are not broken by upgrading. Operators should populate this to
+    /// actually get the protection.
+    #[serde(default)]
+    pub allowed_model_dirs: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -105,6 +125,8 @@ impl Default for ServerConfig {
             batch_max_pending_bytes: 1024 * 1024 * 1024, // 1 GiB
 
             per_key_rate_limits: None,
+
+            allowed_model_dirs: Vec::new(),
         }
     }
 }

@@ -251,6 +251,7 @@ mod tests {
     /// Two slots with different KV caches.  Compute batched output and verify
     /// each row matches a single-slot call to `flash_attention_forward` with
     /// the same inputs.
+    #[cfg_attr(miri, ignore)] // rayon/crossbeam-epoch uses integer-to-pointer casts (Stacked Borrows incompatible)
     #[test]
     fn batched_flash_decode_matches_serial() {
         let num_heads = 2usize;

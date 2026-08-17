@@ -101,3 +101,40 @@ def test_engine_config_zero_ctx_size_raises():
 def test_engine_config_negative_ctx_size_raises():
     with pytest.raises(Exception):
         _NATIVE.EngineConfig(model_path="m.gguf", context_size=-1)
+
+
+# ---------------------------------------------------------------------------
+# Audit: adjacent parameters (empty model_path). `context_size` is unsigned
+# at the FFI boundary, so a negative Python int is already rejected before
+# any Rust validation code runs (see test above) — `model_path` has no such
+# built-in guard, since any string, including an empty one, converts cleanly.
+# ---------------------------------------------------------------------------
+
+
+@_SKIP
+def test_engine_config_empty_model_path_raises():
+    with pytest.raises(Exception):
+        _NATIVE.EngineConfig(model_path="")
+
+
+@_SKIP
+def test_engine_config_whitespace_only_model_path_raises():
+    with pytest.raises(Exception):
+        _NATIVE.EngineConfig(model_path="   ")
+
+
+@_SKIP
+def test_engine_config_context_size_none_is_still_valid():
+    """`None` (not `0`) remains the documented spelling of "use the model's
+    default context length" — validation must not reject it."""
+    cfg = _NATIVE.EngineConfig(model_path="m.gguf", context_size=None)
+    assert cfg.context_size is None
+
+
+@_SKIP
+def test_engine_config_zero_num_threads_is_valid_auto():
+    """`num_threads=0` means "auto" (`available_parallelism()`) per the Rust
+    `EngineConfig` docs — it is not one of the validated fields and must not
+    raise."""
+    cfg = _NATIVE.EngineConfig(model_path="m.gguf", num_threads=0)
+    assert cfg.num_threads == 0

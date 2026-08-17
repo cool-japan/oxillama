@@ -18,15 +18,19 @@ production paths.
 
 ## 2. Status Snapshot
 
-- Version: **0.1.2** (workspace inherited).
+- Version: **0.1.4** (workspace inherited).
 - Completion: **99%**.
-- Source files: **~45** under `src/**/*.rs`.
-- Supported architectures: **27** (25 feature-gated + Yi and InternLM3 compiled unconditionally).
-- Default features (20): `llama`, `qwen3`, `mistral`, `gemma`, `phi`,
-  `command-r`, `starcoder`, `llava`, `llava16`, `falcon`, `minicpm`, `olmo2`,
-  `granite`, `deepseek`, `dbrx`, `grok`, `mamba2`, `jamba`, `bloom`, `phimoe`
-  (`llava16` implies `llava`; `llava` implies `llama`; `jamba` implies `mamba2`).
-- Tests: **481 passing**.
+- Source files: **127** under `src/**/*.rs`.
+- Supported architectures: **26** (24 feature-gated + Yi and InternLM3 compiled unconditionally).
+- Default features (23): `llama`, `qwen3`, `mistral`, `gemma`, `phi`,
+  `command-r`, `starcoder`, `llava`, `llava16`, `qwen2-vl`, `mixtral`,
+  `falcon`, `minicpm`, `olmo2`, `granite`, `deepseek`, `dbrx`, `grok`,
+  `mamba2`, `stablelm`, `gptneox`, `bloom`, `phimoe`
+  (`llava16` implies `llava`; `llava` implies `llama`; `mixtral` implies
+  `llama`. `jamba` implies `mamba2` but `jamba` itself is **not** part of
+  `all-architectures`, so it is not actually default — see Known Gaps §5).
+- Tests: **1036 passing, 1 skipped** (`--all-features`); **1004 passing,
+  1 skipped** (default features).
 - Upstream dependencies: `oxillama-gguf`, `oxillama-quant`, `half`,
   `thiserror`, `tracing` — all workspace-pinned.
 - Policy compliance: no `unwrap()` in production paths, all files
@@ -39,11 +43,14 @@ production paths.
 | LLaMA (2/3/4) | ✓ | GQA + RoPE + MoE (Mixtral) |
 | Qwen3 | ✓ | Attention bias |
 | Mistral | ✓ | Sliding-window attention |
+| Mixtral | ✓ | Sparse MoE FFN over LLaMA topology; own module `src/mixtral/`, feature `mixtral` enables `llama` |
 | Gemma (2/3) | ✓ | GeGLU, post-norm, logit soft-capping, interleaved SWA |
 | Phi (3/4) | ✓ | Merged QKV, partial RoPE |
 | StarCoder (GPT-BigCode) | ✓ | MQA, LayerNorm, GELU, absolute position emb |
 | Command-R/R+ | ✓ | Logit scaling, optional Q/K norms |
 | LLaVA-1.5 | ✓ | CLIP ViT-L/14 + MmProjector (LLaMA backbone) |
+| LLaVA-1.6 / LLaVA-NeXT | ✓ | Anyres tiling (variable grid + global thumbnail), each tile independently CLIP-encoded; `src/llava_next/`, registered `"llava16"` |
+| Qwen2-VL | ✓ | Native ViT (dynamic resolution, window attention) + M-RoPE (time/height/width) + 2×2 patch merger; `src/qwen2_vl/`, registered `"qwen2vl"` |
 | Falcon | ✓ | Old + new variants; rotary + parallel-attention |
 | MiniCPM | ✓ | Scaled embedding before first transformer block |
 | OLMo2 | ✓ | Reordered post-norms (after attention + after FFN) |
@@ -52,6 +59,9 @@ production paths.
 | DBRX | ✓ | Fine-grained 16-expert MoE, top-4 routing — new in v0.1.1; GGUF loaders completed in v0.1.2 |
 | Grok-1 | ✓ | 8-expert MoE, top-2, RoPE θ=1e6 — new in v0.1.1; GGUF loaders completed in v0.1.2 |
 | Mamba-2 | ✓ | Selective-scan SSM with learned Δ — new in v0.1.1; GGUF loaders completed in v0.1.2 |
+| Jamba | ⚠ scaffolding only, not loadable — see Known Gaps | Hybrid LLaMA-attention × Mamba-2 SSM; `src/jamba/` |
+| StableLM | ✓ | `src/stablelm/` |
+| GPT-NeoX | ✓ | EleutherAI GPT-NeoX / Pythia family; `src/gpt_neox/` |
 | Yi | ✓ | 01.AI Yi; LLaMA topology, GGUF arch `"yi"` |
 | InternLM3 | ✓ | Shanghai AI Lab InternLM3 |
 | BLOOM | ✓ | BigScience BLOOM; ALiBi positional bias, fused QKV, pre-LayerNorm with bias, GELU FFN |
@@ -102,6 +112,24 @@ production paths.
 - `src/phi_moe/` — Phi-3.5-MoE (partial RoPE, GQA, top-2 sparse
   SwiGLU MoE with stacked expert tensors; `mod.rs`, `model.rs`,
   `config.rs`).
+- `src/llava_next/` — LLaVA-1.6/NeXT anyres tiling (`mod.rs`,
+  `model.rs`, `tiler.rs`); registered as `"llava16"`.
+- `src/qwen2_vl/` — Qwen2-VL native-ViT + M-RoPE multimodal
+  (`mod.rs`, `model.rs`, `loader.rs`, `vision.rs`); registered as
+  `"qwen2vl"`.
+- `src/mixtral/` — Mixtral sparse MoE over LLaMA topology (`mod.rs`,
+  `model.rs`); feature `mixtral` enables `llama`.
+- `src/jamba/` — Hybrid LLaMA-attention × Mamba-2 SSM (`mod.rs`,
+  `model.rs`, `config.rs`); feature `jamba` is omitted from
+  `all-architectures` and therefore not part of the default build —
+  see §5 Known Gaps.
+- `src/stablelm/` — StableLM (`mod.rs`, `model.rs`, `config.rs`,
+  `loader.rs`, `head_norm.rs`).
+- `src/gpt_neox/` — GPT-NeoX / Pythia family (`mod.rs`, `model.rs`,
+  `loader.rs`, `tensor_names.rs`).
+- `src/reference/` — full-precision f32 reference path for CI
+  numeric-diff testing (`mod.rs`, `loader.rs`, `forward.rs`); feature
+  `reference-f32`, off by default.
 - `src/common/alibi.rs` — ALiBi positional bias primitive (`AlibiBias`
   struct; slope computation for power-of-two and non-power-of-two head
   counts; `apply()` modifies score buffer in-place before softmax).
@@ -184,6 +212,31 @@ depends on `llama` for its language-model backbone and enables the
   implementations. These are under the splitrs 2000-line policy
   threshold today, but GQA/MoE/SWA additions could push them over.
   Watch: `llama/model.rs`, `gemma/model.rs`, `llava/model.rs`.
+- **`jamba` exclusion from `all-architectures` is deliberate, not a bug**
+  (corrected 2026-08-17; an earlier revision of this entry called it a
+  "one-line `Cargo.toml` fix" — that was wrong, verified by reading the code
+  rather than just the feature list). `JambaArchitecture` in `src/jamba/mod.rs`
+  implements `arch_id()` and `tensor_names()` but does **not** override
+  `ModelArchitecture::build_from_gguf()`, so it falls through to the trait's
+  default, which unconditionally returns `ArchError::NotSupported`. The
+  generic engine dispatch (`oxillama-runtime`'s `build_forward_pass()`) reacts
+  to `NotSupported` by falling back to `build_forward_pass_direct()` — a
+  hard-coded match gated on `oxillama-runtime`'s *own* feature flags, which do
+  not include `jamba` at all (`oxillama-runtime/Cargo.toml` has no `jamba`
+  feature to gate an arm with). So adding `jamba` to `all-architectures` would
+  only add the arch id to the registry; `InferenceEngine::load_model()` on an
+  actual Jamba GGUF would still fail, just later and with a more confusing
+  error. `src/jamba/model.rs` (1750 lines, 12 tests) and `tests/jamba.rs`
+  (structural: layer pattern, sequence-state reset/isolation, arch_id, tensor
+  names, registry membership) are real and substantive, but neither exercises
+  the `build_from_gguf` → `build_forward_pass` path an actual `oxillama run
+  --model x.gguf` invocation takes. This matches `registry.rs`'s own doc
+  comment ("`jamba` is feature-gated and is **not** in the crate's `default`
+  list") and README.md's "Not shipped (non-functional stub)" — both are
+  accurate as written. Making Jamba loadable needs a `build_from_gguf`
+  override wired to `load_jamba_from_gguf()` (or an oxillama-runtime-side
+  `jamba` feature + direct-loader arm) plus verification against a real
+  checkpoint — a real implementation task, not a manifest tweak.
 - **Granite-3.x** (IBM) — [x] implemented (`crates/oxillama-arch/src/granite/`); dense decoder-only, LLaMA topology, GGUF arch key `"granite"`.
 - [x] **DeepSeek-V2 / V3** — implemented; Multi-Latent Attention (MLA)
   primitive in `common/mla.rs`, MoE FFN in `deepseek/moe.rs`,
@@ -198,7 +251,7 @@ depends on `llama` for its language-model backbone and enables the
 - **State-space models** — [x] Mamba-2 implemented (`crates/oxillama-arch/src/mamba2/`);
   `SequenceState` trait in `common/sequence_state.rs` generalises KvCacheAccess for SSMs. (v0.1.1)
   Jamba hybrid: see B1 below.
-- **Advanced multimodal**: ~~LLaVA-1.6~~ ✅ Shipped (v0.1.3, anyres tiling in `src/llava_next/`; registered under arch id `"llava16"`). Qwen2-VL, Molmo — not yet covered.
+- **Advanced multimodal**: ~~LLaVA-1.6~~ ✅ Shipped (v0.1.3, anyres tiling in `src/llava_next/`; registered under arch id `"llava16"`). ~~Qwen2-VL~~ ✅ Shipped (`src/qwen2_vl/`; registered under arch id `"qwen2vl"`, feature `qwen2-vl`, default-on). Molmo — not yet covered.
 - [x] **B4 — `tensor_loader.rs` preventive split via splitrs (planned 2026-04-20)** — DROPPED: `tensor_loader.rs` does not exist in the tree. Largest arch file is `llava/model.rs` at 1,210 lines (well under the 2,000-line splitrs threshold). The split intent is subsumed by B3's lora submodule restructure.
   - **Goal:** `crates/oxillama-arch/src/tensor_loader.rs` is approaching the 2000-LoC limit. Split before B1's Jamba additions push it over.
   - **Design:** Run `rslines 50 crates/oxillama-arch/src/tensor_loader.rs` to confirm size and identify natural split boundaries. Run `splitrs crates/oxillama-arch/src/tensor_loader.rs` to refactor into `tensor_loader/{mod,llama,qwen,mamba2,...}.rs` along arch boundaries. Re-export the public API from `tensor_loader/mod.rs` so callers see no API change. Verify with `cargo check -p oxillama-arch --all-features` and `cargo nextest run -p oxillama-arch --all-features`.
@@ -240,9 +293,9 @@ depends on `llama` for its language-model backbone and enables the
   Registered under arch id `"deepseek2"`. (2026-04-19)
 - [x] **Falcon** — old and new spec. Both share the rotary +
   parallel-attention layout but diverge on norm placement.
-- **MiniCPM** — scaled embedding variant (scale applied to token
+- ~~**MiniCPM**~~ — [x] implemented (scaled embedding variant; scale applied to token
   embedding output before first transformer block).
-- **Olmo2** — reordered post-norms (norm after attention output
+- ~~**Olmo2**~~ — [x] implemented (reordered post-norms; norm after attention output
   and after FFN output, rather than pre-norm).
 - ~~**Granite-3.x**~~ — [x] implemented (dense decoder-only; IBM's open LLM family).
 - **Arch subdir refactor**: when any per-arch `model.rs`
@@ -286,8 +339,9 @@ depends on `llama` for its language-model backbone and enables the
   - **Prerequisites:** B3 first (keeps traits.rs churn linear); B2 parallel-safe. Integration sub-item: add `allocate_sequence_state(&self) -> Box<dyn SequenceState>` to `ModelArchitecture` with default KV wrapper impl; override in Mamba-2 and Jamba; update `sequence_pool.rs` to route through the new method.
   - **Tests:** tensor_names; per-layer dispatch correctness; integration forward via fixture; shape + finiteness; mixed-state isolation.
   - **Risk:** Jamba's exact MoE config varies by checkpoint. Default to top-2 of 16 (published config); overridable via metadata.
-- **Qwen2-VL** — advanced multimodal (dynamic resolution,
-  M-RoPE).
+- ~~**Qwen2-VL**~~ ✅ Shipped — native ViT (dynamic resolution, window
+  attention), M-RoPE, 2×2 patch merger. Files: `src/qwen2_vl/{mod,model,loader,vision}.rs`.
+  Registered under GGUF arch id `"qwen2vl"`; feature `qwen2-vl`, default-on.
 - ~~**LLaVA-1.6**~~ ✅ Shipped (v0.1.3) — anyres tiling: variable grid (1×2, 2×1, 2×2, 3×1, 1×3) + global thumbnail, each tile independently CLIP-encoded, features concatenated before MM projector. Registered under `"llava16"`. Feature `llava16` (depends on `llava`). Files: `src/llava_next/{mod,model,tiler}.rs`.
 - **Molmo** — next-gen multimodal stack.
 - ~~**InternLM3**~~ ✅ Shipped (`src/internlm3/`).
@@ -406,4 +460,14 @@ depends on `llama` for its language-model backbone and enables the
   - Tests: (a) `ssm_scan_matches_reference` — 32-token sequence, tol 1e-5; (b) `conv1d_depthwise_matches_reference`; (c) `mamba2_forward_shape_and_finite` via `build_minimal_mamba2_gguf()`; (d) `sequence_state_reset_roundtrip`.
   - Risk: A stored as log(A) — MUST use `exp(-Δ * exp(log_A))`. ssm.rs should stay under 1000 LoC; split into scan.rs + state.rs if needed.
 
-*Last updated: 2026-05-05 (v0.1.3 — BLOOM and Phi-3.5-MoE architectures added; ALiBi primitive in `common/alibi.rs`; `bloom/` and `phi_moe/` modules registered under `"bloom"` and `"phimoe"`; 27 architectures, 481 tests, 1 skipped)*
+*Last updated: 2026-08-17 (v0.1.4 — LLaMA-family RoPE convention fix (llama/mistral/mixtral/
+command-r used the NeoX half-split instead of llama.cpp's interleaved-pairs `LLAMA_ROPE_TYPE_NORM`);
+architecture loader bugs fixed for StarCoder (`attn_out.weight` naming), Command-R (missing
+`ffn_norm`, wrong block type), Gemma (`buf_attn_out` sizing panic on Gemma-2-9B), Phi
+(`rope.partial_rotary_factor` never read), Gemma-2 (soft-capping disabled by misspelled metadata
+keys), BLOOM (missing `token_embd_norm`), ALiBi (wrong slopes for non-power-of-two head counts),
+DBRX/Grok (`kv_cache.advance()` called once per layer instead of once per token), OLMo2/MiniCPM
+(discarded every prompt token but the last), DeepSeek-V3 (used the biased router score as the
+combination weight); 1036 tests, 1 skipped. Note: this count is `registry.register()` calls
+directly verified against `src/registry.rs` — 26, correcting the v0.1.3 entry below's "27", whose
+counting methodology (possibly alias-inclusive) was not re-derivable from that entry alone.)*

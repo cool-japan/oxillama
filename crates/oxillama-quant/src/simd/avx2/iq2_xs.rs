@@ -97,7 +97,7 @@ impl QuantKernel for Iq2XsAvx2 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: bounds checked above. CPU avx2+fma guaranteed by dispatcher.
             *out = unsafe {
@@ -108,7 +108,7 @@ impl QuantKernel for Iq2XsAvx2 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }

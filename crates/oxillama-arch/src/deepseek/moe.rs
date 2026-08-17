@@ -226,6 +226,16 @@ pub fn moe_forward(x: &[f32], weights: &MoeWeights, cfg: &MoeConfig) -> ArchResu
             ),
         });
     }
+    // `top_k` comes straight from `{arch}.expert_used_count`, i.e. from the
+    // file.  Only the upper bound used to be checked, and the selection below
+    // then computed `select_nth_unstable_by(top_k - 1, ...)` — an underflow
+    // panic on any checkpoint declaring 0.  `common::moe` returns
+    // `InvalidConfig` here; match it.
+    if cfg.top_k == 0 {
+        return Err(ArchError::InvalidConfig {
+            detail: "moe_forward: top_k must be >= 1 (expert_used_count = 0)".to_string(),
+        });
+    }
 
     let mut output = vec![0.0f32; cfg.hidden_size];
     let mut expert_out = vec![0.0f32; cfg.hidden_size];
@@ -250,48 +260,61 @@ pub fn moe_forward(x: &[f32], weights: &MoeWeights, cfg: &MoeConfig) -> ArchResu
         *score = row.iter().zip(x.iter()).map(|(w, xi)| w * xi).sum();
     }
 
-    // Apply scoring function
+    // Apply scoring function.  `scores` stays **unbiased**: it is what the
+    // combination weights are read from.  `selection` carries the bias.
     match cfg.scoring_mode {
         ScoringMode::Softmax => {
             softmax_inplace(&mut scores);
         }
         ScoringMode::SigmoidWithBias => {
-            // Sigmoid element-wise
             for s in scores.iter_mut() {
                 *s = 1.0 / (1.0 + (-*s).exp());
-            }
-            // Add per-expert bias if available
-            if let Some(ref bias) = weights.expert_bias {
-                if bias.len() != n_experts {
-                    return Err(ArchError::InvalidShape {
-                        name: "expert_bias".to_string(),
-                        expected: vec![n_experts],
-                        got: vec![bias.len()],
-                    });
-                }
-                for (s, &b) in scores.iter_mut().zip(bias.iter()) {
-                    *s += b;
-                }
             }
         }
     }
 
-    // ── Top-k selection ───────────────────────────────────────────────────────
-    // Select the top_k experts by score (partial sort via linear scan).
-    let mut selected: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
-    // Partial sort: move top_k highest scores to the front.
-    selected.select_nth_unstable_by(cfg.top_k - 1, |a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let top_selected = selected[..cfg.top_k].to_vec();
+    // DeepSeek-V3's `exp_probs_b` steers **selection only**.  llama.cpp's
+    // `build_moe_ffn`:
+    //
+    //     selection_probs = ggml_add(probs, exp_probs_b);   // "leave probs
+    //     weights = ggml_get_rows(probs, selected_experts); //  unbiased"
+    //
+    // The previous implementation folded the bias into `scores` in place and
+    // then used that same value as the weight.  `exp_probs_b` is a
+    // load-balancing term that can be negative, so weights could go negative
+    // and the `weight_sum > 0.0` guard below zeroed the whole routed branch.
+    let mut selection: Vec<f32> = scores.clone();
+    if let Some(ref bias) = weights.expert_bias {
+        if bias.len() != n_experts {
+            return Err(ArchError::InvalidShape {
+                name: "expert_bias".to_string(),
+                expected: vec![n_experts],
+                got: vec![bias.len()],
+            });
+        }
+        if cfg.scoring_mode == ScoringMode::SigmoidWithBias {
+            for (s, &b) in selection.iter_mut().zip(bias.iter()) {
+                *s += b;
+            }
+        }
+    }
 
-    // Normalise routing weights for the selected experts.
+    // ── Top-k selection by the BIASED score ───────────────────────────────────
+    let mut order: Vec<usize> = (0..n_experts).collect();
+    order.sort_by(|&a, &b| {
+        selection[b]
+            .partial_cmp(&selection[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    // …combined with the UNBIASED probability.
+    let top_selected: Vec<(usize, f32)> =
+        order[..cfg.top_k].iter().map(|&e| (e, scores[e])).collect();
+
+    // llama.cpp clamps the divisor to the smallest normal f16 rather than
+    // testing `> 0.0`.
     let weight_sum: f32 = top_selected.iter().map(|&(_, w)| w).sum();
-    let inv_weight_sum = if weight_sum > 0.0 {
-        1.0 / weight_sum
-    } else {
-        0.0
-    };
+    let inv_weight_sum = 1.0 / weight_sum.max(6.103_515_6e-5);
 
     // ── Routed expert accumulation ────────────────────────────────────────────
     for (expert_idx, raw_weight) in top_selected {

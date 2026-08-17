@@ -5,7 +5,8 @@
 //! - bytes[2..4]: FP16 minimum `m` (little-endian)
 //! - bytes[4..20]: 16 packed nibble bytes (32 × 4-bit unsigned values)
 //!
-//! Each byte: lo = byte & 0x0F (weight 2i), hi = byte >> 4 (weight 2i+1).
+//! GGML's split-half layout (`dequantize_row_q4_1`): byte `j` holds weight
+//! `j` in `byte & 0x0F` and weight `j + 16` in `byte >> 4`.
 //! Weight reconstruction: `d * nibble + m`, nibble in [0..15] (unsigned).
 
 #![cfg(all(feature = "simd-neon", target_arch = "aarch64"))]
@@ -37,7 +38,10 @@ unsafe fn hsum_f32x4(v: float32x4_t) -> f32 {
 
 /// Dequantize one Q4_1 block using NEON intrinsics.
 ///
-/// Produces 32 f32 values in interleaved order [lo0, hi0, lo1, hi1, ...].
+/// Produces 32 f32 values in GGML's split-half order: the 16 low nibbles are
+/// weights `0..16` and the 16 high nibbles are weights `16..32`.  A `vld1q_u8`
+/// load already delivers the bytes in weight order, so the masked and shifted
+/// halves need no lane permutation.
 /// Weight formula: `d * nibble + m` (unsigned nibbles, no centering bias).
 ///
 /// # Safety
@@ -95,20 +99,16 @@ unsafe fn dequant_block_neon(nibbles: *const u8, d: f32, m: f32, output: &mut [f
     };
     let hi_f3 = unsafe { vfmaq_f32(m_vec, vcvtq_f32_u32(vmovl_high_u16(hi16_high)), d_vec) };
 
-    // Interleave lo/hi pairs: [lo0,hi0,lo1,hi1, lo2,hi2,lo3,hi3, ...]
-    let zip0 = unsafe { vzipq_f32(lo_f0, hi_f0) };
-    let zip1 = unsafe { vzipq_f32(lo_f1, hi_f1) };
-    let zip2 = unsafe { vzipq_f32(lo_f2, hi_f2) };
-    let zip3 = unsafe { vzipq_f32(lo_f3, hi_f3) };
-
-    unsafe { vst1q_f32(output.as_mut_ptr(), zip0.0) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(4), zip0.1) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(8), zip1.0) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(12), zip1.1) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(16), zip2.0) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(20), zip2.1) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(24), zip3.0) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(28), zip3.1) };
+    // Store directly — lanes are already in weight order.
+    // lo_f0..lo_f3 → weights  0..16, hi_f0..hi_f3 → weights 16..32.
+    unsafe { vst1q_f32(output.as_mut_ptr(), lo_f0) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(4), lo_f1) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(8), lo_f2) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(12), lo_f3) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(16), hi_f0) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(20), hi_f1) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(24), hi_f2) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(28), hi_f3) };
 }
 
 /// Compute the dot product between one Q4_1 block and 32 f32 inputs.
@@ -142,28 +142,33 @@ unsafe fn dot_block_neon(nibbles: *const u8, d: f32, m: f32, input: &[f32]) -> f
     let hi_f2 = unsafe { vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16_high))) };
     let hi_f3 = unsafe { vcvtq_f32_u32(vmovl_high_u16(hi16_high)) };
 
-    // Load input: vld2q_f32 deinterleaves into even (lo weights) and odd (hi weights)
+    // Split-half layout: the low nibbles pair with input[0..16] and the high
+    // nibbles with input[16..32], both loaded contiguously.
     let ip = input.as_ptr();
-    let val0 = unsafe { vld2q_f32(ip) };
-    let val1 = unsafe { vld2q_f32(ip.add(8)) };
-    let val2 = unsafe { vld2q_f32(ip.add(16)) };
-    let val3 = unsafe { vld2q_f32(ip.add(24)) };
+    let in_lo0 = unsafe { vld1q_f32(ip) };
+    let in_lo1 = unsafe { vld1q_f32(ip.add(4)) };
+    let in_lo2 = unsafe { vld1q_f32(ip.add(8)) };
+    let in_lo3 = unsafe { vld1q_f32(ip.add(12)) };
+    let in_hi0 = unsafe { vld1q_f32(ip.add(16)) };
+    let in_hi1 = unsafe { vld1q_f32(ip.add(20)) };
+    let in_hi2 = unsafe { vld1q_f32(ip.add(24)) };
+    let in_hi3 = unsafe { vld1q_f32(ip.add(28)) };
 
     // Accumulate: d * q * inp (deferred m correction via sum of inputs)
-    let mut acc = unsafe { vmulq_f32(lo_f0, val0.0) };
-    acc = unsafe { vfmaq_f32(acc, hi_f0, val0.1) };
-    acc = unsafe { vfmaq_f32(acc, lo_f1, val1.0) };
-    acc = unsafe { vfmaq_f32(acc, hi_f1, val1.1) };
-    acc = unsafe { vfmaq_f32(acc, lo_f2, val2.0) };
-    acc = unsafe { vfmaq_f32(acc, hi_f2, val2.1) };
-    acc = unsafe { vfmaq_f32(acc, lo_f3, val3.0) };
-    acc = unsafe { vfmaq_f32(acc, hi_f3, val3.1) };
+    let mut acc = unsafe { vmulq_f32(lo_f0, in_lo0) };
+    acc = unsafe { vfmaq_f32(acc, lo_f1, in_lo1) };
+    acc = unsafe { vfmaq_f32(acc, lo_f2, in_lo2) };
+    acc = unsafe { vfmaq_f32(acc, lo_f3, in_lo3) };
+    acc = unsafe { vfmaq_f32(acc, hi_f0, in_hi0) };
+    acc = unsafe { vfmaq_f32(acc, hi_f1, in_hi1) };
+    acc = unsafe { vfmaq_f32(acc, hi_f2, in_hi2) };
+    acc = unsafe { vfmaq_f32(acc, hi_f3, in_hi3) };
 
     // Sum of all inputs for the m correction: Σ input_i
-    let mut inp_sum = unsafe { vaddq_f32(val0.0, val0.1) };
-    inp_sum = unsafe { vaddq_f32(inp_sum, vaddq_f32(val1.0, val1.1)) };
-    inp_sum = unsafe { vaddq_f32(inp_sum, vaddq_f32(val2.0, val2.1)) };
-    inp_sum = unsafe { vaddq_f32(inp_sum, vaddq_f32(val3.0, val3.1)) };
+    let mut inp_sum = unsafe { vaddq_f32(in_lo0, in_hi0) };
+    inp_sum = unsafe { vaddq_f32(inp_sum, vaddq_f32(in_lo1, in_hi1)) };
+    inp_sum = unsafe { vaddq_f32(inp_sum, vaddq_f32(in_lo2, in_hi2)) };
+    inp_sum = unsafe { vaddq_f32(inp_sum, vaddq_f32(in_lo3, in_hi3)) };
 
     d * unsafe { hsum_f32x4(acc) } + m * unsafe { hsum_f32x4(inp_sum) }
 }
@@ -218,7 +223,7 @@ impl QuantKernel for Q4_1Neon {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -241,20 +246,21 @@ impl QuantKernel for Q4_1Neon {
                         )
                     };
                 } else {
-                    // Scalar tail for partial blocks
+                    // Scalar tail for partial blocks.  Split-half layout:
+                    // weight `i` is byte `i`'s low nibble for i < 16, and byte
+                    // `i - 16`'s high nibble otherwise.
                     for i in 0..block_input_len {
-                        let byte = block[4 + i / 2];
-                        let nibble = if i % 2 == 0 {
-                            (byte & 0x0F) as f32
+                        let nibble = if i < BLOCK_SIZE / 2 {
+                            (block[4 + i] & 0x0F) as f32
                         } else {
-                            ((byte >> 4) & 0x0F) as f32
+                            ((block[4 + i - BLOCK_SIZE / 2] >> 4) & 0x0F) as f32
                         };
                         sum += (d * nibble + m) * input[input_offset + i];
                     }
                 }
             }
             *out = sum;
-        }
+        });
 
         Ok(())
     }

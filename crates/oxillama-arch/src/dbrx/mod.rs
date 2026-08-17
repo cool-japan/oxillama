@@ -10,17 +10,22 @@
 //! ## Sub-modules
 //! - [`config`]: `DbrxConfig` parsed from GGUF metadata.
 //! - [`model`]: `DbrxModel` full transformer + `ForwardPass` impl.
+//! - [`loader`]: GGUF tensor loading.
 
 pub mod config;
+pub mod loader;
 pub mod model;
+#[cfg(test)]
+pub(crate) mod testkit;
 
 pub use config::DbrxConfig;
-pub use model::{build_dbrx_model, load_dbrx_from_gguf, DbrxLayer, DbrxModel};
+pub use loader::load_dbrx_from_gguf;
+pub use model::{build_dbrx_model, DbrxLayer, DbrxModel};
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::traits::{ForwardPass, ModelArchitecture, TensorNamePattern};
-use oxillama_gguf::TensorStore;
+use oxillama_gguf::{GgufModel, TensorStore};
 
 /// Architecture plugin for DBRX models.
 ///
@@ -58,6 +63,19 @@ impl ModelArchitecture for DbrxArchitecture {
         })
     }
 
+    /// Route the registry straight at [`load_dbrx_from_gguf`].
+    ///
+    /// Without this override the engine could not build DBRX at all: the
+    /// default returns `NotSupported`, and [`Self::build`] only ever sees the
+    /// tensor metadata table.
+    fn build_from_gguf(
+        &self,
+        model: &GgufModel,
+        _config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Ok(Box::new(load_dbrx_from_gguf(model)?))
+    }
+
     fn tensor_names(&self) -> Vec<TensorNamePattern> {
         vec![
             TensorNamePattern {
@@ -67,7 +85,7 @@ impl ModelArchitecture for DbrxArchitecture {
             },
             TensorNamePattern {
                 pattern: "output_norm.weight".to_string(),
-                description: "Final RMSNorm scale".to_string(),
+                description: "Final LayerNorm scale".to_string(),
                 required: true,
             },
             TensorNamePattern {
@@ -77,22 +95,12 @@ impl ModelArchitecture for DbrxArchitecture {
             },
             TensorNamePattern {
                 pattern: "blk.*.attn_norm.weight".to_string(),
-                description: "Per-layer pre-attention RMSNorm".to_string(),
+                description: "Per-layer pre-attention LayerNorm".to_string(),
                 required: true,
             },
             TensorNamePattern {
-                pattern: "blk.*.attn_q.weight".to_string(),
-                description: "Query projection".to_string(),
-                required: true,
-            },
-            TensorNamePattern {
-                pattern: "blk.*.attn_k.weight".to_string(),
-                description: "Key projection".to_string(),
-                required: true,
-            },
-            TensorNamePattern {
-                pattern: "blk.*.attn_v.weight".to_string(),
-                description: "Value projection".to_string(),
+                pattern: "blk.*.attn_qkv.weight".to_string(),
+                description: "Fused QKV projection [hidden + 2*kv_dim, hidden]".to_string(),
                 required: true,
             },
             TensorNamePattern {
@@ -101,8 +109,8 @@ impl ModelArchitecture for DbrxArchitecture {
                 required: true,
             },
             TensorNamePattern {
-                pattern: "blk.*.ffn_norm.weight".to_string(),
-                description: "Per-layer pre-FFN RMSNorm".to_string(),
+                pattern: "blk.*.attn_output_norm.weight".to_string(),
+                description: "Per-layer pre-FFN LayerNorm (DBRX has no ffn_norm)".to_string(),
                 required: true,
             },
             TensorNamePattern {

@@ -82,7 +82,11 @@ fn unpack_q5_k_scales(scales_and_mins: &[u8]) -> ([u8; 8], [u8; 8]) {
 
 /// Dequantise all Q5_K blocks to a flat f32 buffer.
 #[cfg(any(feature = "gpu", test))]
-fn dequant_q5_k_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuResult<Vec<f32>> {
+pub(crate) fn dequant_q5_k_to_f32(
+    weight_bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> GpuResult<Vec<f32>> {
     let blocks_per_row = cols.div_ceil(Q5_K_BLOCK_SIZE);
     let expected_bytes = rows * blocks_per_row * Q5_K_BLOCK_BYTES;
     if weight_bytes.len() < expected_bytes {
@@ -107,38 +111,57 @@ fn dequant_q5_k_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuResu
             let scales_and_mins = &block[4..16];
             let (sc, m) = unpack_q5_k_scales(scales_and_mins);
 
-            // Bytes 16-143: qs (128 bytes, low 4-bit nibbles for 256 values)
-            let qs = &block[16..144];
-            // Bytes 144-175: qh (32 bytes, 1 high bit per value)
-            let qh = &block[144..176];
+            // Upstream `block_q5_K` is `{ d; dmin; scales[12]; qh[32]; qs[128] }`
+            // — `qh` precedes `qs`.  The previous implementation here read
+            // them in the opposite order (a second, independent bug from the
+            // nibble/qh-bit mapping bug fixed below).
+            //
+            // Bytes 16-47: qh (32 bytes, 1 high bit per value)
+            let qh = &block[16..48];
+            // Bytes 48-175: qs (128 bytes, low 4-bit nibbles for 256 values)
+            let qs = &block[48..176];
 
-            for j in 0..Q5_K_NUM_SUB_BLOCKS {
-                let scale_val = d * sc[j] as f32;
-                let min_val = dmin * m[j] as f32;
+            // Upstream `dequantize_row_q5_K` walks the block in four
+            // 64-weight groups.  Within group `g`, the low-nibble half (32
+            // weights) takes its 5th bit from `qh[l]` bit `2g`, and the
+            // high-nibble half takes its 5th bit from `qh[l]` bit `2g + 1` —
+            // so the eight bits of `qh[0]` feed weights 0, 32, 64, 96, 128,
+            // 160, 192, 224 (see `oxillama_quant::reference::q5_k`'s module
+            // doc, which this must match exactly).  This is *not* the same
+            // as reading `qh[idx / 8]` bit `idx % 8` per output index.
+            let mut is = 0usize;
+            let mut qs_offset = 0usize;
+            let mut out_offset = 0usize;
 
-                for k in 0..Q5_K_SUB_BLOCK_SIZE {
-                    let idx = j * Q5_K_SUB_BLOCK_SIZE + k;
-                    let col = blk * Q5_K_BLOCK_SIZE + idx;
-                    if col >= cols {
-                        break;
+            for group in 0..(Q5_K_NUM_SUB_BLOCKS / 2) {
+                let d1 = d * sc[is] as f32;
+                let m1 = dmin * m[is] as f32;
+                let d2 = d * sc[is + 1] as f32;
+                let m2 = dmin * m[is + 1] as f32;
+
+                // Low nibbles → first 32 weights of this group.
+                for l in 0..Q5_K_SUB_BLOCK_SIZE {
+                    let col = blk * Q5_K_BLOCK_SIZE + out_offset + l;
+                    if col < cols {
+                        let qh_bit = (qh[l] >> (2 * group)) & 1;
+                        let q = ((qs[qs_offset + l] & 0x0F) | (qh_bit << 4)) as f32;
+                        f32_weights[row * cols + col] = d1 * q - m1;
                     }
-
-                    // Low 4 bits from qs.
-                    let byte_idx = idx / 2;
-                    let lo_nibble = if idx.is_multiple_of(2) {
-                        qs[byte_idx] & 0x0F
-                    } else {
-                        (qs[byte_idx] >> 4) & 0x0F
-                    };
-
-                    // High bit from qh.
-                    let qh_byte = qh[idx / 8];
-                    let qh_bit = (qh_byte >> (idx % 8)) & 1;
-
-                    let quant_val = lo_nibble as u32 | ((qh_bit as u32) << 4);
-
-                    f32_weights[row * cols + col] = scale_val * quant_val as f32 - min_val;
                 }
+
+                // High nibbles → next 32 weights of this group.
+                for l in 0..Q5_K_SUB_BLOCK_SIZE {
+                    let col = blk * Q5_K_BLOCK_SIZE + out_offset + Q5_K_SUB_BLOCK_SIZE + l;
+                    if col < cols {
+                        let qh_bit = (qh[l] >> (2 * group + 1)) & 1;
+                        let q = (((qs[qs_offset + l] >> 4) & 0x0F) | (qh_bit << 4)) as f32;
+                        f32_weights[row * cols + col] = d2 * q - m2;
+                    }
+                }
+
+                is += 2;
+                qs_offset += Q5_K_SUB_BLOCK_SIZE;
+                out_offset += 2 * Q5_K_SUB_BLOCK_SIZE;
             }
         }
     }
@@ -329,13 +352,16 @@ mod tests {
     use super::*;
 
     /// Build a minimal Q5_K super-block (176 bytes) for testing.
+    ///
+    /// Field order matches upstream `block_q5_K`:
+    /// `{ d; dmin; scales[12]; qh[32]; qs[128] }`.
     fn make_q5_k_block(
         d: f32,
         dmin: f32,
         scales: &[u8; 8],
         mins: &[u8; 8],
-        qs: &[u8; 128],
         qh: &[u8; 32],
+        qs: &[u8; 128],
     ) -> Vec<u8> {
         let mut block = Vec::with_capacity(Q5_K_BLOCK_BYTES);
 
@@ -358,15 +384,15 @@ mod tests {
         }
         block.extend_from_slice(&packed);
 
-        block.extend_from_slice(qs);
         block.extend_from_slice(qh);
+        block.extend_from_slice(qs);
 
         block
     }
 
     #[test]
     fn test_dequant_q5_k_zeros() {
-        let block = make_q5_k_block(1.0, 1.0, &[0; 8], &[0; 8], &[0; 128], &[0; 32]);
+        let block = make_q5_k_block(1.0, 1.0, &[0; 8], &[0; 8], &[0; 32], &[0; 128]);
         let mut data = Vec::new();
         data.extend_from_slice(&block);
         data.extend_from_slice(&block);
@@ -390,7 +416,7 @@ mod tests {
         let mut qh = [0u8; 32];
         qh[0] = 0x01; // bit 0 set → qh_bit for idx=0 is 1
 
-        let block = make_q5_k_block(0.5, 0.25, &scales, &mins, &qs, &qh);
+        let block = make_q5_k_block(0.5, 0.25, &scales, &mins, &qh, &qs);
         let result = dequant_q5_k_to_f32(&block, 1, 256).expect("dequant");
 
         let expected_0 = 0.5 * 2.0 * 21.0 - 0.25 * 1.0; // 20.75
@@ -408,6 +434,43 @@ mod tests {
             "got {}, expected {expected_1}",
             result[1]
         );
+    }
+
+    /// Discriminates the old buggy `qh[idx/8] bit idx%8` mapping from the
+    /// correct `qh[l] bit 2*group(+1)` mapping upstream
+    /// `dequantize_row_q5_K` uses.  `test_dequant_q5_k_values` above only
+    /// exercises `idx` 0 and 1, where both mappings happen to agree — this
+    /// test picks an index (32) where they disagree, so it would have failed
+    /// against the pre-fix kernel.
+    #[test]
+    fn test_dequant_q5_k_group_qh_bit_mapping() {
+        // Only qh[0] bit 1 is set.  Under the correct mapping that is the
+        // 5th-bit source for group 0's HIGH-nibble half at l=0, i.e.
+        // weight[32].  Under the old per-index mapping, weight[32] (idx=32)
+        // would instead read qh[32/8]=qh[4] bit 32%8=0, which is unset, and
+        // stay 0 — so this test distinguishes the two.
+        let mut scales = [0u8; 8];
+        scales[0] = 1;
+        scales[1] = 1;
+        let mins = [0u8; 8];
+        let qs = [0u8; 128];
+        let mut qh = [0u8; 32];
+        qh[0] = 0x02;
+
+        let block = make_q5_k_block(1.0, 0.0, &scales, &mins, &qh, &qs);
+        let result = dequant_q5_k_to_f32(&block, 1, 256).expect("dequant");
+
+        assert!(
+            (result[32] - 16.0).abs() < 0.01,
+            "weight[32] = {}, expected 16.0",
+            result[32]
+        );
+        for (i, &v) in result.iter().enumerate() {
+            if i == 32 {
+                continue;
+            }
+            assert!(v.abs() < 0.01, "weight[{i}] = {v}, expected 0.0");
+        }
     }
 
     #[test]

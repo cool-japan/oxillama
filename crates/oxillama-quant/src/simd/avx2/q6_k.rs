@@ -20,6 +20,7 @@
 use core::arch::x86_64::*;
 
 use crate::error::{QuantError, QuantResult};
+use crate::simd::avx2::int_dot::{dot_u8_i8, load_q8_act, sum_i8, MAX_FUSED_BATCH};
 use crate::simd::avx2::util::{f16_to_f32, hsum_f32_avx};
 use crate::traits::QuantKernel;
 use crate::types::QuantTensor;
@@ -86,7 +87,7 @@ impl QuantKernel for Q6_KAvx2 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row/block bounds verified above.
             // CPU avx2+fma support guaranteed by KernelDispatcher.
@@ -98,7 +99,7 @@ impl QuantKernel for Q6_KAvx2 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -171,7 +172,7 @@ impl QuantKernel for Q6_KAvx2 {
             });
         }
 
-        for row in 0..n_rows {
+        crate::parallel::for_each_row(out, n_rows, n_cols, |row, out_val| {
             let row_start = row * row_bytes;
             // SAFETY: bounds checked above; CPU avx2+fma guaranteed by KernelDispatcher.
             let row_sum = unsafe {
@@ -182,7 +183,87 @@ impl QuantKernel for Q6_KAvx2 {
                     n_cols,
                 )
             };
-            out[row] += row_sum;
+            *out_val += row_sum;
+        });
+
+        Ok(())
+    }
+
+    /// Q6_K/AVX2 is on the fused decode path: one Q6_K super-block (256
+    /// weights) consumes 8 Q8_0 activation blocks, matching
+    /// `matvec_q8_fused` above.
+    ///
+    /// This override is the dispatch gate itself — without it,
+    /// `matvec_q8_fused`'s working AVX2+FMA body above is unreachable dead
+    /// code, because callers gate on this method before ever invoking it
+    /// (see `QuantKernel::q8_fused_acts_blocks`'s trait doc).
+    fn q8_fused_acts_blocks(&self, n_cols: usize) -> Option<usize> {
+        Some(n_cols.div_ceil(BLOCK_SIZE) * 8)
+    }
+
+    /// Batched fused Q6_K × Q8_0 matmul — the prefill kernel.
+    ///
+    /// Reads each weight row once for the whole batch and unpacks its 6-bit
+    /// quants once, instead of once per token.  See
+    /// [`fused_q6_k_q8_0_row_batch_avx2`].
+    ///
+    /// Batches wider than `MAX_FUSED_BATCH` are processed in chunks of that
+    /// size; every chunk is exact, so the split is invisible in the result.
+    fn matmul_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+        m: usize,
+    ) -> QuantResult<()> {
+        if m == 0 {
+            return Ok(());
+        }
+        if out.len() < n_rows * m {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows * m,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let acts_stride = blocks_per_row * 8 * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < m * acts_stride {
+            return Err(QuantError::BufferTooSmall {
+                needed: m * acts_stride,
+                available: acts_q8.len(),
+            });
+        }
+
+        let mut done = 0usize;
+        while done < m {
+            let chunk = (m - done).min(MAX_FUSED_BATCH);
+            let acts_chunk = &acts_q8[done * acts_stride..(done + chunk) * acts_stride];
+            crate::parallel::for_each_row_batch(out, n_rows, n_cols, m, |row, out_row| {
+                let row_start = row * row_bytes;
+                // SAFETY: all bounds checked above; CPU avx2+fma guaranteed by KernelDispatcher.
+                unsafe {
+                    fused_q6_k_q8_0_row_batch_avx2(
+                        &weights[row_start..row_start + row_bytes],
+                        acts_chunk,
+                        blocks_per_row,
+                        n_cols,
+                        acts_stride,
+                        &mut out_row[done..done + chunk],
+                    );
+                }
+            });
+            done += chunk;
         }
 
         Ok(())
@@ -193,6 +274,74 @@ impl QuantKernel for Q6_KAvx2 {
 const Q8_0_BLOCK_BYTES: usize = 34;
 
 /// Fused Q6_K weight × Q8_0 activation dot product for one row using AVX2+FMA.
+///
+/// # What this replaced, and why
+///
+/// The previous body of this function was scalar despite its name: a
+/// `for l in 0..32` loop that re-derived one 6-bit quant at a time and, for
+/// *every single column*, re-sliced the activation buffer and re-decoded that
+/// Q8_0 block's FP16 scale — 256 redundant FP16 decodes per row per block.
+/// `crate::simd::neon::q6_k` hit the identical pathology (measured 7.5x
+/// slower than that kernel's own f32-activation GEMV on Apple M3) and fixed
+/// it with real NEON; this is the AVX2 port of that fix.
+///
+/// # Structure
+///
+/// A Q6_K super-block is 256 weights = 16 sub-blocks of 16, each with its own
+/// `i8` scale, times an FP16 super-block scale `d`.  The 256 columns map onto
+/// exactly 8 Q8_0 activation blocks of 32 (no straddling): activation block
+/// `b` covers weight sub-blocks `2b` and `2b + 1` — one Q8_0 scale over two
+/// weight scales, with no straddling in either direction. Verified directly
+/// against the scalar body this replaced: for group `g` and stream index
+/// `s` (0..3, i.e. the former `q1..q4`), column `l` (0..31) sat at absolute
+/// column `g*128 + s*32 + l`, used weight scale `scales[g*8 + s*2 + l/16]`,
+/// and read Q8_0 block `blk*8 + g*4 + s`, lane `l` — exactly the
+/// `(sub, s_lo, s_hi)` indexing below, with `sub = g*4 + s`.
+///
+/// ```text
+/// row += d * Σ_sub  d_a[sub] * ( s_lo[sub]·P_lo(sub) + s_hi[sub]·P_hi(sub) )
+/// P_lo(sub) = Σ_{16 cols} (q6 − 32) · q_a          (i32, exact — see below)
+/// P_hi(sub) = Σ_{next 16 cols} (q6 − 32) · q_a
+/// ```
+///
+/// # Why the unsigned-dot-minus-correction trick, and why it stays exact
+///
+/// NEON has a native signed×signed `SDOT`, so it centres the quant to `i8`
+/// (`q6 - 32`, range `-32..=31`) before the dot product.  AVX2's
+/// `VPMADDUBSW` (see [`dot_u8_i8`]) requires its first operand **unsigned**,
+/// so centring first and feeding the result to `dot_u8_i8` would silently
+/// reinterpret negative centred quants as large positive `u8`s.  Instead this
+/// keeps the *raw* unsigned quant (`0..=63`) and subtracts the centring term
+/// after the dot product:
+///
+/// ```text
+/// Σ (w_raw[i] - 32) · a[i]  =  Σ w_raw[i]·a[i]  -  32 · Σ a[i]
+///                            =  dot_u8_i8(w_raw, a) - 32 * sum_i8(a)
+/// ```
+///
+/// computed once per 16-column half (`w_raw`/`a` masked to that half — see
+/// [`q6k_stream_acc_avx2`]).  Both terms are exact integers: masking 16 of 32
+/// lanes to zero can only shrink a sum, so [`dot_u8_i8`]'s own documented
+/// bound for its *unmasked* 32-lane case (`|dot_u8_i8| <= 32*63*128 =
+/// 258048`) safely covers this 16-real-lane case too, and the *true*
+/// magnitude is tighter still: `|Σ_{16} w_raw·a| <= 16*63*128 = 129024`,
+/// `|32 * Σ_{16} a| <= 32*16*128 = 65536`. Their exact `i32` difference is
+/// `P_lo`/`P_hi`, algebraically identical to what NEON's `SDOT` produces
+/// directly, and — because it equals the *centred* sum exactly — is tightly
+/// bounded by `16 * 32 * 128 = 65536` regardless of the looser intermediate
+/// bound above.
+///
+/// `|scale · P| <= 128 * 65536 = 2^23`, and the lo/hi terms for one
+/// activation block sum to at most `2^24` — exactly the bound
+/// `crate::simd::neon::q6_k::fused_q6_k_q8_0_row_neon`'s doc derives for the
+/// NEON kernel — so the `i32` combination `s_lo*P_lo + s_hi*P_hi` is exactly
+/// representable as `f32` with zero rounding. Only the final per-block
+/// `d_a *` and the per-super-block `d *` multiplies are genuine floating
+/// point, matching NEON term for term.
+///
+/// The bit-extraction reuses [`decode_q6_group`] via
+/// [`q6k_group_streams_avx2`], the same routine the dequantizer and the f32
+/// GEMV use, so all three paths agree on the layout by construction.
 ///
 /// # Safety
 /// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
@@ -211,76 +360,228 @@ unsafe fn fused_q6_k_q8_0_row_avx2(
         let bo = blk * BLOCK_BYTES;
         // SAFETY: row_data.len() == blocks_per_row * BLOCK_BYTES; blk < blocks_per_row.
         let block = &row_data[bo..bo + BLOCK_BYTES];
-
-        let ql = &block[0..128];
-        let qh = &block[128..192];
         let scales = &block[192..208];
         let d = f16_to_f32(&block[208..]);
 
-        let input_offset = blk * BLOCK_SIZE;
-        let cols_in_block = (n_cols - input_offset).min(BLOCK_SIZE);
+        let cols_in_block = n_cols.saturating_sub(blk * BLOCK_SIZE).min(BLOCK_SIZE);
+        if cols_in_block == 0 {
+            continue;
+        }
 
-        // Q6_K: 2 groups of 128 weights; each group has 4 sub-blocks of 32.
-        // Within each sub-block of 32, use Q8_0 block at: blk*8 + (in_off+col)/32
-        for group in 0..2 {
-            let ql_off = group * 64;
-            let qh_off = group * 32;
-            let sc_off = group * 8;
-            let in_off = group * 128;
+        let mut block_sum = 0.0f32;
 
-            for l in 0..32 {
-                let is = l / 16; // sub-block index within group (0 or 1)
+        for group in 0..2usize {
+            // SAFETY: group < 2; block.len() == BLOCK_BYTES.
+            let streams = q6k_group_streams_avx2(block, group);
 
-                let q1 = ((ql[ql_off + l] & 0x0F) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
-                let q2 =
-                    ((ql[ql_off + l + 32] & 0x0F) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
-                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 =
-                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
-
-                let s0 = d * scales[sc_off + is] as i8 as f32;
-                let s1 = d * scales[sc_off + is + 2] as i8 as f32;
-                let s2 = d * scales[sc_off + is + 4] as i8 as f32;
-                let s3 = d * scales[sc_off + is + 6] as i8 as f32;
-
-                let c0 = in_off + l;
-                let c1 = in_off + l + 32;
-                let c2 = in_off + l + 64;
-                let c3 = in_off + l + 96;
-
-                // For each column, resolve the corresponding Q8_0 sample.
-                // Column `col` within the super-block → Q8_0 block `blk*8 + col/32`,
-                // lane `col % 32`.
-                let sample_q8 = |col: usize| -> Option<f32> {
-                    if col >= cols_in_block {
-                        return None;
-                    }
-                    let q8_blk = blk * 8 + col / 32;
-                    let q8_lane = col % 32;
-                    // SAFETY: acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES.
-                    let ab = &acts_q8[q8_blk * Q8_0_BLOCK_BYTES..(q8_blk + 1) * Q8_0_BLOCK_BYTES];
-                    let d_a = f16_to_f32(ab);
-                    let q_a = ab[2 + q8_lane] as i8 as f32;
-                    Some(d_a * q_a)
-                };
-
-                if let Some(a0) = sample_q8(c0) {
-                    row_sum += s0 * q1 as f32 * a0;
+            for (stream, &w) in streams.iter().enumerate() {
+                let sub = group * 4 + stream;
+                let valid = cols_in_block.saturating_sub(sub * 32).min(32);
+                if valid == 0 {
+                    continue;
                 }
-                if let Some(a1) = sample_q8(c1) {
-                    row_sum += s1 * q2 as f32 * a1;
-                }
-                if let Some(a2) = sample_q8(c2) {
-                    row_sum += s2 * q3 as f32 * a2;
-                }
-                if let Some(a3) = sample_q8(c3) {
-                    row_sum += s3 * q4 as f32 * a3;
-                }
+                let s_lo = scales[group * 8 + stream * 2] as i8 as i32;
+                let s_hi = scales[group * 8 + stream * 2 + 1] as i8 as i32;
+                // SAFETY: acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES.
+                q6k_stream_acc_avx2(&mut block_sum, w, s_lo, s_hi, acts_q8, blk * 8 + sub, valid);
             }
         }
+
+        row_sum += d * block_sum;
     }
 
     row_sum
+}
+
+/// Decode all four quant streams of group `group` (0 or 1) as full 32-column
+/// `__m256i` registers (each stream = one Q8_0-sized column block).
+///
+/// Each returned stream packs 16 columns from the "a" half of
+/// [`decode_q6_group`] (positions 0..15) in the low 128 bits, then 16 columns
+/// from the "b" half (positions 16..31) in the high 128 bits — exactly the
+/// two `decode_q6_group` calls [`dequant_block_avx2`] makes for this group,
+/// so the byte layout agrees with the dequantizer and the f32 GEMV by
+/// construction.  Bytes hold the **raw unsigned** 6-bit quant (`0..=63`), not
+/// yet offset by `-32`: [`q6k_stream_acc_avx2`] applies that offset
+/// algebraically (`dot_u8_i8(w, a) - 32 * sum_i8(a)`) rather than on these
+/// bytes directly, since subtracting 32 here would produce negative values
+/// that an unsigned `u8` lane cannot hold.
+///
+/// # Safety
+/// `block.len() == BLOCK_BYTES`, `group < 2`, caller has `avx2`.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn q6k_group_streams_avx2(block: &[u8], group: usize) -> [__m256i; 4] {
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let ql_off = group * 64;
+    let qh_off = group * 32;
+
+    // SAFETY: ql_off + 16 + 47 <= 127 and qh_off + 16 + 15 <= 63 (group < 2) —
+    // identical bounds to the two `decode_q6_group` calls `dequant_block_avx2`
+    // makes for this group.
+    let (q1_a, q2_a, q3_a, q4_a) =
+        decode_q6_group(ql.as_ptr().add(ql_off), qh.as_ptr().add(qh_off));
+    let (q1_b, q2_b, q3_b, q4_b) =
+        decode_q6_group(ql.as_ptr().add(ql_off + 16), qh.as_ptr().add(qh_off + 16));
+
+    [
+        combine_16_16(q1_a, q1_b),
+        combine_16_16(q2_a, q2_b),
+        combine_16_16(q3_a, q3_b),
+        combine_16_16(q4_a, q4_b),
+    ]
+}
+
+/// Pack two 16-byte halves into one 32-byte register: `lo` occupies columns
+/// 0..15 (the low 128 bits), `hi` occupies columns 16..31 (the high 128
+/// bits).
+///
+/// # Safety
+/// Caller has `avx2`.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn combine_16_16(lo: __m128i, hi: __m128i) -> __m256i {
+    _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1)
+}
+
+/// Accumulate one Q6_K quant stream (32 columns = one Q8_0 activation block,
+/// spanning two 16-wide weight sub-blocks with scales `s_lo`/`s_hi`) into
+/// `block_sum`, for a single activation vector.
+///
+/// `valid` bounds ragged-K (`< 32` means some trailing columns of this stream
+/// are past `n_cols` and must contribute exact zero — enforced by
+/// [`load_q8_act`]'s lane masking).
+///
+/// Split out of [`fused_q6_k_q8_0_row_avx2`] so the batched kernel
+/// ([`fused_q6_k_q8_0_row_batch_avx2`]) runs the identical arithmetic in the
+/// identical order, with the 6-bit decode hoisted out of the token loop —
+/// mirroring `crate::simd::neon::q6_k::q6k_stream_acc`.
+///
+/// # Safety
+/// `acts_q8.len() >= (q8_blk + 1) * 34`, caller has `avx2` and `fma`.
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn q6k_stream_acc_avx2(
+    block_sum: &mut f32,
+    w: __m256i,
+    s_lo: i32,
+    s_hi: i32,
+    acts_q8: &[u8],
+    q8_blk: usize,
+    valid: usize,
+) {
+    // SAFETY: caller guarantees the Q8_0 block is in bounds.
+    let (d_a, a) = load_q8_act(acts_q8, q8_blk, valid);
+
+    // Low 128 bits set, high 128 bits clear: selects columns 0..15 (scale
+    // `s_lo`) versus 16..31 (scale `s_hi`) out of the combined 32-lane
+    // stream/activation registers built by `q6k_group_streams_avx2` /
+    // `load_q8_act`.
+    let low_half = _mm256_set_epi64x(0, 0, -1, -1);
+    let w_lo = _mm256_and_si256(w, low_half);
+    let w_hi = _mm256_andnot_si256(low_half, w);
+    let a_lo = _mm256_and_si256(a, low_half);
+    let a_hi = _mm256_andnot_si256(low_half, a);
+
+    // Raw (uncentred) unsigned-weight dot products and activation sums — see
+    // `fused_q6_k_q8_0_row_avx2`'s doc for why this stays exact.
+    let p_lo = dot_u8_i8(w_lo, a);
+    let p_hi = dot_u8_i8(w_hi, a);
+    let c_lo = sum_i8(a_lo);
+    let c_hi = sum_i8(a_hi);
+
+    // Exact i32 centring: Σ(w-32)·a = Σw·a - 32·Σa, per half.
+    let p_lo_centred = p_lo - 32 * c_lo;
+    let p_hi_centred = p_hi - 32 * c_hi;
+
+    // Exact i32 combine (bounded by 2^24, see doc above); cast to f32 once,
+    // then the one genuinely-rounding multiply-accumulate with the
+    // activation block's FP16-derived scale.
+    let combined = s_lo * p_lo_centred + s_hi * p_hi_centred;
+    *block_sum += d_a * combined as f32;
+}
+
+/// Batched sibling of [`fused_q6_k_q8_0_row_avx2`]: one weight row against
+/// `out.len()` (`<= MAX_FUSED_BATCH`) Q8_0 activation vectors, accumulating
+/// into `out`.
+///
+/// The 6-bit unpack ([`q6k_group_streams_avx2`], the most expensive part of a
+/// Q6_K row) and the 210-byte block load happen once per weight block rather
+/// than once per block per token — the whole point of a batched prefill
+/// kernel.  Per `(row, t)` the accumulation order matches the single-vector
+/// kernel exactly: same helper, same sequence of `+=`, same final `d *`
+/// scaling.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8` holds `out.len()` vectors of `acts_stride` bytes each, vector
+///   `t` starting at `t * acts_stride`.
+/// - `out.len() <= MAX_FUSED_BATCH`.
+/// - CPU must support `avx2` and `fma`.
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fused_q6_k_q8_0_row_batch_avx2(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+    acts_stride: usize,
+    out: &mut [f32],
+) {
+    let m = out.len().min(MAX_FUSED_BATCH);
+    let mut block_sum = [0.0f32; MAX_FUSED_BATCH];
+    // Per-token row accumulators, kept separate from `out` so that — exactly
+    // as in the single-vector kernel, which returns one `row_sum` the caller
+    // adds — a pre-seeded `out` is touched by a single `+=` per token.
+    let mut row_sum = [0.0f32; MAX_FUSED_BATCH];
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        // SAFETY: blk < blocks_per_row; row_data.len() == blocks_per_row * BLOCK_BYTES.
+        let block = &row_data[bo..bo + BLOCK_BYTES];
+        let scales = &block[192..208];
+        let d = f16_to_f32(&block[208..]);
+
+        let cols_in_block = n_cols.saturating_sub(blk * BLOCK_SIZE).min(BLOCK_SIZE);
+        if cols_in_block == 0 {
+            continue;
+        }
+
+        block_sum[..m].fill(0.0);
+
+        for group in 0..2usize {
+            // Hoisted out of the token loop — this is the amortised work.
+            // SAFETY: group < 2; block.len() == BLOCK_BYTES.
+            let streams = q6k_group_streams_avx2(block, group);
+
+            for (stream, &w) in streams.iter().enumerate() {
+                let sub = group * 4 + stream;
+                let valid = cols_in_block.saturating_sub(sub * 32).min(32);
+                if valid == 0 {
+                    continue;
+                }
+                let s_lo = scales[group * 8 + stream * 2] as i8 as i32;
+                let s_hi = scales[group * 8 + stream * 2 + 1] as i8 as i32;
+                let q8_blk = blk * 8 + sub;
+
+                for (t, bs) in block_sum[..m].iter_mut().enumerate() {
+                    let base = t * acts_stride;
+                    let vec_acts = &acts_q8[base..base + acts_stride];
+                    // SAFETY: bounds as for the single-vector path.
+                    q6k_stream_acc_avx2(bs, w, s_lo, s_hi, vec_acts, q8_blk, valid);
+                }
+            }
+        }
+
+        for (rs, &bs) in row_sum[..m].iter_mut().zip(block_sum[..m].iter()) {
+            *rs += d * bs;
+        }
+    }
+
+    for (o, &rs) in out[..m].iter_mut().zip(row_sum[..m].iter()) {
+        *o += rs;
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -19,21 +19,33 @@
 //! 4. When all candidates are accepted, sample one bonus token from the
 //!    target model to maintain the correct output distribution.
 //!
-//! ## KV cache synchronisation
+//! ## KV cache synchronisation (delta sync)
 //!
-//! After each acceptance/rejection step the draft model's KV cache is
-//! re-synced by resetting and re-prefilling from all accepted tokens so far.
-//! This is correct but not maximally efficient.
+//! Naively, after every speculation round the draft model's KV cache could be
+//! rebuilt by resetting and re-prefilling from the entire accepted history.
+//! That is correct but costs `O(context)` forward passes per round, which comes
+//! to dominate runtime as the context grows.
 //!
-//! TODO: implement delta-KV-cache sync so the draft model only processes the
-//! newly accepted tokens rather than the full history on every round.
+//! Instead, [`SpeculativeEngine`] keeps the draft KV cache *aligned* with the
+//! committed context across rounds and applies a **delta sync**: each round it
+//! retains the already-verified prefix in place (an `O(1)` logical truncation
+//! via [`InferenceEngine::truncate`]) and recomputes only the single newly
+//! committed token. Rejected speculative tokens are discarded by the same
+//! truncation. The per-round draft cost therefore drops from `O(context)` to
+//! `O(1)` plus one forward pass, independent of context length.
+//!
+//! To make this possible the engine never re-forwards a token that is already
+//! resident in the cache: the "current prediction" logits for both the draft
+//! and the target are carried across rounds (`draft_next_logits` /
+//! `target_next_logits`) rather than being recovered by replaying the last
+//! committed token. [`SpeculativeDeltaSync`] performs the truncation and records
+//! reuse statistics.
 
 use std::io::Write;
 use std::path::Path;
 
 use crate::engine::{EngineConfig, InferenceEngine};
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::kv_cache::KvCacheSnapshot;
 use crate::snapshot::SpeculativeEngineSnapshot;
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -125,6 +137,7 @@ impl SpeculativeEngine {
         // ── Initialise ────────────────────────────────────────────────────────
         self.draft.reset();
         self.target.reset();
+        self.delta_sync.reset();
 
         // Tokenise using the target model (it has the authoritative tokeniser).
         let prompt_tokens = self.target.tokenize(prompt)?;
@@ -132,13 +145,26 @@ impl SpeculativeEngine {
             return Ok(String::new());
         }
 
-        // Prefill both models with the prompt tokens.
-        self.draft.prefill(&prompt_tokens)?;
-        self.target.prefill(&prompt_tokens)?;
+        // ── Clean prefill ─────────────────────────────────────────────────────
+        // Prefill all but the final prompt token into both caches, then forward
+        // the final prompt token once to obtain each model's "current
+        // prediction" logits. This fills the cache to exactly
+        // `prompt_tokens.len()` positions with no duplicated token — the
+        // alignment invariant the delta sync depends on.
+        let prompt_len = prompt_tokens.len();
+        let last_prompt = prompt_tokens[prompt_len - 1];
+        self.draft.prefill(&prompt_tokens[..prompt_len - 1])?;
+        self.target.prefill(&prompt_tokens[..prompt_len - 1])?;
+        let mut draft_next_logits = self.draft.forward_one(last_prompt)?;
+        let mut target_next_logits = self.target.forward_one(last_prompt)?;
 
-        // `all_tokens` tracks the complete context (prompt + accepted tokens).
-        // Used for re-syncing the draft KV cache after each round.
-        let mut all_tokens: Vec<u32> = prompt_tokens;
+        // Number of tokens whose KV entries are committed (and identical) in both
+        // caches. Invariant at the top of every round:
+        //   draft.kv_cache_seq_len()  == committed_len
+        //   target.kv_cache_seq_len() == committed_len
+        //   draft_next_logits  predicts position `committed_len`
+        //   target_next_logits predicts position `committed_len`
+        let mut committed_len = prompt_len;
 
         let mut generated = String::new();
         let mut tokens_generated = 0usize;
@@ -147,144 +173,124 @@ impl SpeculativeEngine {
         while tokens_generated < max_tokens {
             let k = self.num_speculative.min(max_tokens - tokens_generated);
 
-            // ── Draft phase ─────────────────────────────────────────────────
-            // Forward-pass the last token already in the draft model's KV cache
-            // to get logits for the current position, then sample k times.
-            let last_token = *all_tokens.last().ok_or(RuntimeError::ModelLoadError {
-                message: "token history is unexpectedly empty".to_string(),
-            })?;
-
-            // Get logits at the current position from the draft model.
-            let mut draft_logits = self.draft.forward_one(last_token)?;
-
+            // ── Draft proposal phase ───────────────────────────────────────────
+            // Propose up to `k` tokens, advancing the draft cache one step per
+            // token. `draft_step_logits[i]` is the full draft distribution that
+            // produced `draft_tokens[i]`; it is needed to build the residual
+            // distribution should that token later be rejected.
             let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
             let mut draft_probs: Vec<f32> = Vec::with_capacity(k);
-
-            for _ in 0..k {
-                let (token, prob) = sample_with_prob(&draft_logits, &mut self.rng);
-                if self.draft.is_eos(token) {
-                    break;
+            let mut draft_step_logits: Vec<Vec<f32>> = Vec::with_capacity(k);
+            {
+                let mut cur = std::mem::take(&mut draft_next_logits);
+                for _ in 0..k {
+                    let (token, prob) = sample_with_prob(&cur, &mut self.rng);
+                    if self.draft.is_eos(token) {
+                        break;
+                    }
+                    draft_tokens.push(token);
+                    draft_probs.push(prob);
+                    let next = self.draft.forward_one(token)?;
+                    // Stash the distribution that produced `token`, then advance.
+                    draft_step_logits.push(std::mem::replace(&mut cur, next));
                 }
-                draft_tokens.push(token);
-                draft_probs.push(prob);
-
-                // Advance draft model for the next speculative step.
-                draft_logits = self.draft.forward_one(token)?;
+                // `cur` (logits after the final draft step) is intentionally
+                // dropped: the delta sync recomputes `draft_next_logits` from the
+                // committed bonus token below.
             }
 
-            if draft_tokens.is_empty() {
-                // Draft hit EOS immediately — run one target step and finish.
-                let target_logits = self.target.forward_one(last_token)?;
-                let (bonus_tok, _) = sample_with_prob(&target_logits, &mut self.rng);
-                if !self.target.is_eos(bonus_tok) {
-                    let text = self.target.decode_token(bonus_tok)?;
-                    callback(&text);
-                    generated.push_str(&text);
+            // ── Verification phase ─────────────────────────────────────────────
+            // Verify each draft token against the target distribution at its
+            // position, advancing the target cache only for accepted tokens.
+            let mut accepted = 0usize;
+            let mut bonus_token: Option<u32> = None;
+            let mut eos_reached = false;
+            {
+                let mut tgt_cur = std::mem::take(&mut target_next_logits);
+                for (i, (&draft_tok, &p_draft)) in
+                    draft_tokens.iter().zip(draft_probs.iter()).enumerate()
+                {
+                    let target_probs = softmax(&tgt_cur);
+                    let p_target = target_probs
+                        .get(draft_tok as usize)
+                        .copied()
+                        .unwrap_or(0.0f32);
+
+                    let u = self.rng.next_f32();
+                    let accept_threshold = (p_target / p_draft.max(1e-10)).min(1.0);
+
+                    if u <= accept_threshold {
+                        if self.target.is_eos(draft_tok) {
+                            // Target agrees the sequence ends here. Emit the
+                            // tokens accepted before EOS and stop.
+                            eos_reached = true;
+                            break;
+                        }
+                        accepted += 1;
+                        tgt_cur = self.target.forward_one(draft_tok)?;
+                    } else {
+                        // Reject: draw the bonus from the residual distribution
+                        // residual[t] = max(0, p_target[t] - p_draft[t]) / Z
+                        // using the *per-position* draft distribution.
+                        let p_draft_full = softmax(&draft_step_logits[i]);
+                        bonus_token =
+                            Some(sample_residual(&target_probs, &p_draft_full, &mut self.rng));
+                        break;
+                    }
                 }
+                // Carry the target's next-position prediction into the bonus step
+                // (used directly when every draft token was accepted).
+                target_next_logits = tgt_cur;
+            }
+
+            // ── Commit accepted draft tokens ───────────────────────────────────
+            for &tok in &draft_tokens[..accepted] {
+                emit_token(
+                    &self.target,
+                    tok,
+                    &mut generated,
+                    &mut tokens_generated,
+                    &mut callback,
+                )?;
+            }
+            committed_len += accepted;
+
+            if eos_reached {
+                return Ok(generated);
+            }
+            if tokens_generated >= max_tokens {
                 break;
             }
 
-            // ── Verification phase ───────────────────────────────────────────
-            // Run the target model forward from the position *before* the first
-            // draft candidate (i.e. starting from the last committed token).
-            let mut accepted = 0usize;
-            let mut bonus_token: Option<u32> = None;
-
-            // We need target probabilities for each draft token.  The target
-            // processes each candidate token autoregressively: at step i it
-            // has already seen all tokens up to and including draft_tokens[i-1].
-            let mut target_logits = self.target.forward_one(last_token)?;
-
-            for (i, (&draft_tok, &p_draft)) in
-                draft_tokens.iter().zip(draft_probs.iter()).enumerate()
-            {
-                let target_probs = softmax(&target_logits);
-                let p_target = target_probs
-                    .get(draft_tok as usize)
-                    .copied()
-                    .unwrap_or(0.0f32);
-
-                let u = self.rng.next_f32();
-                let accept_threshold = (p_target / p_draft.max(1e-10)).min(1.0);
-
-                if u <= accept_threshold {
-                    // Accept this draft token.
-                    accepted += 1;
-
-                    if self.target.is_eos(draft_tok) {
-                        // Accepted up to EOS — generation is done.
-                        // Commit accepted tokens excluding the EOS itself.
-                        commit_and_emit(
-                            &draft_tokens[..accepted.saturating_sub(1)],
-                            &mut self.target,
-                            &mut all_tokens,
-                            &mut generated,
-                            &mut tokens_generated,
-                            &mut callback,
-                        )?;
-                        return Ok(generated);
-                    }
-
-                    // Advance the target model for the next verification step.
-                    if i + 1 < draft_tokens.len() {
-                        target_logits = self.target.forward_one(draft_tok)?;
-                    } else {
-                        // Last candidate was accepted — keep target_logits for
-                        // the bonus token step below.
-                        target_logits = self.target.forward_one(draft_tok)?;
-                    }
-                } else {
-                    // Reject: sample a bonus token from the residual distribution
-                    // residual_i = max(0, p_target - p_draft) / Z
-                    let target_probs_for_bonus = softmax(&target_logits);
-                    let draft_probs_full = softmax_draft_at(&draft_logits, &draft_tokens, i);
-                    let bonus =
-                        sample_residual(&target_probs_for_bonus, &draft_probs_full, &mut self.rng);
-                    bonus_token = Some(bonus);
-                    break;
-                }
+            // ── Bonus token ────────────────────────────────────────────────────
+            // On rejection this is the residual sample; when every draft token
+            // was accepted it is a fresh sample from the target (required to keep
+            // the output distribution exact).
+            let bonus = match bonus_token {
+                Some(residual) => residual,
+                None => sample_with_prob(&target_next_logits, &mut self.rng).0,
+            };
+            if self.target.is_eos(bonus) {
+                break;
             }
-
-            // ── Commit accepted tokens ───────────────────────────────────────
-            commit_and_emit(
-                &draft_tokens[..accepted],
-                &mut self.target,
-                &mut all_tokens,
+            target_next_logits = self.target.forward_one(bonus)?;
+            emit_token(
+                &self.target,
+                bonus,
                 &mut generated,
                 &mut tokens_generated,
                 &mut callback,
             )?;
+            committed_len += 1;
 
-            if let Some(bonus) = bonus_token {
-                // Rejected branch: commit the bonus token, then re-sync draft.
-                if !self.target.is_eos(bonus) {
-                    let _fwd = self.target.forward_one(bonus)?;
-                    let text = self.target.decode_token(bonus)?;
-                    callback(&text);
-                    generated.push_str(&text);
-                    all_tokens.push(bonus);
-                    tokens_generated += 1;
-                }
-                // Re-sync draft KV cache to match the target's accepted context.
-                resync_draft(&mut self.draft, &all_tokens, &mut self.delta_sync)?;
-            } else if accepted == draft_tokens.len() {
-                // All candidates accepted: sample one bonus token from target
-                // (required to maintain the correct output distribution).
-                let (bonus, _) = sample_with_prob(&target_logits, &mut self.rng);
-                if self.target.is_eos(bonus) {
-                    break;
-                }
-                let _fwd = self.target.forward_one(bonus)?;
-                let text = self.target.decode_token(bonus)?;
-                callback(&text);
-                generated.push_str(&text);
-                all_tokens.push(bonus);
-                tokens_generated += 1;
-
-                // Checkpoint verified state, then re-sync draft KV cache.
-                let _ = self.delta_sync.checkpoint(&self.draft);
-                resync_draft(&mut self.draft, &all_tokens, &mut self.delta_sync)?;
-            }
+            // ── Delta KV-cache sync (draft) ────────────────────────────────────
+            // Retain the verified prefix in the draft cache and recompute only
+            // the newly committed bonus token. `truncate` is O(1); the single
+            // `forward_one` below is the entire per-round draft recomputation
+            // cost, independent of context length.
+            self.delta_sync
+                .rollback(&mut self.draft, committed_len - 1)?;
+            draft_next_logits = self.draft.forward_one(bonus)?;
         }
 
         Ok(generated)
@@ -418,76 +424,91 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> RuntimeResult<()> {
     Ok(())
 }
 
-// ─── KV cache re-sync ────────────────────────────────────────────────────────
-
-/// Reset the draft engine and re-prefill it from the entire accepted context.
-///
-/// This ensures the draft model's KV cache is consistent with the target's
-/// accepted token history.  The last token is *not* prefilled here — it will
-/// be forwarded at the start of the next draft phase.
-///
-/// Uses [`SpeculativeDeltaSync`] when a verified checkpoint is available,
-/// falling back to full re-prefill on the first round.
-fn resync_draft(
-    draft: &mut InferenceEngine,
-    all_tokens: &[u32],
-    delta: &mut SpeculativeDeltaSync,
-) -> RuntimeResult<()> {
-    // Attempt delta restoration from the last verified checkpoint.
-    if let Err(_e) = delta.restore(draft) {
-        // No checkpoint yet — fall back to full reset + re-prefill.
-        draft.reset();
-        if all_tokens.len() > 1 {
-            draft.prefill(&all_tokens[..all_tokens.len() - 1])?;
-        }
-    }
-    Ok(())
-}
-
 // ─── Delta KV sync ──────────────────────────────────────────────────────────
 
-/// Delta-sync manager for speculative decoding KV cache.
+/// Delta-sync manager for the speculative draft KV cache.
 ///
-/// After each round of accepted tokens the caller should call [`checkpoint`]
-/// to save the current KV state.  On rejection, [`restore`] rolls the draft
-/// model back to the snapshot so only the corrected token needs to be
-/// re-run, rather than the entire token history.
+/// Speculative decoding advances the draft cache by several tokens per round,
+/// but only a prefix of those tokens is ultimately committed. Rather than
+/// rebuilding the draft cache from scratch each round, [`rollback`] retains the
+/// verified prefix in place and discards the speculative tail with an `O(1)`
+/// logical truncation. The caller then recomputes only the single newly
+/// committed token. The manager also records how many cache positions were
+/// reused, which quantifies the savings over a full re-prefill.
 ///
-/// [`checkpoint`]: SpeculativeDeltaSync::checkpoint
-/// [`restore`]: SpeculativeDeltaSync::restore
+/// [`rollback`]: SpeculativeDeltaSync::rollback
 pub struct SpeculativeDeltaSync {
-    /// Snapshot of the KV cache at the last verified token boundary.
-    verified_snapshot: Option<KvCacheSnapshot>,
+    /// Draft KV length retained at the most recent rollback, if any.
+    verified_len: Option<usize>,
+    /// Cumulative count of draft KV positions reused across rollbacks (i.e.
+    /// positions a naive full re-prefill would have recomputed).
+    tokens_reused: u64,
+    /// Number of rollback operations performed since the last [`reset`].
+    ///
+    /// [`reset`]: SpeculativeDeltaSync::reset
+    rounds: u64,
 }
 
 impl SpeculativeDeltaSync {
-    /// Create a new delta-sync manager with no checkpoint.
+    /// Create a new delta-sync manager with no recorded state.
     pub fn new() -> Self {
         Self {
-            verified_snapshot: None,
+            verified_len: None,
+            tokens_reused: 0,
+            rounds: 0,
         }
     }
 
-    /// Capture the current KV cache state from `engine` as the latest
-    /// verified checkpoint.
+    /// Clear all recorded state, returning the manager to its initial form.
     ///
-    /// Returns [`RuntimeError::ModelNotLoaded`] if no model is loaded.
-    pub fn checkpoint(&mut self, engine: &InferenceEngine) -> RuntimeResult<()> {
-        let snap = engine.kv_snapshot().ok_or(RuntimeError::ModelNotLoaded)?;
-        self.verified_snapshot = Some(snap);
-        Ok(())
+    /// Called at the start of each [`SpeculativeEngine::generate`] run so reuse
+    /// statistics describe a single generation.
+    pub fn reset(&mut self) {
+        self.verified_len = None;
+        self.tokens_reused = 0;
+        self.rounds = 0;
     }
 
-    /// Restore the engine's KV cache to the last verified checkpoint.
+    /// Roll the draft cache back to `keep` tokens, discarding any speculative
+    /// tail beyond the verified boundary.
     ///
-    /// Returns [`RuntimeError::ModelNotLoaded`] if no model is loaded, or
-    /// [`RuntimeError::Cancelled`] if no checkpoint has been taken yet.
-    pub fn restore(&self, engine: &mut InferenceEngine) -> RuntimeResult<()> {
-        let snap = self
-            .verified_snapshot
-            .as_ref()
-            .ok_or(RuntimeError::Cancelled)?;
-        engine.kv_restore(snap)
+    /// Returns the number of cache positions discarded. The retained prefix is
+    /// recorded as reuse (positions that did not need recomputation). This is an
+    /// `O(1)` logical operation — it never copies or recomputes KV data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::ModelNotLoaded`] if `engine` has no model loaded.
+    pub fn rollback(&mut self, engine: &mut InferenceEngine, keep: usize) -> RuntimeResult<usize> {
+        let before = engine.kv_cache_seq_len();
+        engine.truncate(keep)?;
+        let after = engine.kv_cache_seq_len();
+        self.verified_len = Some(after);
+        self.tokens_reused += after as u64;
+        self.rounds += 1;
+        Ok(before.saturating_sub(after))
+    }
+
+    /// The draft KV length retained at the most recent [`rollback`], if any.
+    ///
+    /// [`rollback`]: SpeculativeDeltaSync::rollback
+    pub fn verified_len(&self) -> Option<usize> {
+        self.verified_len
+    }
+
+    /// Cumulative number of draft KV positions reused across all rollbacks.
+    ///
+    /// This equals the number of forward passes saved relative to rebuilding the
+    /// draft cache from the full accepted history each round.
+    pub fn tokens_reused(&self) -> u64 {
+        self.tokens_reused
+    }
+
+    /// Number of rollback operations performed since the last [`reset`].
+    ///
+    /// [`reset`]: SpeculativeDeltaSync::reset
+    pub fn rounds(&self) -> u64 {
+        self.rounds
     }
 }
 
@@ -499,25 +520,22 @@ impl Default for SpeculativeDeltaSync {
 
 // ─── Accept / reject helpers ─────────────────────────────────────────────────
 
-/// Emit accepted draft tokens, updating the output string and token history.
+/// Decode `token` to text, invoke `callback`, append the text to `generated`,
+/// and bump the generated-token counter.
 ///
-/// Note: this does NOT call `forward_one` on the target — the caller is
-/// responsible for keeping the target KV cache in sync.
-fn commit_and_emit(
-    tokens: &[u32],
-    target: &mut InferenceEngine,
-    all_tokens: &mut Vec<u32>,
+/// This does NOT advance any KV cache — the caller is responsible for forwarding
+/// the token through the appropriate engine to keep the cache in sync.
+fn emit_token(
+    target: &InferenceEngine,
+    token: u32,
     generated: &mut String,
     tokens_generated: &mut usize,
     callback: &mut impl FnMut(&str),
 ) -> RuntimeResult<()> {
-    for &tok in tokens {
-        let text = target.decode_token(tok)?;
-        callback(&text);
-        generated.push_str(&text);
-        all_tokens.push(tok);
-        *tokens_generated += 1;
-    }
+    let text = target.decode_token(token)?;
+    callback(&text);
+    generated.push_str(&text);
+    *tokens_generated += 1;
     Ok(())
 }
 
@@ -575,26 +593,6 @@ fn sample_residual(p_target: &[f32], p_draft: &[f32], rng: &mut Xorshift64) -> u
     }
     // Fallback.
     residual.len().saturating_sub(1) as u32
-}
-
-/// Build a full draft probability distribution over the vocabulary, aligned with
-/// the target distribution, for the position at index `candidate_idx`.
-///
-/// We approximate this by taking `p_draft` equal to the draft model's softmax at
-/// the logit position for the candidate tokens, and zero everywhere else.  Because
-/// we only need the residual to be correct for the rejection step, this is fine.
-///
-/// In practice, this helper reconstructs a sparse vector from the known draft
-/// probabilities at each candidate position.
-fn softmax_draft_at(
-    draft_logits_at_pos: &[f32],
-    draft_tokens: &[u32],
-    candidate_idx: usize,
-) -> Vec<f32> {
-    // Recompute softmax over all vocab at this draft position.
-    // This is the full draft distribution at the rejected position.
-    let _ = (draft_tokens, candidate_idx); // used for documentation; not needed here
-    softmax(draft_logits_at_pos)
 }
 
 // ─── Math helpers ─────────────────────────────────────────────────────────────
@@ -808,27 +806,6 @@ mod tests {
             let (token, _prob) = sample_with_prob(&logits, &mut rng);
             assert_eq!(token, 2, "peaked distribution must always return index 2");
         }
-    }
-
-    /// `softmax_draft_at` must return valid probabilities summing to 1.
-    #[test]
-    fn test_softmax_draft_at_sums_to_one() {
-        let logits = vec![0.5f32, 1.5, -0.5, 2.0];
-        let draft_tokens = vec![1u32, 3u32];
-        let probs = softmax_draft_at(&logits, &draft_tokens, 0);
-        let sum: f32 = probs.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-5,
-            "softmax_draft_at must sum to 1, got {sum}"
-        );
-        assert_eq!(probs.len(), logits.len());
-    }
-
-    /// `softmax_draft_at` on empty logits returns empty vec.
-    #[test]
-    fn test_softmax_draft_at_empty() {
-        let probs = softmax_draft_at(&[], &[], 0);
-        assert!(probs.is_empty());
     }
 
     /// Xorshift64 with seed 0 must not get stuck (uses hardcoded non-zero default).
@@ -1073,23 +1050,41 @@ mod tests {
         );
     }
 
-    // ── SpeculativeDeltaSync tests ────────────────────────────────────────────
-
-    /// `restore` before any `checkpoint` returns Err (Cancelled).
+    /// `SpeculativeDeltaSync::new`/`reset` start from a clean slate.
     #[test]
-    fn test_delta_sync_restore_without_checkpoint_is_err() {
-        use crate::engine::EngineConfig;
-
+    fn test_delta_sync_new_is_empty() {
         let sync = SpeculativeDeltaSync::new();
-        let mut engine = InferenceEngine::new(EngineConfig::default());
-        // No model loaded — restore must fail (either ModelNotLoaded or no checkpoint).
-        assert!(sync.restore(&mut engine).is_err());
+        assert_eq!(sync.rounds(), 0);
+        assert_eq!(sync.tokens_reused(), 0);
+        assert!(sync.verified_len().is_none());
     }
 
-    /// `checkpoint` followed by `restore` preserves `seq_len`.
+    // ── SpeculativeDeltaSync tests ────────────────────────────────────────────
+
+    /// `rollback` on an engine with no model loaded must fail and must not be
+    /// counted as a completed round.
+    #[test]
+    fn test_delta_sync_rollback_without_model_is_err() {
+        use crate::engine::EngineConfig;
+
+        let mut sync = SpeculativeDeltaSync::new();
+        let mut engine = InferenceEngine::new(EngineConfig::default());
+        assert!(
+            sync.rollback(&mut engine, 0).is_err(),
+            "rollback with no model must return Err"
+        );
+        assert_eq!(
+            sync.rounds(),
+            0,
+            "a failed rollback must not count as a round"
+        );
+    }
+
+    /// `rollback` truncates the cache to `keep`, records reuse, and never
+    /// extends beyond the current length; `reset` then clears the statistics.
     #[cfg(any(feature = "tokenizer-onig", feature = "tokenizer-wasm"))]
     #[test]
-    fn test_delta_sync_checkpoint_restore_seq_len() {
+    fn test_delta_sync_rollback_truncates_and_records() {
         use oxillama_gguf::test_utils::{build_minimal_llama_gguf, minimal_tokenizer_json};
 
         let bytes = build_minimal_llama_gguf();
@@ -1099,21 +1094,127 @@ mod tests {
             .load_model_from_bytes(&bytes, json)
             .expect("load model for delta sync test");
 
-        // Take a checkpoint at the initial (empty) state.
-        let mut sync = SpeculativeDeltaSync::new();
-        sync.checkpoint(&engine).expect("checkpoint must succeed");
-
-        // Run a couple of forward steps to change seq_len.
+        // Advance the cache to two tokens.
         engine.prefill(&[1, 2]).expect("prefill");
-        let seq_after_prefill = engine.kv_snapshot().map(|s| s.seq_len).unwrap_or(0);
-        assert!(seq_after_prefill > 0, "seq_len should have advanced");
+        assert_eq!(engine.kv_cache_seq_len(), 2, "two tokens prefilled");
 
-        // Restore to checkpoint — seq_len should be 0.
-        sync.restore(&mut engine).expect("restore must succeed");
-        let snap_after_restore = engine.kv_snapshot().expect("snapshot after restore");
+        let mut sync = SpeculativeDeltaSync::new();
+        let discarded = sync
+            .rollback(&mut engine, 1)
+            .expect("rollback must succeed");
+        assert_eq!(discarded, 1, "one position discarded (2 → 1)");
         assert_eq!(
-            snap_after_restore.seq_len, 0,
-            "restored seq_len should match checkpoint (0)"
+            engine.kv_cache_seq_len(),
+            1,
+            "cache truncated to keep length"
+        );
+        assert_eq!(sync.verified_len(), Some(1));
+        assert_eq!(
+            sync.tokens_reused(),
+            1,
+            "one retained position counts as reuse"
+        );
+        assert_eq!(sync.rounds(), 1);
+
+        // rollback never extends: keeping more than present clamps to current.
+        let discarded2 = sync.rollback(&mut engine, 99).expect("rollback clamp");
+        assert_eq!(discarded2, 0, "nothing to discard when keep >= seq_len");
+        assert_eq!(engine.kv_cache_seq_len(), 1);
+        assert_eq!(sync.rounds(), 2);
+
+        // reset clears all recorded statistics.
+        sync.reset();
+        assert_eq!(sync.rounds(), 0);
+        assert_eq!(sync.tokens_reused(), 0);
+        assert!(sync.verified_len().is_none());
+    }
+
+    /// **Gold correctness test for delta sync.**
+    ///
+    /// The whole optimisation rests on this equivalence: rolling the draft cache
+    /// back to the verified prefix and forwarding only the newly committed token
+    /// must leave the cache in *byte-identical* state to rebuilding it from
+    /// scratch via a full re-prefill. We process the same committed context
+    /// `[1,2,3,4]` + bonus `5` two ways and compare the resulting KV snapshots.
+    #[cfg(any(feature = "tokenizer-onig", feature = "tokenizer-wasm"))]
+    #[test]
+    fn test_delta_sync_matches_full_reprefill_kv_state() {
+        use oxillama_gguf::test_utils::{build_minimal_llama_gguf, minimal_tokenizer_json};
+
+        let bytes = build_minimal_llama_gguf();
+        let json = minimal_tokenizer_json();
+        let committed = [1u32, 2, 3, 4];
+        let bonus = 5u32;
+
+        // Delta path: prefill the committed context, speculate two (later
+        // rejected) tokens, roll back to the verified prefix, then forward the
+        // single committed bonus token — exactly what `generate` does per round.
+        let mut delta_engine = InferenceEngine::new(crate::engine::EngineConfig::default());
+        delta_engine
+            .load_model_from_bytes(&bytes, json)
+            .expect("load delta engine");
+        delta_engine.prefill(&committed).expect("prefill committed");
+        // Speculative tokens (later rejected) — distinct in-vocab ids that differ
+        // from the bonus so a stale buffer would be detectable.
+        delta_engine.forward_one(6).expect("speculative token 1");
+        delta_engine.forward_one(7).expect("speculative token 2");
+        assert_eq!(delta_engine.kv_cache_seq_len(), committed.len() + 2);
+        let mut sync = SpeculativeDeltaSync::new();
+        sync.rollback(&mut delta_engine, committed.len())
+            .expect("rollback to verified prefix");
+        delta_engine.forward_one(bonus).expect("forward bonus");
+        let delta_snap = delta_engine.kv_snapshot().expect("delta snapshot");
+
+        // Reference path: rebuild the same context from scratch.
+        let mut ref_engine = InferenceEngine::new(crate::engine::EngineConfig::default());
+        ref_engine
+            .load_model_from_bytes(&bytes, json)
+            .expect("load reference engine");
+        ref_engine.prefill(&committed).expect("prefill committed");
+        ref_engine.forward_one(bonus).expect("forward bonus");
+        let ref_snap = ref_engine.kv_snapshot().expect("reference snapshot");
+
+        assert_eq!(
+            delta_snap.seq_len, ref_snap.seq_len,
+            "delta sync seq_len must equal full re-prefill"
+        );
+        assert_eq!(
+            delta_snap.seq_len,
+            committed.len() + 1,
+            "final length is committed prefix + bonus"
+        );
+        assert_eq!(
+            delta_snap.keys, ref_snap.keys,
+            "delta-synced KV keys must be byte-identical to full re-prefill"
+        );
+        assert_eq!(
+            delta_snap.values, ref_snap.values,
+            "delta-synced KV values must be byte-identical to full re-prefill"
+        );
+    }
+
+    /// End-to-end: a multi-round `generate` run must exercise the delta sync and
+    /// keep the draft and target caches length-aligned throughout.
+    #[test]
+    fn test_speculative_generate_keeps_caches_aligned() {
+        let mut engine = match make_loaded_engine(2) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skip test_speculative_generate_keeps_caches_aligned: {e}");
+                return;
+            }
+        };
+        let result = engine.generate("hello world", 8, |_| {});
+        if result.is_err() {
+            eprintln!("skip (forward pass unavailable): {:?}", result.err());
+            return;
+        }
+        // After generation the draft and target caches must agree on length —
+        // the delta sync keeps them in lock-step rather than drifting.
+        assert_eq!(
+            engine.draft.kv_cache_seq_len(),
+            engine.target.kv_cache_seq_len(),
+            "draft and target KV caches must stay length-aligned"
         );
     }
 }

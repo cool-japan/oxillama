@@ -12,15 +12,21 @@
 //! - [`model`]: `GrokModel` full transformer + `ForwardPass` impl.
 
 pub mod config;
+pub mod loader;
 pub mod model;
+pub mod moe;
+#[cfg(test)]
+pub(crate) mod testkit;
 
 pub use config::GrokConfig;
-pub use model::{build_grok_model, load_grok_from_gguf, GrokLayer, GrokModel};
+pub use loader::load_grok_from_gguf;
+pub use model::{build_grok_model, GrokDenseFfn, GrokLayer, GrokModel};
+pub use moe::GrokMoe;
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::traits::{ForwardPass, ModelArchitecture, TensorNamePattern};
-use oxillama_gguf::TensorStore;
+use oxillama_gguf::{GgufModel, TensorStore};
 
 /// Architecture plugin for Grok-1 models.
 ///
@@ -56,6 +62,18 @@ impl ModelArchitecture for GrokArchitecture {
                    call load_grok_from_gguf() instead"
                 .to_string(),
         })
+    }
+
+    /// Route the registry straight at [`load_grok_from_gguf`].
+    ///
+    /// Without this override the default `NotSupported` made Grok unreachable
+    /// from the engine.
+    fn build_from_gguf(
+        &self,
+        model: &GgufModel,
+        _config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Ok(Box::new(load_grok_from_gguf(model)?))
     }
 
     fn tensor_names(&self) -> Vec<TensorNamePattern> {
@@ -101,8 +119,20 @@ impl ModelArchitecture for GrokArchitecture {
                 required: true,
             },
             TensorNamePattern {
+                pattern: "blk.*.attn_output_norm.weight".to_string(),
+                description: "Post-attention RMSNorm, applied before the residual".to_string(),
+                required: true,
+            },
+            TensorNamePattern {
                 pattern: "blk.*.ffn_norm.weight".to_string(),
                 description: "Per-layer pre-FFN RMSNorm".to_string(),
+                required: true,
+            },
+            TensorNamePattern {
+                pattern: "blk.*.layer_output_norm.weight".to_string(),
+                description: "Post-FFN RMSNorm, applied before the residual \
+                              (or blk.*.post_ffw_norm.weight)"
+                    .to_string(),
                 required: true,
             },
             TensorNamePattern {

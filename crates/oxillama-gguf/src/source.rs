@@ -30,6 +30,19 @@ pub trait Source {
 
     /// Return the current byte position in the stream.
     fn position(&self) -> u64;
+
+    /// Best-effort hint of how many bytes remain to be read from the current
+    /// position, if that is cheaply known.
+    ///
+    /// Returns `None` when the total length of the underlying stream is not
+    /// known ahead of time (e.g. a network source that has not reached
+    /// EOF). Callers use this to bound speculative allocations driven by
+    /// attacker-controlled length/count fields; when it returns `None` they
+    /// must fall back to a conservative hard cap instead of trusting the
+    /// file-declared value outright.
+    fn remaining_hint(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A [`Source`] backed by a byte slice.
@@ -83,16 +96,26 @@ impl Source for SliceSource<'_> {
     }
 
     fn seek(&mut self, pos: u64) -> Result<u64, SliceError> {
-        let pos_usize = pos as usize;
-        if pos_usize > self.data.len() {
+        // Validate against `data.len()` while still in `u64` — casting first
+        // (the old `pos as usize` order) truncates on 32-bit/wasm32 targets
+        // where `usize` is narrower than `u64`, letting an out-of-range seek
+        // (e.g. `0x1_0000_0004`) silently wrap into an in-bounds position.
+        if pos > self.data.len() as u64 {
             return Err(SliceError::InvalidSeek);
         }
+        // Safe: `pos <= self.data.len()`, and `self.data.len()` is itself a
+        // valid `usize`, so `pos` fits without truncation.
+        let pos_usize = pos as usize;
         self.pos = pos_usize;
         Ok(pos)
     }
 
     fn position(&self) -> u64 {
         self.pos as u64
+    }
+
+    fn remaining_hint(&self) -> Option<u64> {
+        Some((self.data.len() - self.pos) as u64)
     }
 }
 
@@ -203,6 +226,35 @@ mod tests {
         // Reading 0 bytes must succeed
         src.read_exact(&mut []).expect("test: empty read");
         assert_eq!(src.position(), 0);
+    }
+
+    /// V5 regression: a seek far past the end of the slice must be rejected
+    /// via the `u64`-domain comparison, not silently accepted after a
+    /// truncating `as usize` cast. `u64::MAX` cannot survive a truncating
+    /// cast to a smaller `usize` without losing high bits, so this also
+    /// stands in for the 32-bit/wasm32 truncation case that cannot be
+    /// reproduced on this 64-bit host (see report).
+    #[test]
+    fn slice_source_seek_far_past_end_is_rejected() {
+        let data = [0u8; 4];
+        let mut src = SliceSource::new(&data);
+        let err = src
+            .seek(u64::MAX)
+            .expect_err("seek far past end must error");
+        assert_eq!(err, SliceError::InvalidSeek);
+        // Position must be left unchanged on a rejected seek.
+        assert_eq!(src.position(), 0);
+    }
+
+    #[test]
+    fn slice_source_remaining_hint_reports_bytes_left() {
+        let data = [0u8; 10];
+        let mut src = SliceSource::new(&data);
+        assert_eq!(src.remaining_hint(), Some(10));
+        src.seek(3).expect("test: seek");
+        assert_eq!(src.remaining_hint(), Some(7));
+        src.seek(10).expect("test: seek to end");
+        assert_eq!(src.remaining_hint(), Some(0));
     }
 
     #[test]

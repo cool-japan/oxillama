@@ -1,7 +1,42 @@
 //! GGUF tensor name patterns for the Falcon model family.
 //!
-//! Covers both the old Falcon-1 naming (llama.cpp convention) and the
-//! updated Falcon-2 naming used in more recent GGUF files.
+//! # Reference
+//!
+//! `~/work/refs/llama.cpp/src/llama-model.cpp`, `case LLM_ARCH_FALCON:` in
+//! `load_tensors()`:
+//!
+//! ```text
+//! tok_embd      = create_tensor(TOKEN_EMBD  "weight", {n_embd, n_vocab}, 0);
+//! output_norm   = create_tensor(OUTPUT_NORM "weight", {n_embd}, 0);
+//! output_norm_b = create_tensor(OUTPUT_NORM "bias",   {n_embd}, 0);
+//! output        = create_tensor(OUTPUT      "weight", {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+//! if (!output) output = create_tensor(TOKEN_EMBD "weight", ..., TENSOR_DUPLICATED);
+//! // per layer:
+//! attn_norm     = create_tensor(ATTN_NORM   "weight", i, {n_embd}, 0);
+//! attn_norm_b   = create_tensor(ATTN_NORM   "bias",   i, {n_embd}, 0);
+//! attn_norm_2   = create_tensor(ATTN_NORM_2 "weight", i, {n_embd}, TENSOR_NOT_REQUIRED);
+//! attn_norm_2_b = create_tensor(ATTN_NORM_2 "bias",   i, {n_embd}, TENSOR_NOT_REQUIRED);
+//! wqkv          = create_tensor(ATTN_QKV    "weight", i, {n_embd, n_embd + 2*n_embd_gqa}, 0);
+//! wo            = create_tensor(ATTN_OUT    "weight", i, {n_embd, n_embd}, 0);
+//! ffn_down      = create_tensor(FFN_DOWN    "weight", i, {n_ff, n_embd}, 0);
+//! ffn_up        = create_tensor(FFN_UP      "weight", i, {n_embd, n_ff}, 0);
+//! ```
+//!
+//! `LLM_TENSOR_NAMES` (`src/llama-arch.cpp`) resolves `ATTN_NORM_2` to the
+//! literal `"blk.%d.attn_norm_2"`.
+//!
+//! Two consequences the previous version of this table got wrong:
+//!
+//! * Falcon has **no linear biases at all** — no `attn_qkv.bias`, no
+//!   `attn_output.bias`, no `ffn_{up,down}.bias`.  The only biases in the
+//!   architecture are the LayerNorm shifts, and those are **required**.
+//! * Falcon has **no `ffn_norm`**.  The FFN reads the same `attn_norm` output
+//!   the attention branch was built from.
+//!
+//! The optional bias/`ffn_norm` patterns those two facts retire are not listed
+//! here any more; the loader still accepts them if a third-party conversion
+//! ships one (`load_bias` returns `None` when a tensor is absent), it just no
+//! longer advertises tensors llama.cpp never writes.
 
 use crate::traits::TensorNamePattern;
 
@@ -18,78 +53,73 @@ pub fn falcon_tensor_name_patterns() -> Vec<TensorNamePattern> {
         },
         TensorNamePattern {
             pattern: "output_norm.weight".to_string(),
-            description: "Final LayerNorm scale weights".to_string(),
+            description: "Final LayerNorm scale".to_string(),
             required: true,
         },
         TensorNamePattern {
             pattern: "output_norm.bias".to_string(),
-            description: "Final LayerNorm bias".to_string(),
-            required: false,
+            // `create_tensor(OUTPUT_NORM "bias", {n_embd}, 0)` — flags 0, i.e.
+            // required.  Falcon's final norm is a true LayerNorm, not RMSNorm.
+            description: "Final LayerNorm shift".to_string(),
+            required: true,
         },
         TensorNamePattern {
             pattern: "output.weight".to_string(),
-            description: "LM head / unembedding matrix [vocab_size, hidden_size]".to_string(),
-            required: true,
+            // TENSOR_NOT_REQUIRED with a TENSOR_DUPLICATED fallback onto
+            // `token_embd.weight`; `load_lm_head` implements that fallback.
+            description: "LM head / unembedding matrix [vocab_size, hidden_size] \
+                          (absent on tied checkpoints — falls back to token_embd.weight)"
+                .to_string(),
+            required: false,
         },
     ];
 
     // ── Per-layer tensors ────────────────────────────────────────────────────
-    //
-    // Old Falcon-1 naming (parallel attention): one shared LayerNorm feeds
-    // both the attention and FFN branches.  Newer Falcon-2 files may have
-    // separate `attn_norm` and `ffn_norm` per layer.
     let layer_patterns: &[(&str, &str, bool)] = &[
-        // Attention normalisation (present in all Falcon variants)
+        // Pre-attention / pre-FFN LayerNorm.  Its output feeds the FFN
+        // unconditionally, and the attention branch too unless `attn_norm_2`
+        // is present.  Weight *and* bias are required.
         (
             "blk.{i}.attn_norm.weight",
-            "Pre-attention LayerNorm scale",
+            "Pre-attention LayerNorm scale (also the FFN's input norm)",
             true,
         ),
         (
             "blk.{i}.attn_norm.bias",
-            "Pre-attention LayerNorm bias",
-            false,
+            "Pre-attention LayerNorm shift",
+            true,
         ),
-        // FFN normalisation — Falcon-1 (parallel) uses a shared attn_norm;
-        // Falcon-2 (sequential) has a separate ffn_norm.
+        // Falcon-40B's second LayerNorm: when present the attention branch
+        // reads *this* norm's output instead of `attn_norm`'s.
         (
-            "blk.{i}.ffn_norm.weight",
-            "Pre-FFN LayerNorm scale (Falcon-2 / sequential mode)",
+            "blk.{i}.attn_norm_2.weight",
+            "Second pre-attention LayerNorm scale (Falcon-40B only)",
             false,
         ),
         (
-            "blk.{i}.ffn_norm.bias",
-            "Pre-FFN LayerNorm bias (Falcon-2 / sequential mode)",
+            "blk.{i}.attn_norm_2.bias",
+            "Second pre-attention LayerNorm shift (Falcon-40B only)",
             false,
         ),
-        // Fused QKV projection — Falcon-1 packs Q, K, V into one weight.
+        // Fused QKV projection: [n_embd, n_embd + 2*n_embd_gqa], no bias.
         (
             "blk.{i}.attn_qkv.weight",
-            "Fused QKV projection weight",
+            "Fused QKV projection weight [n_embd, n_embd + 2*n_embd_gqa]",
             true,
         ),
-        ("blk.{i}.attn_qkv.bias", "Fused QKV projection bias", false),
-        // Attention output projection
+        // Attention output projection, no bias.
         (
             "blk.{i}.attn_output.weight",
-            "Attention output projection weight",
+            "Attention output projection weight [n_embd, n_embd]",
             true,
         ),
-        (
-            "blk.{i}.attn_output.bias",
-            "Attention output projection bias",
-            false,
-        ),
-        // FFN projections (Falcon uses a simple up → GELU/SiLU → down FFN,
-        // not SwiGLU, so there is no gate weight)
+        // FFN: plain up → GELU → down.  No gate (not SwiGLU), no biases.
         ("blk.{i}.ffn_up.weight", "FFN up-projection weight", true),
-        ("blk.{i}.ffn_up.bias", "FFN up-projection bias", false),
         (
             "blk.{i}.ffn_down.weight",
             "FFN down-projection weight",
             true,
         ),
-        ("blk.{i}.ffn_down.bias", "FFN down-projection bias", false),
     ];
 
     for (pattern, description, required) in layer_patterns {
@@ -110,7 +140,12 @@ mod tests {
     #[test]
     fn test_required_global_tensors_present() {
         let pats = falcon_tensor_name_patterns();
-        let required_globals = ["token_embd.weight", "output_norm.weight", "output.weight"];
+        let required_globals = [
+            "token_embd.weight",
+            "output_norm.weight",
+            // `create_tensor(OUTPUT_NORM "bias", ..., 0)` — required, not optional.
+            "output_norm.bias",
+        ];
         for name in required_globals {
             assert!(
                 pats.iter().any(|p| p.pattern == name && p.required),
@@ -119,11 +154,28 @@ mod tests {
         }
     }
 
+    /// `output.weight` is `TENSOR_NOT_REQUIRED` in llama.cpp with a tied
+    /// `token_embd.weight` fallback, so advertising it as required would
+    /// reject every tied Falcon checkpoint.
+    #[test]
+    fn test_output_weight_is_optional_because_it_can_be_tied() {
+        let pats = falcon_tensor_name_patterns();
+        let out = pats
+            .iter()
+            .find(|p| p.pattern == "output.weight")
+            .expect("output.weight pattern");
+        assert!(
+            !out.required,
+            "output.weight must be optional (tied fallback)"
+        );
+    }
+
     #[test]
     fn test_required_per_layer_tensors_present() {
         let pats = falcon_tensor_name_patterns();
         let required_layer = [
             "blk.{i}.attn_norm.weight",
+            "blk.{i}.attn_norm.bias",
             "blk.{i}.attn_qkv.weight",
             "blk.{i}.attn_output.weight",
             "blk.{i}.ffn_up.weight",
@@ -137,22 +189,51 @@ mod tests {
         }
     }
 
+    /// F2 regression: `attn_norm_2` (Falcon-40B's second LayerNorm) must be
+    /// declared, and declared *optional* — Falcon-7B/Falcon-2 have no such
+    /// tensor.  Before the fix neither pattern existed at all, so a Falcon-40B
+    /// checkpoint's second norm was invisible to the loader.
     #[test]
-    fn test_bias_tensors_are_optional() {
+    fn test_attn_norm_2_is_declared_and_optional() {
         let pats = falcon_tensor_name_patterns();
-        let optional_biases = [
-            "blk.{i}.attn_norm.bias",
+        for name in ["blk.{i}.attn_norm_2.weight", "blk.{i}.attn_norm_2.bias"] {
+            let pat = pats
+                .iter()
+                .find(|p| p.pattern == name)
+                .unwrap_or_else(|| panic!("{name:?} must be declared (Falcon-40B)"));
+            assert!(
+                !pat.required,
+                "{name:?} is TENSOR_NOT_REQUIRED in llama.cpp"
+            );
+        }
+    }
+
+    /// Falcon creates no linear bias tensors at all (`llama-model.cpp`,
+    /// `LLM_ARCH_FALCON`), so the table must not advertise any.
+    #[test]
+    fn test_no_linear_bias_patterns() {
+        let pats = falcon_tensor_name_patterns();
+        for name in [
             "blk.{i}.attn_qkv.bias",
             "blk.{i}.attn_output.bias",
             "blk.{i}.ffn_up.bias",
             "blk.{i}.ffn_down.bias",
-        ];
-        for name in optional_biases {
+        ] {
             assert!(
-                pats.iter().any(|p| p.pattern == name && !p.required),
-                "Bias tensor {name:?} should be optional"
+                !pats.iter().any(|p| p.pattern == name),
+                "Falcon has no linear biases; {name:?} must not be advertised"
             );
         }
+    }
+
+    /// Falcon has no `ffn_norm`: the FFN reuses `attn_norm`'s output.
+    #[test]
+    fn test_no_ffn_norm_pattern() {
+        let pats = falcon_tensor_name_patterns();
+        assert!(
+            !pats.iter().any(|p| p.pattern.contains("ffn_norm")),
+            "Falcon's FFN reads attn_norm; llama.cpp creates no ffn_norm tensor"
+        );
     }
 
     #[test]
@@ -186,5 +267,15 @@ mod tests {
                 p.pattern
             );
         }
+    }
+
+    /// Falcon's FFN is up → GELU → down; there is no gate projection.
+    #[test]
+    fn test_no_ffn_gate_pattern() {
+        let pats = falcon_tensor_name_patterns();
+        assert!(
+            !pats.iter().any(|p| p.pattern.contains("ffn_gate")),
+            "Falcon's FFN is not SwiGLU; there is no ffn_gate tensor"
+        );
     }
 }

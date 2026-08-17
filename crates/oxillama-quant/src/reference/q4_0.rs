@@ -5,6 +5,21 @@
 //! - 16 bytes: 32 × 4-bit unsigned nibbles packed into 16 bytes
 //!
 //! Each weight is reconstructed as: `(nibble - 8) * d`
+//!
+//! # Nibble layout
+//!
+//! GGML packs the block in **split halves**, not interleaved pairs — see
+//! `dequantize_row_q4_0` in `llama.cpp/ggml/src/ggml-quants.c`:
+//!
+//! ```text
+//! weight[j]      ← qs[j] & 0x0F        for j in 0..16
+//! weight[j + 16] ← qs[j] >> 4          for j in 0..16
+//! ```
+//!
+//! So byte `j` carries weight `j` in its low nibble and weight `j + 16` in its
+//! high nibble.  Q5_0, Q4_K (`l` / `l + 32`) and Q6_K (`l` / `l + 64`) use the
+//! same convention one block size up.  Reading it as `weight[2j]` /
+//! `weight[2j + 1]` silently permutes every Q4_0 tensor.
 
 use crate::error::{QuantError, QuantResult};
 use crate::traits::QuantKernel;
@@ -36,13 +51,13 @@ impl QuantKernel for Q4_0Ref {
         // Read FP16 scale
         let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
 
-        // Dequantize 32 nibbles
+        // Dequantize 32 nibbles into the two halves of the block.
         for i in 0..Q4_0_BLOCK_SIZE / 2 {
             let byte = block[2 + i];
             let lo = (byte & 0x0F) as i32 - 8;
             let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-            output[i * 2] = lo as f32 * d;
-            output[i * 2 + 1] = hi as f32 * d;
+            output[i] = lo as f32 * d;
+            output[i + Q4_0_BLOCK_SIZE / 2] = hi as f32 * d;
         }
 
         Ok(())
@@ -77,7 +92,7 @@ impl QuantKernel for Q4_0Ref {
         let blocks_per_row = n_cols.div_ceil(Q4_0_BLOCK_SIZE);
         let row_bytes = blocks_per_row * Q4_0_BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -91,17 +106,18 @@ impl QuantKernel for Q4_0Ref {
                     let byte = block[2 + i];
                     let lo = (byte & 0x0F) as i32 - 8;
                     let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-                    let idx = input_offset + i * 2;
-                    if idx + 1 < n_cols {
-                        sum += lo as f32 * d * input[idx];
-                        sum += hi as f32 * d * input[idx + 1];
-                    } else if idx < n_cols {
-                        sum += lo as f32 * d * input[idx];
+                    let idx_lo = input_offset + i;
+                    let idx_hi = idx_lo + Q4_0_BLOCK_SIZE / 2;
+                    if idx_lo < n_cols {
+                        sum += lo as f32 * d * input[idx_lo];
+                    }
+                    if idx_hi < n_cols {
+                        sum += hi as f32 * d * input[idx_hi];
                     }
                 }
             }
             *out = sum;
-        }
+        });
 
         Ok(())
     }
@@ -187,7 +203,7 @@ pub fn matvec_q8_fused_reference(
         });
     }
 
-    for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+    crate::parallel::for_each_row(out, n_rows, n_cols, |row, out_val| {
         let row_start = row * row_bytes;
         let mut sum = 0.0f32;
 
@@ -206,27 +222,28 @@ pub fn matvec_q8_fused_reference(
             let w_offset = blk * Q4_0_BLOCK_SIZE;
             let valid = (n_cols - w_offset).min(Q4_0_BLOCK_SIZE);
 
-            for i in 0..(valid / 2) {
+            // Split-half layout: byte `i` holds weight `i` (low nibble) and
+            // weight `i + 16` (high nibble), so each nibble is paired with the
+            // activation lane of the same index.  A partial trailing block
+            // truncates the two halves independently.
+            for i in 0..(Q4_0_BLOCK_SIZE / 2) {
                 let byte = w_block[2 + i];
                 let q_lo = (byte & 0x0F) as i32 - 8;
                 let q_hi = ((byte >> 4) & 0x0F) as i32 - 8;
-                let a_lo = q8_bytes[i * 2] as i8 as f32;
-                let a_hi = q8_bytes[i * 2 + 1] as i8 as f32;
-                sum += q_lo as f32 * d_w * a_lo * d_a;
-                sum += q_hi as f32 * d_w * a_hi * d_a;
-            }
-            // Handle odd valid count.
-            if valid % 2 == 1 {
-                let i = valid / 2;
-                let byte = w_block[2 + i];
-                let q_lo = (byte & 0x0F) as i32 - 8;
-                let a_lo = q8_bytes[i * 2] as i8 as f32;
-                sum += q_lo as f32 * d_w * a_lo * d_a;
+                if i < valid {
+                    let a_lo = q8_bytes[i] as i8 as f32;
+                    sum += q_lo as f32 * d_w * a_lo * d_a;
+                }
+                let hi_idx = i + Q4_0_BLOCK_SIZE / 2;
+                if hi_idx < valid {
+                    let a_hi = q8_bytes[hi_idx] as i8 as f32;
+                    sum += q_hi as f32 * d_w * a_hi * d_a;
+                }
             }
         }
 
         *out_val += sum; // ACCUMULATE
-    }
+    });
 
     Ok(())
 }
@@ -257,7 +274,9 @@ mod tests {
 
     #[test]
     fn test_dequant_block_simple() {
-        // First byte: lo=0 (val=-8*d), hi=15 (val=7*d)
+        // First byte: lo=0 (val=-8*d), hi=15 (val=7*d).
+        // GGML's split-half layout puts the low nibble of byte 0 at weight 0
+        // and its high nibble at weight 16 — *not* at weight 1.
         let mut nibbles = [0x88u8; 16];
         nibbles[0] = 0xF0; // lo=0 → -8, hi=15 → 7
         let block = make_q4_0_block(0.5, &nibbles);
@@ -266,7 +285,8 @@ mod tests {
         kernel.dequant_block(&block, &mut output).unwrap();
 
         assert!((output[0] - (-4.0)).abs() < 0.01, "got {}", output[0]); // -8 * 0.5
-        assert!((output[1] - 3.5).abs() < 0.01, "got {}", output[1]); // 7 * 0.5
+        assert!((output[16] - 3.5).abs() < 0.01, "got {}", output[16]); // 7 * 0.5
+        assert!((output[1]).abs() < 0.01, "got {}", output[1]); // 0x8 → 0
     }
 
     #[test]

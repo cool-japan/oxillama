@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::error::{ServerError, ServerResult};
-use crate::queue::{BatchRequest, UsageStats};
+use crate::queue::{BatchRequest, GenerateReply};
 use crate::state::AppState;
 
 /// Text completion request (OpenAI-compatible).
@@ -71,7 +71,7 @@ pub async fn completions(
         config.temperature = temp;
     }
 
-    let (reply_tx, reply_rx) = oneshot::channel::<Result<(String, UsageStats), String>>();
+    let (reply_tx, reply_rx) = oneshot::channel::<GenerateReply>();
 
     state
         .queue
@@ -81,12 +81,16 @@ pub async fn completions(
             config,
             cache_prompt: true,
             lora_selection: vec![],
+            // `/v1/completions` takes the caller's prompt literally — no chat
+            // template is applied, so nothing has pre-rendered a BOS marker
+            // and the model's own `add_bos_token` policy must run.
+            add_special: true,
             reply: reply_tx,
         })
         .await
         .map_err(|_| ServerError::WorkerDead)?;
 
-    let (generated, usage) = reply_rx
+    let (generated, usage, finish_reason) = reply_rx
         .await
         .map_err(|_| ServerError::WorkerDead)?
         .map_err(|e| ServerError::InvalidRequest { message: e })?;
@@ -104,7 +108,10 @@ pub async fn completions(
         choices: vec![CompletionChoice {
             index: 0,
             text: generated,
-            finish_reason: Some("stop".to_string()),
+            // Reports `"length"` when generation was truncated at
+            // `max_tokens` / ran out of context, rather than the
+            // unconditional `"stop"` this used to hardcode.
+            finish_reason: Some(finish_reason.as_openai_str().to_string()),
         }],
         usage: CompletionUsage {
             prompt_tokens: usage.prompt_tokens,
@@ -120,7 +127,10 @@ pub async fn completions(
 mod tests {
     use serde_json::json;
 
-    use crate::test_helpers::{build_live_test_app, build_test_app, post_json};
+    use crate::test_helpers::{
+        build_live_test_app, build_live_test_app_spec, build_test_app, post_json, MockWorkerSpec,
+    };
+    use oxillama_runtime::FinishReason;
 
     /// A request body missing required fields (`model`, `prompt`) must be
     /// rejected with HTTP 422 by axum's JSON extractor.
@@ -225,6 +235,76 @@ mod tests {
             status.as_u16(),
             200,
             "live worker + max_tokens should return 200: {json}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // finish_reason (Defect: hardcoded "stop")
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// A generation that ended on an EOG token reports `"stop"`.
+    #[tokio::test]
+    async fn test_completions_finish_reason_is_stop_on_eos() {
+        let (app, _captured) = build_live_test_app_spec(MockWorkerSpec {
+            finish_reason: FinishReason::Eos,
+            ..MockWorkerSpec::default()
+        })
+        .await;
+        let (status, json) = post_json(
+            app,
+            "/v1/completions",
+            json!({"model": "test", "prompt": "hi"}),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200, "{json}");
+        assert_eq!(json["choices"][0]["finish_reason"].as_str(), Some("stop"));
+    }
+
+    /// The regression: truncation at `max_tokens` must report `"length"`.
+    /// This used to be hardcoded to `"stop"`.
+    #[tokio::test]
+    async fn test_completions_finish_reason_is_length_on_max_tokens() {
+        let (app, _captured) = build_live_test_app_spec(MockWorkerSpec {
+            finish_reason: FinishReason::MaxTokens,
+            ..MockWorkerSpec::default()
+        })
+        .await;
+        let (status, json) = post_json(
+            app,
+            "/v1/completions",
+            json!({"model": "test", "prompt": "hi", "max_tokens": 1}),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200, "{json}");
+        assert_eq!(
+            json["choices"][0]["finish_reason"].as_str(),
+            Some("length"),
+            "a truncated completion must not claim the model chose to stop: {json}"
+        );
+    }
+
+    /// `/v1/completions` takes the prompt literally — no chat template is
+    /// applied, and the model's own BOS policy must still run.
+    #[tokio::test]
+    async fn test_completions_prompt_is_not_chat_templated() {
+        let (app, captured) = build_live_test_app_spec(MockWorkerSpec {
+            chat_template: oxillama_runtime::ChatTemplate::Llama3,
+            ..MockWorkerSpec::default()
+        })
+        .await;
+        let (status, json) = post_json(
+            app,
+            "/v1/completions",
+            json!({"model": "test", "prompt": "Once upon a time"}),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200, "{json}");
+        let captured = captured.lock().expect("captured lock");
+        assert_eq!(captured[0].prompt, "Once upon a time");
+        assert!(
+            captured[0].add_special,
+            "a raw completion prompt renders no BOS itself, so the \
+             tokenizer's add_bos_token policy must apply"
         );
     }
 }

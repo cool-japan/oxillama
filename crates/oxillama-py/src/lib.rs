@@ -34,6 +34,9 @@
 //! | `EngineConfig`       | `engine.rs`       |
 //! | `Engine`             | `engine.rs`       |
 //! | `SamplerConfig`      | `sampler.rs`      |
+//! | `FinishReason`       | `generation.rs`   |
+//! | `GenerationConfig`   | `generation.rs`   |
+//! | `GenerationOutcome`  | `generation.rs`   |
 //! | `SpeculativeConfig`  | `speculative.rs`  |
 //! | `SpeculativeEngine`  | `speculative.rs`  |
 //! | `Lora`               | `lora.rs`         |
@@ -45,6 +48,7 @@ pub mod chat_template;
 pub mod dlpack;
 pub mod engine;
 pub mod error;
+pub mod generation;
 #[cfg(feature = "hub")]
 pub mod hub;
 pub mod lora;
@@ -65,6 +69,9 @@ fn oxillama_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<engine::PyEngine>()?;
     m.add_class::<async_support::PyAsyncEngine>()?;
     m.add_class::<sampler::PySamplerConfig>()?;
+    m.add_class::<generation::PyFinishReason>()?;
+    m.add_class::<generation::PyGenerationConfig>()?;
+    m.add_class::<generation::PyGenerationOutcome>()?;
     m.add_class::<speculative::PySpeculativeConfig>()?;
     m.add_class::<speculative::PySpeculativeEngine>()?;
     m.add_class::<lora::PyLora>()?;

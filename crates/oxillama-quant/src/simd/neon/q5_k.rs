@@ -6,9 +6,10 @@
 //! - bytes[4..16]  — 12 bytes encoding 8 sub-block scales + 8 sub-block mins,
 //!   6 bits each, packed (same packing as Q4_K)
 //! - bytes[16..48] — 32 bytes `qh` — the high (5th) bit of each 5-bit quant,
-//!   bit `j` of byte `qh[l]` is the high bit of weight
-//!   (group * 32 + l) in the lo sub-block (j < 4) or
-//!   (group * 32 + l) in the hi sub-block (j >= 4).
+//!   for group `g` (of four 64-weight groups), bit `2g` of `qh[l]` is the 5th
+//!   bit of weight `64g + l` (lo sub-block) and bit `2g + 1` is the 5th bit of
+//!   weight `64g + 32 + l` (hi sub-block).  This is upstream's `u1 = 1`,
+//!   `u2 = 2`, each `<<= 2` per group.
 //! - bytes[48..176] — 128 packed nibble bytes (256 × 4-bit unsigned lo values)
 //!
 //! Block structure: 8 sub-blocks of 32 weights each (4 groups of 2 sub-blocks).
@@ -261,12 +262,13 @@ unsafe fn dequant_block_neon(block: &[u8], output: &mut [f32]) {
         let hi0 = unsafe { vshrq_n_u8::<4>(raw_lo) };
         let hi1 = unsafe { vshrq_n_u8::<4>(raw_hi) };
 
-        // Extract high bits for lo sub-block (bit = group) and hi sub-block (bit = group + 4).
-        // SAFETY: group is 0..3, so group is in 0..8 and group+4 is in 4..8.
-        let hb_lo_0 = unsafe { extract_high_bit_neon(qh_0, group) }; // positions 0..15
-        let hb_lo_1 = unsafe { extract_high_bit_neon(qh_1, group) }; // positions 16..31
-        let hb_hi_0 = unsafe { extract_high_bit_neon(qh_0, group + 4) }; // positions 0..15
-        let hb_hi_1 = unsafe { extract_high_bit_neon(qh_1, group + 4) }; // positions 16..31
+        // Extract 5th bits: upstream's `u1 = 1 << 2g` for the lo sub-block and
+        // `u2 = 2 << 2g` (i.e. bit 2g + 1) for the hi sub-block.
+        // SAFETY: group is 0..3, so 2*group and 2*group+1 are both in 0..8.
+        let hb_lo_0 = unsafe { extract_high_bit_neon(qh_0, 2 * group) }; // positions 0..15
+        let hb_lo_1 = unsafe { extract_high_bit_neon(qh_1, 2 * group) }; // positions 16..31
+        let hb_hi_0 = unsafe { extract_high_bit_neon(qh_0, 2 * group + 1) }; // positions 0..15
+        let hb_hi_1 = unsafe { extract_high_bit_neon(qh_1, 2 * group + 1) }; // positions 16..31
 
         // --- Lo sub-block: 32 weights = a_lo * q5 - b_lo ---
         // lo0 has 16 nibbles at positions 0..15, lo1 has positions 16..31.
@@ -398,12 +400,13 @@ unsafe fn gemv_row_neon(
                 let hi0 = unsafe { vshrq_n_u8::<4>(raw_lo) };
                 let hi1 = unsafe { vshrq_n_u8::<4>(raw_hi) };
 
-                // Extract high bits for lo and hi sub-blocks.
-                // SAFETY: group is 0..3, so bit positions are in 0..8.
-                let hb_lo_0 = unsafe { extract_high_bit_neon(qh_0, group) };
-                let hb_lo_1 = unsafe { extract_high_bit_neon(qh_1, group) };
-                let hb_hi_0 = unsafe { extract_high_bit_neon(qh_0, group + 4) };
-                let hb_hi_1 = unsafe { extract_high_bit_neon(qh_1, group + 4) };
+                // Extract 5th bits: bit 2g for the lo sub-block, bit 2g + 1
+                // for the hi sub-block (upstream's u1/u2, each <<= 2 per group).
+                // SAFETY: group is 0..3, so both bit positions are in 0..8.
+                let hb_lo_0 = unsafe { extract_high_bit_neon(qh_0, 2 * group) };
+                let hb_lo_1 = unsafe { extract_high_bit_neon(qh_1, 2 * group) };
+                let hb_hi_0 = unsafe { extract_high_bit_neon(qh_0, 2 * group + 1) };
+                let hb_hi_1 = unsafe { extract_high_bit_neon(qh_1, 2 * group + 1) };
 
                 // Input pointers for lo and hi sub-blocks.
                 // SAFETY: w_off + 64 <= input_offset + BLOCK_SIZE <= n_cols <= input.len().
@@ -502,7 +505,7 @@ unsafe fn gemv_row_neon(
                         // SAFETY: qs_off + l < 128 because qs_off < 128 and l < 32.
                         // qh index l < 32.
                         let lo_nib = (unsafe { *qs.get_unchecked(qs_off + l) } & 0x0F) as u32;
-                        let hi_bit = ((unsafe { *qh.get_unchecked(l) } >> group) & 1) as u32;
+                        let hi_bit = ((unsafe { *qh.get_unchecked(l) } >> (2 * group)) & 1) as u32;
                         let q = (lo_nib | (hi_bit << 4)) as f32;
                         partial_sum += (d1 * q - m1) * input[idx];
                     }
@@ -515,7 +518,8 @@ unsafe fn gemv_row_neon(
                         // SAFETY: qs_off + l < 128; qh index l < 32.
                         let hi_nib =
                             ((unsafe { *qs.get_unchecked(qs_off + l) } >> 4) & 0x0F) as u32;
-                        let hi_bit = ((unsafe { *qh.get_unchecked(l) } >> (group + 4)) & 1) as u32;
+                        let hi_bit =
+                            ((unsafe { *qh.get_unchecked(l) } >> (2 * group + 1)) & 1) as u32;
                         let q = (hi_nib | (hi_bit << 4)) as f32;
                         partial_sum += (d2 * q - m2) * input[idx];
                     }
@@ -584,7 +588,7 @@ impl QuantKernel for Q5_KNeon {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row/block bounds verified above. AArch64 always has NEON.
             *out = unsafe {
@@ -595,7 +599,7 @@ impl QuantKernel for Q5_KNeon {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -666,7 +670,7 @@ impl QuantKernel for Q5_KNeon {
             });
         }
 
-        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(out, n_rows, n_cols, |row, out_val| {
             let row_start = row * row_bytes;
             // SAFETY: bounds checked above.
             let row_sum = unsafe {
@@ -678,7 +682,7 @@ impl QuantKernel for Q5_KNeon {
                 )
             };
             *out_val += row_sum;
-        }
+        });
 
         Ok(())
     }
@@ -749,7 +753,7 @@ unsafe fn fused_q5_k_q8_0_row_neon(
             let mut dot_lo = 0.0f32;
             let mut sum_a_lo = 0.0f32;
             for l in 0..valid_lo {
-                let qh_bit = (qh[l] >> group) & 1;
+                let qh_bit = (qh[l] >> (2 * group)) & 1;
                 let q_w = ((qs[qs_off + l] & 0x0F) | (qh_bit << 4)) as f32;
                 let q_a = q8_lo[l] as i8 as f32;
                 dot_lo += q_w * q_a;
@@ -761,7 +765,7 @@ unsafe fn fused_q5_k_q8_0_row_neon(
             let mut dot_hi = 0.0f32;
             let mut sum_a_hi = 0.0f32;
             for l in 0..valid_hi {
-                let qh_bit = (qh[l] >> (group + 4)) & 1;
+                let qh_bit = (qh[l] >> (2 * group + 1)) & 1;
                 let q_w = (((qs[qs_off + l] >> 4) & 0x0F) | (qh_bit << 4)) as f32;
                 let q_a = q8_hi[l] as i8 as f32;
                 dot_hi += q_w * q_a;

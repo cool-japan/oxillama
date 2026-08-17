@@ -31,13 +31,14 @@ shader coverage, batching, and attention fusion.
 
 | Item              | Value                                        |
 |-------------------|----------------------------------------------|
-| Version           | 0.1.3 (workspace)                            |
+| Version           | 0.1.4 (workspace)                            |
 | Completion        | ~95 %                                        |
 | Feature flag      | `gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]` (off by default) |
-| wgpu version      | 29.0.1                                       |
-| Source files      | 7 Rust files (`lib.rs`, `context.rs`, `buffer.rs`, `error.rs`, `kernels/mod.rs`, `kernels/q4_0.rs`, `kernels/q8_0.rs`) + `kernels/sampling.rs` |
-| WGSL shaders      | 6 shader files (`gemv_f32.wgsl`, `batched_gemv_f32.wgsl`, `gemm_f32.wgsl`, `gemv_f16.wgsl`, `attention_fused_f32.wgsl`, `sampling.wgsl`) |
-| Tests             | 211 unit tests (smoke + error-display + gated end-to-end correctness + 13 sampling tests) |
+| wgpu version      | 30.0.0 (workspace-pinned; measured from `Cargo.lock`, not guessed) |
+| pollster version  | 1.0.1 (workspace-pinned; measured from `Cargo.lock`, not guessed) |
+| Source files      | 40 Rust files under `src/` (measured via `find src -name '*.rs' \| wc -l`) — one file per quant-type kernel plus `lib.rs`/`context.rs`/`buffer.rs`/`error.rs`/`kernels/mod.rs`, the IQ1_S grid submodule, `sampling.rs`, `tiled_gemm.rs`, `fused_attention.rs`, `batched_gemv.rs`, `f16_accumulator.rs`, and `q4_0_resident.rs` |
+| WGSL shaders      | 7 shader files (`gemv_f32.wgsl`, `batched_gemv_f32.wgsl`, `gemm_f32.wgsl`, `gemv_f16.wgsl`, `attention_fused_f32.wgsl`, `sampling.wgsl`, `gemv_q4_0_resident.wgsl`) |
+| Tests             | 262 `--features gpu` lib tests (measured 2026-08-17 via `cargo nextest list`, includes `src/kernels/golden_tests.rs` — the GPU-crate sibling of `oxillama-quant`'s upstream-pinned golden vectors) + 1 in `tests/cpu_gpu_cross_check.rs` (every dispatcher-supported quant type vs the CPU reference, on real hardware) + 3 in `tests/shader_validation.rs` = 266 total (`cargo nextest -p oxillama-gpu --all-features`) |
 | Quant coverage    | 24 / 25 quant types (Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q8_K, Q1_0_G128, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ1_S, IQ1_M, IQ2_XS, IQ4_NL, TQ1_0, TQ2_0, Q4_1, Q5_0, Q5_1, Q8_1; tiled GEMM + fused attention + GPU sampling) |
 | Pure Rust         | Yes — wgpu is Rust-native                    |
 | Default behaviour | Graceful CPU fallback when no adapter found  |
@@ -121,7 +122,7 @@ kernel.gemv(ctx, weights, input, output, rows, cols)?;
 
 ## 4. Shipped in v0.1.0
 
-- wgpu 29.0.1 compute backend, with `pollster` 0.4 for blocking on async
+- wgpu (workspace-pinned; 29.0.4 as of 2026-08-05) compute backend, with `pollster` 0.4 for blocking on async
   futures from sync contexts and `bytemuck` 1 for safe `#[repr(C)]` →
   byte-slice casts on host/device interchange structs.
 - Cross-platform adapter selection: Metal on macOS, Vulkan on Linux and
@@ -159,10 +160,45 @@ kernel.gemv(ctx, weights, input, output, rows, cols)?;
 
 These items make up the remaining ~18 % of the v0.1.0 completion figure.
 
-- 20 of 25 quant types have no GPU shader. Only Q4_0, Q8_0, Q4_K, Q5_K,
-  Q6_K, and Q1_0_G128 dispatch to GPU today; every other tensor type silently falls back to
-  CPU. This is the single biggest contributor to the remaining-work estimate.
-- No GEMM — only GEMV. Batched prompt processing and multi-query attention
+- ~~20 of 25 quant types have no GPU shader.~~ Stale — superseded by §2's
+  own "24 / 25 quant types" line; kept here struck through rather than
+  deleted so the history is visible. Verified 2026-08-05: all 24 types
+  `GpuDispatcher::get_kernel` matches on do have working kernels (see
+  `tests/cpu_gpu_cross_check.rs`, which cross-checks every one of them
+  against the upstream-pinned CPU reference on real GPU hardware).
+- ~~**Not wired into `oxillama-runtime` or `oxillama-cli`.** This crate is a
+  complete, tested library with no caller: `oxillama-runtime`'s
+  `Cargo.toml` does not depend on `oxillama-gpu`, and no CLI subcommand has
+  a `--gpu` / `--n-gpu-layers` flag.~~ **Half-resolved in v0.1.4.**
+  `oxillama-runtime` now depends on `oxillama-gpu` behind its own `gpu`
+  feature; a new `gpu_backend` module (`GpuPolicy`/`GpuOptions`/`GpuStatus`)
+  wired through `EngineConfig::gpu` dispatches exactly
+  `Q4_0Resident::upload` at load time and `gemv_q4_0_resident` per token
+  (see `kernels/q4_0_resident.rs`'s module doc) into single-token decode —
+  matching the integration shape this bullet originally called for, for
+  that one kernel. The other 23 quant-type GEMVs, tiled GEMM, fused
+  attention and GPU sampling remain unreached (none measured faster than
+  the CPU path on repeated calls, so nothing wires them in). `oxillama-cli`
+  still has no `--gpu` flag — `gpu_policy_from_flags`/`print_gpu_banner`
+  exist in `cli_args.rs` as unit-tested forward-prep but neither `run` nor
+  `serve` defines the clap arguments yet, and `oxillama-py` has no
+  constructor kwarg either. See the top-level `TODO.md`'s "GPU CLI/Python
+  wiring" entry for the remaining half.
+- **Every `gpu_gemv_*` function except the new
+  `kernels::q4_0_resident::gemv_q4_0_resident` rebuilds its entire compute
+  pipeline (`create_shader_module` → `create_bind_group_layout` →
+  `create_pipeline_layout` → `create_compute_pipeline`) on *every call*,
+  and dequantises weights on the CPU before re-uploading them as f32 (4×
+  the quantised byte count) on every call too.** `GpuContext` gained a
+  pipeline cache (`GpuContext::get_or_create_pipeline`) and
+  `Q4_0Resident`/`gemv_q4_0_resident` demonstrate the fully fixed pattern
+  (quantised bytes uploaded once, dequantised in-shader, pipeline cached) —
+  measured ~9.8× faster than the legacy `Q4_0GpuKernel::gemv` path on a
+  4096×4096 shape on real Apple M3 / Metal hardware. The other 23 kernel
+  files still use the old per-call-rebuild pattern; converting them is
+  mechanical (same shape as the Q4_0 conversion) but not yet done.
+- No GEMM — only GEMV (aside from the tiled GEMM kernel below). Batched
+  prompt processing and multi-query attention
   cannot use the GPU path at all. Prefill stays on CPU, which dominates
   time-to-first-token for any non-trivial prompt.
 - ~~No batched GEMV either: a single query vector per dispatch. Multi-sample
@@ -232,7 +268,70 @@ These items make up the remaining ~18 % of the v0.1.0 completion figure.
   tuned for tile-based mobile GPUs, coordinated with the `oxillama-wasm`
   hookup so a browser build gets real acceleration, not just portability.
 
-*Last updated: 2026-05-05 (v0.1.3 shipped — GPU sampling kernels: softmax, top-k, categorical; 211 oxillama-gpu tests; ~95% completion)*
+## 11. Numerical-correctness pass (2026-08-05)
+
+A sibling agent fixed seven quantisation formats' CPU kernels
+(`oxillama-quant`) after finding their decoded layout disagreed with
+upstream GGML (`llama.cpp/ggml/src/ggml-quants.c`). This crate's GPU
+kernels had independently copied the same wrong layouts (and, in two cases
+— Q4_K and Q6_K, not on the original seven-format list — had their *own*,
+different wrong layout), so GPU inference silently produced different
+numbers than CPU inference for any tensor using one of these formats.
+
+- **Fixed in `oxillama-gpu`** (dequant helper + any hardcoded-layout unit
+  tests updated to match): Q4_0, Q4_1, IQ4_NL, IQ4_XS, Q5_K, TQ1_0, TQ2_0
+  (interleaved nibbles → split-half; a Q5_K `qh`/`qs` byte-order swap; TQ1_0's
+  naive base-3 decode → upstream's fixed-point `ceil(q·256/243)` scheme and
+  a separate multi-block column-aliasing bug; TQ2_0's digit-minor →
+  digit-major order).
+- **Also fixed, found via the new cross-check test below rather than the
+  original handoff list**: Q4_K and Q6_K GPU kernels used a flat
+  `qs[idx/2]`-style nibble mapping instead of upstream's group-based
+  mapping — a materially different bug from the same class, caught because
+  it produced 17%–296% relative error against the CPU oracle on real
+  hardware with non-uniform random test data (measured across the 6
+  mismatching rows: Q4_K 17%/82%, Q6_K 239%/296%/plus 2 more; not every row
+  of every type failed, since some random blocks happen to hit near-equal
+  outputs under both mappings).
+- **New oracle**: `src/kernels/golden_tests.rs` — the same upstream-derived
+  expected values as `oxillama-quant/tests/golden_vectors.rs`, asserted
+  against this crate's own dequant helpers, so CPU and GPU are each pinned
+  to upstream independently rather than to each other.
+- **New cross-check**: `tests/cpu_gpu_cross_check.rs` — every one of the 24
+  quant types `GpuDispatcher::get_kernel` supports, run on real GPU
+  hardware, compared against `oxillama_quant::reference`. This is the test
+  whose absence let the divergence ship in the first place; its lack of any
+  history in this file until now is itself evidence of the gap.
+- Also fixed: `crates/oxillama-wasm/src/webgpu.rs`'s embedded Q4_0 WGSL
+  shader had the same interleaved-nibble defect, plus an independent
+  `block_idx * 5u`-word-stride bug that only produced correct byte offsets
+  for `block_idx == 0`. Both fixed; this shader is not currently dispatched
+  from anywhere (`WebGpuContext::read_buffer` is a documented placeholder),
+  so the fix is latent-correctness rather than an observed behaviour change.
+
+## 12. GPU→runtime wiring and pipeline-caching (2026-08-05, wired 2026-08-16)
+
+See §5's "Not wired into `oxillama-runtime` or `oxillama-cli`" and
+"rebuilds its entire compute pipeline... on every call" bullets — those are
+this pass's other two findings. `GpuContext::get_or_create_pipeline` (a
+per-context pipeline cache) and `kernels/q4_0_resident.rs`
+(`Q4_0Resident` + `gemv_q4_0_resident`: quantised-byte upload once,
+in-shader dequantisation, cached pipeline) are the fix, demonstrated for
+Q4_0 and measured ~9.8× faster than the legacy path on a 4096×4096 shape on
+real Apple M3 / Metal hardware. The other 23 kernels still use the
+rebuild-every-call pattern.
+
+**Update (v0.1.4):** the `oxillama-runtime` half of "not wired" is now done —
+`oxillama-runtime` depends on this crate behind its own `gpu` feature and a
+new `gpu_backend` module dispatches `gemv_q4_0_resident` into single-token
+decode via `EngineConfig::gpu`/`GpuPolicy`. `oxillama-cli` still has no
+`--gpu` flag (only unit-tested forward-prep helpers in `cli_args.rs`), so
+nothing reaches this from a shipped binary yet — see the top-level `TODO.md`'s
+"GPU CLI/Python wiring" entry.
+
+*Last updated: 2026-08-17 (v0.1.4 — GPU→runtime wiring landed via `oxillama-runtime`'s new `gpu_backend` module; 266 `--features gpu` tests)*
+
+*Previously updated: 2026-05-05 (v0.1.3 shipped — GPU sampling kernels: softmax, top-k, categorical; 211 oxillama-gpu tests; ~95% completion)*
 
 ## Track E — GPU Sampling Kernels (v0.1.3 — Shipped 2026-05-05)
 

@@ -18,6 +18,8 @@ pub use app::TuiApp;
 /// `engine` is the already-loaded inference engine wrapped in an `Arc<Mutex<...>>`.
 /// `sampler` is the sampling configuration to use for generation.
 /// `max_tokens` caps the number of tokens generated per turn.
+/// `system_prompt` is seeded once as the session's leading system message,
+/// if present (see `--system` / per-model profile `system_prompt`).
 ///
 /// The function blocks until the user quits (`Ctrl+C`, `Ctrl+Q`, or `/quit`).
 /// The terminal is restored to its previous state before returning, even when
@@ -28,6 +30,7 @@ pub fn run_tui(
     engine: std::sync::Arc<std::sync::Mutex<oxillama_runtime::InferenceEngine>>,
     sampler: oxillama_runtime::SamplerConfig,
     max_tokens: usize,
+    system_prompt: Option<String>,
 ) -> anyhow::Result<()> {
     use crossterm::{
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -42,7 +45,14 @@ pub fn run_tui(
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = TuiApp::new(model_path, model_id, engine, sampler, max_tokens);
+    let mut app = TuiApp::new(
+        model_path,
+        model_id,
+        engine,
+        sampler,
+        max_tokens,
+        system_prompt,
+    );
     let result = app.run(&mut terminal);
 
     // Always restore the terminal, regardless of success or error.

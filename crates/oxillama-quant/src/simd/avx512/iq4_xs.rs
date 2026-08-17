@@ -116,7 +116,7 @@ impl QuantKernel for Iq4XsAvx512 {
             );
         }
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: bounds checked; avx512f confirmed.
             *out = unsafe {
@@ -127,7 +127,7 @@ impl QuantKernel for Iq4XsAvx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -180,7 +180,7 @@ fn scalar_gemv(
     blocks_per_row: usize,
     row_bytes: usize,
 ) -> QuantResult<()> {
-    for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+    crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
         let row_start = row * row_bytes;
         let mut sum = 0.0f32;
         for blk in 0..blocks_per_row {
@@ -195,12 +195,14 @@ fn scalar_gemv(
                 let scale = d * ls_signed as f32;
                 let nibble_off = sub * NIBBLES_PER_SUB;
                 let col_base = blk * BLOCK_SIZE + sub * SUB_BLOCK_SIZE;
+                // Split-half layout within the sub-block: byte `i` holds
+                // weight `i` (low nibble) and weight `i + 16` (high nibble).
                 for i in 0..NIBBLES_PER_SUB {
                     let byte = nibbles[nibble_off + i];
                     let lo = (byte & 0x0F) as usize;
                     let hi = ((byte >> 4) & 0x0F) as usize;
-                    let c0 = col_base + i * 2;
-                    let c1 = c0 + 1;
+                    let c0 = col_base + i;
+                    let c1 = c0 + SUB_BLOCK_SIZE / 2;
                     if c0 < n_cols {
                         sum += scale * KVALUES_IQ4NL[lo] as f32 * input[c0];
                     }
@@ -211,7 +213,7 @@ fn scalar_gemv(
             }
         }
         *out = sum;
-    }
+    });
     Ok(())
 }
 
@@ -230,8 +232,10 @@ unsafe fn decode_sub_block_avx512(nibbles: &[u8], scale: f32, output: &mut [f32]
         let byte = nibbles[i];
         let lo = (byte & 0x0F) as usize;
         let hi = ((byte >> 4) & 0x0F) as usize;
-        staging[i * 2] = KVALUES_IQ4NL[lo] as f32;
-        staging[i * 2 + 1] = KVALUES_IQ4NL[hi] as f32;
+        // GGML split-half layout within the sub-block: byte `i` holds weight
+        // `i` (low nibble) and weight `i + 16` (high nibble).
+        staging[i] = KVALUES_IQ4NL[lo] as f32;
+        staging[i + SUB_BLOCK_SIZE / 2] = KVALUES_IQ4NL[hi] as f32;
     }
 
     // Two 16-wide AVX-512 passes to cover 32 values.
@@ -298,15 +302,20 @@ unsafe fn gemv_row_avx512(
             let nibble_off = sub * NIBBLES_PER_SUB;
             let w_col_base = col + sub * SUB_BLOCK_SIZE;
 
-            // Process in 16-wide chunks (2 nibble-bytes → 4 weights... but
-            // SUB_BLOCK_SIZE=32, so 2 passes of 16 weights using 8 nibble-bytes each).
+            // Process in 16-wide chunks: SUB_BLOCK_SIZE == 32, so two passes.
+            // Split-half layout: chunk 0 (weights 0..16) is the *low* nibbles
+            // of all 16 nibble-bytes and chunk 1 (weights 16..32) is their
+            // *high* nibbles — one nibble half per chunk, not 8 bytes each.
             for chunk in 0..2 {
-                // 8 nibble-bytes → 16 weights
                 let mut w16 = [0.0f32; 16];
-                for i in 0..8 {
-                    let byte = nibbles[nibble_off + chunk * 8 + i];
-                    w16[i * 2] = KVALUES_IQ4NL[(byte & 0x0F) as usize] as f32;
-                    w16[i * 2 + 1] = KVALUES_IQ4NL[((byte >> 4) & 0x0F) as usize] as f32;
+                for (i, w) in w16.iter_mut().enumerate() {
+                    let byte = nibbles[nibble_off + i];
+                    let nib = if chunk == 0 {
+                        byte & 0x0F
+                    } else {
+                        (byte >> 4) & 0x0F
+                    };
+                    *w = KVALUES_IQ4NL[nib as usize] as f32;
                 }
                 let c_base = w_col_base + chunk * 16;
                 if c_base + 16 <= n_cols {

@@ -20,6 +20,7 @@
 use core::arch::aarch64::*;
 
 use crate::error::{QuantError, QuantResult};
+use crate::simd::neon::int_dot::{dot_acc_s8, MAX_FUSED_BATCH};
 use crate::traits::QuantKernel;
 use crate::types::QuantTensor;
 
@@ -497,7 +498,7 @@ impl QuantKernel for Q6_KNeon {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row/block bounds verified above. AArch64 always has NEON.
             *out = unsafe {
@@ -508,7 +509,7 @@ impl QuantKernel for Q6_KNeon {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -528,6 +529,31 @@ impl QuantKernel for Q6_KNeon {
             self.gemv(quant_matrix, input_row, output_row)?;
         }
         Ok(())
+    }
+
+    /// Q6_K/NEON is on the fused decode path: one Q6_K super-block (256
+    /// weights) consumes 8 Q8_0 activation blocks, indexed `blk * 8 + sub` by
+    /// `fused_q6_k_q8_0_row_neon`.
+    ///
+    /// This gate is only open because the rewritten SDOT/NEON row kernel
+    /// measures *faster* than this kernel's own [`Self::gemv`] — 1.89x at
+    /// `ffn_down` (2560x9728) and 1.22x at the bandwidth-bound tied LM head
+    /// (151936x2560) on Apple M3.  The previous scalar body of
+    /// `fused_q6_k_q8_0_row_neon` was 7.5x *slower* than the f32 GEMV, which
+    /// is exactly the situation this `Option` exists to keep off the hot path.
+    ///
+    /// End-to-end confirmation (Qwen3-4B `Q4_K_M`, `measure.sh`, median of 5,
+    /// everything else held at its final state — this gate is the only
+    /// difference between the two builds):
+    ///
+    /// ```text
+    /// gate closed (Q6_K on the f32 GEMV)   10.7246 tok/s
+    /// gate open   (Q6_K fused)             12.9807 tok/s     +21%
+    /// ```
+    ///
+    /// In this checkpoint Q6_K carries `ffn_down` and the tied LM head.
+    fn q8_fused_acts_blocks(&self, n_cols: usize) -> Option<usize> {
+        Some(n_cols.div_ceil(BLOCK_SIZE) * 8)
     }
 
     fn block_size(&self) -> usize {
@@ -580,7 +606,7 @@ impl QuantKernel for Q6_KNeon {
             });
         }
 
-        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(out, n_rows, n_cols, |row, out_val| {
             let row_start = row * row_bytes;
             // SAFETY: bounds checked above.
             let row_sum = unsafe {
@@ -592,6 +618,74 @@ impl QuantKernel for Q6_KNeon {
                 )
             };
             *out_val += row_sum;
+        });
+
+        Ok(())
+    }
+
+    /// Batched fused Q6_K × Q8_0 matmul — the prefill kernel.
+    ///
+    /// Reads each weight row once for the whole batch and unpacks its 6-bit
+    /// quants once, instead of once per token.  See
+    /// `fused_q6_k_q8_0_row_batch_neon`.
+    ///
+    /// Batches wider than `MAX_FUSED_BATCH` are processed in chunks of that
+    /// size; every chunk is exact, so the split is invisible in the result.
+    fn matmul_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+        m: usize,
+    ) -> QuantResult<()> {
+        if m == 0 {
+            return Ok(());
+        }
+        if out.len() < n_rows * m {
+            return Err(QuantError::DimensionMismatch {
+                expected: n_rows * m,
+                got: out.len(),
+            });
+        }
+
+        let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let acts_stride = blocks_per_row * 8 * Q8_0_BLOCK_BYTES;
+
+        if weights.len() < n_rows * row_bytes {
+            return Err(QuantError::BufferTooSmall {
+                needed: n_rows * row_bytes,
+                available: weights.len(),
+            });
+        }
+        if acts_q8.len() < m * acts_stride {
+            return Err(QuantError::BufferTooSmall {
+                needed: m * acts_stride,
+                available: acts_q8.len(),
+            });
+        }
+
+        let mut done = 0usize;
+        while done < m {
+            let chunk = (m - done).min(MAX_FUSED_BATCH);
+            let acts_chunk = &acts_q8[done * acts_stride..(done + chunk) * acts_stride];
+            crate::parallel::for_each_row_batch(out, n_rows, n_cols, m, |row, out_row| {
+                let row_start = row * row_bytes;
+                // SAFETY: all bounds checked above; AArch64 always has NEON.
+                unsafe {
+                    fused_q6_k_q8_0_row_batch_neon(
+                        &weights[row_start..row_start + row_bytes],
+                        acts_chunk,
+                        blocks_per_row,
+                        n_cols,
+                        acts_stride,
+                        &mut out_row[done..done + chunk],
+                    );
+                }
+            });
+            done += chunk;
         }
 
         Ok(())
@@ -607,7 +701,71 @@ fn f16_bytes_to_f32_neon(bytes: [u8; 2]) -> f32 {
     half::f16::from_le_bytes(bytes).to_f32()
 }
 
+/// Load the 32 `i8` activations of Q8_0 block `q8_blk`, masking every lane at
+/// or beyond `valid` to zero, and return them with the block's f32 scale.
+///
+/// Masking is what makes the ragged-K tail exact: a column past `n_cols`
+/// contributes a zero product, exactly as the f32 GEMV's bounds check does.
+///
+/// # Safety
+/// - `acts_q8.len() >= (q8_blk + 1) * Q8_0_BLOCK_BYTES`
+/// - Must run on AArch64 with NEON.
+#[inline(always)]
+unsafe fn load_q8_act(acts_q8: &[u8], q8_blk: usize, valid: usize) -> (f32, int8x16_t, int8x16_t) {
+    let base = q8_blk * Q8_0_BLOCK_BYTES;
+    // SAFETY: caller guarantees the block is in bounds.
+    let ab = &acts_q8[base..base + Q8_0_BLOCK_BYTES];
+    let d_a = f16_bytes_to_f32_neon([ab[0], ab[1]]);
+    let qs = ab.as_ptr().wrapping_add(2) as *const i8;
+
+    if valid >= 32 {
+        // SAFETY: `qs` addresses 32 valid i8 values.
+        unsafe { (d_a, vld1q_s8(qs), vld1q_s8(qs.add(16))) }
+    } else {
+        let mut buf = [0i8; 32];
+        for (i, slot) in buf.iter_mut().enumerate().take(valid) {
+            *slot = ab[2 + i] as i8;
+        }
+        // SAFETY: `buf` is 32 i8 values.
+        unsafe { (d_a, vld1q_s8(buf.as_ptr()), vld1q_s8(buf.as_ptr().add(16))) }
+    }
+}
+
 /// Fused Q6_K weight × Q8_0 activation dot product for one row using NEON.
+///
+/// # What this replaced, and why
+///
+/// The previous body of this function was scalar despite its name: a
+/// `for l in 0..32` loop that re-derived one 6-bit quant at a time and, for
+/// *every single column*, re-sliced the activation buffer and re-decoded that
+/// Q8_0 block's FP16 scale.  Measured on Apple M3 it ran **7.5x slower than
+/// this kernel's own f32-activation [`gemv_row_neon`]**, so routing Q6_K
+/// through the fused path was a large net loss and the dispatch gate had to
+/// stay off.  This rewrite is the real thing.
+///
+/// # Structure
+///
+/// A Q6_K super-block is 256 weights = 16 sub-blocks of 16, each with its own
+/// `i8` scale, times an FP16 super-block scale `d`.  The 256 columns map onto
+/// exactly 8 Q8_0 activation blocks of 32, so activation block `b` covers
+/// weight sub-blocks `2b` and `2b + 1` — one Q8_0 scale over two weight
+/// scales, with no straddling in either direction.
+///
+/// That alignment is what makes the whole block integer-exact:
+///
+/// ```text
+/// row += d * Σ_b  d_a[b] * ( scale[2b]·P(2b) + scale[2b+1]·P(2b+1) )
+/// P(j) = Σ_{16 cols} (q6 − 32) · q_a          (i32, computed by SDOT)
+/// ```
+///
+/// `|q6 − 32| ≤ 32` and `|q_a| ≤ 128`, so `|P| ≤ 16 · 4096 = 65536` and
+/// `|scale·P| ≤ 128 · 65536 = 2^23` — the i32 accumulation cannot overflow and
+/// carries no rounding at all.  Only the final 8 `d_a`-weighted terms are
+/// floating point.
+///
+/// The bit-extraction reuses [`decode_q6_half_neon`], the same routine the
+/// dequantizer and the f32 GEMV use, so all three paths agree on the layout by
+/// construction.
 ///
 /// # Safety
 /// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
@@ -625,71 +783,216 @@ unsafe fn fused_q6_k_q8_0_row_neon(
         let bo = blk * BLOCK_BYTES;
         // SAFETY: blk < blocks_per_row; row_data.len() == blocks_per_row * BLOCK_BYTES.
         let block = &row_data[bo..bo + BLOCK_BYTES];
-
-        let ql = &block[0..128];
-        let qh = &block[128..192];
         let scales = &block[192..208];
         let d = f16_bytes_to_f32_neon([block[208], block[209]]);
 
-        let input_offset = blk * BLOCK_SIZE;
-        let cols_in_block = (n_cols - input_offset).min(BLOCK_SIZE);
+        let cols_in_block = n_cols.saturating_sub(blk * BLOCK_SIZE).min(BLOCK_SIZE);
+        if cols_in_block == 0 {
+            continue;
+        }
 
-        for group in 0..2 {
-            let ql_off = group * 64;
-            let qh_off = group * 32;
-            let sc_off = group * 8;
-            let in_off = group * 128;
+        let mut block_sum = 0.0f32;
 
-            for l in 0..32 {
-                let is = l / 16;
+        for group in 0..2usize {
+            // SAFETY: group < 2, so every offset stays inside ql/qh.
+            let (halves_a, halves_b) = unsafe { q6k_group_halves(block, group) };
 
-                let q1 = ((ql[ql_off + l] & 0x0F) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
-                let q2 =
-                    ((ql[ql_off + l + 32] & 0x0F) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
-                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 =
-                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
-
-                let s0 = d * scales[sc_off + is] as i8 as f32;
-                let s1 = d * scales[sc_off + is + 2] as i8 as f32;
-                let s2 = d * scales[sc_off + is + 4] as i8 as f32;
-                let s3 = d * scales[sc_off + is + 6] as i8 as f32;
-
-                let c0 = in_off + l;
-                let c1 = in_off + l + 32;
-                let c2 = in_off + l + 64;
-                let c3 = in_off + l + 96;
-
-                let sample_q8 = |col: usize| -> Option<f32> {
-                    if col >= cols_in_block {
-                        return None;
-                    }
-                    let q8_blk = blk * 8 + col / 32;
-                    let q8_lane = col % 32;
-                    // SAFETY: acts_q8.len() >= blocks_per_row * 8 * Q8_0_BLOCK_BYTES.
-                    let ab = &acts_q8[q8_blk * Q8_0_BLOCK_BYTES..(q8_blk + 1) * Q8_0_BLOCK_BYTES];
-                    let d_a = f16_bytes_to_f32_neon([ab[0], ab[1]]);
-                    let q_a = ab[2 + q8_lane] as i8 as f32;
-                    Some(d_a * q_a)
-                };
-
-                if let Some(a0) = sample_q8(c0) {
-                    row_sum += s0 * q1 as f32 * a0;
+            for stream in 0..4usize {
+                let sub = group * 4 + stream;
+                let valid = cols_in_block.saturating_sub(sub * 32).min(32);
+                if valid == 0 {
+                    continue;
                 }
-                if let Some(a1) = sample_q8(c1) {
-                    row_sum += s1 * q2 as f32 * a1;
-                }
-                if let Some(a2) = sample_q8(c2) {
-                    row_sum += s2 * q3 as f32 * a2;
-                }
-                if let Some(a3) = sample_q8(c3) {
-                    row_sum += s3 * q4 as f32 * a3;
+                // SAFETY: the centring bias keeps every lane in i8 range.
+                let (w_lo, w_hi) = unsafe { q6k_centre(halves_a[stream], halves_b[stream]) };
+                let s_lo = scales[group * 8 + stream * 2] as i8 as i32;
+                let s_hi = scales[group * 8 + stream * 2 + 1] as i8 as i32;
+                // SAFETY: acts_q8 holds blocks_per_row * 8 Q8_0 blocks.
+                unsafe {
+                    q6k_stream_acc(
+                        &mut block_sum,
+                        w_lo,
+                        w_hi,
+                        s_lo,
+                        s_hi,
+                        acts_q8,
+                        blk * 8 + sub,
+                        valid,
+                    );
                 }
             }
         }
+
+        row_sum += d * block_sum;
     }
 
     row_sum
+}
+
+/// Decode both 16-column halves of all four quant streams of group `group`.
+///
+/// Returns `([q1_a, q2_a, q3_a, q4_a], [q1_b, q2_b, q3_b, q4_b])`, exactly the
+/// registers [`decode_q6_half_neon`] hands the dequantizer and the f32 GEMV,
+/// so all paths agree on the bit layout by construction.
+///
+/// # Safety
+/// - `block.len() == BLOCK_BYTES`, `group < 2`.
+/// - Must run on AArch64 with NEON.
+#[inline(always)]
+unsafe fn q6k_group_halves(block: &[u8], group: usize) -> ([uint8x16_t; 4], [uint8x16_t; 4]) {
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let ql_off = group * 64;
+    let qh_off = group * 32;
+    // SAFETY: ql_off + 16 + 47 <= 127 and qh_off + 16 + 15 <= 63.
+    unsafe {
+        let (q1_a, q2_a, q3_a, q4_a) =
+            decode_q6_half_neon(ql.as_ptr().add(ql_off), qh.as_ptr().add(qh_off));
+        let (q1_b, q2_b, q3_b, q4_b) =
+            decode_q6_half_neon(ql.as_ptr().add(ql_off + 16), qh.as_ptr().add(qh_off + 16));
+        ([q1_a, q2_a, q3_a, q4_a], [q1_b, q2_b, q3_b, q4_b])
+    }
+}
+
+/// Centre the unsigned 6-bit quants: `q6` in `0..63` → `-32..31`, which is
+/// why an `i8` lane suffices for the SDOT operand.
+///
+/// # Safety
+/// Must run on AArch64 with NEON.
+#[inline(always)]
+unsafe fn q6k_centre(qa: uint8x16_t, qb: uint8x16_t) -> (int8x16_t, int8x16_t) {
+    // SAFETY: vsubq_s8 / vdupq_n_s8 are always valid on AArch64.
+    unsafe {
+        let bias = vdupq_n_s8(32);
+        (
+            vsubq_s8(vreinterpretq_s8_u8(qa), bias),
+            vsubq_s8(vreinterpretq_s8_u8(qb), bias),
+        )
+    }
+}
+
+/// Accumulate one Q6_K quant stream (32 columns = one Q8_0 activation block,
+/// two 16-wide weight sub-blocks) into `block_sum`, for a single activation
+/// vector.
+///
+/// Split out of [`fused_q6_k_q8_0_row_neon`] so the batched kernel runs the
+/// identical arithmetic in the identical order with the 6-bit decode hoisted
+/// out of the token loop.
+///
+/// # Safety
+/// - `acts_q8[(q8_blk + 1) * Q8_0_BLOCK_BYTES ..]` must be in bounds.
+/// - Must run on AArch64 with NEON.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn q6k_stream_acc(
+    block_sum: &mut f32,
+    w_lo: int8x16_t,
+    w_hi: int8x16_t,
+    s_lo: i32,
+    s_hi: i32,
+    acts_q8: &[u8],
+    q8_blk: usize,
+    valid: usize,
+) {
+    // SAFETY: caller guarantees the Q8_0 block is in bounds.
+    let (d_a, act_lo, act_hi) = unsafe { load_q8_act(acts_q8, q8_blk, valid) };
+
+    // SAFETY: dot_acc_s8 only needs AArch64 + NEON; the |w|·|a| bound
+    // (32 · 128) is far inside the documented limit.
+    let (p_lo, p_hi) = unsafe {
+        let zero = vdupq_n_s32(0);
+        (
+            vaddvq_s32(dot_acc_s8(zero, w_lo, act_lo)),
+            vaddvq_s32(dot_acc_s8(zero, w_hi, act_hi)),
+        )
+    };
+
+    *block_sum += d_a * (s_lo * p_lo + s_hi * p_hi) as f32;
+}
+
+/// Batched sibling of [`fused_q6_k_q8_0_row_neon`]: one weight row against `m`
+/// Q8_0 activation vectors, accumulating into `out[0..m]`.
+///
+/// The 6-bit unpacking ([`q6k_group_halves`], the most expensive part of a
+/// Q6_K row) and the 210-byte block load happen once per weight block rather
+/// than once per block per token.  Q6_K carries `ffn_down` and the tied LM
+/// head of Qwen3-4B `Q4_K_M`, so this matters for prefill even though most
+/// projections are Q4_K.
+///
+/// Per `(row, t)` the accumulation order matches the single-vector kernel
+/// exactly — same helper, same sequence of `+=`, same final `d *` scaling.
+///
+/// # Safety
+/// - `row_data.len() == blocks_per_row * BLOCK_BYTES`
+/// - `acts_q8` holds `m` vectors of `blocks_per_row * 8` Q8_0 blocks, vector
+///   `t` starting at `t * acts_stride`.
+/// - `out.len() >= m`, `m <= MAX_FUSED_BATCH`.
+/// - Must run on AArch64 with NEON.
+unsafe fn fused_q6_k_q8_0_row_batch_neon(
+    row_data: &[u8],
+    acts_q8: &[u8],
+    blocks_per_row: usize,
+    n_cols: usize,
+    acts_stride: usize,
+    out: &mut [f32],
+) {
+    let m = out.len().min(MAX_FUSED_BATCH);
+    let mut block_sum = [0.0f32; MAX_FUSED_BATCH];
+    // Per-token row accumulators, kept separate from `out` so that — exactly
+    // as in the single-vector kernel, which returns one `row_sum` the caller
+    // adds — a pre-seeded `out` is touched by a single `+=` per token.
+    let mut row_sum = [0.0f32; MAX_FUSED_BATCH];
+
+    for blk in 0..blocks_per_row {
+        let bo = blk * BLOCK_BYTES;
+        // SAFETY: blk < blocks_per_row; row_data.len() == blocks_per_row * BLOCK_BYTES.
+        let block = &row_data[bo..bo + BLOCK_BYTES];
+        let scales = &block[192..208];
+        let d = f16_bytes_to_f32_neon([block[208], block[209]]);
+
+        let cols_in_block = n_cols.saturating_sub(blk * BLOCK_SIZE).min(BLOCK_SIZE);
+        if cols_in_block == 0 {
+            continue;
+        }
+
+        block_sum[..m].fill(0.0);
+
+        for group in 0..2usize {
+            // Hoisted out of the token loop — this is the amortised work.
+            // SAFETY: group < 2, so every offset stays inside ql/qh.
+            let (halves_a, halves_b) = unsafe { q6k_group_halves(block, group) };
+
+            for stream in 0..4usize {
+                let sub = group * 4 + stream;
+                let valid = cols_in_block.saturating_sub(sub * 32).min(32);
+                if valid == 0 {
+                    continue;
+                }
+                // SAFETY: the centring bias keeps every lane in i8 range.
+                let (w_lo, w_hi) = unsafe { q6k_centre(halves_a[stream], halves_b[stream]) };
+                let s_lo = scales[group * 8 + stream * 2] as i8 as i32;
+                let s_hi = scales[group * 8 + stream * 2 + 1] as i8 as i32;
+                let q8_blk = blk * 8 + sub;
+
+                for (t, bs) in block_sum[..m].iter_mut().enumerate() {
+                    let base = t * acts_stride;
+                    let vec_acts = &acts_q8[base..base + acts_stride];
+                    // SAFETY: bounds as for the single-vector path.
+                    unsafe {
+                        q6k_stream_acc(bs, w_lo, w_hi, s_lo, s_hi, vec_acts, q8_blk, valid);
+                    }
+                }
+            }
+        }
+
+        for (rs, &bs) in row_sum[..m].iter_mut().zip(block_sum[..m].iter()) {
+            *rs += d * bs;
+        }
+    }
+
+    for (o, &rs) in out[..m].iter_mut().zip(row_sum[..m].iter()) {
+        *o += rs;
+    }
 }
 
 // ---------------------------------------------------------------------------

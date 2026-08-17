@@ -131,12 +131,17 @@ impl QuantKernel for Iq2XxsNeon {
 
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
-        let mut scratch = [0.0f32; BLOCK_SIZE];
-
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
+            // Per-row scratch: the closure may run on several threads at once.
+            let mut scratch = [0.0f32; BLOCK_SIZE];
             let row_start = row * row_bytes;
             // SAFETY: we are on AArch64 with NEON; acc is a valid float32x4_t.
             let mut sum = unsafe { vdupq_n_f32(0.0) };
+            // Scalar accumulator for the tail elements (< 4 remaining per block).
+            // Kept separate from `sum` and added once after the horizontal
+            // reduction below — broadcasting a scalar into all four lanes of
+            // `sum` before `vaddvq_f32` would count it 4x.
+            let mut tail = 0.0f32;
 
             for blk in 0..blocks_per_row {
                 let bo = row_start + blk * BLOCK_BYTES;
@@ -160,15 +165,14 @@ impl QuantKernel for Iq2XxsNeon {
                     }
                     // Scalar tail
                     for k in (lanes * 4)..block_input_len {
-                        let s: f32 = scratch[k] * input[input_base + k];
-                        sum = vaddq_f32(sum, vdupq_n_f32(s));
+                        tail += scratch[k] * input[input_base + k];
                     }
                 }
             }
 
             // SAFETY: AArch64 with NEON.
-            *out = unsafe { vaddvq_f32(sum) };
-        }
+            *out = unsafe { vaddvq_f32(sum) } + tail;
+        });
 
         Ok(())
     }
@@ -230,7 +234,7 @@ mod tests {
         let block = make_zero_block();
         let data = block.clone();
         let tensor = QuantTensor {
-            data,
+            data: data.into(),
             shape: vec![1, BLOCK_SIZE],
             tensor_type: GgufTensorType::Iq2Xxs,
         };
@@ -239,5 +243,62 @@ mod tests {
         Iq2XxsNeon
             .gemv(&tensor, &input, &mut out)
             .expect("gemv failed");
+    }
+
+    /// Regression test for the NEON tail-accumulation bug: the remainder loop
+    /// (`k in (lanes*4)..block_input_len`) used to broadcast each scalar
+    /// product into all four lanes of the FMA accumulator via
+    /// `vaddq_f32(sum, vdupq_n_f32(s))`, so `vaddvq_f32` summed it 4x. `n_cols`
+    /// values below are deliberately not multiples of 4 (and 257 also crosses
+    /// a block boundary) so every affected row exercises a non-empty tail.
+    ///
+    /// This test FAILED before the fix (NEON output ~4x too high on the tail
+    /// contribution) and PASSES after it, matching the reference kernel to
+    /// fp32 accumulation-order noise.
+    #[test]
+    fn test_gemv_matches_reference_ragged_tail() {
+        let mut block = make_zero_block();
+        // Non-trivial payload so the tail elements are non-zero (reuses the
+        // byte pattern from `test_dequant_cross_validate`).
+        block[2] = 0xAB;
+        block[3] = 0x34;
+        block[6] = 0x12;
+        block[10] = 0xFF;
+
+        for &n_cols in &[33usize, 34, 257] {
+            let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+            let mut data = Vec::with_capacity(blocks_per_row * BLOCK_BYTES);
+            for _ in 0..blocks_per_row {
+                data.extend_from_slice(&block);
+            }
+            // 2 rows so the parallel row-splitting path is exercised too.
+            let mut two_row_data = data.clone();
+            two_row_data.extend_from_slice(&data);
+
+            let tensor = QuantTensor {
+                data: two_row_data.into(),
+                shape: vec![2, n_cols],
+                tensor_type: GgufTensorType::Iq2Xxs,
+            };
+            let input: Vec<f32> = (0..n_cols).map(|i| (i as f32) * 0.01 - 1.0).collect();
+
+            let mut neon_out = vec![0.0f32; 2];
+            Iq2XxsNeon
+                .gemv(&tensor, &input, &mut neon_out)
+                .expect("neon gemv");
+
+            let mut ref_out = vec![0.0f32; 2];
+            Iq2XxsRef
+                .gemv(&tensor, &input, &mut ref_out)
+                .expect("ref gemv");
+
+            for (row, (&n, &r)) in neon_out.iter().zip(ref_out.iter()).enumerate() {
+                let scale = r.abs().max(1e-3);
+                assert!(
+                    (n - r).abs() / scale < 1e-3,
+                    "n_cols={n_cols} row={row}: neon={n} ref={r} (tail-accumulation bug?)"
+                );
+            }
+        }
     }
 }

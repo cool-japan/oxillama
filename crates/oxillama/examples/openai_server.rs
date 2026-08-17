@@ -66,11 +66,17 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(feature = "server")]
 fn run_server(model_path: String, port: u16) -> anyhow::Result<()> {
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
     use oxillama_runtime::{EngineConfig, InferenceEngine};
-    use oxillama_server::{build_app, spawn_inference_worker, AppState, ServerConfig};
+    use oxillama_server::{
+        build_app_with_config, spawn_inference_worker, AppState, PrefixCacheRegistry, ServerConfig,
+        DEFAULT_MAX_NAMESPACES,
+    };
 
     // ── Build engine ──────────────────────────────────────────────────────────
     let engine_config = EngineConfig {
@@ -87,19 +93,9 @@ fn run_server(model_path: String, port: u16) -> anyhow::Result<()> {
     let cached_sampler = engine.config().sampler.clone();
     let hidden_size = engine.hidden_size().unwrap_or(0);
     let vocab_bytes = engine.vocab_bytes().map(std::sync::Arc::new);
-
-    // ── Wire up the worker queue ──────────────────────────────────────────────
-    // The worker owns the engine exclusively; route handlers communicate with
-    // it through an mpsc channel.
-    let (tx, rx) = mpsc::channel(64);
-    let prefix_cache = std::sync::Arc::new(std::sync::Mutex::new(
-        oxillama_runtime::PrefixKvCache::new(oxillama_runtime::PrefixCacheConfig::default()),
-    ));
-    let loras = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::<
-        String,
-        std::sync::Arc<oxillama_runtime::LoadedLora>,
-    >::new()));
-    spawn_inference_worker(engine, rx, prefix_cache, loras);
+    // The model's real chat template, resolved from the GGUF metadata the
+    // engine already holds. Every chat-shaped route renders through it.
+    let chat_template = engine.chat_template().unwrap_or_default();
 
     // ── Build shared state ────────────────────────────────────────────────────
     let server_cfg = ServerConfig {
@@ -108,16 +104,47 @@ fn run_server(model_path: String, port: u16) -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    // ── Wire up the worker queue ──────────────────────────────────────────────
+    // The worker owns the engine exclusively; route handlers communicate with
+    // it through an mpsc channel. `prefix_registry` and `worker_alive` are
+    // shared `Arc`s between the worker and `AppState` so both sides observe
+    // the same prefix-cache/liveness state.
+    let (tx, rx) = mpsc::channel(64);
+    let prefix_registry = Arc::new(PrefixCacheRegistry::new(
+        oxillama_runtime::PrefixCacheConfig::default(),
+        DEFAULT_MAX_NAMESPACES,
+    ));
+    let worker_alive = Arc::new(AtomicBool::new(false));
+    let loras = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::<
+        String,
+        std::sync::Arc<oxillama_runtime::LoadedLora>,
+    >::new()));
+    spawn_inference_worker(
+        engine,
+        rx,
+        model_path.clone(),
+        Arc::clone(&prefix_registry),
+        loras,
+        Arc::clone(&worker_alive),
+    );
+
     let state = Arc::new(AppState::new(
         tx,
         model_path.clone(),
         cached_sampler,
         vocab_bytes,
         hidden_size,
-    ));
+        chat_template,
+        prefix_registry,
+        worker_alive,
+        server_cfg.batch_spool_dir.clone().map(PathBuf::from),
+    )?);
 
     // ── Build the axum router ─────────────────────────────────────────────────
-    let app = build_app(Arc::clone(&state));
+    // `build_app_with_config` (not the test-only `build_app`) applies the full
+    // production layer stack: admin auth, rate limiting, timeouts, CORS,
+    // metrics, and tracing, all driven by `server_cfg`.
+    let app = build_app_with_config(Arc::clone(&state), &server_cfg)?;
 
     let bind_addr = format!("{}:{}", server_cfg.host, server_cfg.port);
     eprintln!("Server listening on http://{bind_addr}");
@@ -132,9 +159,16 @@ fn run_server(model_path: String, port: u16) -> anyhow::Result<()> {
 
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(oxillama_server::shutdown_signal())
-            .await
-            .map_err(anyhow::Error::from)
+        // `with_connect_info` is required: the loopback-only admin fallback
+        // (no bearer token configured) reads `ConnectInfo<SocketAddr>` and
+        // fails closed — denying even legitimate loopback requests — if the
+        // service is built with the plain `into_make_service()` instead.
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(oxillama_server::shutdown_signal())
+        .await
+        .map_err(anyhow::Error::from)
     })
 }

@@ -31,7 +31,9 @@
 //! ```
 //!
 //! Each nibble stores a weight value in [0, 15], where the dequantized value
-//! is `(nibble - 8) * scale`.
+//! is `(nibble - 8) * scale`.  Byte `j` carries weight `j` in its low nibble
+//! and weight `j + 16` in its high nibble — GGML's split-half layout, not
+//! interleaved pairs.
 //!
 //! ## Q8_0 block layout (34 bytes / 32 weights)
 //!
@@ -144,8 +146,12 @@ impl Default for QuantPlan {
 /// Inputs must be a multiple of 32 in length (zero-padded otherwise).
 ///
 /// Each block is 18 bytes: 2-byte f16 scale + 16 bytes of packed nibbles.
-/// The mapping is `quant = round(weight / scale) + 8` clamped to `[0, 15]`.
-fn encode_q4_0(weights: &[f32]) -> Vec<u8> {
+///
+/// This is a byte-exact port of llama.cpp's `quantize_row_q4_0_ref`, and is
+/// public so that the cross-crate byte-identity test in `oxillama-quant` can
+/// hold it against `oxillama_quant::quantize_f32_to_q4_0`, which must emit
+/// exactly the same bytes.
+pub fn encode_q4_0(weights: &[f32]) -> Vec<u8> {
     const BLOCK: usize = 32;
 
     let n_blocks = weights.len().div_ceil(BLOCK);
@@ -156,32 +162,35 @@ fn encode_q4_0(weights: &[f32]) -> Vec<u8> {
         let end = (start + BLOCK).min(weights.len());
         let block = &weights[start..end];
 
-        // Compute max absolute value for scale derivation
-        let amax = block
+        // Find the element with the largest *absolute* value but keep its
+        // sign — upstream's `max`, not `amax`.
+        let max_val = block
             .iter()
             .copied()
-            .fold(0.0f32, |acc, w| acc.max(w.abs()));
+            .fold(0.0f32, |acc, w| if w.abs() > acc.abs() { w } else { acc });
 
-        // Scale: maps the full block range to [-8, 7] (offset by 8 for nibble storage)
-        let scale = if amax == 0.0 { 0.0 } else { amax / 7.0 };
-        let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+        // Scale: `d = max / -8`, so the extreme element maps to nibble 0 and
+        // the representable range is the signed [-8, 7] the decoder assumes.
+        // `id` is derived from the f32 `d`, before the f16 store.
+        let d = max_val / -8.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
 
         // Write scale as f16
-        let scale_f16 = f16::from_f32(scale);
-        out.extend_from_slice(&scale_f16.to_le_bytes());
+        let d_f16 = f16::from_f32(d);
+        out.extend_from_slice(&d_f16.to_le_bytes());
 
-        // Pack 32 nibbles into 16 bytes (two nibbles per byte, low nibble first)
-        let mut nibbles = [8u8; BLOCK]; // default to 0-centered (offset 8 = zero)
+        // Quantize into the natural weight order first; a short trailing block
+        // is padded with nibble 8 (the value that dequantizes to zero).
+        let mut nibbles = [8u8; BLOCK];
         for (i, &w) in block.iter().enumerate() {
-            let q = (w * inv_scale).round() as i32;
-            let q_clamped = (q + 8).clamp(0, 15) as u8;
-            nibbles[i] = q_clamped;
+            nibbles[i] = ((w * id + 8.5) as i32).clamp(0, 15) as u8;
         }
 
-        // Pack pairs of nibbles
-        for pair in nibbles.chunks(2) {
-            let lo = pair[0] & 0x0F;
-            let hi = if pair.len() > 1 { pair[1] & 0x0F } else { 8 };
+        // Pack split halves: byte `j` carries weight `j` in its low nibble and
+        // weight `j + 16` in its high nibble (GGML `quantize_row_q4_0_ref`).
+        for j in 0..BLOCK / 2 {
+            let lo = nibbles[j] & 0x0F;
+            let hi = nibbles[j + BLOCK / 2] & 0x0F;
             out.push(lo | (hi << 4));
         }
     }
@@ -287,9 +296,13 @@ fn blob_to_f32(blob: &[u8], source_type: GgufTensorType) -> GgufResult<Vec<f32>>
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Per-tensor quantization override — stores the quantized bytes and the new dtype.
+///
+/// The bytes are held as [`SharedBytes`] so that
+/// [`GgufModel::tensor_bytes`][crate::GgufModel::tensor_bytes] can hand out a
+/// view of them without a second copy.
 #[derive(Debug)]
 pub(crate) struct QuantOverride {
-    pub(crate) data: Vec<u8>,
+    pub(crate) data: crate::bytes::SharedBytes,
     pub(crate) new_type: GgufTensorType,
 }
 
@@ -385,7 +398,7 @@ pub(crate) fn apply_quant_plan(model: &mut GgufModel, plan: &QuantPlan) -> GgufR
         model.quant_overrides.insert(
             name,
             QuantOverride {
-                data: quantized,
+                data: crate::bytes::SharedBytes::from_vec(quantized),
                 new_type: new_tensor_type,
             },
         );
@@ -473,12 +486,31 @@ mod tests {
         assert_eq!(encoded.len(), 36, "Q4_0: two blocks = 36 bytes");
     }
 
+    /// An all-zero block stores **negative** zero, byte-for-byte as llama.cpp
+    /// does.
+    ///
+    /// Upstream computes `d = max / -8` with `max` initialised to `0.0f` and
+    /// never updated (`amax < fabsf(v)` is false for every element), so
+    /// `d = 0.0f / -8 = -0.0f` and `GGML_FP32_TO_FP16(-0.0f) = 0x8000`.
+    /// Verified against the extracted upstream `quantize_row_q4_0_ref`.
+    ///
+    /// The previous expectation of `0x0000` came from the rejected
+    /// `scale = amax / 7` convention, where `amax = 0` gives `+0.0`.  Both
+    /// dequantize every weight to zero, but only `0x8000` is byte-identical
+    /// to a llama.cpp-produced GGUF.
     #[test]
-    fn q4_0_zero_block_has_zero_scale() {
+    fn q4_0_zero_block_stores_negative_zero_scale() {
         let weights = vec![0.0f32; 32];
         let encoded = encode_q4_0(&weights);
         let scale_bits = u16::from_le_bytes([encoded[0], encoded[1]]);
-        assert_eq!(scale_bits, 0, "zero weights should produce zero scale");
+        assert_eq!(scale_bits, 0x8000, "zero weights should produce -0.0 scale");
+        assert_eq!(f16::from_bits(scale_bits).to_f32(), 0.0);
+        // Every nibble is 8, so every dequantized weight is exactly zero.
+        assert!(
+            encoded[2..].iter().all(|&b| b == 0x88),
+            "{:?}",
+            &encoded[2..]
+        );
     }
 
     #[test]

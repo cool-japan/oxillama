@@ -116,7 +116,7 @@ impl QuantKernel for Q5_KAvx2 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row/block bounds verified above.
             // CPU avx2+fma support guaranteed by KernelDispatcher.
@@ -128,7 +128,7 @@ impl QuantKernel for Q5_KAvx2 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -304,7 +304,7 @@ unsafe fn fused_q5_k_q8_0_row_avx2(
                     let mut nib_buf = [0i8; 8];
                     let mut q8_buf = [0i8; 8];
                     for j in 0..8 {
-                        let qh_bit = (qh[l + j] >> group) & 1;
+                        let qh_bit = (qh[l + j] >> (2 * group)) & 1;
                         nib_buf[j] = ((qs[q5_ptr + j] & 0x0F) | (qh_bit << 4)) as i8;
                         q8_buf[j] = q8_lo[l + j] as i8;
                     }
@@ -323,7 +323,7 @@ unsafe fn fused_q5_k_q8_0_row_avx2(
             let mut sum_a_lo_scalar = 0.0f32;
             let lo_simd_done = (valid_lo / 8) * 8;
             for l in lo_simd_done..valid_lo {
-                let qh_bit = (qh[l] >> group) & 1;
+                let qh_bit = (qh[l] >> (2 * group)) & 1;
                 let q_w = ((qs[qs_off + l] & 0x0F) | (qh_bit << 4)) as f32;
                 let q_a = q8_lo[l] as i8 as f32;
                 dot_lo_scalar += q_w * q_a;
@@ -344,7 +344,7 @@ unsafe fn fused_q5_k_q8_0_row_avx2(
                     let mut nib_buf = [0i8; 8];
                     let mut q8_buf = [0i8; 8];
                     for j in 0..8 {
-                        let qh_bit = (qh[l + j] >> (group + 4)) & 1;
+                        let qh_bit = (qh[l + j] >> (2 * group + 1)) & 1;
                         nib_buf[j] = (((qs[q5_ptr + j] >> 4) & 0x0F) | (qh_bit << 4)) as i8;
                         q8_buf[j] = q8_hi[l + j] as i8;
                     }
@@ -361,7 +361,7 @@ unsafe fn fused_q5_k_q8_0_row_avx2(
             let mut sum_a_hi_scalar = 0.0f32;
             let hi_simd_done = (valid_hi / 8) * 8;
             for l in hi_simd_done..valid_hi {
-                let qh_bit = (qh[l] >> (group + 4)) & 1;
+                let qh_bit = (qh[l] >> (2 * group + 1)) & 1;
                 let q_w = (((qs[qs_off + l] >> 4) & 0x0F) | (qh_bit << 4)) as f32;
                 let q_a = q8_hi[l] as i8 as f32;
                 dot_hi_scalar += q_w * q_a;
@@ -508,12 +508,12 @@ unsafe fn dequant_block_avx2(block: &[u8], output: &mut [f32]) {
         let qh_1 = _mm_loadu_si128(qh.as_ptr().add(16) as *const __m128i); // bytes 16..31
 
         // High bits for lo sub-block: bit `group` of qh (positions 0..32).
-        let hb_lo_0 = extract_high_bit(qh_0, group); // positions 0..15
-        let hb_lo_1 = extract_high_bit(qh_1, group); // positions 16..31
+        let hb_lo_0 = extract_high_bit(qh_0, 2 * group); // positions 0..15
+        let hb_lo_1 = extract_high_bit(qh_1, 2 * group); // positions 16..31
 
         // High bits for hi sub-block: bit `group+4` of qh.
-        let hb_hi_0 = extract_high_bit(qh_0, group + 4); // positions 0..15
-        let hb_hi_1 = extract_high_bit(qh_1, group + 4); // positions 16..31
+        let hb_hi_0 = extract_high_bit(qh_0, 2 * group + 1); // positions 0..15
+        let hb_hi_1 = extract_high_bit(qh_1, 2 * group + 1); // positions 16..31
 
         // --- Lo sub-block: 32 weights = a_lo * q5 - b_lo ---
 
@@ -625,10 +625,10 @@ unsafe fn gemv_row_avx2(
                 let qh_0 = _mm_loadu_si128(qh.as_ptr() as *const __m128i);
                 let qh_1 = _mm_loadu_si128(qh.as_ptr().add(16) as *const __m128i);
 
-                let hb_lo_0 = extract_high_bit(qh_0, group);
-                let hb_lo_1 = extract_high_bit(qh_1, group);
-                let hb_hi_0 = extract_high_bit(qh_0, group + 4);
-                let hb_hi_1 = extract_high_bit(qh_1, group + 4);
+                let hb_lo_0 = extract_high_bit(qh_0, 2 * group);
+                let hb_lo_1 = extract_high_bit(qh_1, 2 * group);
+                let hb_hi_0 = extract_high_bit(qh_0, 2 * group + 1);
+                let hb_hi_1 = extract_high_bit(qh_1, 2 * group + 1);
 
                 // SAFETY: w_off + 64 <= input_offset + BLOCK_SIZE <= n_cols.
                 let inp_lo = input.as_ptr().add(w_off);
@@ -690,7 +690,7 @@ unsafe fn gemv_row_avx2(
                     if idx < n_cols {
                         // SAFETY: qs_off + l < 128; qh index l < 32.
                         let lo_nib = (*qs.get_unchecked(qs_off + l) & 0x0F) as u32;
-                        let hi_bit = ((*qh.get_unchecked(l) >> group) & 1) as u32;
+                        let hi_bit = ((*qh.get_unchecked(l) >> (2 * group)) & 1) as u32;
                         let q = (lo_nib | (hi_bit << 4)) as f32;
                         partial_sum += (d1 * q - m1) * input[idx];
                     }
@@ -701,7 +701,7 @@ unsafe fn gemv_row_avx2(
                     if idx < n_cols {
                         // SAFETY: qs_off + l < 128; qh index l < 32.
                         let hi_nib = ((*qs.get_unchecked(qs_off + l) >> 4) & 0x0F) as u32;
-                        let hi_bit = ((*qh.get_unchecked(l) >> (group + 4)) & 1) as u32;
+                        let hi_bit = ((*qh.get_unchecked(l) >> (2 * group + 1)) & 1) as u32;
                         let q = (hi_nib | (hi_bit << 4)) as f32;
                         partial_sum += (d2 * q - m2) * input[idx];
                     }

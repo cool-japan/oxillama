@@ -1,113 +1,218 @@
 //! StableLM transformer forward pass implementation.
 //!
-//! StableLM departs from LLaMA/Mistral in three key ways:
+//! Every structural decision here is taken from
+//! `~/work/refs/llama.cpp/src/models/stablelm.cpp` (`llm_build_stablelm`) and
+//! `~/work/refs/llama.cpp/src/llama-model.cpp` (`case LLM_ARCH_STABLELM:` in
+//! `load_tensors()`).  StableLM departs from LLaMA/Mistral in four ways:
 //!
-//! 1. **LayerNorm instead of RMSNorm** — both the attention and FFN pre-norms
-//!    use a full LayerNorm with learned bias (`attn_norm.weight/bias`,
-//!    `ffn_norm.weight/bias`).
+//! 1. **LayerNorm, not RMSNorm.** `build_norm(..., LLM_NORM, ...)` — mean
+//!    centred, with a learned bias — is used for `attn_norm`, `ffn_norm` and
+//!    `output_norm`, all of which ship a `.bias` tensor.  The epsilon comes
+//!    from `{arch}.attention.layer_norm_epsilon`.
 //!
-//! 2. **Partial RoPE** — RoPE is applied only to the first
-//!    `round(partial_rotary_factor × head_dim)` dimensions of each Q/K head
-//!    vector. The remaining dimensions are passed through unmodified.
+//! 2. **Partial RoPE.** The rotation covers `hparams.n_rot` dimensions, taken
+//!    from `{arch}.rope.dimension_count`, which is **not** `head_dim` for this
+//!    family.  The pairing is GPT-NeoX (`LLAMA_ROPE_TYPE_NEOX`), i.e.
+//!    `(x[i], x[i + n_rot/2])` — note `n_rot/2`, not `head_dim/2`.
 //!
-//! 3. **Parallel attention + FFN** — the residual stream receives both the
-//!    attention output *and* the FFN output added simultaneously:
+//! 3. **Two residual topologies.**  With `ffn_norm` present (the common case,
+//!    every StableLM except StableLM 2 12B) the block is the ordinary
+//!    sequential one.  Without it the block is *parallel*, and the FFN reads
+//!    `inpSA` — the output of `attn_norm` — not a second norm of the residual:
+//!
 //!    ```text
-//!    y = x + Attention(LayerNorm(x)) + FFN(LayerNorm(x))
+//!    cur     = LN(inpL,  attn_norm)      // inpSA
+//!    attn    = Attention(cur)
+//!    ffn_inp = attn + inpL               // residual add, both topologies
+//!    ffn_in  = ffn_norm ? LN(ffn_inp, ffn_norm) : inpSA
+//!    out     = FFN(ffn_in) + ffn_inp
 //!    ```
-//!    rather than the sequential LLaMA pattern where attention is applied first
-//!    and then FFN is applied to the updated residual.
+//!
+//! 4. **Optional per-head QK LayerNorm.**  See
+//!    [`PerHeadLayerNorm`](super::head_norm::PerHeadLayerNorm): the weight is
+//!    `{head_dim, n_head}`, one distinct vector per head.
+//!
+//! Q/K/V are three separate projections (never fused into `attn_qkv`) and each
+//! carries an **optional** bias (`bq`/`bk`/`bv`, present in Stable LM 2 1.6B).
+//! `attn_output` has no bias tensor at all.  The FFN is SwiGLU
+//! (`LLM_FFN_SILU, LLM_FFN_PAR` over `ffn_gate`/`ffn_up`/`ffn_down`).
 //!
 //! ## Tensor names (GGUF)
 //!
-//! - `blk.{i}.attn_norm.weight` / `.bias` — pre-attention LayerNorm
-//! - `blk.{i}.ffn_norm.weight` / `.bias` — pre-FFN LayerNorm (same input as attn_norm)
-//! - `blk.{i}.attn_q.weight` — Q projection
-//! - `blk.{i}.attn_k.weight` — K projection
-//! - `blk.{i}.attn_v.weight` — V projection
-//! - `blk.{i}.attn_output.weight` — attention output projection
-//! - `blk.{i}.ffn_gate.weight` — FFN gate (SwiGLU)
-//! - `blk.{i}.ffn_up.weight` — FFN up projection
-//! - `blk.{i}.ffn_down.weight` — FFN down projection
-//! - `output_norm.weight` / `.bias` — final LayerNorm
-//! - `output.weight` — LM head
+//! | Name | Required |
+//! |------|----------|
+//! | `token_embd.weight` | yes |
+//! | `output_norm.weight` / `.bias` | yes (both) |
+//! | `output.weight` | yes |
+//! | `blk.{i}.attn_norm.weight` / `.bias` | yes (both) |
+//! | `blk.{i}.attn_q.weight`, `attn_k.weight`, `attn_v.weight` | yes |
+//! | `blk.{i}.attn_q.bias`, `attn_k.bias`, `attn_v.bias` | no |
+//! | `blk.{i}.attn_output.weight` | yes |
+//! | `blk.{i}.attn_q_norm.weight`, `attn_k_norm.weight` | no |
+//! | `blk.{i}.ffn_norm.weight`, `ffn_norm.bias` | no (independently) |
+//! | `blk.{i}.ffn_gate.weight`, `ffn_up.weight`, `ffn_down.weight` | yes |
 
+use std::sync::Arc;
+
+use oxillama_quant::{quantize_activations_q8_0_into, KernelDispatcher, QuantKernel};
+
+use crate::common::attention::{validate_context_bounds, validate_token_ids};
 use crate::common::layer_norm::LayerNorm;
+use crate::common::linear::QuantLinear;
 use crate::common::rope::RopeTable;
+use crate::common::swiglu::swiglu_inplace;
 use crate::config::ModelConfig;
-use crate::error::ArchResult;
+use crate::error::{ArchError, ArchResult};
 use crate::traits::{ForwardPass, KvCacheAccess};
 
 use super::config::StablelmConfig;
+use super::head_norm::PerHeadLayerNorm;
 
-/// Apply partial RoPE to a single head vector using a pre-built `RopeTable`.
+/// The weights of one StableLM block, before kernel resolution.
 ///
-/// Only the first `rotary_dims` elements (which must be even) are rotated;
-/// the remaining `head.len() - rotary_dims` elements are left unchanged.
-///
-/// This is a free function so that callers can hold a mutable borrow on the
-/// buffer fields at the same time as an immutable borrow on `rope`.
-fn apply_partial_rope_with_table(
-    rope: &RopeTable,
-    head: &mut [f32],
-    position: usize,
-    rotary_dims: usize,
-) {
-    if rotary_dims == 0 || head.is_empty() {
-        return;
-    }
-    let rotate_len = rotary_dims.min(head.len());
-    rope.apply(&mut head[..rotate_len], position);
-}
-
-/// Apply partial RoPE to a head using pre-extracted cos/sin slices.
-///
-/// Avoids split-borrow conflicts when the rope table is a field of the same
-/// struct as the buffer being mutated.
-fn apply_partial_rope_precomputed(
-    head: &mut [f32],
-    rope_cos: &[f32],
-    rope_sin: &[f32],
-    rotary_dims: usize,
-) {
-    if rotary_dims == 0 || rope_cos.is_empty() || rope_sin.is_empty() {
-        return;
-    }
-    let rotate_half = rotary_dims / 2;
-    for i in 0..rotate_half
-        .min(rope_cos.len())
-        .min(head.len().saturating_sub(rotate_half))
-    {
-        let x0 = head[i];
-        let x1 = head[i + rotate_half];
-        head[i] = x0 * rope_cos[i] - x1 * rope_sin[i];
-        head[i + rotate_half] = x0 * rope_sin[i] + x1 * rope_cos[i];
-    }
+/// Passed to [`StablelmLayer::new`], which resolves each projection's
+/// quantization kernel **once** and stores it on the layer.  Re-dispatching
+/// per token — as the pre-loader implementation effectively did by carrying
+/// dense `Vec<f32>` weights and a hand-rolled GEMV — costs an allocation per
+/// projection per token.
+pub struct StablelmLayerWeights {
+    /// Pre-attention LayerNorm (`attn_norm.weight` + `attn_norm.bias`).
+    pub attn_norm: LayerNorm,
+    /// Q projection; `bias` carries the optional `attn_q.bias`.
+    pub attn_q: QuantLinear,
+    /// K projection; `bias` carries the optional `attn_k.bias`.
+    pub attn_k: QuantLinear,
+    /// V projection; `bias` carries the optional `attn_v.bias`.
+    pub attn_v: QuantLinear,
+    /// Attention output projection (never has a bias in this architecture).
+    pub attn_output: QuantLinear,
+    /// Optional per-head Q LayerNorm (`attn_q_norm.weight`, StableLM 2 12B).
+    pub attn_q_norm: Option<PerHeadLayerNorm>,
+    /// Optional per-head K LayerNorm (`attn_k_norm.weight`, StableLM 2 12B).
+    pub attn_k_norm: Option<PerHeadLayerNorm>,
+    /// Optional pre-FFN LayerNorm.  `None` selects the parallel-residual
+    /// topology, in which the FFN reads `attn_norm`'s output instead.
+    pub ffn_norm: Option<LayerNorm>,
+    /// SwiGLU gate projection.
+    pub ffn_gate: QuantLinear,
+    /// SwiGLU up projection.
+    pub ffn_up: QuantLinear,
+    /// SwiGLU down projection.
+    pub ffn_down: QuantLinear,
 }
 
 /// A single StableLM transformer layer.
-///
-/// Uses LayerNorm (with bias) for both norms and combines attention + FFN
-/// outputs in parallel before adding to the residual.
 pub struct StablelmLayer {
     /// Pre-attention LayerNorm (with bias).
     pub attn_norm: LayerNorm,
-    /// Pre-FFN LayerNorm (with bias, applied to the *same* pre-residual input).
-    pub ffn_norm: LayerNorm,
-    /// Q projection weights `[num_heads * head_dim, hidden_size]` (f32).
-    pub attn_q: Vec<f32>,
-    /// K projection weights `[num_kv_heads * head_dim, hidden_size]` (f32).
-    pub attn_k: Vec<f32>,
-    /// V projection weights `[num_kv_heads * head_dim, hidden_size]` (f32).
-    pub attn_v: Vec<f32>,
-    /// Attention output projection `[hidden_size, num_heads * head_dim]` (f32).
-    pub attn_output: Vec<f32>,
-    /// FFN gate projection `[intermediate_size, hidden_size]` (f32).
-    pub ffn_gate: Vec<f32>,
-    /// FFN up projection `[intermediate_size, hidden_size]` (f32).
-    pub ffn_up: Vec<f32>,
-    /// FFN down projection `[hidden_size, intermediate_size]` (f32).
-    pub ffn_down: Vec<f32>,
+    /// Q projection `[num_heads * head_dim, hidden_size]` with optional bias.
+    pub attn_q: QuantLinear,
+    /// K projection `[num_kv_heads * head_dim, hidden_size]` with optional bias.
+    pub attn_k: QuantLinear,
+    /// V projection `[num_kv_heads * head_dim, hidden_size]` with optional bias.
+    pub attn_v: QuantLinear,
+    /// Attention output projection `[hidden_size, num_heads * head_dim]`.
+    pub attn_output: QuantLinear,
+    /// Optional per-head Q LayerNorm.
+    pub attn_q_norm: Option<PerHeadLayerNorm>,
+    /// Optional per-head K LayerNorm.
+    pub attn_k_norm: Option<PerHeadLayerNorm>,
+    /// Optional pre-FFN LayerNorm (`None` ⇒ parallel residual).
+    pub ffn_norm: Option<LayerNorm>,
+    /// SwiGLU gate projection `[intermediate_size, hidden_size]`.
+    pub ffn_gate: QuantLinear,
+    /// SwiGLU up projection `[intermediate_size, hidden_size]`.
+    pub ffn_up: QuantLinear,
+    /// SwiGLU down projection `[hidden_size, intermediate_size]`.
+    pub ffn_down: QuantLinear,
+
+    /// Kernel for [`Self::attn_q`], resolved once at load time.
+    pub attn_q_kernel: Arc<dyn QuantKernel>,
+    /// Kernel for [`Self::attn_k`], resolved once at load time.
+    pub attn_k_kernel: Arc<dyn QuantKernel>,
+    /// Kernel for [`Self::attn_v`], resolved once at load time.
+    pub attn_v_kernel: Arc<dyn QuantKernel>,
+    /// Kernel for [`Self::attn_output`], resolved once at load time.
+    pub attn_output_kernel: Arc<dyn QuantKernel>,
+    /// Kernel for [`Self::ffn_gate`], resolved once at load time.
+    pub ffn_gate_kernel: Arc<dyn QuantKernel>,
+    /// Kernel for [`Self::ffn_up`], resolved once at load time.
+    pub ffn_up_kernel: Arc<dyn QuantKernel>,
+    /// Kernel for [`Self::ffn_down`], resolved once at load time.
+    pub ffn_down_kernel: Arc<dyn QuantKernel>,
+}
+
+impl StablelmLayer {
+    /// Resolve every projection's kernel and assemble the layer.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::Quant`] when a weight's tensor type has no registered
+    /// dequantization kernel.
+    pub fn new(dispatcher: &KernelDispatcher, w: StablelmLayerWeights) -> ArchResult<Self> {
+        let attn_q_kernel = resolve_kernel(dispatcher, &w.attn_q)?;
+        let attn_k_kernel = resolve_kernel(dispatcher, &w.attn_k)?;
+        let attn_v_kernel = resolve_kernel(dispatcher, &w.attn_v)?;
+        let attn_output_kernel = resolve_kernel(dispatcher, &w.attn_output)?;
+        let ffn_gate_kernel = resolve_kernel(dispatcher, &w.ffn_gate)?;
+        let ffn_up_kernel = resolve_kernel(dispatcher, &w.ffn_up)?;
+        let ffn_down_kernel = resolve_kernel(dispatcher, &w.ffn_down)?;
+
+        Ok(Self {
+            attn_norm: w.attn_norm,
+            attn_q: w.attn_q,
+            attn_k: w.attn_k,
+            attn_v: w.attn_v,
+            attn_output: w.attn_output,
+            attn_q_norm: w.attn_q_norm,
+            attn_k_norm: w.attn_k_norm,
+            ffn_norm: w.ffn_norm,
+            ffn_gate: w.ffn_gate,
+            ffn_up: w.ffn_up,
+            ffn_down: w.ffn_down,
+            attn_q_kernel,
+            attn_k_kernel,
+            attn_v_kernel,
+            attn_output_kernel,
+            ffn_gate_kernel,
+            ffn_up_kernel,
+            ffn_down_kernel,
+        })
+    }
+
+    /// Whether this block uses the parallel-residual topology.
+    ///
+    /// True exactly when the checkpoint shipped no `ffn_norm.weight`, which is
+    /// llama.cpp's own discriminator (`if (model.layers[il].ffn_norm) { … }
+    /// else { /* parallel residual */ cur = inpSA; }`).
+    pub fn is_parallel_residual(&self) -> bool {
+        self.ffn_norm.is_none()
+    }
+}
+
+/// Resolve `linear`'s kernel once, wrapped for cheap sharing.
+fn resolve_kernel(
+    dispatcher: &KernelDispatcher,
+    linear: &QuantLinear,
+) -> ArchResult<Arc<dyn QuantKernel>> {
+    Ok(dispatcher.get_kernel(linear.weight.tensor_type)?.into())
+}
+
+/// Run one projection, preferring the fused Q8_0 activation path when the
+/// kernel offers one and the caller has already quantized the activations.
+fn run_linear(
+    linear: &QuantLinear,
+    kernel: &dyn QuantKernel,
+    input: &[f32],
+    acts_q8: &[u8],
+    output: &mut [f32],
+) -> ArchResult<()> {
+    if !acts_q8.is_empty() && linear.q8_fused_blocks(kernel).is_some() {
+        linear.forward_q8_fused(kernel, input, acts_q8, output)?;
+    } else {
+        linear.forward(kernel, input, output)?;
+    }
+    Ok(())
 }
 
 /// Complete StableLM model.
@@ -116,19 +221,29 @@ pub struct StablelmModel {
     pub config: ModelConfig,
     /// StableLM-specific configuration.
     pub stablelm_config: StablelmConfig,
-    /// Token embeddings `[vocab_size, hidden_size]` (f32).
+    /// Token embeddings `[vocab_size, hidden_size]` (f32, row-major).
     pub token_embd: Vec<f32>,
     /// Transformer layers.
     pub layers: Vec<StablelmLayer>,
     /// Final LayerNorm (with bias).
     pub output_norm: LayerNorm,
-    /// LM head weights `[vocab_size, hidden_size]` (f32).
-    pub output_weights: Vec<f32>,
-    /// Precomputed RoPE frequency table (covers full head_dim; partial usage
-    /// is enforced inside `apply_partial_rope`).
+    /// LM head (`output.weight`), kept in its GGUF quantization.
+    pub output: QuantLinear,
+    /// Kernel for [`Self::output`], resolved once at load time.
+    pub output_kernel: Arc<dyn QuantKernel>,
+    /// Precomputed RoPE table.
+    ///
+    /// Built over `n_rot` — the **rotary** dimension count — so
+    /// `rope.half_dim == n_rot / 2` and [`RopeTable::apply`] rotates exactly
+    /// `(x[i], x[i + n_rot/2])` for `i < n_rot/2`, leaving the tail of each
+    /// head untouched.  Building it over `head_dim` (as this file used to)
+    /// produced both the wrong frequencies and the wrong pair offset.
     pub rope: RopeTable,
 
-    // Scratch buffers
+    /// Cached `stablelm_config.rotary_dims(head_dim)`.
+    rotary_dims: usize,
+
+    // ── Scratch buffers, all allocated once at load time ──────────────────
     buf_hidden: Vec<f32>,
     buf_attn_norm: Vec<f32>,
     buf_ffn_norm: Vec<f32>,
@@ -142,42 +257,112 @@ pub struct StablelmModel {
     buf_ffn_out: Vec<f32>,
     buf_logits: Vec<f32>,
     buf_attn_scores: Vec<f32>,
+    buf_acts_q8: Vec<u8>,
 }
 
 impl StablelmModel {
-    /// Create a new `StablelmModel` from pre-loaded weights.
+    /// Assemble a `StablelmModel` from pre-loaded weights.
+    ///
+    /// # Errors
+    ///
+    /// * [`ArchError::ConfigMismatch`] when `num_attention_heads`,
+    ///   `num_kv_heads` or `hidden_size` is zero, when `num_kv_heads` does not
+    ///   divide `num_attention_heads`, or when
+    ///   `num_attention_heads * head_dim != hidden_size`.  llama.cpp creates
+    ///   StableLM's `wq`/`wo` as `{n_embd, n_embd}` and reshapes Q to
+    ///   `[n_embd_head, n_head, n_tokens]`, so the product is an identity for
+    ///   this architecture — the previous code instead clamped the GEMV's row
+    ///   stride with `.min(hidden_size)`, which silently made every row of the
+    ///   output projection read from the wrong offset.
+    /// * [`ArchError::InvalidShape`] when `token_embd` is too short to hold
+    ///   `vocab_size × hidden_size` weights.
+    /// * [`ArchError::Quant`] when the LM head's tensor type has no kernel.
     pub fn new(
         config: ModelConfig,
         stablelm_config: StablelmConfig,
         token_embd: Vec<f32>,
         layers: Vec<StablelmLayer>,
         output_norm: LayerNorm,
-        output_weights: Vec<f32>,
-    ) -> Self {
+        output: QuantLinear,
+    ) -> ArchResult<Self> {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_kv_heads;
         let head_dim = config.head_dim;
         let intermediate_size = config.intermediate_size;
         let vocab_size = config.vocab_size;
-        let max_ctx = config.max_context_length;
+        let max_ctx = config.max_context_length.max(1);
 
-        let rope = RopeTable::new(
-            head_dim,
+        if hidden_size == 0 {
+            return Err(ArchError::ConfigMismatch {
+                param: "hidden_size".to_string(),
+                expected: "> 0".to_string(),
+                got: "0".to_string(),
+            });
+        }
+        if num_heads == 0 {
+            return Err(ArchError::ConfigMismatch {
+                param: "num_attention_heads".to_string(),
+                expected: "> 0".to_string(),
+                got: "0".to_string(),
+            });
+        }
+        if num_kv_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
+            return Err(ArchError::ConfigMismatch {
+                param: "num_kv_heads".to_string(),
+                expected: format!("a non-zero divisor of num_attention_heads ({num_heads})"),
+                got: num_kv_heads.to_string(),
+            });
+        }
+        // ── S5 ────────────────────────────────────────────────────────────
+        if num_heads.saturating_mul(head_dim) != hidden_size {
+            return Err(ArchError::ConfigMismatch {
+                param: "num_attention_heads * head_dim".to_string(),
+                expected: format!("hidden_size ({hidden_size})"),
+                got: format!("{num_heads} * {head_dim} = {}", num_heads * head_dim),
+            });
+        }
+
+        // `>=`, not `==`: some converters keep padding rows past the declared
+        // vocabulary.  Falling *short* is what turns an in-range token id into
+        // an out-of-bounds read.
+        let min_embd_len = vocab_size.saturating_mul(hidden_size);
+        if token_embd.len() < min_embd_len {
+            return Err(ArchError::InvalidShape {
+                name: "token_embd.weight".to_string(),
+                expected: vec![vocab_size, hidden_size],
+                got: vec![token_embd.len()],
+            });
+        }
+
+        let rotary_dims = stablelm_config.rotary_dims(head_dim);
+        // `new_with_style` rather than `new_standard_with_style`: it keeps the
+        // checkpoint's RoPE scaling instead of forcing `Standard`/1.0, and
+        // `config.rope_style()` keeps `rope_style_for_arch` ("stablelm" ⇒
+        // NeoX, matching `llama_model_rope_type`'s `LLAMA_ROPE_TYPE_NEOX`
+        // group) as the single source of truth.
+        let rope = RopeTable::new_with_style(
+            rotary_dims,
             max_ctx,
             config.rope_freq_base,
             config.rope_scaling_type,
             config.rope_scaling_factor,
+            config.rope_style(),
         );
 
-        Self {
+        let dispatcher = KernelDispatcher::new();
+        let output_kernel = resolve_kernel(&dispatcher, &output)?;
+
+        Ok(Self {
             config,
             stablelm_config,
             token_embd,
             layers,
             output_norm,
-            output_weights,
+            output,
+            output_kernel,
             rope,
+            rotary_dims,
             buf_hidden: vec![0.0f32; hidden_size],
             buf_attn_norm: vec![0.0f32; hidden_size],
             buf_ffn_norm: vec![0.0f32; hidden_size],
@@ -191,42 +376,49 @@ impl StablelmModel {
             buf_ffn_out: vec![0.0f32; hidden_size],
             buf_logits: vec![0.0f32; vocab_size],
             buf_attn_scores: vec![0.0f32; max_ctx],
-        }
+            buf_acts_q8: Vec::new(),
+        })
     }
 
-    fn embed_token(&mut self, token: u32) {
-        let h = self.config.hidden_size;
-        let offset = token as usize * h;
-        self.buf_hidden
-            .copy_from_slice(&self.token_embd[offset..offset + h]);
+    /// Number of rotated dimensions per head (llama.cpp's `n_rot`).
+    pub fn rotary_dims(&self) -> usize {
+        self.rotary_dims
     }
 
-    /// Apply partial RoPE to a single head vector.
+    /// Apply StableLM's partial RoPE to a single head vector in place.
     ///
-    /// Only the first `rotary_dims` elements are rotated; the remaining
-    /// `head_dim - rotary_dims` elements are left unchanged. This is the
-    /// defining feature of StableLM's partial RoPE implementation.
-    ///
-    /// # Arguments
-    /// * `head`        — mutable slice of length `head_dim`
-    /// * `position`    — token position
-    /// * `rotary_dims` — how many leading dimensions to rotate (must be even)
-    pub fn apply_partial_rope(&self, head: &mut [f32], position: usize, rotary_dims: usize) {
-        // Use the split-borrow-safe free function.
-        apply_partial_rope_with_table(&self.rope, head, position, rotary_dims);
+    /// `head` is a full `head_dim`-wide vector; only its first
+    /// [`Self::rotary_dims`] elements are touched, and they are rotated in
+    /// `(i, i + rotary_dims/2)` pairs — the GPT-NeoX convention llama.cpp
+    /// selects for StableLM.  This is the *same* call the decode path makes,
+    /// so the two can no longer disagree.
+    pub fn apply_partial_rope(&self, head: &mut [f32], position: usize) {
+        self.rope.apply(head, position);
     }
 
-    /// Dense matrix-vector product: `out[i] = dot(W[i, :], x)`.
-    ///
-    /// `W` is stored row-major with shape `[out_dim, in_dim]`.
-    fn gemv(w: &[f32], x: &[f32], out: &mut [f32], in_dim: usize) {
-        for (i, o) in out.iter_mut().enumerate() {
-            let row = &w[i * in_dim..(i + 1) * in_dim];
-            *o = row.iter().zip(x.iter()).map(|(w, x)| w * x).sum();
-        }
+    /// Load the residual stream with `token`'s embedding row.
+    fn embed_token(&mut self, token: u32) -> ArchResult<()> {
+        let Self {
+            config,
+            token_embd,
+            buf_hidden,
+            ..
+        } = self;
+        let hidden = config.hidden_size;
+        let offset = (token as usize)
+            .checked_mul(hidden)
+            .ok_or_else(|| out_of_vocab(token, config.vocab_size))?;
+        let row = token_embd
+            .get(offset..offset + hidden)
+            .ok_or_else(|| out_of_vocab(token, config.vocab_size))?;
+        buf_hidden.copy_from_slice(row);
+        Ok(())
     }
 
-    /// Run scaled dot-product attention with causal masking.
+    /// Scaled dot-product attention with causal masking and GQA.
+    ///
+    /// Reads the post-`attn_norm` activation from `buf_attn_norm` and writes
+    /// the output projection into `buf_attn_proj`.
     fn attention(
         &mut self,
         layer_idx: usize,
@@ -237,61 +429,93 @@ impl StablelmModel {
         let num_kv_heads = self.config.num_kv_heads;
         let head_dim = self.config.head_dim;
         let kv_dim = num_kv_heads * head_dim;
-        let heads_per_kv = num_heads.checked_div(num_kv_heads).unwrap_or(1);
+        // `new()` rejects a non-dividing `num_kv_heads`, so this is exact.
+        let heads_per_kv = num_heads / num_kv_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
         let seq_len = position + 1;
 
-        let rotary_dims = self.stablelm_config.rotary_dims(head_dim);
+        // ── Q / K / V projections (+ optional bq/bk/bv) ───────────────────
+        {
+            let Self {
+                layers,
+                buf_attn_norm,
+                buf_q,
+                buf_k,
+                buf_v,
+                buf_acts_q8,
+                ..
+            } = self;
+            let layer = layers
+                .get(layer_idx)
+                .ok_or_else(|| layer_index_error(layer_idx))?;
 
-        let layer = &self.layers[layer_idx];
+            let q_kernel: &dyn QuantKernel = &*layer.attn_q_kernel;
+            let k_kernel: &dyn QuantKernel = &*layer.attn_k_kernel;
+            let v_kernel: &dyn QuantKernel = &*layer.attn_v_kernel;
 
-        // Project Q, K, V
-        let attn_in = self.buf_attn_norm.clone();
-        Self::gemv(&layer.attn_q, &attn_in, &mut self.buf_q, attn_in.len());
-        Self::gemv(
-            &layer.attn_k,
-            &attn_in,
-            &mut self.buf_k[..kv_dim],
-            attn_in.len(),
-        );
-        Self::gemv(
-            &layer.attn_v,
-            &attn_in,
-            &mut self.buf_v[..kv_dim],
-            attn_in.len(),
-        );
+            // Q/K/V all read the same activation vector, so it is quantized to
+            // Q8_0 exactly once and shared by all three GEMVs.
+            let q_fused = layer.attn_q.q8_fused_blocks(q_kernel);
+            let k_fused = layer.attn_k.q8_fused_blocks(k_kernel);
+            let v_fused = layer.attn_v.q8_fused_blocks(v_kernel);
+            buf_acts_q8.clear();
+            if let Some(n_blocks) = q_fused
+                .iter()
+                .chain(&k_fused)
+                .chain(&v_fused)
+                .copied()
+                .max()
+            {
+                quantize_activations_q8_0_into(buf_attn_norm, n_blocks, buf_acts_q8);
+            }
 
-        // Apply partial RoPE to each Q head.
-        // Snapshot the RoPE slice for this position to avoid split-borrow conflict.
-        let rotate_half = rotary_dims / 2;
-        let rope_offset = position * self.rope.half_dim;
-        let rope_cos: Vec<f32> =
-            if rotate_half > 0 && rope_offset + rotate_half <= self.rope.cos.len() {
-                self.rope.cos[rope_offset..rope_offset + rotate_half].to_vec()
-            } else {
-                vec![]
-            };
-        let rope_sin: Vec<f32> =
-            if rotate_half > 0 && rope_offset + rotate_half <= self.rope.sin.len() {
-                self.rope.sin[rope_offset..rope_offset + rotate_half].to_vec()
-            } else {
-                vec![]
-            };
-
-        for h in 0..num_heads {
-            let q_head = &mut self.buf_q[h * head_dim..(h + 1) * head_dim];
-            apply_partial_rope_precomputed(q_head, &rope_cos, &rope_sin, rotary_dims);
-        }
-        for h in 0..num_kv_heads {
-            let k_head = &mut self.buf_k[h * head_dim..(h + 1) * head_dim];
-            apply_partial_rope_precomputed(k_head, &rope_cos, &rope_sin, rotary_dims);
+            // `QuantLinear::forward` adds the optional bias after the GEMV,
+            // which is exactly `Qcur = ggml_add(ctx0, Qcur, model.layers[il].bq)`
+            // in `llm_build_stablelm`.  A checkpoint without biases carries
+            // `None` and the add is skipped.
+            run_linear(&layer.attn_q, q_kernel, buf_attn_norm, buf_acts_q8, buf_q)?;
+            run_linear(&layer.attn_k, k_kernel, buf_attn_norm, buf_acts_q8, buf_k)?;
+            run_linear(&layer.attn_v, v_kernel, buf_attn_norm, buf_acts_q8, buf_v)?;
         }
 
-        // Cache K, V
+        // ── Optional per-head QK LayerNorm, then partial RoPE ─────────────
+        {
+            let Self {
+                layers,
+                buf_q,
+                buf_k,
+                rope,
+                ..
+            } = self;
+            let layer = layers
+                .get(layer_idx)
+                .ok_or_else(|| layer_index_error(layer_idx))?;
+
+            if let Some(q_norm) = layer.attn_q_norm.as_ref() {
+                q_norm.forward(buf_q);
+            }
+            if let Some(k_norm) = layer.attn_k_norm.as_ref() {
+                k_norm.forward(buf_k);
+            }
+
+            for h in 0..num_heads {
+                rope.apply(&mut buf_q[h * head_dim..(h + 1) * head_dim], position);
+            }
+            for h in 0..num_kv_heads {
+                rope.apply(&mut buf_k[h * head_dim..(h + 1) * head_dim], position);
+            }
+        }
+
         kv_cache.store_kv(layer_idx, &self.buf_k[..kv_dim], &self.buf_v[..kv_dim])?;
 
-        let cached_keys = kv_cache.get_keys(layer_idx)?.to_vec();
-        let cached_values = kv_cache.get_values(layer_idx)?.to_vec();
+        // Borrowed, never copied: the previous implementation called
+        // `.to_vec()` on the whole cache for both K and V on every layer of
+        // every token, which is `2 · n_layer · seq_len · kv_dim` floats copied
+        // per decoded token.
+        let cached_keys = crate::common::fetch_keys(&*kv_cache, layer_idx)?;
+        let cached_values = crate::common::fetch_values(&*kv_cache, layer_idx)?;
+        let cached_keys: &[f32] = &cached_keys;
+        let cached_values: &[f32] = &cached_values;
 
         self.buf_attn_out.fill(0.0);
 
@@ -300,102 +524,229 @@ impl StablelmModel {
             let q_head = &self.buf_q[h * head_dim..(h + 1) * head_dim];
 
             for pos in 0..seq_len {
-                let k_off = pos * kv_dim + kv_head * head_dim;
-                let k_slice = &cached_keys[k_off..k_off + head_dim];
-                let score: f32 =
-                    q_head.iter().zip(k_slice).map(|(q, k)| q * k).sum::<f32>() * scale;
-                self.buf_attn_scores[pos] = score;
+                let k_offset = pos * kv_dim + kv_head * head_dim;
+                let k_vec = cached_keys
+                    .get(k_offset..k_offset + head_dim)
+                    .ok_or_else(|| kv_range_error(layer_idx, "keys"))?;
+                let mut score = 0.0f32;
+                for d in 0..head_dim {
+                    score += q_head[d] * k_vec[d];
+                }
+                self.buf_attn_scores[pos] = score * scale;
             }
 
             softmax_inplace(&mut self.buf_attn_scores[..seq_len]);
 
             let out_head = &mut self.buf_attn_out[h * head_dim..(h + 1) * head_dim];
             for pos in 0..seq_len {
-                let v_off = pos * kv_dim + kv_head * head_dim;
-                let v_slice = &cached_values[v_off..v_off + head_dim];
+                let v_offset = pos * kv_dim + kv_head * head_dim;
+                let v_vec = cached_values
+                    .get(v_offset..v_offset + head_dim)
+                    .ok_or_else(|| kv_range_error(layer_idx, "values"))?;
                 let w = self.buf_attn_scores[pos];
                 for d in 0..head_dim {
-                    out_head[d] += w * v_slice[d];
+                    out_head[d] += w * v_vec[d];
                 }
             }
         }
 
-        // Output projection: attn_proj = W_o @ attn_out
-        let attn_out_copy = self.buf_attn_out.clone();
-        let attn_proj_out_dim = self.config.hidden_size;
-        let attn_proj_in_dim = num_heads * head_dim;
-        Self::gemv(
-            &self.layers[layer_idx].attn_output,
-            &attn_out_copy,
-            &mut self.buf_attn_proj,
-            attn_proj_in_dim.min(attn_proj_out_dim),
-        );
+        // ── Output projection (no bias in this architecture) ──────────────
+        let Self {
+            layers,
+            buf_attn_out,
+            buf_attn_proj,
+            buf_acts_q8,
+            ..
+        } = self;
+        let layer = layers
+            .get(layer_idx)
+            .ok_or_else(|| layer_index_error(layer_idx))?;
+        let o_kernel: &dyn QuantKernel = &*layer.attn_output_kernel;
+        buf_acts_q8.clear();
+        if let Some(n_blocks) = layer.attn_output.q8_fused_blocks(o_kernel) {
+            quantize_activations_q8_0_into(buf_attn_out, n_blocks, buf_acts_q8);
+        }
+        run_linear(
+            &layer.attn_output,
+            o_kernel,
+            buf_attn_out,
+            buf_acts_q8,
+            buf_attn_proj,
+        )?;
 
         Ok(())
     }
 
-    /// Compute SwiGLU FFN output into `buf_ffn_out`.
-    fn feed_forward(&mut self, layer_idx: usize) {
-        let ffn_in = self.buf_ffn_norm.clone();
-        let h = self.config.hidden_size;
-        let n = self.config.intermediate_size;
+    /// SwiGLU feed-forward, writing its output into `buf_ffn_out`.
+    ///
+    /// `parallel` selects the FFN's *input* buffer, mirroring
+    /// `llm_build_stablelm`: with `ffn_norm` present the input is the
+    /// normalized `ffn_inp` (`buf_ffn_norm`); without it the input is `inpSA`,
+    /// the output of `attn_norm` (`buf_attn_norm`).
+    fn feed_forward(&mut self, layer_idx: usize, parallel: bool) -> ArchResult<()> {
+        let Self {
+            layers,
+            buf_attn_norm,
+            buf_ffn_norm,
+            buf_gate,
+            buf_up,
+            buf_ffn_out,
+            buf_acts_q8,
+            ..
+        } = self;
+        let layer = layers
+            .get(layer_idx)
+            .ok_or_else(|| layer_index_error(layer_idx))?;
 
-        let layer = &self.layers[layer_idx];
+        let input: &[f32] = if parallel {
+            buf_attn_norm
+        } else {
+            buf_ffn_norm
+        };
 
-        // gate = W_gate @ ffn_in
-        Self::gemv(&layer.ffn_gate, &ffn_in, &mut self.buf_gate, h);
-        // up = W_up @ ffn_in
-        Self::gemv(&layer.ffn_up, &ffn_in, &mut self.buf_up, h);
+        let gate_kernel: &dyn QuantKernel = &*layer.ffn_gate_kernel;
+        let up_kernel: &dyn QuantKernel = &*layer.ffn_up_kernel;
+        let down_kernel: &dyn QuantKernel = &*layer.ffn_down_kernel;
 
-        // SwiGLU: gate = silu(gate) * up
-        for (g, &u) in self.buf_gate.iter_mut().zip(self.buf_up.iter()) {
-            let silu = *g / (1.0 + (-*g).exp());
-            *g = silu * u;
+        let gate_fused = layer.ffn_gate.q8_fused_blocks(gate_kernel);
+        let up_fused = layer.ffn_up.q8_fused_blocks(up_kernel);
+        buf_acts_q8.clear();
+        if let Some(n_blocks) = gate_fused.iter().chain(&up_fused).copied().max() {
+            quantize_activations_q8_0_into(input, n_blocks, buf_acts_q8);
         }
 
-        // down = W_down @ gate
-        let swiglu = self.buf_gate.clone();
-        Self::gemv(&layer.ffn_down, &swiglu, &mut self.buf_ffn_out, n);
+        run_linear(&layer.ffn_gate, gate_kernel, input, buf_acts_q8, buf_gate)?;
+        run_linear(&layer.ffn_up, up_kernel, input, buf_acts_q8, buf_up)?;
+
+        swiglu_inplace(buf_gate, buf_up);
+
+        buf_acts_q8.clear();
+        if let Some(n_blocks) = layer.ffn_down.q8_fused_blocks(down_kernel) {
+            quantize_activations_q8_0_into(buf_gate, n_blocks, buf_acts_q8);
+        }
+        run_linear(
+            &layer.ffn_down,
+            down_kernel,
+            buf_gate,
+            buf_acts_q8,
+            buf_ffn_out,
+        )?;
+
+        Ok(())
     }
 
-    /// Run one layer: parallel attention + FFN, add both to residual.
-    ///
-    /// `y = x + Attention(LayerNorm_attn(x)) + FFN(LayerNorm_ffn(x))`
+    /// Run one transformer block over the residual stream in `buf_hidden`.
     fn layer_forward(
         &mut self,
         layer_idx: usize,
         position: usize,
         kv_cache: &mut dyn KvCacheAccess,
     ) -> ArchResult<()> {
-        let hidden = self.buf_hidden.clone();
+        // `cur = build_norm(inpL, attn_norm, attn_norm_b, LLM_NORM)`;
+        // `inpSA = cur` — kept intact in `buf_attn_norm` for the whole block
+        // because the parallel-residual FFN reads it.
+        {
+            let Self {
+                layers,
+                buf_hidden,
+                buf_attn_norm,
+                ..
+            } = self;
+            let layer = layers
+                .get(layer_idx)
+                .ok_or_else(|| layer_index_error(layer_idx))?;
+            layer.attn_norm.forward_to(buf_hidden, buf_attn_norm);
+        }
 
-        // Both norms receive the same pre-residual hidden state.
-        self.layers[layer_idx]
-            .attn_norm
-            .forward_to(&hidden, &mut self.buf_attn_norm);
-        self.layers[layer_idx]
-            .ffn_norm
-            .forward_to(&hidden, &mut self.buf_ffn_norm);
-
-        // Attention path (writes result into buf_attn_proj)
         self.attention(layer_idx, position, kv_cache)?;
 
-        // FFN path (writes result into buf_ffn_out)
-        self.feed_forward(layer_idx);
+        // `ffn_inp = ggml_add(ctx0, cur, inpL)` — happens in BOTH topologies.
+        for (h, &p) in self.buf_hidden.iter_mut().zip(self.buf_attn_proj.iter()) {
+            *h += p;
+        }
 
-        // Parallel residual: hidden = original_hidden + attn_proj + ffn_out
-        let attn_proj = self.buf_attn_proj.clone();
-        let ffn_out = self.buf_ffn_out.clone();
-        for ((h, &a), &f) in self
-            .buf_hidden
-            .iter_mut()
-            .zip(attn_proj.iter())
-            .zip(ffn_out.iter())
-        {
-            *h += a + f;
+        // `if (ffn_norm) { cur = build_norm(ffn_inp, ffn_norm, ffn_norm_b) }
+        //  else          { cur = inpSA; }`
+        let parallel = {
+            let Self {
+                layers,
+                buf_hidden,
+                buf_ffn_norm,
+                ..
+            } = self;
+            let layer = layers
+                .get(layer_idx)
+                .ok_or_else(|| layer_index_error(layer_idx))?;
+            match layer.ffn_norm.as_ref() {
+                Some(norm) => {
+                    norm.forward_to(buf_hidden, buf_ffn_norm);
+                    false
+                }
+                None => true,
+            }
+        };
+
+        self.feed_forward(layer_idx, parallel)?;
+
+        // `cur = ggml_add(ctx0, cur, ffn_inp)`
+        for (h, &f) in self.buf_hidden.iter_mut().zip(self.buf_ffn_out.iter()) {
+            *h += f;
         }
 
         Ok(())
+    }
+
+    /// Run every token through all layers, leaving the last token's
+    /// pre-output-norm hidden state in `buf_hidden`.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::ConfigMismatch`] for an out-of-vocabulary token id or a
+    /// prompt that would run past `max_context_length`.  Both used to be
+    /// panics reachable from the HTTP server with attacker-controlled input:
+    /// the embedding lookup indexed `token_embd` unchecked, and
+    /// `buf_attn_scores` (sized `max_context_length`) was indexed by the raw
+    /// position with no prefill guard at all.
+    fn run_layers(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<()> {
+        validate_token_ids(&self.config, tokens)?;
+
+        let start_pos = kv_cache.seq_len();
+        validate_context_bounds(&self.config, start_pos, tokens.len())?;
+
+        for (i, &token) in tokens.iter().enumerate() {
+            let position = start_pos + i;
+            self.embed_token(token)?;
+
+            for layer_idx in 0..self.layers.len() {
+                self.layer_forward(layer_idx, position, kv_cache)?;
+            }
+
+            kv_cache.advance();
+        }
+
+        Ok(())
+    }
+
+    /// Apply `output_norm` and project through the LM head into `buf_logits`.
+    fn project_logits(&mut self) -> ArchResult<()> {
+        if self.buf_logits.len() != self.config.vocab_size {
+            self.buf_logits.resize(self.config.vocab_size, 0.0);
+        }
+
+        let Self {
+            output,
+            output_kernel,
+            buf_hidden,
+            buf_logits,
+            buf_acts_q8,
+            ..
+        } = self;
+        let kernel: &dyn QuantKernel = &**output_kernel;
+        buf_acts_q8.clear();
+        if let Some(n_blocks) = output.q8_fused_blocks(kernel) {
+            quantize_activations_q8_0_into(buf_hidden, n_blocks, buf_acts_q8);
+        }
+        run_linear(output, kernel, buf_hidden, buf_acts_q8, buf_logits)
     }
 }
 
@@ -405,34 +756,19 @@ impl ForwardPass for StablelmModel {
         tokens: &[u32],
         kv_cache: &mut dyn KvCacheAccess,
     ) -> ArchResult<Vec<f32>> {
-        let start_pos = kv_cache.seq_len();
+        self.run_layers(tokens, kv_cache)?;
+        self.output_norm.forward(&mut self.buf_hidden);
+        self.project_logits()?;
+        // Ownership transfer instead of a `vocab_size`-wide clone per token;
+        // `project_logits` restores the length on the next call.
+        Ok(std::mem::take(&mut self.buf_logits))
+    }
 
-        for (i, &token) in tokens.iter().enumerate() {
-            let position = start_pos + i;
-            self.embed_token(token);
-
-            for layer_idx in 0..self.layers.len() {
-                self.layer_forward(layer_idx, position, kv_cache)?;
-            }
-            kv_cache.advance();
-        }
-
-        // Final norm on hidden state
-        let hidden_final = self.buf_hidden.clone();
-        let mut normed = vec![0.0f32; self.config.hidden_size];
-        self.output_norm.forward_to(&hidden_final, &mut normed);
-
-        // LM head: vocab_size × hidden_size
-        let vocab_size = self.config.vocab_size;
-        let hidden_size = self.config.hidden_size;
-        self.buf_logits.fill(0.0);
-        for v in 0..vocab_size {
-            let row = &self.output_weights[v * hidden_size..(v + 1) * hidden_size];
-            let sum: f32 = row.iter().zip(normed.iter()).map(|(w, &x)| w * x).sum();
-            self.buf_logits[v] = sum;
-        }
-
-        Ok(self.buf_logits.clone())
+    /// Post-`output_norm` hidden state, without the LM-head projection.
+    fn embed(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
+        self.run_layers(tokens, kv_cache)?;
+        self.output_norm.forward(&mut self.buf_hidden);
+        Ok(self.buf_hidden.clone())
     }
 
     fn vocab_size(&self) -> usize {
@@ -445,6 +781,32 @@ impl ForwardPass for StablelmModel {
 
     fn hidden_size(&self) -> usize {
         self.config.hidden_size
+    }
+}
+
+/// Out-of-vocabulary token id error.
+fn out_of_vocab(token: u32, vocab_size: usize) -> ArchError {
+    ArchError::ConfigMismatch {
+        param: "token_id".to_string(),
+        expected: format!("< vocab_size ({vocab_size})"),
+        got: token.to_string(),
+    }
+}
+
+/// A layer index past the end of `layers` (defensive; `run_layers` iterates
+/// `0..layers.len()`).
+fn layer_index_error(layer: usize) -> ArchError {
+    ArchError::ForwardPassError {
+        layer,
+        message: "layer index out of range".to_string(),
+    }
+}
+
+/// KV-cache slice out of range (a cache shorter than the sequence claims).
+fn kv_range_error(layer: usize, which: &str) -> ArchError {
+    ArchError::ForwardPassError {
+        layer,
+        message: format!("KV cache {which} shorter than the current sequence length"),
     }
 }
 
@@ -467,322 +829,37 @@ fn softmax_inplace(x: &mut [f32]) {
     }
 }
 
-// ─── Test helpers ─────────────────────────────────────────────────────────────
-
-/// Build a minimal `StablelmLayer` filled with near-zero weights.
-#[cfg(test)]
-pub fn make_test_layer(hidden_size: usize, intermediate_size: usize) -> StablelmLayer {
-    let attn_norm = LayerNorm::new(
-        vec![1.0f32; hidden_size],
-        Some(vec![0.0f32; hidden_size]),
-        1e-5,
-    );
-    let ffn_norm = LayerNorm::new(
-        vec![1.0f32; hidden_size],
-        Some(vec![0.0f32; hidden_size]),
-        1e-5,
-    );
-
-    // All projection weights are 0.01 (small non-zero to produce non-trivial output)
-    let q_k_v_out_size = hidden_size * hidden_size; // square for simplicity (head_dim = hidden)
-    let ffn_gate_up_size = intermediate_size * hidden_size;
-    let ffn_down_size = hidden_size * intermediate_size;
-
-    StablelmLayer {
-        attn_norm,
-        ffn_norm,
-        attn_q: vec![0.01f32; q_k_v_out_size],
-        attn_k: vec![0.01f32; q_k_v_out_size],
-        attn_v: vec![0.01f32; q_k_v_out_size],
-        attn_output: vec![0.01f32; q_k_v_out_size],
-        ffn_gate: vec![0.01f32; ffn_gate_up_size],
-        ffn_up: vec![0.01f32; ffn_gate_up_size],
-        ffn_down: vec![0.01f32; ffn_down_size],
-    }
-}
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ModelConfig;
-    use crate::error::{ArchError, ArchResult};
-    use crate::registry::ArchitectureRegistry;
-    use crate::stablelm::StablelmArchitecture;
-    use crate::traits::ModelArchitecture;
-
-    fn minimal_config(hidden_size: usize) -> (ModelConfig, StablelmConfig) {
-        let num_heads = 2usize;
-        let head_dim = hidden_size / num_heads;
-        let mc = ModelConfig {
-            architecture: "stablelm".to_string(),
-            hidden_size,
-            intermediate_size: 16,
-            num_layers: 1,
-            num_attention_heads: num_heads,
-            num_kv_heads: num_heads,
-            head_dim,
-            vocab_size: 4,
-            max_context_length: 8,
-            ..ModelConfig::default()
-        };
-        let sc = StablelmConfig {
-            partial_rotary_factor: 0.25,
-            num_heads,
-            num_kv_heads: num_heads,
-            hidden_size,
-            intermediate_size: 16,
-            layer_norm_eps: 1e-5,
-        };
-        (mc, sc)
-    }
-
-    fn make_model(mc: &ModelConfig, sc: &StablelmConfig) -> StablelmModel {
-        let h = mc.hidden_size;
-        let v = mc.vocab_size;
-        let token_embd = vec![0.01f32; v * h];
-        let layer = make_test_layer(h, mc.intermediate_size);
-        let output_norm = LayerNorm::new(vec![1.0f32; h], Some(vec![0.0f32; h]), 1e-5);
-        let output_weights = vec![0.01f32; v * h];
-
-        StablelmModel::new(
-            mc.clone(),
-            sc.clone(),
-            token_embd,
-            vec![layer],
-            output_norm,
-            output_weights,
-        )
-    }
-
-    /// Minimal KV cache for tests.
-    struct SimpleKvCache {
-        kv_dim: usize,
-        max_seq: usize,
-        n_layers: usize,
-        position: usize,
-        keys: Vec<Vec<f32>>,
-        values: Vec<Vec<f32>>,
-    }
-
-    impl SimpleKvCache {
-        fn new(n_layers: usize, kv_dim: usize, max_seq: usize) -> Self {
-            Self {
-                kv_dim,
-                max_seq,
-                n_layers,
-                position: 0,
-                keys: vec![vec![0.0f32; max_seq * kv_dim]; n_layers],
-                values: vec![vec![0.0f32; max_seq * kv_dim]; n_layers],
-            }
-        }
-    }
-
-    impl KvCacheAccess for SimpleKvCache {
-        fn seq_len(&self) -> usize {
-            self.position
-        }
-
-        fn store_kv(&mut self, layer: usize, key: &[f32], value: &[f32]) -> ArchResult<()> {
-            if layer >= self.n_layers {
-                return Err(ArchError::InvalidConfig {
-                    detail: format!("layer {layer} out of range"),
-                });
-            }
-            let offset = self.position * self.kv_dim;
-            let ck = key.len().min(self.kv_dim);
-            let cv = value.len().min(self.kv_dim);
-            self.keys[layer][offset..offset + ck].copy_from_slice(&key[..ck]);
-            self.values[layer][offset..offset + cv].copy_from_slice(&value[..cv]);
-            Ok(())
-        }
-
-        fn get_keys(&self, layer: usize) -> ArchResult<&[f32]> {
-            if layer >= self.n_layers {
-                return Err(ArchError::InvalidConfig {
-                    detail: format!("layer {layer} out of range"),
-                });
-            }
-            let end = (self.position + 1) * self.kv_dim;
-            Ok(&self.keys[layer][..end])
-        }
-
-        fn get_values(&self, layer: usize) -> ArchResult<&[f32]> {
-            if layer >= self.n_layers {
-                return Err(ArchError::InvalidConfig {
-                    detail: format!("layer {layer} out of range"),
-                });
-            }
-            let end = (self.position + 1) * self.kv_dim;
-            Ok(&self.values[layer][..end])
-        }
-
-        fn advance(&mut self) {
-            self.position = (self.position + 1).min(self.max_seq - 1);
-        }
-    }
-
-    // ── Registry lookup ───────────────────────────────────────────────────────
 
     #[test]
-    fn stablelm_registry_lookup() {
-        let registry = ArchitectureRegistry::with_builtins();
-        let arch = registry.get("stablelm");
+    fn softmax_sums_to_one() {
+        let mut x = vec![1.0f32, 2.0, 3.0, -1.0];
+        softmax_inplace(&mut x);
+        let sum: f32 = x.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "softmax must sum to 1, got {sum}");
         assert!(
-            arch.is_ok(),
-            "registry.get('stablelm') must succeed; got: {:?}",
-            arch.err()
+            x.windows(2).take(3).all(|w| w[0] != w[1]),
+            "distinct logits must map to distinct probabilities"
         );
-        assert_eq!(arch.expect("stablelm arch").arch_id(), "stablelm");
     }
 
-    // ── Tensor names ──────────────────────────────────────────────────────────
-
     #[test]
-    fn stablelm_tensor_names_complete() {
-        let arch = StablelmArchitecture::new();
-        let names = arch.tensor_names();
-        assert!(
-            !names.is_empty(),
-            "tensor_names() must return at least one pattern"
-        );
-        for tp in &names {
-            assert!(!tp.pattern.is_empty(), "pattern must not be empty");
-            assert!(!tp.description.is_empty(), "description must not be empty");
-        }
-        let required_patterns = [
-            "token_embd.weight",
-            "output_norm.weight",
-            "output.weight",
-            "blk.{i}.attn_norm.weight",
-            "blk.{i}.attn_norm.bias",
-            "blk.{i}.ffn_norm.weight",
-            "blk.{i}.ffn_norm.bias",
-        ];
-        let pattern_strs: Vec<&str> = names.iter().map(|n| n.pattern.as_str()).collect();
-        for req in required_patterns {
+    fn softmax_is_stable_for_large_inputs() {
+        let mut x = vec![1000.0f32, 1000.0, 1000.0];
+        softmax_inplace(&mut x);
+        for v in &x {
             assert!(
-                pattern_strs.contains(&req),
-                "tensor_names should contain '{req}'"
+                (*v - 1.0 / 3.0).abs() < 1e-6,
+                "identical large logits must give a uniform distribution, got {v}"
             );
         }
     }
 
-    // ── Partial RoPE correctness ───────────────────────────────────────────────
-
-    /// Only the first 25% of head dims must be rotated; the remaining 75%
-    /// must remain unchanged after `apply_partial_rope`.
     #[test]
-    fn stablelm_partial_rope_correctness() {
-        let (mc, sc) = minimal_config(8);
-        let model = make_model(&mc, &sc);
-
-        let head_dim = mc.head_dim; // = hidden / num_heads = 4
-        let rotary_dims = sc.rotary_dims(head_dim); // 25% of 4 = 1 → rounds down to even 0
-                                                    // Use a larger head_dim for a meaningful test.
-        let big_head_dim = 64usize;
-        let big_rotary_dims = sc.rotary_dims(big_head_dim); // 25% of 64 = 16
-
-        let mut head = vec![0.0f32; big_head_dim];
-        // Fill with distinguishable values.
-        for (i, v) in head.iter_mut().enumerate() {
-            *v = (i + 1) as f32;
-        }
-        let original = head.clone();
-
-        // Apply partial RoPE at position 1 (non-trivial rotation).
-        model.apply_partial_rope(&mut head, 1, big_rotary_dims);
-
-        // Dimensions [0, big_rotary_dims) must have changed (rotation applied).
-        // Dimensions [big_rotary_dims, big_head_dim) must be IDENTICAL to original.
-        let rotated_changed = (0..big_rotary_dims).any(|i| (head[i] - original[i]).abs() > 1e-6);
-        assert!(
-            rotated_changed,
-            "at least some rotated dims should change after partial RoPE at pos=1"
-        );
-
-        for i in big_rotary_dims..big_head_dim {
-            assert!(
-                (head[i] - original[i]).abs() < 1e-9,
-                "dim {i} (outside rotary range [{big_rotary_dims}, {big_head_dim})) must be unchanged; \
-                 got {} vs original {}",
-                head[i],
-                original[i]
-            );
-        }
-
-        // Sanity check: the model has the right partial_rotary_factor.
-        assert_eq!(
-            sc.partial_rotary_factor, 0.25,
-            "StablelmConfig default partial_rotary_factor must be 0.25"
-        );
-        // For the tiny model (head_dim=4), rotary_dims is the even-floored 25% of 4.
-        // 25% of 4 = 1.0 → floor = 1 → round down to even = 0.
-        assert_eq!(
-            rotary_dims, 0,
-            "25% of head_dim=4 rounds to 0 (must be even)"
-        );
-        // For head_dim=64, 25% = 16, which is already even.
-        assert_eq!(big_rotary_dims, 16, "25% of 64 = 16");
-    }
-
-    // ── Parallel FFN + attn output shape ─────────────────────────────────────
-
-    /// Parallel computation: the output of a forward pass must have the correct
-    /// shape (vocab_size). The parallel residual adds both attn and ffn outputs
-    /// to the same residual in one step.
-    #[test]
-    fn stablelm_parallel_ffn_attn_shapes() {
-        let (mc, sc) = minimal_config(8);
-        let vocab_size = mc.vocab_size;
-        let num_kv_heads = mc.num_kv_heads;
-        let head_dim = mc.head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-        let mut model = make_model(&mc, &sc);
-        let mut kv_cache = SimpleKvCache::new(1, kv_dim, mc.max_context_length);
-
-        let result = model.forward(&[0u32], &mut kv_cache);
-        assert!(
-            result.is_ok(),
-            "StableLM forward must succeed: {:?}",
-            result.err()
-        );
-        let logits = result.expect("logits");
-        assert_eq!(
-            logits.len(),
-            vocab_size,
-            "logits must have vocab_size={vocab_size} elements, got {}",
-            logits.len()
-        );
-    }
-
-    // ── Parallel residual: attn + ffn both contribute ─────────────────────────
-
-    /// The parallel residual update means that both the attention output and
-    /// the FFN output are added to the residual in the same step. We verify
-    /// this by checking that calling two forward passes produces consistent
-    /// (deterministic) outputs.
-    #[test]
-    fn stablelm_parallel_residual_is_deterministic() {
-        let (mc, sc) = minimal_config(8);
-        let num_kv_heads = mc.num_kv_heads;
-        let head_dim = mc.head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-
-        let mut model1 = make_model(&mc, &sc);
-        let mut model2 = make_model(&mc, &sc);
-        let mut kv1 = SimpleKvCache::new(1, kv_dim, mc.max_context_length);
-        let mut kv2 = SimpleKvCache::new(1, kv_dim, mc.max_context_length);
-
-        let out1 = model1.forward(&[1u32], &mut kv1).expect("first forward");
-        let out2 = model2.forward(&[1u32], &mut kv2).expect("second forward");
-
-        for (a, b) in out1.iter().zip(out2.iter()) {
-            assert!(
-                (a - b).abs() < 1e-9,
-                "stablelm forward must be deterministic: {a} != {b}"
-            );
-        }
+    fn softmax_handles_empty_slice() {
+        let mut x: Vec<f32> = Vec::new();
+        softmax_inplace(&mut x);
     }
 }

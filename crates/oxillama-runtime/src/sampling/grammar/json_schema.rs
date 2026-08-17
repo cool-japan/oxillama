@@ -8,13 +8,22 @@
 //! | Keyword | Notes |
 //! |---------|-------|
 //! | `type` | `"string"`, `"number"`, `"integer"`, `"boolean"`, `"null"`, `"object"`, `"array"` |
-//! | `properties` + `required` | For `object` type; unknown properties are ignored |
-//! | `enum` | String values only |
+//! | `properties` + `required` | For `object` type |
+//! | `additionalProperties` | `false`/absent = strict (only declared keys); `true` or a schema = extra keys allowed |
+//! | `enum` | String, number, boolean, and null values |
+//! | `const` | Any JSON value (string/number/bool/null/array/object — non-primitives matched via their canonical JSON text) |
+//! | `anyOf`, `oneOf` | Compiled as a GBNF alternation of each branch. Note: a regular grammar can only express *membership* in the union — `oneOf`'s "exactly one branch validates" semantics cannot be enforced at generation time, only `anyOf`'s "at least one" can. |
+//! | `allOf` | Best-effort: merges branches that are all object schemas (union of `properties`/`required`). Mixing non-object branches returns [`GrammarError::UnsupportedKeyword`]. |
 //! | `items` | Single sub-schema for `array` type |
-//! | `minimum`, `maximum` | Numeric range (informational — produces digit pattern) |
-//! | `minLength`, `maxLength` | String length constraints (informational) |
+//! | `minItems`, `maxItems` | Enforced exactly via bounded repetition expansion |
+//! | `minLength`, `maxLength` | Enforced exactly via bounded repetition expansion |
+//! | `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum` | **Not expressible** as a regular grammar — returns [`GrammarError::UnsupportedKeyword`] rather than silently ignoring them |
 //! | `pattern` | Only literal strings (no regex metacharacters) |
 //! | Nested objects / arrays | Fully supported via recursive rule generation |
+//!
+//! Any keyword this compiler cannot express is reported via
+//! [`GrammarError::UnsupportedKeyword`] or [`GrammarError::ParseError`] —
+//! never silently widened to "any value" (see defect S7).
 //!
 //! # Generated GBNF dialect
 //!
@@ -22,9 +31,25 @@
 //! - `rule-name ::= body`
 //! - Sequences: `item1 item2`
 //! - Alternations: `body1 | body2`
-//! - Repetitions: `body*`, `body+`, `body?`
+//! - Repetitions: `body*`, `body+`, `body?` (GBNF has no `{min,max}` syntax —
+//!   bounded repetition is expanded explicitly, see `bounded_repeat`)
 //! - Quoted literals: `"text"`
 //! - Character classes: `[a-z]`, `[0-9]`, etc.
+//!
+//! # Public API shape (for downstream integration)
+//!
+//! [`JsonSchemaCompiler::compile`] returns a parsed [`Grammar`] (for direct
+//! use with [`super::GrammarState`]). [`JsonSchemaCompiler::compile_to_gbnf`]
+//! returns the raw GBNF **text** instead — this is the entry point intended
+//! for the HTTP server's own JSON-Schema→GBNF conversion path (which has an
+//! independent, weaker converter with a dangling-comma bug) to delegate to:
+//! it lets the server inspect/cache/log the generated grammar text, or hand
+//! it to a different consumer, without this module owning the parse step.
+//! Both entry points accept either a JSON string or an already-parsed
+//! [`serde_json::Value`] (via the `_value` counterparts), so a caller that
+//! already deserialized the schema (e.g. from an OpenAI-style
+//! `response_format.json_schema` request body) doesn't pay to re-serialize
+//! and re-parse it.
 
 use std::collections::HashSet;
 
@@ -51,17 +76,46 @@ impl JsonSchemaCompiler {
     ///
     /// Returns [`GrammarError::UnknownRule`] when a `$ref` is encountered
     /// (not yet supported — use inline schemas instead).
+    ///
+    /// Returns [`GrammarError::UnsupportedKeyword`] when a recognised
+    /// keyword cannot be expressed as a regular (GBNF) grammar — e.g.
+    /// `minimum`/`maximum` numeric ranges, or an `allOf` mixing non-object
+    /// branches.
     pub fn compile(schema_json: &str) -> GrammarResult<Grammar> {
+        let gbnf = Self::compile_to_gbnf(schema_json)?;
+        Grammar::parse(&gbnf)
+    }
+
+    /// Compile an already-parsed [`serde_json::Value`] schema into a GBNF
+    /// [`Grammar`]. Use this when the caller already deserialized the
+    /// schema (e.g. from a request body) and doesn't want to re-serialize
+    /// it just to re-parse it here.
+    pub fn compile_value(schema: &Value) -> GrammarResult<Grammar> {
+        let gbnf = Self::compile_value_to_gbnf(schema)?;
+        Grammar::parse(&gbnf)
+    }
+
+    /// Compile a JSON Schema JSON string into raw GBNF **text**, without
+    /// parsing it into a [`Grammar`].
+    ///
+    /// This is the intended delegation point for other JSON-Schema→GBNF
+    /// converters in the workspace (e.g. the HTTP server's own, weaker
+    /// converter) — see the module-level "Public API shape" note.
+    pub fn compile_to_gbnf(schema_json: &str) -> GrammarResult<String> {
         let schema: Value =
             serde_json::from_str(schema_json).map_err(|e| GrammarError::ParseError {
                 pos: 0,
                 msg: format!("invalid JSON in schema: {e}"),
             })?;
+        Self::compile_value_to_gbnf(&schema)
+    }
 
+    /// Compile an already-parsed [`serde_json::Value`] schema into raw GBNF
+    /// text. See [`JsonSchemaCompiler::compile_to_gbnf`].
+    pub fn compile_value_to_gbnf(schema: &Value) -> GrammarResult<String> {
         let mut compiler = SchemaCompiler::new();
-        compiler.compile_root(&schema)?;
-        let gbnf = compiler.build_gbnf();
-        Grammar::parse(&gbnf)
+        compiler.compile_root(schema)?;
+        Ok(compiler.build_gbnf())
     }
 }
 
@@ -143,9 +197,34 @@ impl SchemaCompiler {
             });
         }
 
-        // Handle `enum` first — it overrides `type`.
+        // `const` is a single-value enum; handle it before `enum`/`type` so
+        // it always wins if present (matches JSON Schema precedence: const
+        // is the strictest possible constraint).
+        if let Some(const_val) = obj.get("const") {
+            return self.compile_const(const_val);
+        }
+
+        // Handle `enum` next — it overrides `type`.
         if let Some(enum_val) = obj.get("enum") {
             return self.compile_enum(enum_val);
+        }
+
+        // `anyOf` / `oneOf`: compile as a GBNF alternation of each branch.
+        // A regular grammar can only express "matches at least one
+        // alternative" — `oneOf`'s "matches EXACTLY one" cannot be enforced
+        // at generation time (a value that happens to satisfy two branches
+        // is still emittable), so we intentionally compile both the same
+        // way rather than silently pretending to enforce exclusivity.
+        if let Some(Value::Array(variants)) = obj.get("anyOf") {
+            return self.compile_any_of(variants);
+        }
+        if let Some(Value::Array(variants)) = obj.get("oneOf") {
+            return self.compile_any_of(variants);
+        }
+
+        // `allOf`: best-effort merge (see `compile_all_of`'s doc comment).
+        if let Some(Value::Array(schemas)) = obj.get("allOf") {
+            return self.compile_all_of(schemas);
         }
 
         // Determine the type.
@@ -189,6 +268,113 @@ impl SchemaCompiler {
         }
     }
 
+    // ── const ─────────────────────────────────────────────────────────────────
+
+    /// Compile a `const` keyword: the value must match exactly.
+    fn compile_const(&mut self, value: &Value) -> GrammarResult<String> {
+        match value {
+            Value::String(s) => {
+                let escaped = escape_gbnf_literal(s);
+                Ok(format!("\"\\\"\" \"{escaped}\" \"\\\"\""))
+            }
+            Value::Null => Ok("\"null\"".to_string()),
+            Value::Bool(b) => Ok(format!("\"{b}\"")),
+            Value::Number(n) => Ok(format!("\"{n}\"")),
+            Value::Array(_) | Value::Object(_) => {
+                // Non-primitive const: match the value's canonical JSON
+                // serialization exactly. This is precise (not an
+                // approximation) but requires byte-for-byte whitespace —
+                // acceptable since `const` values are author-controlled.
+                let text = serde_json::to_string(value).map_err(|e| GrammarError::ParseError {
+                    pos: 0,
+                    msg: format!("failed to serialize `const` value: {e}"),
+                })?;
+                let escaped = escape_gbnf_literal(&text);
+                Ok(format!("\"{escaped}\""))
+            }
+        }
+    }
+
+    // ── anyOf / oneOf / allOf ────────────────────────────────────────────────
+
+    /// Compile `anyOf`/`oneOf` as a GBNF alternation of each branch.
+    fn compile_any_of(&mut self, variants: &[Value]) -> GrammarResult<String> {
+        if variants.is_empty() {
+            return Err(GrammarError::ParseError {
+                pos: 0,
+                msg: "`anyOf`/`oneOf` array must not be empty".to_string(),
+            });
+        }
+        let mut alts: Vec<String> = Vec::with_capacity(variants.len());
+        for variant in variants {
+            let expr = self.compile_schema(variant)?;
+            let rule = if is_inline_expr(&expr) {
+                expr
+            } else {
+                let name = self.next_rule_name();
+                self.add_rule(name.clone(), expr);
+                name
+            };
+            alts.push(rule);
+        }
+        Ok(format!("({})", alts.join(" | ")))
+    }
+
+    /// Compile `allOf` via a best-effort merge.
+    ///
+    /// True JSON-Schema `allOf` intersection semantics (e.g. combining a
+    /// numeric range from one branch with a `multipleOf` from another)
+    /// cannot be expressed as a regular grammar in general. The one
+    /// tractable, common case — every branch being an object schema — is
+    /// supported by taking the union of `properties` and `required` across
+    /// all branches. Anything else returns [`GrammarError::UnsupportedKeyword`]
+    /// rather than silently dropping branches.
+    fn compile_all_of(&mut self, schemas: &[Value]) -> GrammarResult<String> {
+        if schemas.is_empty() {
+            return Err(GrammarError::ParseError {
+                pos: 0,
+                msg: "`allOf` array must not be empty".to_string(),
+            });
+        }
+        if schemas.len() == 1 {
+            return self.compile_schema(&schemas[0]);
+        }
+
+        let mut merged_props = serde_json::Map::new();
+        let mut merged_required: Vec<Value> = Vec::new();
+        for schema in schemas {
+            let obj = schema
+                .as_object()
+                .ok_or_else(|| GrammarError::UnsupportedKeyword {
+                    keyword: "allOf".to_string(),
+                    reason: "only object-schema branches can be merged into a single grammar rule"
+                        .to_string(),
+                })?;
+            let is_object_like = matches!(obj.get("type"), Some(Value::String(t)) if t == "object")
+                || obj.contains_key("properties");
+            if !is_object_like {
+                return Err(GrammarError::UnsupportedKeyword {
+                    keyword: "allOf".to_string(),
+                    reason: "combining non-object schemas (e.g. numeric/string constraints) is not expressible as a regular grammar".to_string(),
+                });
+            }
+            if let Some(Value::Object(props)) = obj.get("properties") {
+                for (k, v) in props {
+                    merged_props.insert(k.clone(), v.clone());
+                }
+            }
+            if let Some(Value::Array(req)) = obj.get("required") {
+                merged_required.extend(req.iter().cloned());
+            }
+        }
+
+        let mut merged = serde_json::Map::new();
+        merged.insert("type".to_string(), Value::String("object".to_string()));
+        merged.insert("properties".to_string(), Value::Object(merged_props));
+        merged.insert("required".to_string(), Value::Array(merged_required));
+        self.compile_object_type(&merged)
+    }
+
     // ── Primitive type generators ─────────────────────────────────────────────
 
     /// Inline GBNF expression that matches any JSON boolean.
@@ -226,16 +412,39 @@ impl SchemaCompiler {
             return Ok(format!(r#""{escaped}""#));
         }
 
-        // Ensure the string-char helper rule exists (add once).
         self.ensure_string_char_rule();
+
+        let min_length = obj
+            .get("minLength")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize);
+        let max_length = obj
+            .get("maxLength")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize);
+
+        if min_length.is_some() || max_length.is_some() {
+            if let (Some(min), Some(max)) = (min_length, max_length) {
+                if min > max {
+                    return Err(GrammarError::ParseError {
+                        pos: 0,
+                        msg: format!("minLength ({min}) > maxLength ({max})"),
+                    });
+                }
+            }
+            let body = bounded_repeat("string-char", min_length.unwrap_or(0), max_length);
+            return Ok(format!(r#""\"" {body} "\"""#));
+        }
+
         Ok(r#""\"" string-char* "\"" "#.trim().to_string())
     }
 
     /// Inline GBNF expression for a JSON number (integer or float).
     fn compile_number_type(
         &mut self,
-        _obj: &serde_json::Map<String, Value>,
+        obj: &serde_json::Map<String, Value>,
     ) -> GrammarResult<String> {
+        reject_unsupported_numeric_range(obj)?;
         // Produce a rule for JSON numbers: optional minus, digits, optional fraction.
         self.ensure_number_rule();
         Ok("json-number".to_string())
@@ -244,8 +453,9 @@ impl SchemaCompiler {
     /// Inline GBNF expression for a JSON integer.
     fn compile_integer_type(
         &mut self,
-        _obj: &serde_json::Map<String, Value>,
+        obj: &serde_json::Map<String, Value>,
     ) -> GrammarResult<String> {
+        reject_unsupported_numeric_range(obj)?;
         self.ensure_integer_rule();
         Ok("json-integer".to_string())
     }
@@ -421,6 +631,30 @@ impl SchemaCompiler {
             all_parts.push(format!("({rule_name})?"));
         }
 
+        // `additionalProperties`: `false`/absent keeps the existing strict
+        // behaviour (only the declared keys are allowed). `true` or a
+        // schema allows zero or more EXTRA `"key": value` pairs (with
+        // arbitrary keys) after the declared ones.
+        let extra_value_expr = match obj.get("additionalProperties") {
+            None | Some(Value::Bool(false)) => None,
+            Some(Value::Bool(true)) => Some(self.any_json_expr()),
+            Some(schema) => Some(self.compile_schema(schema)?),
+        };
+        let extra_pair_rule = extra_value_expr.map(|val_expr| {
+            self.ensure_string_char_rule();
+            let val_rule = if is_inline_expr(&val_expr) {
+                val_expr
+            } else {
+                let name = self.next_rule_name();
+                self.add_rule(name.clone(), val_expr);
+                name
+            };
+            let pair_body = format!("\"\\\"\" string-char* \"\\\"\" {ws} \":\" {ws} {val_rule}");
+            let pair_rule_name = self.next_rule_name();
+            self.add_rule(pair_rule_name.clone(), pair_body);
+            pair_rule_name
+        });
+
         // Build object body: `{` ws members ws `}`
         // Members are joined by `,` ws.
         // We use string concatenation rather than format! to avoid the Rust
@@ -429,12 +663,30 @@ impl SchemaCompiler {
         let close_brace = "\"}\"";
         let comma = "\",\"";
 
-        let body = if all_parts.is_empty() {
+        let joined = if all_parts.is_empty() {
+            match &extra_pair_rule {
+                // No declared properties, but extras are allowed: a
+                // (possibly empty) comma-separated list of extra pairs —
+                // the first pair has no leading comma, subsequent ones do.
+                Some(extra) => format!("({extra} ({ws} {comma} {ws} {extra})*)?"),
+                None => String::new(),
+            }
+        } else {
+            let sep = [" ", &ws, " ", comma, " ", &ws, " "].concat();
+            let declared = all_parts.join(&sep);
+            match &extra_pair_rule {
+                // Declared properties exist; extras (if any) each bring
+                // their own leading comma via the `*` group, so no
+                // dangling-comma risk when zero extras are present.
+                Some(extra) => format!("{declared} ({ws} {comma} {ws} {extra})*"),
+                None => declared,
+            }
+        };
+
+        let body = if joined.is_empty() {
             // Empty object: `"{"` ws `"}"`
             [open_brace, " ", &ws, " ", close_brace].concat()
         } else {
-            let sep = [" ", &ws, " ", comma, " ", &ws, " "].concat();
-            let joined = all_parts.join(&sep);
             [
                 open_brace,
                 " ",
@@ -475,10 +727,29 @@ impl SchemaCompiler {
             rule_name
         };
 
-        // Array: `[` ws (item (ws `,` ws item)*)? ws `]`
-        Ok(format!(
-            r#""[" {ws} ({items_rule} ({ws} "," {ws} {items_rule})*)? {ws} "]""#
-        ))
+        let min_items = obj
+            .get("minItems")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        let max_items = obj
+            .get("maxItems")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize);
+        if let Some(max) = max_items {
+            if min_items > max {
+                return Err(GrammarError::ParseError {
+                    pos: 0,
+                    msg: format!("minItems ({min_items}) > maxItems ({max})"),
+                });
+            }
+        }
+
+        // Array: `[` ws <bounded comma-separated list of item> ws `]`.
+        // With no minItems/maxItems this reduces to exactly the previous
+        // unconstrained pattern: `(item (ws "," ws item)*)?`.
+        let list_body = bounded_list(&items_rule, &ws, min_items, max_items);
+        Ok(format!(r#""[" {ws} {list_body} {ws} "]""#))
     }
 
     // ── Helper rule management ────────────────────────────────────────────────
@@ -546,6 +817,97 @@ impl SchemaCompiler {
 }
 
 // ─── Utility functions ────────────────────────────────────────────────────────
+
+/// Reject `minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum` rather
+/// than silently ignoring them (defect S7).
+///
+/// A regular grammar (which is all GBNF can express) has no notion of
+/// numeric comparison — encoding "the number's value must be >= 5" would
+/// require enumerating every valid digit-sequence shape, which is not
+/// tractable in general (and unbounded for open ranges). Rather than
+/// silently producing an unconstrained `json-number`/`json-integer` pattern
+/// that quietly ignores the requested range, this returns a typed error so
+/// callers know the constraint was NOT applied.
+fn reject_unsupported_numeric_range(obj: &serde_json::Map<String, Value>) -> GrammarResult<()> {
+    const RANGE_KEYWORDS: [&str; 4] =
+        ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"];
+    for &kw in &RANGE_KEYWORDS {
+        if obj.contains_key(kw) {
+            return Err(GrammarError::UnsupportedKeyword {
+                keyword: kw.to_string(),
+                reason: "numeric range constraints cannot be expressed as a regular (GBNF) grammar; omit the keyword and validate the range downstream of generation instead".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Generate GBNF text for `atom` repeated between `min` and `max` (inclusive)
+/// times. `max = None` means unbounded.
+///
+/// GBNF (as implemented by this crate's parser) has no `{min,max}`
+/// quantifier syntax, so bounded repetition is expanded explicitly: `min`
+/// mandatory copies, followed by up to `(max - min)` nested optionals
+/// (`(atom (atom (atom)?)?)?` for three optional trailing copies), or a
+/// trailing `(atom)*` when unbounded.
+fn bounded_repeat(atom: &str, min: usize, max: Option<usize>) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(min + 1);
+    for _ in 0..min {
+        parts.push(atom.to_string());
+    }
+    match max {
+        Some(max) if max > min => {
+            let mut tail = String::new();
+            for i in 0..(max - min) {
+                tail = if i == 0 {
+                    format!("({atom})?")
+                } else {
+                    format!("({atom} {tail})?")
+                };
+            }
+            parts.push(tail);
+        }
+        None => parts.push(format!("({atom})*")),
+        _ => {}
+    }
+    parts.join(" ")
+}
+
+/// Generate a GBNF body for a comma-separated list of `item` occurring
+/// between `min` and `max` (inclusive) times, using `ws` as the
+/// insignificant-whitespace rule name. `max = None` means unbounded.
+///
+/// With `min = 0, max = None` this reduces to exactly
+/// `(item (ws "," ws item)*)?` — the same pattern used before bounded
+/// list support existed, so unconstrained arrays are unaffected.
+fn bounded_list(item: &str, ws: &str, min: usize, max: Option<usize>) -> String {
+    if max == Some(0) {
+        // The list must always be empty.
+        return String::new();
+    }
+    if min == 0 {
+        let rest = match max {
+            Some(m) => bounded_repeat(&format!("{ws} \",\" {ws} {item}"), 0, Some(m - 1)),
+            None => format!("({ws} \",\" {ws} {item})*"),
+        };
+        let body = if rest.is_empty() {
+            item.to_string()
+        } else {
+            format!("{item} {rest}")
+        };
+        format!("({body})?")
+    } else {
+        let rest_min = min - 1;
+        let rest_max = max.map(|m| m - 1);
+        let sep_item = format!("{ws} \",\" {ws} {item}");
+        let rest = bounded_repeat(&sep_item, rest_min, rest_max);
+        if rest.is_empty() {
+            item.to_string()
+        } else {
+            format!("{item} {rest}")
+        }
+    }
+}
 
 /// Escape a plain string so it can appear safely inside GBNF double-quoted literals.
 ///
@@ -800,5 +1162,301 @@ mod tests {
         }"#;
         let g = compile_ok(schema);
         assert!(g.rules.contains_key("root"));
+    }
+
+    // ── Defect S7: anyOf / oneOf / allOf / const ──────────────────────────────
+
+    #[test]
+    fn compile_any_of_accepts_either_branch() {
+        let schema = r#"{"anyOf": [{"type": "string"}, {"type": "number"}]}"#;
+        let g = compile_ok(schema);
+        let state = g.initial_state();
+        assert!(
+            state.allows_token(b"\"hi\""),
+            "anyOf must accept a string branch match"
+        );
+        let state2 = g.initial_state();
+        assert!(
+            state2.allows_token(b"42"),
+            "anyOf must accept a number branch match"
+        );
+    }
+
+    #[test]
+    fn compile_one_of_accepts_either_branch() {
+        // Defect S7: previously anyOf/oneOf were silently ignored and the
+        // schema widened to "any JSON value" with no warning. This test
+        // pins that oneOf is now actually compiled into an alternation
+        // rather than falling through to `any_json_expr`.
+        let schema = r#"{"oneOf": [{"const": "cat"}, {"const": "dog"}]}"#;
+        let g = compile_ok(schema);
+        let state = g.initial_state();
+        assert!(state.allows_token(b"\"cat\""));
+        let state2 = g.initial_state();
+        assert!(state2.allows_token(b"\"dog\""));
+        let state3 = g.initial_state();
+        assert!(
+            !state3.allows_token(b"\"bird\""),
+            "oneOf must reject a value matching neither branch"
+        );
+    }
+
+    #[test]
+    fn compile_any_of_empty_array_errors() {
+        let schema = r#"{"anyOf": []}"#;
+        assert!(JsonSchemaCompiler::compile(schema).is_err());
+    }
+
+    #[test]
+    fn compile_all_of_merges_object_properties() {
+        let schema = r#"{
+            "allOf": [
+                {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                {"type": "object", "properties": {"b": {"type": "integer"}}, "required": ["b"]}
+            ]
+        }"#;
+        let g = compile_ok(schema);
+        assert!(g.source.contains('a'));
+        assert!(g.source.contains('b'));
+    }
+
+    #[test]
+    fn compile_all_of_non_object_branch_errors() {
+        // Defect S7: previously allOf was silently ignored (schema widened
+        // to "any value"). Mixing a non-object branch is not expressible as
+        // a regular grammar, so this must be a typed error, not a silent
+        // widening.
+        let schema = r#"{"allOf": [{"type": "string"}, {"type": "number"}]}"#;
+        let result = JsonSchemaCompiler::compile(schema);
+        assert!(
+            matches!(result, Err(GrammarError::UnsupportedKeyword { .. })),
+            "expected UnsupportedKeyword, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn compile_const_string_matches_exactly() {
+        let schema = r#"{"const": "fixed-value"}"#;
+        let g = compile_ok(schema);
+        let state = g.initial_state();
+        assert!(state.allows_token(b"\"fixed-value\""));
+        let state2 = g.initial_state();
+        assert!(!state2.allows_token(b"\"other\""));
+    }
+
+    #[test]
+    fn compile_const_number() {
+        let schema = r#"{"const": 42}"#;
+        let g = compile_ok(schema);
+        let state = g.initial_state();
+        assert!(state.allows_token(b"42"));
+    }
+
+    // ── Defect S7: minLength / maxLength ──────────────────────────────────────
+
+    #[test]
+    fn compile_string_min_max_length_enforced() {
+        let schema = r#"{"type": "string", "minLength": 2, "maxLength": 3}"#;
+        let g = compile_ok(schema);
+
+        // "a" (length 1) must be rejected: advancing the opening quote then
+        // closing immediately (length 0 chars) must fail.
+        let mut too_short = g.initial_state();
+        too_short
+            .advance(b"\"a\"")
+            .expect_err("length-1 string must be rejected (minLength=2)");
+
+        // "ab" (length 2) must be accepted.
+        let mut ok_min = g.initial_state();
+        ok_min
+            .advance(b"\"ab\"")
+            .expect("length-2 string should be accepted (minLength=2)");
+        assert!(ok_min.is_complete());
+
+        // "abc" (length 3) must be accepted.
+        let mut ok_max = g.initial_state();
+        ok_max
+            .advance(b"\"abc\"")
+            .expect("length-3 string should be accepted (maxLength=3)");
+        assert!(ok_max.is_complete());
+
+        // "abcd" (length 4) must be rejected (exceeds maxLength=3).
+        let mut too_long = g.initial_state();
+        too_long
+            .advance(b"\"abcd\"")
+            .expect_err("length-4 string must be rejected (maxLength=3)");
+    }
+
+    #[test]
+    fn compile_string_min_length_only() {
+        let schema = r#"{"type": "string", "minLength": 1}"#;
+        let g = compile_ok(schema);
+        let mut state = g.initial_state();
+        state
+            .advance(b"\"\"")
+            .expect_err("empty string must be rejected when minLength=1");
+    }
+
+    #[test]
+    fn compile_string_min_length_exceeds_max_length_errors() {
+        let schema = r#"{"type": "string", "minLength": 5, "maxLength": 2}"#;
+        assert!(JsonSchemaCompiler::compile(schema).is_err());
+    }
+
+    // ── Defect S7: minimum / maximum are rejected, not silently ignored ──────
+
+    #[test]
+    fn compile_number_with_minimum_errors() {
+        let schema = r#"{"type": "number", "minimum": 0}"#;
+        let result = JsonSchemaCompiler::compile(schema);
+        assert!(
+            matches!(result, Err(GrammarError::UnsupportedKeyword { .. })),
+            "numeric `minimum` must be a typed error, not silently ignored; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn compile_integer_with_maximum_errors() {
+        let schema = r#"{"type": "integer", "maximum": 100}"#;
+        let result = JsonSchemaCompiler::compile(schema);
+        assert!(matches!(
+            result,
+            Err(GrammarError::UnsupportedKeyword { .. })
+        ));
+    }
+
+    // ── Defect S7: minItems / maxItems ────────────────────────────────────────
+
+    #[test]
+    fn compile_array_min_max_items_enforced() {
+        let schema = r#"{"type": "array", "items": {"const": "x"}, "minItems": 1, "maxItems": 2}"#;
+        let g = compile_ok(schema);
+
+        let mut empty = g.initial_state();
+        empty
+            .advance(b"[]")
+            .expect_err("empty array must be rejected when minItems=1");
+
+        let mut one = g.initial_state();
+        one.advance(b"[\"x\"]")
+            .expect("1-item array should be accepted");
+        assert!(one.is_complete());
+
+        let mut two = g.initial_state();
+        two.advance(b"[\"x\",\"x\"]")
+            .expect("2-item array should be accepted (maxItems=2)");
+        assert!(two.is_complete());
+
+        let mut three = g.initial_state();
+        three
+            .advance(b"[\"x\",\"x\",\"x\"]")
+            .expect_err("3-item array must be rejected (maxItems=2)");
+    }
+
+    #[test]
+    fn compile_array_min_items_exceeds_max_items_errors() {
+        let schema = r#"{"type": "array", "minItems": 5, "maxItems": 2}"#;
+        assert!(JsonSchemaCompiler::compile(schema).is_err());
+    }
+
+    #[test]
+    fn compile_array_unconstrained_matches_previous_shape() {
+        // With no minItems/maxItems, the emitted grammar must still accept
+        // zero, one, or many items — the unconstrained shape from before
+        // bounded-list support existed.
+        let schema = r#"{"type": "array", "items": {"const": "x"}}"#;
+        let g = compile_ok(schema);
+        g.initial_state()
+            .advance(b"[]")
+            .expect("empty array still allowed");
+        g.initial_state()
+            .advance(b"[\"x\",\"x\",\"x\",\"x\"]")
+            .expect("many items still allowed with no maxItems");
+    }
+
+    // ── Defect S7: additionalProperties ───────────────────────────────────────
+
+    #[test]
+    fn compile_additional_properties_false_stays_strict() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"a": {"const": "x"}},
+            "required": ["a"],
+            "additionalProperties": false
+        }"#;
+        let g = compile_ok(schema);
+        let mut with_extra = g.initial_state();
+        with_extra
+            .advance(b"{\"a\":\"x\",\"b\":1}")
+            .expect_err("additionalProperties:false must reject unknown keys");
+    }
+
+    #[test]
+    fn compile_additional_properties_true_allows_extra_keys() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"a": {"const": "x"}},
+            "required": ["a"],
+            "additionalProperties": true
+        }"#;
+        let g = compile_ok(schema);
+
+        let mut exact = g.initial_state();
+        exact
+            .advance(b"{\"a\":\"x\"}")
+            .expect("declared-only object should still be accepted");
+        assert!(exact.is_complete());
+
+        let mut with_extra = g.initial_state();
+        with_extra
+            .advance(b"{\"a\":\"x\",\"extra\":123}")
+            .expect("additionalProperties:true must allow an unknown extra key");
+        assert!(with_extra.is_complete());
+    }
+
+    #[test]
+    fn compile_additional_properties_true_no_declared_properties() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true
+        }"#;
+        let g = compile_ok(schema);
+        let mut with_extra = g.initial_state();
+        with_extra
+            .advance(b"{\"anything\":1}")
+            .expect("additionalProperties:true with no declared properties should allow extras");
+        assert!(with_extra.is_complete());
+
+        let mut empty = g.initial_state();
+        empty
+            .advance(b"{}")
+            .expect("empty object should also be accepted");
+        assert!(empty.is_complete());
+    }
+
+    // ── compile_to_gbnf / compile_value API surface ───────────────────────────
+
+    #[test]
+    fn compile_to_gbnf_returns_parseable_text() {
+        let schema = r#"{"type": "object", "properties": {"name": {"type": "string"}}}"#;
+        let gbnf =
+            JsonSchemaCompiler::compile_to_gbnf(schema).expect("should compile to GBNF text");
+        assert!(
+            gbnf.contains("root ::="),
+            "GBNF text should define a root rule"
+        );
+        // The text must itself be parseable by the GBNF parser.
+        Grammar::parse(&gbnf).expect("compile_to_gbnf output must be valid GBNF");
+    }
+
+    #[test]
+    fn compile_value_matches_compile_from_string() {
+        let schema_str = r#"{"type": "boolean"}"#;
+        let value: Value = serde_json::from_str(schema_str).unwrap();
+        let from_value =
+            JsonSchemaCompiler::compile_value(&value).expect("compile_value should succeed");
+        let from_str = JsonSchemaCompiler::compile(schema_str).expect("compile should succeed");
+        assert_eq!(from_value.source, from_str.source);
     }
 }

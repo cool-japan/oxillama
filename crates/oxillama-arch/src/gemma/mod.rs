@@ -30,7 +30,7 @@
 
 mod model;
 
-pub use model::{load_gemma_from_gguf, GemmaModel};
+pub use model::{load_gemma_from_gguf, GemmaLayer, GemmaModel};
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};

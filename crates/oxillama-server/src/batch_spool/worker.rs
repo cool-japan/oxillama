@@ -17,17 +17,21 @@ use tracing::{debug, error, info, warn};
 
 use crate::batch_spool::queue::BatchQueueReceiver;
 use crate::batch_spool::store::{BatchJobStatus, BatchStore};
-use crate::queue::{BatchRequest, UsageStats};
+use crate::queue::{BatchRequest, GenerateReply};
+use oxillama_runtime::{ChatTemplate, Turn};
 
 /// Spawn the batch background worker task.
 ///
 /// - `rx` — work-item receiver from `BatchQueue`.
 /// - `inference_tx` — sender into the inference queue (shared with route handlers).
 /// - `store` — disk-backed store reference.
+/// - `chat_template` — the loaded model's chat template family, used to render
+///   `messages`-shaped batch lines (see [`AppState::chat_template`](crate::state::AppState::chat_template)).
 pub fn spawn_batch_worker(
     mut rx: BatchQueueReceiver,
     inference_tx: mpsc::Sender<BatchRequest>,
     store: Arc<BatchStore>,
+    chat_template: ChatTemplate,
 ) {
     tokio::spawn(async move {
         info!("batch worker started");
@@ -35,7 +39,7 @@ pub fn spawn_batch_worker(
             let job_id = item.job_id.clone();
             debug!(job_id, "batch worker picked up job");
 
-            if let Err(e) = process_job(&job_id, &inference_tx, &store).await {
+            if let Err(e) = process_job(&job_id, &inference_tx, &store, chat_template).await {
                 error!(job_id, error = %e, "batch job failed");
                 // Best-effort: mark as failed on disk.
                 if let Ok(mut meta) = store.read_status(&job_id) {
@@ -54,6 +58,7 @@ async fn process_job(
     job_id: &str,
     inference_tx: &mpsc::Sender<BatchRequest>,
     store: &Arc<BatchStore>,
+    chat_template: ChatTemplate,
 ) -> Result<(), String> {
     // Read input lines.
     let input_lines = tokio::task::spawn_blocking({
@@ -160,10 +165,9 @@ async fn process_job(
         };
 
         // Submit to the inference queue and wait for the result.
-        let (reply_tx, reply_rx) =
-            tokio::sync::oneshot::channel::<Result<(String, UsageStats), String>>();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<GenerateReply>();
 
-        let prompt = extract_prompt(&request_body);
+        let (prompt, is_chat_shaped) = extract_prompt(&request_body, chat_template);
         let max_tokens = extract_max_tokens(&request_body);
         let sampler = oxillama_runtime::sampling::SamplerConfig::default();
 
@@ -174,6 +178,10 @@ async fn process_job(
                 config: sampler,
                 cache_prompt: false, // batch jobs use full prefill
                 lora_selection: vec![],
+                // Only a chat-shaped line went through the template (which
+                // may already carry a literal BOS marker); a raw `prompt`
+                // line is passed to the model verbatim.
+                add_special: !(is_chat_shaped && chat_template.emits_literal_bos()),
                 reply: reply_tx,
             })
             .await
@@ -198,13 +206,16 @@ async fn process_job(
         };
 
         let (output_line, success) = match result {
-            Ok((text, usage)) => {
+            Ok((text, usage, finish_reason)) => {
                 let record = serde_json::json!({
                     "custom_id": format!("line-{line_idx}"),
                     "response": {
                         "status_code": 200,
                         "body": {
-                            "choices": [{"message": {"role": "assistant", "content": text}}],
+                            "choices": [{
+                                "message": {"role": "assistant", "content": text},
+                                "finish_reason": finish_reason.as_openai_str(),
+                            }],
                             "usage": {
                                 "prompt_tokens": usage.prompt_tokens,
                                 "completion_tokens": usage.completion_tokens,
@@ -293,23 +304,35 @@ fn parse_request_line(line: &str) -> Result<Value, String> {
 ///
 /// Supports both `{ "prompt": "..." }` (completions) and
 /// `{ "messages": [...] }` (chat completions) formats.
-fn extract_prompt(body: &Value) -> String {
+///
+/// Returns `(prompt, is_chat_shaped)`. `is_chat_shaped` is `true` when the
+/// line carried `messages` and was therefore rendered through `template` —
+/// the caller needs it to decide whether the prompt already contains a
+/// literal BOS marker.
+///
+/// The chat branch used to build a fifth hand-rolled copy of the fabricated
+/// `<|{role}|>…<|end|>` skeleton; it now renders through the loaded model's
+/// own template like every other chat-shaped endpoint.
+fn extract_prompt(body: &Value, template: ChatTemplate) -> (String, bool) {
     // Chat completions format.
     if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-        let mut prompt = String::new();
-        for msg in messages {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            prompt.push_str(&format!("<|{role}|>\n{content}\n<|end|>\n"));
-        }
-        prompt.push_str("<|assistant|>\n");
-        return prompt;
+        let turns: Vec<Turn<'_>> = messages
+            .iter()
+            .map(|msg| Turn {
+                role: msg.get("role").and_then(|r| r.as_str()).unwrap_or("user"),
+                content: msg.get("content").and_then(|c| c.as_str()).unwrap_or(""),
+            })
+            .collect();
+        return (template.render(&turns, true), true);
     }
     // Completions format.
-    body.get("prompt")
-        .and_then(|p| p.as_str())
-        .unwrap_or("")
-        .to_string()
+    (
+        body.get("prompt")
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .to_string(),
+        false,
+    )
 }
 
 /// Extract `max_tokens` from a batch request body, defaulting to 256.
@@ -374,6 +397,7 @@ mod tests {
                             completion_tokens: 3,
                             total_tokens: 5,
                         },
+                        oxillama_runtime::FinishReason::Eos,
                     )));
                 }
             }
@@ -381,7 +405,12 @@ mod tests {
 
         // Create queue and batch worker.
         let (batch_tx, batch_rx) = crate::batch_spool::queue::new_batch_queue(8);
-        spawn_batch_worker(batch_rx, inference_tx, Arc::clone(&store));
+        spawn_batch_worker(
+            batch_rx,
+            inference_tx,
+            Arc::clone(&store),
+            ChatTemplate::default(),
+        );
 
         // Submit the job.
         batch_tx
@@ -458,13 +487,19 @@ mod tests {
                             completion_tokens: 1,
                             total_tokens: 2,
                         },
+                        oxillama_runtime::FinishReason::Eos,
                     )));
                 }
             }
         });
 
         let (batch_tx, batch_rx) = crate::batch_spool::queue::new_batch_queue(4);
-        spawn_batch_worker(batch_rx, inference_tx, Arc::clone(&store));
+        spawn_batch_worker(
+            batch_rx,
+            inference_tx,
+            Arc::clone(&store),
+            ChatTemplate::default(),
+        );
 
         batch_tx
             .send(crate::batch_spool::queue::BatchWorkItem {

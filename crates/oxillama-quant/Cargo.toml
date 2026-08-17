@@ -12,10 +12,28 @@ categories = ["algorithms", "mathematics", "science"]
 readme = "README.md"
 
 [features]
-default = ["parallel"]
+# `simd-neon` and `simd-avx2` are on by default: every SIMD module is
+# double-gated on `feature` AND `target_arch`, and `dispatch.rs` additionally
+# consults `simd::cached_capabilities()`, so enabling them compiles to nothing
+# on foreign architectures and can never mis-dispatch.  Leaving them opt-in
+# silently routed every real build through the scalar reference kernels
+# (3.4-4.1x slower).  `simd-avx512` stays opt-in because of AVX-512
+# downclocking on some Intel parts.
+default = ["parallel", "simd-neon", "simd-avx2"]
 parallel = ["dep:rayon"]
 simd-avx2 = []
-simd-avx512 = []
+# `simd-avx512` IMPLIES `simd-avx2`, and must keep doing so.  The AVX-512 tier
+# is a *superset* of the AVX2 tier, not an alternative to it:
+#   * `dispatch.rs` checks AVX-512 first and falls through (`_ => {}`) to the
+#     AVX2 arm for the five types that have no AVX-512 kernel (IQ1_S, IQ1_M,
+#     IQ2_S, IQ3_XXS, IQ4_NL).  Without the implication,
+#     `--no-default-features --features simd-avx512` silently dropped those to
+#     the scalar reference kernels.
+#   * The AVX-512 K-quant kernels deliberately delegate `matvec_q8_fused` to
+#     their AVX2 counterparts (see `simd/avx512/q4_k.rs` and siblings), which
+#     only compile when `simd-avx2` is on.
+# Every AVX-512F CPU also has AVX2+FMA, so the implication costs nothing.
+simd-avx512 = ["simd-avx2"]
 simd-neon = []
 
 [dependencies]
@@ -27,6 +45,12 @@ oxiblas = { workspace = true, features = ["f16"] }
 
 [dev-dependencies]
 criterion.workspace = true
+# `half` is used directly by tests/golden_kquant_encoders.rs to pin this crate's
+# fp16 rounding against ggml's software converter.
+half.workspace = true
+# `std` pulls in `oxillama_gguf::quantize_on_load`, whose Q4_0 encoder the
+# `golden_vectors` test holds byte-for-byte against this crate's encoder.
+oxillama-gguf = { path = "../oxillama-gguf", default-features = false, features = ["std"] }
 
 [[bench]]
 name = "quant_kernels"

@@ -92,7 +92,7 @@ impl QuantKernel for Q8_1Avx512 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row/block bounds verified above.
             // CPU avx512f support guaranteed by KernelDispatcher.
@@ -104,7 +104,7 @@ impl QuantKernel for Q8_1Avx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -124,6 +124,30 @@ impl QuantKernel for Q8_1Avx512 {
             self.gemv(quant_matrix, input_row, output_row)?;
         }
         Ok(())
+    }
+
+    /// Fused Q8_1 weight × Q8_0 activation GEMV — native AVX-512.
+    ///
+    /// Mirrors this crate's Q8_1 GEMV: the weight is `d * q` and the FP16 `s`
+    /// field is not used.  See [`crate::simd::avx512::fused`].  Unlike the AVX2
+    /// kernel, which converts every quant to `f32` before accumulating, this
+    /// keeps the block dot in exact `i32`; results may differ in the last bit
+    /// and the integer path is the more accurate of the two.
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        crate::simd::avx512::fused::matvec_q8_1(weights, acts_q8, out, n_rows, n_cols)
+    }
+
+    /// One Q8_1 weight block (32 weights) consumes exactly one Q8_0 activation
+    /// block — the same gate `Q8_1Avx2` advertises.
+    fn q8_fused_acts_blocks(&self, n_cols: usize) -> Option<usize> {
+        crate::simd::avx512::fused::acts_blocks_32(n_cols)
     }
 
     fn block_size(&self) -> usize {
@@ -337,8 +361,7 @@ mod tests {
                 let scale = 0.01 * (row as f32 + 1.0) * (blk as f32 * 0.1 + 0.5);
                 let mut qs = [0i8; 32];
                 for (i, q) in qs.iter_mut().enumerate() {
-                    *q = (((row * 7 + blk * 3 + i * 11) as i16 % 256) as i16 - 128).clamp(-128, 127)
-                        as i8;
+                    *q = (((row * 7 + blk * 3 + i * 11) as i16 % 256) - 128).clamp(-128, 127) as i8;
                 }
                 weight_data.extend_from_slice(&make_q8_1_block(scale, &qs));
             }

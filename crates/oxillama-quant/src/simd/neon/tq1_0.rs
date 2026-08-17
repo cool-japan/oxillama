@@ -1,11 +1,16 @@
 //! TQ1_0 NEON-optimised kernel.
 //!
 //! Block format (54 bytes / 256 weights):
-//! - bytes[0..48]:  qs — 48 bytes, each encodes 5 ternary values in base-3
-//! - bytes[48..52]: qh — 4 bytes, each encodes 4 ternary values as 2-bit codes
+//! - bytes[0..48]:  qs — 48 bytes, each encodes 5 ternary digits
+//! - bytes[48..52]: qh — 4 bytes, each encodes 4 ternary digits
 //! - bytes[52..54]: FP16 scale `d`
 //!
 //! Ternary encoding: {0→-1, 1→0, 2→+1}. Weight = d * ternary.
+//!
+//! Both `qs` and `qh` use upstream's *fixed-point* base-3 packing — the stored
+//! byte is `ceil(q * 256 / 243)` for the digit-tuple value `q`, and digit `n`
+//! is recovered with `((u8)(byte * 3^n) as u16 * 3) >> 8`.  Decode order is
+//! digit-major.  See [`crate::reference::tq1_0`] for the full derivation.
 
 #![cfg(all(feature = "simd-neon", target_arch = "aarch64"))]
 
@@ -26,47 +31,54 @@ const D_OFFSET: usize = QS_BYTES + QH_BYTES;
 #[allow(non_camel_case_types)]
 pub struct Tq1_0Neon;
 
-/// Decode a single `qs` byte into 5 ternary values (-1, 0, or +1).
-#[inline]
-fn decode_qs_byte(byte: u8) -> [i8; 5] {
-    let mut q = byte as u16;
-    let mut out = [0i8; 5];
-    for v in &mut out {
-        *v = (q % 3) as i8 - 1;
-        q /= 3;
-    }
-    out
-}
+/// Powers of three, as the `uint8_t pow3[]` upstream declares.
+const POW3: [u8; 5] = [1, 3, 9, 27, 81];
+/// Ternary digits packed into one `qs` byte.
+const QS_DIGITS: usize = 5;
+/// Ternary digits packed into one `qh` byte.
+const QH_DIGITS: usize = 4;
 
-/// Decode a single `qh` byte into 4 ternary values (-1, 0, or +1).
+/// Recover ternary digit `digit` from a packed TQ1_0 byte.
+///
+/// Port of upstream's `q = byte * pow3[n]; xi = ((uint16_t) q * 3) >> 8;`,
+/// including the `uint8_t` wrap that discards the more significant digits.
 #[inline]
-fn decode_qh_byte(byte: u8) -> [i8; 4] {
-    [
-        (byte & 0x03) as i8 - 1,
-        ((byte >> 2) & 0x03) as i8 - 1,
-        ((byte >> 4) & 0x03) as i8 - 1,
-        ((byte >> 6) & 0x03) as i8 - 1,
-    ]
+fn decode_trit(byte: u8, digit: usize) -> i8 {
+    let q = byte.wrapping_mul(POW3[digit]);
+    ((((q as u16) * 3) >> 8) as i8) - 1
 }
 
 fn decode_block(block: &[u8], output: &mut [f32]) {
     let d = half::f16::from_le_bytes([block[D_OFFSET], block[D_OFFSET + 1]]).to_f32();
 
-    // Decode qs: 48 bytes → 240 ternary values
+    // Decode qs: 48 bytes → 240 ternary values, digit-major within each group
+    // (one 32-byte group then one 16-byte group, upstream's split).
     let mut out_idx = 0usize;
-    for &qs_byte in &block[..QS_BYTES] {
-        let vals = decode_qs_byte(qs_byte);
-        for &v in &vals {
-            output[out_idx] = d * v as f32;
-            out_idx += 1;
+    let mut j = 0usize;
+    let qs_head = QS_BYTES - QS_BYTES % 32;
+    while j < qs_head {
+        for digit in 0..QS_DIGITS {
+            for m in 0..32 {
+                output[out_idx] = d * decode_trit(block[j + m], digit) as f32;
+                out_idx += 1;
+            }
         }
+        j += 32;
+    }
+    while j < QS_BYTES {
+        for digit in 0..QS_DIGITS {
+            for m in 0..16 {
+                output[out_idx] = d * decode_trit(block[j + m], digit) as f32;
+                out_idx += 1;
+            }
+        }
+        j += 16;
     }
 
-    // Decode qh: 4 bytes → 16 ternary values
-    for &qh_byte in &block[QH_OFFSET..QH_OFFSET + QH_BYTES] {
-        let vals = decode_qh_byte(qh_byte);
-        for &v in &vals {
-            output[out_idx] = d * v as f32;
+    // Decode qh: 4 bytes → 16 ternary values, also digit-major.
+    for digit in 0..QH_DIGITS {
+        for m in 0..QH_BYTES {
+            output[out_idx] = d * decode_trit(block[QH_OFFSET + m], digit) as f32;
             out_idx += 1;
         }
     }
@@ -145,12 +157,18 @@ impl QuantKernel for Tq1_0Neon {
 
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
-        let mut scratch = [0.0f32; BLOCK_SIZE];
-
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
+            // Per-row scratch: the closure may run on several threads at once.
+            let mut scratch = [0.0f32; BLOCK_SIZE];
             let row_start = row * row_bytes;
             // SAFETY: AArch64 with NEON.
             let mut sum = unsafe { vdupq_n_f32(0.0) };
+            // Separate scalar accumulator for the sub-4-lane remainder.
+            // Folding it in as `vaddq_f32(sum, vdupq_n_f32(s))` would put `s`
+            // in all four lanes, and the closing `vaddvq_f32` would then count
+            // it four times — the same tail-accumulation bug already fixed in
+            // `simd/neon/iq2_xxs.rs`.
+            let mut scalar_tail = 0.0f32;
 
             for blk in 0..blocks_per_row {
                 let bo = row_start + blk * BLOCK_BYTES;
@@ -172,15 +190,14 @@ impl QuantKernel for Tq1_0Neon {
                         sum = vfmaq_f32(sum, wv, iv);
                     }
                     for k in (lanes * 4)..block_input_len {
-                        let s: f32 = scratch[k] * input[input_base + k];
-                        sum = vaddq_f32(sum, vdupq_n_f32(s));
+                        scalar_tail += scratch[k] * input[input_base + k];
                     }
                 }
             }
 
             // SAFETY: AArch64 with NEON.
-            *out = unsafe { vaddvq_f32(sum) };
-        }
+            *out = unsafe { vaddvq_f32(sum) } + scalar_tail;
+        });
 
         Ok(())
     }
@@ -239,7 +256,7 @@ mod tests {
         let block = make_zero_block();
         let data = block.clone();
         let tensor = QuantTensor {
-            data,
+            data: data.into(),
             shape: vec![1, BLOCK_SIZE],
             tensor_type: GgufTensorType::Tq1_0,
         };

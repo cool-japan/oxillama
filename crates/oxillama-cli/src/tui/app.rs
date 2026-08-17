@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::events::TuiEvent;
+use crate::chat_template::{render_session, seed_system_message, ChatTemplate};
 use crate::session::{ChatMessage, SessionSnapshot};
 
 /// The lifecycle state of the TUI application.
@@ -39,6 +40,10 @@ pub struct TuiApp {
     pub token_count: u64,
     /// KV-cache utilisation as a percentage (0–100).
     pub kv_usage_pct: f64,
+    /// The chat template family this model was resolved to at construction
+    /// time, used to render `session` into a single prompt string every
+    /// turn (see [`crate::chat_template`]).
+    pub chat_template: ChatTemplate,
 
     /// Channel to send prompt strings to the inference worker.
     request_tx: std::sync::mpsc::SyncSender<String>,
@@ -60,11 +65,12 @@ impl TuiApp {
     /// Spawns a background blocking worker on the current Tokio runtime that
     /// owns the engine and processes one prompt at a time.
     pub fn new(
-        _model_path: PathBuf,
+        model_path: PathBuf,
         model_id: String,
         engine: Arc<Mutex<oxillama_runtime::InferenceEngine>>,
         sampler: oxillama_runtime::SamplerConfig,
         max_tokens: usize,
+        system_prompt: Option<String>,
     ) -> Self {
         let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<String>(1);
         let (event_tx, event_rx) = std::sync::mpsc::channel::<TuiEvent>();
@@ -72,24 +78,62 @@ impl TuiApp {
         let engine_clone = engine.clone();
         let event_tx_clone = event_tx.clone();
 
+        // Turns are rendered through the model's own chat template (see
+        // `render_session` / `chat_template::ChatTemplate::resolve_from_path`)
+        // rather than a hardcoded `User:`/`Assistant:` transcript.
+        let chat_template = ChatTemplate::resolve_from_path(&model_path);
+        let gen_config = oxillama_runtime::GenerationConfig {
+            max_tokens,
+            sampler,
+            stop: Vec::new(),
+            render_special: false,
+            // Only Llama3/Mistral templates emit a literal BOS marker
+            // (`<|begin_of_text|>` / `<s>`) themselves; add_special = true
+            // would duplicate it for those. ChatML/Alpaca emit no such
+            // marker, so add_special must stay true there or the
+            // tokenizer's own `add_bos_token` policy is silently skipped
+            // (see `ChatTemplate::emits_literal_bos`). Control-token text
+            // emitted by the template (`<|im_start|>`, `<|eot_id|>`, …)
+            // must still be *recognised* as single tokens rather than split
+            // byte-by-byte, hence `parse_special: true`.
+            add_special: !chat_template.emits_literal_bos(),
+            parse_special: true,
+            // The TUI has no in-flight cancel affordance yet; when one is
+            // added, share an `Arc<AtomicBool>` here and raise it from the
+            // key handler to stop the decode loop at the next token.
+            cancel_flag: None,
+        };
+
         // Spawn the inference worker on a dedicated Tokio blocking thread so
         // that the heavy generate() call never stalls the draw loop.
         tokio::task::spawn_blocking(move || {
             while let Ok(prompt) = request_rx.recv() {
-                let result = {
+                let (result, kv_seq_len, max_context) = {
                     let mut eng = engine_clone.lock().unwrap_or_else(|e| e.into_inner());
-                    // Reset KV cache between turns so the full conversation
-                    // is prefilled fresh each time (avoids double-prefill).
+                    // Reset KV cache between turns: the whole conversation is
+                    // re-rendered through the chat template and prefilled
+                    // fresh every turn rather than relying on the KV cache
+                    // to accumulate turn over turn (see the crate's C2 fix
+                    // note — the plain REPL used to do the latter, which
+                    // disagreed with the TUI's own strategy here and made
+                    // `/load` restore a transcript the model's context
+                    // didn't actually reflect).
                     eng.reset();
-                    eng.generate_with_config(&prompt, max_tokens, sampler.clone(), |tok| {
+                    let r = eng.generate_detailed(&prompt, &gen_config, |tok| {
                         // Ignore send errors (TUI might have quit).
                         let _ = event_tx_clone.send(TuiEvent::Token(tok.to_string()));
-                    })
+                    });
+                    let seq_len = eng.kv_cache_seq_len();
+                    let max_ctx = eng.model_config().map_or(0, |c| c.max_context_length);
+                    (r, seq_len, max_ctx)
                 };
 
                 match result {
                     Ok(_) => {
-                        let _ = event_tx_clone.send(TuiEvent::GenerationDone);
+                        let _ = event_tx_clone.send(TuiEvent::GenerationDone {
+                            kv_seq_len,
+                            max_context,
+                        });
                     }
                     Err(e) => {
                         let _ = event_tx_clone.send(TuiEvent::GenerationError(e.to_string()));
@@ -98,8 +142,11 @@ impl TuiApp {
             }
         });
 
+        let mut session = SessionSnapshot::new(model_id.as_str());
+        seed_system_message(&mut session, &system_prompt);
+
         Self {
-            session: SessionSnapshot::new(model_id.as_str()),
+            session,
             model_id,
             input_buffer: String::new(),
             cursor_pos: 0,
@@ -109,6 +156,7 @@ impl TuiApp {
             tokens_per_sec: 0.0,
             token_count: 0,
             kv_usage_pct: 0.0,
+            chat_template,
             request_tx,
             event_rx,
             partial_assistant: None,
@@ -136,6 +184,7 @@ impl TuiApp {
             tokens_per_sec: 0.0,
             token_count: 0,
             kv_usage_pct: 0.0,
+            chat_template: ChatTemplate::ChatMl,
             request_tx,
             event_rx,
             partial_assistant: None,
@@ -148,7 +197,7 @@ impl TuiApp {
     ///
     /// The idle channels are never written to; the app stays in `Idle` state.
     #[cfg(test)]
-    pub fn new_ui_test(_model_path: PathBuf, model_id: String) -> Self {
+    pub fn new_ui_test(model_path: PathBuf, model_id: String) -> Self {
         let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<String>(1);
         let (_event_tx, event_rx) = std::sync::mpsc::channel::<TuiEvent>();
 
@@ -157,6 +206,11 @@ impl TuiApp {
         // The thread exits cleanly when request_tx is dropped (i.e., when the
         // TuiApp is dropped).
         std::thread::spawn(move || while request_rx.recv().is_ok() {});
+
+        // `model_path` is typically a placeholder that doesn't exist on disk
+        // in these tests; `resolve_from_path` falls back to `ChatMl` rather
+        // than erroring, so this stays a no-filesystem-surprises call.
+        let chat_template = ChatTemplate::resolve_from_path(&model_path);
 
         Self {
             session: SessionSnapshot::new(model_id.as_str()),
@@ -169,6 +223,7 @@ impl TuiApp {
             tokens_per_sec: 0.0,
             token_count: 0,
             kv_usage_pct: 0.0,
+            chat_template,
             request_tx,
             event_rx,
             partial_assistant: None,
@@ -237,11 +292,19 @@ impl TuiApp {
                     }
                 }
 
-                Ok(TuiEvent::GenerationDone) => {
+                Ok(TuiEvent::GenerationDone {
+                    kv_seq_len,
+                    max_context,
+                }) => {
                     self.state = AppState::Idle;
                     self.partial_assistant = None;
                     self.gen_start = None;
                     self.status_msg = None;
+                    self.kv_usage_pct = if max_context > 0 {
+                        (kv_seq_len as f64 / max_context as f64 * 100.0).min(100.0)
+                    } else {
+                        0.0
+                    };
                 }
 
                 Ok(TuiEvent::GenerationError(e)) => {
@@ -361,8 +424,9 @@ impl TuiApp {
         self.gen_start = Some(Instant::now());
         self.last_token_count = self.token_count;
 
-        // Build full prompt from session history (excluding the empty placeholder).
-        let prompt = build_prompt_from_session(&self.session);
+        // Build full prompt from session history (excluding the empty
+        // placeholder) through the model's own chat template.
+        let prompt = render_session(&self.session, self.chat_template);
 
         // Send the prompt to the worker.  On failure, roll back state.
         if let Err(e) = self.request_tx.try_send(prompt) {
@@ -408,16 +472,36 @@ impl TuiApp {
                     self.status_msg = Some("Usage: /load <path>".to_string());
                 }
             }
+            "/system" => {
+                if let Some(text) = parts.get(1) {
+                    seed_system_message(&mut self.session, &Some(text.trim().to_string()));
+                    self.status_msg = Some("System prompt set".to_string());
+                } else {
+                    self.status_msg = Some("Usage: /system <text>".to_string());
+                }
+            }
             "/clear" => {
+                // Preserve a leading system message across `/clear`, matching
+                // the plain REPL's `/reset`: a system prompt is a session
+                // setting, not a conversation turn.
+                let system_prompt = self
+                    .session
+                    .messages
+                    .first()
+                    .filter(|m| m.role == "system")
+                    .map(|m| m.content.clone());
                 self.session.messages.clear();
+                seed_system_message(&mut self.session, &system_prompt);
                 self.status_msg = Some("Conversation cleared".to_string());
             }
             "/quit" | "/q" => {
                 self.state = AppState::Quitting;
             }
             "/help" => {
-                self.status_msg =
-                    Some("Commands: /save <path>, /load <path>, /clear, /quit".to_string());
+                self.status_msg = Some(
+                    "Commands: /system <text>, /save <path>, /load <path>, /clear, /quit"
+                        .to_string(),
+                );
             }
             _ => {
                 self.status_msg = Some(format!("Unknown command: {}", parts[0]));
@@ -425,41 +509,6 @@ impl TuiApp {
         }
         Ok(())
     }
-}
-
-/// Build a single prompt string from the full session history.
-///
-/// The empty assistant placeholder pushed at the tail of `submit_prompt` is
-/// intentionally excluded (it has an empty `content` string and is the target
-/// for streaming, not an input).  All prior complete turns are included.
-fn build_prompt_from_session(session: &SessionSnapshot) -> String {
-    let mut prompt = String::new();
-    for msg in &session.messages {
-        // Skip empty assistant placeholders (the streaming target).
-        if msg.role == "assistant" && msg.content.is_empty() {
-            continue;
-        }
-        match msg.role.as_str() {
-            "user" => {
-                prompt.push_str("User: ");
-                prompt.push_str(&msg.content);
-                prompt.push('\n');
-            }
-            "assistant" => {
-                prompt.push_str("Assistant: ");
-                prompt.push_str(&msg.content);
-                prompt.push('\n');
-            }
-            "system" => {
-                prompt.push_str(&msg.content);
-                prompt.push('\n');
-            }
-            _ => {}
-        }
-    }
-    // Elicit the assistant response.
-    prompt.push_str("Assistant:");
-    prompt
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -522,7 +571,12 @@ mod tests {
         app.partial_assistant = Some("half".to_string());
         app.gen_start = Some(Instant::now());
 
-        event_tx.send(TuiEvent::GenerationDone).unwrap();
+        event_tx
+            .send(TuiEvent::GenerationDone {
+                kv_seq_len: 12,
+                max_context: 128,
+            })
+            .unwrap();
         app.drain_worker_events();
 
         assert!(
@@ -535,6 +589,30 @@ mod tests {
         );
         assert!(app.gen_start.is_none(), "gen_start should be cleared");
         assert!(app.status_msg.is_none(), "status_msg should be cleared");
+        assert!(
+            (app.kv_usage_pct - 9.375).abs() < 1e-9,
+            "kv_usage_pct should be 12/128 * 100 = 9.375, got {}",
+            app.kv_usage_pct
+        );
+    }
+
+    #[test]
+    fn tui_generation_done_zero_max_context_reports_zero_usage() {
+        let (mut app, event_tx, _req_rx) = make_test_app();
+        app.state = AppState::Generating;
+
+        event_tx
+            .send(TuiEvent::GenerationDone {
+                kv_seq_len: 0,
+                max_context: 0,
+            })
+            .unwrap();
+        app.drain_worker_events();
+
+        assert_eq!(
+            app.kv_usage_pct, 0.0,
+            "kv_usage_pct must not divide by zero when max_context is unknown"
+        );
     }
 
     #[test]
@@ -591,53 +669,64 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_skips_empty_assistant_placeholder() {
-        let mut session = SessionSnapshot::new("test");
-        session.messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: "Hi".to_string(),
-        });
-        // Empty assistant placeholder (streaming target — must be excluded).
-        session.messages.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: String::new(),
-        });
+    fn tui_submit_prompt_renders_through_chat_template_skipping_placeholder() {
+        // `submit_prompt` pushes the user turn plus an empty assistant
+        // placeholder, then sends `render_session(&session, chat_template)`
+        // to the worker — this exercises that end-to-end rather than
+        // duplicating chat_template.rs's own render tests.
+        let (mut app, _event_tx, req_rx) = make_test_app();
+        app.chat_template = ChatTemplate::ChatMl;
+        app.input_buffer = "Hi".to_string();
+        app.cursor_pos = 2;
 
-        let prompt = build_prompt_from_session(&session);
+        app.submit_prompt().expect("submit should not fail");
+
+        let sent = req_rx
+            .try_recv()
+            .expect("a prompt should have been sent to the worker");
         assert!(
-            prompt.contains("User: Hi"),
-            "prompt should include user turn"
+            sent.contains("<|im_start|>user\nHi<|im_end|>"),
+            "rendered prompt should use the resolved chat template, got: {sent}"
         );
         assert!(
-            !prompt.contains("Assistant: \n"),
-            "empty assistant placeholder should not appear in prompt"
+            !sent.contains("<|im_start|>assistant\n\n<|im_end|>"),
+            "empty assistant placeholder should not appear in the rendered prompt"
         );
         assert!(
-            prompt.ends_with("Assistant:"),
-            "prompt should end with 'Assistant:' to elicit the response"
+            sent.ends_with("<|im_start|>assistant\n"),
+            "prompt should end with the generation-prompt marker, got: {sent}"
         );
     }
 
     #[test]
-    fn build_prompt_includes_completed_turns() {
-        let mut session = SessionSnapshot::new("test");
-        session.messages.push(ChatMessage {
+    fn tui_system_prompt_seeded_once_survives_clear() {
+        let (mut app, _event_tx, _req_rx) = make_test_app();
+        seed_system_message(&mut app.session, &Some("Be terse.".to_string()));
+        app.session.messages.push(ChatMessage {
             role: "user".to_string(),
-            content: "Turn 1".to_string(),
-        });
-        session.messages.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: "Reply 1".to_string(),
-        });
-        session.messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: "Turn 2".to_string(),
+            content: "hi".to_string(),
         });
 
-        let prompt = build_prompt_from_session(&session);
-        assert!(prompt.contains("User: Turn 1"));
-        assert!(prompt.contains("Assistant: Reply 1"));
-        assert!(prompt.contains("User: Turn 2"));
-        assert!(prompt.ends_with("Assistant:"));
+        app.handle_slash_command("/clear")
+            .expect("slash clear should not fail");
+
+        assert_eq!(
+            app.session.messages.len(),
+            1,
+            "only the system message should survive /clear"
+        );
+        assert_eq!(app.session.messages[0].role, "system");
+        assert_eq!(app.session.messages[0].content, "Be terse.");
+    }
+
+    #[test]
+    fn tui_slash_system_sets_leading_message() {
+        let (mut app, _event_tx, _req_rx) = make_test_app();
+        app.handle_slash_command("/system Answer in one word.")
+            .expect("slash system should not fail");
+
+        assert_eq!(app.session.messages.len(), 1);
+        assert_eq!(app.session.messages[0].role, "system");
+        assert_eq!(app.session.messages[0].content, "Answer in one word.");
     }
 }

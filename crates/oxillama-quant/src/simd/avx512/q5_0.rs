@@ -82,7 +82,7 @@ impl QuantKernel for Q5_0Avx512 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row/block bounds verified above.
             // CPU avx512f support guaranteed by KernelDispatcher.
@@ -94,7 +94,7 @@ impl QuantKernel for Q5_0Avx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -114,6 +114,32 @@ impl QuantKernel for Q5_0Avx512 {
             self.gemv(quant_matrix, input_row, output_row)?;
         }
         Ok(())
+    }
+
+    /// Fused Q5_0 weight × Q8_0 activation GEMV — native AVX-512.
+    ///
+    /// See [`crate::simd::avx512::fused`].  The `qh` fifth-bit plane is
+    /// expanded with an AVX-512 opmask (`_mm512_maskz_set1_epi32` +
+    /// `VPMOVDB`) instead of the AVX2 kernel's scalar `from_fn` array build,
+    /// and the block dot stays in exact `i32` instead of AVX2's `f32` FMA
+    /// accumulation; results may therefore differ from AVX2 in the last bit,
+    /// with the integer path the more accurate of the two (it is also what
+    /// `ggml_vec_dot_q5_0_q8_0` does).
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        crate::simd::avx512::fused::matvec_q5_0(weights, acts_q8, out, n_rows, n_cols)
+    }
+
+    /// One Q5_0 weight block (32 weights) consumes exactly one Q8_0 activation
+    /// block — the same gate `Q5_0Avx2` advertises.
+    fn q8_fused_acts_blocks(&self, n_cols: usize) -> Option<usize> {
+        crate::simd::avx512::fused::acts_blocks_32(n_cols)
     }
 
     fn block_size(&self) -> usize {

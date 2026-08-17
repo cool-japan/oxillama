@@ -31,9 +31,7 @@
 
 mod model;
 
-#[cfg(test)]
-pub use model::make_test_layer;
-pub use model::{MixtralLayer, MixtralModel, MixtralMoeConfig};
+pub use model::{load_mixtral_from_gguf, MixtralLayer, MixtralModel, MixtralMoeConfig};
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};

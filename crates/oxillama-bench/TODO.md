@@ -8,38 +8,53 @@ downstream crate can plug into. Feature-gated (not part of the default
 workspace build) so that the heavy Criterion dependency tree stays opt-in.
 
 Dependency role: terminal leaf — consumes `oxillama-runtime`, `oxillama-quant`,
-and `oxillama-gguf`, but nothing depends on it. Runs as `cargo bench` or as a
-standalone binary target; never linked into production builds.
+and `oxillama-gguf`, and (since the `real_e2e` module) actually depends on
+`oxillama-runtime` at the `Cargo.toml` level, not just in aspiration; nothing
+depends on this crate. Runs as `cargo bench` or as a standalone binary target;
+never linked into production builds.
 
 ## 2. Status Snapshot
 
 | Field | Value |
 |---|---|
-| Version | 0.1.1 |
-| Tests | 79 passing |
-| Completion | ~78% |
-| src files | 7 (`lib.rs`, `latency.rs`, `throughput.rs`, `memory.rs`, `e2e.rs`, `prefill_decode.rs`, `arch_config.rs`) |
-| Bench targets | kernel-level (quant dequant/GEMV/GEMM, sampling) |
+| Version | 0.1.4 |
+| Tests | 146 passing |
+| Completion | ~80% |
+| src files | 16 (`lib.rs`, `arch_config.rs`, `dispatch_matrix.rs`, `e2e.rs`, `heatmap.rs`, `latency.rs`, `long_context.rs`, `memory.rs`, `memory_profiler.rs`, `power.rs`, `prefill_decode.rs`, `real_e2e.rs`, `regression_gate.rs`, `simd_comparison.rs`, `speculative.rs`, `throughput.rs`) |
+| Bench targets | kernel-level (quant dequant/GEMV/GEMM across SIMD paths) + one real end-to-end target (`real_e2e`, gated on `OXILLAMA_BENCH_MODEL`) |
 | Criterion version | workspace-pinned (latest) |
 | Pure Rust | yes (no C/FFI in bench harness) |
 | Default feature | off (opt-in `bench` flag at workspace root) |
 
-Completion rationale (78%): kernel-level micro-bench coverage is thorough and
-stable, macOS RSS, end-to-end harness, prefill/decode split, and per-architecture
-configurations now ship, but cross-SIMD, KV-cache scaling, and batched-inference
-breadth remain absent.
+Completion rationale (80%): kernel-level micro-bench coverage is thorough and
+stable — macOS RSS, end-to-end harness, prefill/decode split, per-architecture
+configurations, cross-SIMD dispatch comparison, KV-cache scaling, memory
+profiling, tokenizer throughput, and a real (non-stub) end-to-end benchmark
+all now ship. The remaining ~20% is CI automation (the bench-CI workflow is
+blocked by repo policy — see §6) and comparative/multi-node breadth (§7:
+vs-llama.cpp, distributed bench, regression-history dashboard), not missing
+measurement capability.
 
 ## 3. Module Map
 
 | File | Responsibility |
 |---|---|
-| `src/lib.rs` | Crate root; re-exports the three public helper APIs (latency, memory, throughput) behind a flat surface. |
+| `src/lib.rs` | Crate root; declares 15 sub-modules and re-exports 13 of them at the crate root (`dispatch_matrix` and `memory_profiler` are `pub mod`-only, reached via their own path rather than the flat top-level namespace). |
 | `src/latency.rs` | Per-token and time-to-first-token timers; percentile aggregation (P50/P95/P99) via `LatencyTimer`, `LatencyConfig`, `LatencyResult`, `TokenLatencyResult`. |
 | `src/throughput.rs` | Sustained tokens-per-second measurement with warm-up / measurement windowing; FLOP/s attachment; `ThroughputTracker`, `TrackerConfig`, `TokenThroughputResult`, `aggregate_throughput`. |
 | `src/memory.rs` | Cross-platform RSS sampling (`/proc/self/status` on Linux; `ps` on macOS); model-weight and KV-cache byte estimators; `RssTracker`, `MemoryEstimate`. |
-| `src/prefill_decode.rs` | Prefill/decode split benchmarking (`PrefillDecodeBench` trait, `run_prefill_decode_bench`, P95 calculation, formatted summary table). |
+| `src/prefill_decode.rs` | Prefill/decode split benchmarking (`PrefillDecodeBench` trait, `run_prefill_decode_bench`, P95 calculation, formatted summary table); also KV-cache scaling (`run_kv_cache_scaling`) and prefill-vs-decode isolation (`run_prefill_vs_decode_isolation`). |
 | `src/arch_config.rs` | Architecture-specific bench configurations (LLaMA-3, Qwen3, Mistral, Gemma, Phi — `from_name`, `known_architectures`, conversion to `PrefillDecodeConfig`/`E2eBenchConfig`). |
-| `src/e2e.rs` | End-to-end benchmark harness (`InferenceBenchmark` trait, `run_e2e_bench()`). |
+| `src/e2e.rs` | Synthetic end-to-end benchmark harness (`InferenceBenchmark` trait, `run_e2e_bench()`) — driven exclusively by mock/stub engines; never loads a real model. |
+| `src/real_e2e.rs` | Real end-to-end benchmark against `oxillama_runtime::InferenceEngine` (`run_real_e2e_bench()`, `RealE2eConfig`, `RealE2eReport`) — model load wall-time, prefill/decode tok/s (fixed 64-token greedy), peak RSS, gated on `OXILLAMA_BENCH_MODEL`. |
+| `src/dispatch_matrix.rs` | Cross-SIMD dispatch matrix: `matvec_q8_fused` for every shipped quant type across all SIMD paths (scalar/AVX2/AVX-512/NEON); CSV/ASCII table output (`DispatchMatrixRow`, `run_dispatch_matrix`, `write_csv`, `print_table`). |
+| `src/simd_comparison.rs` | Cross-SIMD comparison: dequant + GEMV performance across scalar/NEON/AVX2/AVX-512 tiers (`run_dequant_comparison`, `run_gemv_comparison`, `format_comparison_table`). |
+| `src/memory_profiler.rs` | Async background RSS profiler: Tokio task samples RSS at a configurable interval, annotated with semantic events (`AsyncMemoryProfiler`, `MemEvent`, `ProfileReport`). |
+| `src/heatmap.rs` | Latency-vs-batch-size heatmap: 2-D sweep over `(batch_size × seq_len)`, records tok/s, P99 latency, memory (`BatchHeatmap`, `HeatmapPoint`). |
+| `src/long_context.rs` | Long-context KV-cache sweep: `ctx ∈ {1024, 4096, 8192, 16384, 32768}`, records decode tok/s, memory, prefill latency (`LongContextSweep`, `default_ctx_lengths()`). |
+| `src/power.rs` | Linux RAPL power reader: energy counters from `/sys/class/powercap/intel-rapl:*`, tokens-per-joule (`RaplReader`, `measure_tokens_per_joule`); gracefully returns `NoRapl` off-Linux or without permission. |
+| `src/regression_gate.rs` | CI regression gate: compares benchmark results against a saved JSON baseline, per-metric threshold checks (`RegressionGate`, `RegressionFailure`, `format_report`). |
+| `src/speculative.rs` | Speculative decoding acceptance-rate sweep: deterministic `(draft_size, accept_threshold)` grid (`run_acceptance_sweep`, `SpeculativeBenchTable`, `StubSpecEngine`). |
 
 ## 4. Shipped in v0.1.0
 
@@ -68,8 +83,9 @@ breadth remain absent.
 
 ## 5. Known Gaps / Incomplete
 
-The 35%-gap is breadth, not depth. Kernel micro-benches are solid; the
-missing portion is comparative and per-architecture measurement.
+The ~20% gap is CI automation and comparative/multi-node breadth (§6–§7),
+not missing measurement capability — kernel micro-benches, cross-SIMD
+comparison, and per-architecture measurement are all shipped below.
 
 - ~~**No prefill / decode split.**~~ ✅ Shipped: `PrefillDecodeBench` trait,
   `run_prefill_decode_bench()`, P95 calculation, formatted summary table.
@@ -103,15 +119,30 @@ missing portion is comparative and per-architecture measurement.
 - ~~**No E2E tokens/sec bench binary.**~~ ✅ Shipped (stub harness): `benches/end_to_end.rs`
   with Criterion groups for LLaMA-3, Qwen3, and Mistral using a synthetic
   `StubEngine`; real model support gated on a future GGUF cache in CI.
+- ~~**No dependency on `oxillama-runtime` — no true end-to-end benchmark
+  exists.**~~ ✅ Shipped: `oxillama-runtime` (features `llama`, `qwen3`,
+  `parallel`, `mmap`, `tokenizer-wasm`) is now a real `Cargo.toml` dependency,
+  not just an aspiration. `src/real_e2e.rs` + `benches/real_e2e.rs` drive the
+  actual `InferenceEngine` — model load wall-time, prefill tok/s, decode
+  tok/s (fixed 64-token greedy, EOS ignored on purpose so the number is
+  reproducible release over release), and peak RSS (`MemoryProfiler`
+  checkpoints across load/prefill/decode) — against a real GGUF file named by
+  `OXILLAMA_BENCH_MODEL`. Not wired into CI's model cache (there still isn't
+  one), so it remains opt-in via the env var rather than run automatically —
+  that half of the original gap is still open.
 
 ## 6. v1.1 Roadmap
 
 1. ~~**End-to-end tokens/sec benches.**~~ ✅ Shipped: `benches/end_to_end.rs` with
-   Criterion groups for LLaMA-3, Qwen3, and Mistral (stub `StubEngine`; real GGUF
-   support pending model cache in CI).
+   Criterion groups for LLaMA-3, Qwen3, and Mistral (stub `StubEngine`, for
+   harness/CI-shape testing without a model file) **and** `benches/real_e2e.rs`
+   (real `InferenceEngine`, gated on `OXILLAMA_BENCH_MODEL`, for actual
+   tok/s numbers against a real GGUF). CI still has no model cache, so the
+   real variant runs manually/locally rather than on every push.
 
-2. **Prefill vs decode isolation.** Report prefill `tok/s` (batch GEMM) and
-   decode `tok/s` (per-token GEMV) as separate Criterion groups.
+2. ~~**Prefill vs decode isolation.**~~ ✅ Shipped: `run_prefill_vs_decode_isolation()`
+   in `prefill_decode.rs` reports prefill `tok/s` (batch GEMM) and decode
+   `tok/s` (per-token GEMV) as a separate `PrefillVsDecodeResult` (see §5).
 - [x] **E1 — Cross-SIMD dispatch matrix + memory profiling (planned 2026-04-20)**
   - **Goal:** Benchmarks measure all SIMD paths (scalar / AVX2 / AVX512 / NEON) of every shipped quant kernel in a single matrix-style report. Memory profiling module records peak RSS, KV-cache occupancy, and weight memory at fixed sample intervals during inference.
   - **Design:**
@@ -129,12 +160,25 @@ missing portion is comparative and per-architecture measurement.
   - **Tests:** (a) `dispatch_matrix_runs_all_paths` — CSV contains expected number of rows. (b) `memory_profiler_captures_baseline` — RSS bump within 10% of expected after ~100MB allocation. (c) `memory_events_correlate_with_kv_alloc` — KV slot allocation appears in profiler output.
   - **Risk:** `sysinfo` RSS reporting can be coarse on macOS (~1 MB granularity). Document. Report bench results alongside cpuinfo for context.
 
-4. **Long-context curves.** Sweep `ctx ∈ {4K, 8K, 32K}` and plot decode
-   `tok/s` as the KV cache grows.
+4. ~~**Long-context curves.**~~ ✅ `src/long_context.rs` (`LongContextSweep`,
+   `default_ctx_lengths()`) and `benches/long_context.rs` sweep
+   `ctx ∈ {1024, 4096, 8192, 16384, 32768}` and record decode `tok/s` as the
+   KV cache grows. Fixed 2026-08-17 (v0.1.4): unlike the other 11 bench
+   binaries, `benches/long_context.rs` was missing its `[[bench]]` entry
+   (`harness = false`) in `Cargo.toml`, so it silently ran under the default
+   libtest harness instead of Criterion (`cargo bench --bench long_context --
+   --test` compiled and exited 0 but reported `0 measured`). Added the
+   `[[bench]] name = "long_context"` / `harness = false` entry; also fixed the
+   file's doc comment, which referenced a nonexistent `--features bench` flag
+   (this crate has no `[features]` table). Verified:
+   `cargo bench -p oxillama-bench --bench long_context -- --test` now runs
+   under Criterion and reports real measurements per `ctx` value.
 5. ~~**Memory-profiling module.**~~ Promoted to [x] E1 above (combined with Cross-SIMD dispatch matrix).
-6. ~~**CI hook.**~~ ✅ Shipped: `.github/workflows/bench_ci.yml` — weekly Monday
-   schedule + `workflow_dispatch`; runs `--test` for compile/sanity, then
-   `--save-baseline master`, and uploads `target/criterion/` as an artifact.
+6. **CI hook.** Blocked by repo policy, not merely undone: `.github/workflows/`
+   is restricted to `pypi-publish.yml` / `npm-publish.yml` only, so a
+   `bench_ci.yml` workflow cannot be added under current policy. Verified: no
+   such file exists now, nor anywhere in git history. Do not re-create it — a
+   benchmark CI hook needs a policy exception first, not a new workflow file.
 
 All code examples in this crate must remain `unwrap`-free — prefer
 `ok_or_else(|| BenchError::...)` and `?`. No deviation from the No-Unwrap
@@ -175,4 +219,4 @@ policy in benchmark harnesses either, even though they are not strictly
 
 - ~~**No speculative decoding benchmark.**~~ ✅ Shipped (v0.1.3): `run_acceptance_sweep`, `StubSpecEngine`, `SpeculativeBenchTable`, `SpeculativePoint`, `SpeculativeBenchConfig` in `src/speculative.rs`; Criterion bench at `benches/speculative.rs`; 8 unit tests; re-exported from `lib.rs`; `OXILLAMA_BENCH_PRINT_SPEC=1` enables Markdown table output.
 
-*Last updated: 2026-05-05 (v0.1.3 — speculative decoding acceptance sweep shipped; 8 new tests)*
+*Last updated: 2026-08-17 (v0.1.4 — real end-to-end benchmark against `oxillama-runtime::InferenceEngine` shipped: `src/real_e2e.rs` + `benches/real_e2e.rs`, gated on `OXILLAMA_BENCH_MODEL`; 146 tests passing. Documentation pass: Module Map / src-file count corrected 8 → 16 (8 files were undocumented); README's dead references to nonexistent `benches/quant_kernels.rs` / `benches/sampling.rs` removed; roadmap items 2 (prefill/decode isolation) and 4 (long-context curves — shipped in source but not registered as a Criterion `[[bench]]` target, verified to silently no-op) corrected; false "`bench_ci.yml` shipped" claim reverted — the file doesn't exist and is blocked by repo policy, not merely undone.)*

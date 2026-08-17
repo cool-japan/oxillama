@@ -64,7 +64,7 @@ impl QuantKernel for F16Ref {
 
         let row_bytes = n_cols * F16_BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -79,7 +79,7 @@ impl QuantKernel for F16Ref {
             }
 
             *out = sum;
-        }
+        });
 
         Ok(())
     }

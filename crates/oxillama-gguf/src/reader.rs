@@ -44,8 +44,14 @@ impl<'a> BinaryReader<'a> {
     }
 
     /// Check that at least `n` bytes are available.
+    ///
+    /// Uses `saturating_sub` rather than `self.pos + n > self.data.len()`:
+    /// the naive form can overflow `usize` when `n` is derived from an
+    /// attacker-controlled file length (e.g. a GGUF v3 string length of
+    /// `0xFFFF_FFFF_FFFF_FFFF`), wrapping `self.pos + n` to a small value
+    /// that passes the bounds check and defeats it entirely.
     fn check(&self, n: usize) -> GgufResult<()> {
-        if self.pos + n > self.data.len() {
+        if n > self.data.len().saturating_sub(self.pos) {
             return Err(GgufError::UnexpectedEof {
                 offset: self.pos as u64,
             });
@@ -175,8 +181,21 @@ impl<'a> BinaryReader<'a> {
 
     /// Read a GGUF string: u64 length prefix followed by UTF-8 bytes (no null terminator).
     pub fn read_string(&mut self) -> GgufResult<String> {
-        let len = self.read_u64()? as usize;
-        self.check(len)?;
+        let len_u64 = self.read_u64()?;
+        // Validate the *undivided* `u64` length against `remaining()` before
+        // ever narrowing it to `usize`. Narrowing first (the old
+        // `self.read_u64()? as usize` order) silently truncates on
+        // 32-bit/wasm32 targets where `usize` is narrower than `u64`,
+        // letting a huge attacker-supplied length reappear as a small,
+        // in-bounds one and bypass the check entirely.
+        if len_u64 > self.remaining() as u64 {
+            return Err(GgufError::UnexpectedEof {
+                offset: self.pos as u64,
+            });
+        }
+        // Safe: `len_u64 <= self.remaining()`, which is itself a valid
+        // `usize`, so the value fits without truncation on any platform.
+        let len = len_u64 as usize;
         let bytes = self.data[self.pos..self.pos + len].to_vec();
         self.pos += len;
         String::from_utf8(bytes).map_err(|e| GgufError::InvalidString {
@@ -187,8 +206,17 @@ impl<'a> BinaryReader<'a> {
 
     /// Read a GGUF v2 string: u32 length prefix followed by UTF-8 bytes.
     pub fn read_string_v2(&mut self) -> GgufResult<String> {
-        let len = self.read_u32()? as usize;
-        self.check(len)?;
+        let len_u64 = u64::from(self.read_u32()?);
+        // See `read_string` above: validate before narrowing, even though a
+        // `u32` length cannot itself truncate against a `usize` on any
+        // realistic target — keeping the same pattern here avoids the two
+        // functions silently drifting apart in a future edit.
+        if len_u64 > self.remaining() as u64 {
+            return Err(GgufError::UnexpectedEof {
+                offset: self.pos as u64,
+            });
+        }
+        let len = len_u64 as usize;
         let bytes = self.data[self.pos..self.pos + len].to_vec();
         self.pos += len;
         String::from_utf8(bytes).map_err(|e| GgufError::InvalidString {
@@ -482,5 +510,75 @@ mod tests {
         let data = [0u8; 4];
         let mut r = BinaryReader::new(&data, 0);
         assert!(r.read_f64().is_err(), "f64 read on 4 bytes should error");
+    }
+
+    // ── V1 regression: `usize` overflow bypassing BinaryReader::check() ────
+    //
+    // A GGUF v3 string length of `u64::MAX` used to make `self.pos + n`
+    // wrap around inside `check()`, so the bounds check itself returned
+    // `Ok` and the subsequent slice indexing panicked instead of producing
+    // a typed error. Confirmed pre-fix: this test panics (integer overflow
+    // is detected as a debug-mode panic on `self.pos + n`, or — in a
+    // release build without overflow checks — the wraparound instead lets
+    // the slice index computation panic at `reader.rs:180` with "slice
+    // index starts at 32 but ends at 31", matching the auditor's exact
+    // release-build repro). Post-fix it must return a clean typed
+    // `GgufError::UnexpectedEof`, never panic.
+    #[test]
+    fn test_v1_read_string_max_len_does_not_panic() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // malicious length
+        data.extend_from_slice(b"short tail bytes"); // some trailing bytes
+        let mut r = BinaryReader::new(&data, 0);
+        let err = r
+            .read_string()
+            .expect_err("u64::MAX length must be rejected, not panic");
+        assert!(
+            matches!(err, GgufError::UnexpectedEof { .. }),
+            "expected UnexpectedEof, got {err:?}"
+        );
+    }
+
+    /// Same as above but for the v2 (u32-length) string reader.
+    #[test]
+    fn test_v1_read_string_v2_max_len_does_not_panic() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        data.extend_from_slice(b"tail");
+        let mut r = BinaryReader::new(&data, 0);
+        let err = r
+            .read_string_v2()
+            .expect_err("u32::MAX length must be rejected, not panic");
+        assert!(matches!(err, GgufError::UnexpectedEof { .. }));
+    }
+
+    /// V1 regression: `skip()` funnels through the same `check()`, so a
+    /// huge attacker-controlled skip length must error rather than
+    /// silently moving the cursor (in release, backward, due to wraparound;
+    /// in this debug-mode test, `check()`'s old unchecked `self.pos + n`
+    /// would itself panic on overflow before ever reaching the comparison).
+    #[test]
+    fn test_v1_skip_huge_length_does_not_panic() {
+        let data = [0u8; 8];
+        let mut r = BinaryReader::new(&data, 5);
+        let err = r.skip(usize::MAX - 2).expect_err("huge skip must error");
+        assert!(matches!(err, GgufError::UnexpectedEof { .. }));
+        assert_eq!(
+            r.position(),
+            5,
+            "position must be unchanged after a rejected skip"
+        );
+    }
+
+    /// Direct exercise of the fixed `check()` arithmetic via `read_bytes`,
+    /// independent of any string-length parsing path.
+    #[test]
+    fn test_v1_check_overflow_via_read_bytes() {
+        let data = [0u8; 4];
+        let mut r = BinaryReader::new(&data, 2);
+        let err = r
+            .read_bytes(usize::MAX - 1)
+            .expect_err("must not overflow pos + n internally");
+        assert!(matches!(err, GgufError::UnexpectedEof { .. }));
     }
 }

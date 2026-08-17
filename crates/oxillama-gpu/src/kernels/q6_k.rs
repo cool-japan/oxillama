@@ -48,12 +48,6 @@ const Q6_K_BLOCK_SIZE: usize = 256;
 /// Bytes per Q6_K super-block.
 #[cfg(any(feature = "gpu", test))]
 const Q6_K_BLOCK_BYTES: usize = 210;
-/// Number of sub-blocks (16 sub-blocks of 16 weights each).
-#[cfg(any(feature = "gpu", test))]
-const Q6_K_NUM_SUB_BLOCKS: usize = 16;
-/// Weights per sub-block.
-#[cfg(any(feature = "gpu", test))]
-const Q6_K_SUB_BLOCK_SIZE: usize = 16;
 
 /// Dequantise all Q6_K blocks to a flat f32 buffer.
 ///
@@ -91,34 +85,54 @@ fn dequant_q6_k_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuResu
             // Bytes 208-209: d (f16)
             let d = half::f16::from_bits(u16::from_le_bytes([block[208], block[209]])).to_f32();
 
-            for (j, &sc_byte) in scales.iter().enumerate().take(Q6_K_NUM_SUB_BLOCKS) {
-                let sc = sc_byte as i8;
+            // Upstream `dequantize_row_q6_K` (and this crate's CPU
+            // reference, `oxillama_quant::reference::q6_k`) processes the
+            // block in TWO groups of 128 weights, each producing four
+            // 32-weight quarters `l`, `l+32`, `l+64`, `l+96` per inner index
+            // `l` in `0..32`, reading `ql`/`qh` at DIFFERENT byte offsets and
+            // bit shifts per quarter, and non-contiguous scale indices
+            // (`is`, `is+2`, `is+4`, `is+6` where `is = l/16`).  That is NOT
+            // equivalent to a flat `qs[idx/2]` nibble / `qs[idx/4]` 2-bit
+            // mapping over a linear 16-weight sub-block index — the previous
+            // implementation here used the latter and was caught diverging
+            // from the CPU oracle by `tests/cpu_gpu_cross_check.rs` on real
+            // hardware.
+            for group in 0..2usize {
+                let ql_off = group * 64;
+                let qh_off = group * 32;
+                let sc_off = group * 8;
+                let out_off = group * 128;
 
-                for k in 0..Q6_K_SUB_BLOCK_SIZE {
-                    let idx = j * Q6_K_SUB_BLOCK_SIZE + k;
-                    let col = blk * Q6_K_BLOCK_SIZE + idx;
-                    if col >= cols {
-                        break;
+                for l in 0..32usize {
+                    let is = l / 16; // sub-block index within group: 0 or 1
+
+                    let q1 = ((ql[ql_off + l] & 0x0F) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
+                    let q2 = ((ql[ql_off + l + 32] & 0x0F) | (((qh[qh_off + l] >> 2) & 3) << 4))
+                        as i32
+                        - 32;
+                    let q3 =
+                        ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                    let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4))
+                        as i32
+                        - 32;
+
+                    let s0 = scales[sc_off + is] as i8 as f32;
+                    let s1 = scales[sc_off + is + 2] as i8 as f32;
+                    let s2 = scales[sc_off + is + 4] as i8 as f32;
+                    let s3 = scales[sc_off + is + 6] as i8 as f32;
+
+                    let cols_out = [
+                        (out_off + l, d * s0 * q1 as f32),
+                        (out_off + l + 32, d * s1 * q2 as f32),
+                        (out_off + l + 64, d * s2 * q3 as f32),
+                        (out_off + l + 96, d * s3 * q4 as f32),
+                    ];
+                    for (local_idx, weight) in cols_out {
+                        let col = blk * Q6_K_BLOCK_SIZE + local_idx;
+                        if col < cols {
+                            f32_weights[row * cols + col] = weight;
+                        }
                     }
-
-                    // Low 4 bits from ql (each byte has 2 nibbles).
-                    let ql_byte_idx = idx / 2;
-                    let ql_nibble = if idx.is_multiple_of(2) {
-                        ql[ql_byte_idx] & 0x0F
-                    } else {
-                        (ql[ql_byte_idx] >> 4) & 0x0F
-                    };
-
-                    // High 2 bits from qh (each byte has 4 × 2-bit values).
-                    let qh_byte_idx = idx / 4;
-                    let qh_shift = (idx % 4) * 2;
-                    let qh_2bit = (qh[qh_byte_idx] >> qh_shift) & 0x03;
-
-                    // Combine: 6-bit value = ql_4bit | (qh_2bit << 4), then subtract 32.
-                    let quant_val = (ql_nibble as i32) | ((qh_2bit as i32) << 4);
-                    let weight = d * sc as f32 * (quant_val - 32) as f32;
-
-                    f32_weights[row * cols + col] = weight;
                 }
             }
         }
@@ -371,6 +385,29 @@ mod tests {
             (result[1] - expected_1).abs() < 0.01,
             "got {}, expected {expected_1}",
             result[1]
+        );
+    }
+
+    /// Discriminates the old buggy flat `ql[idx/2]`/`qh[idx/4]` mapping from
+    /// the correct four-quarter group mapping: for weight index 32 (the
+    /// first weight of the SECOND quarter of group 0), the two mappings
+    /// read different `ql` bytes even though they agree on the scale index.
+    #[test]
+    fn test_dequant_q6_k_second_quarter_byte_mapping() {
+        let mut scales = [0i8; 16];
+        scales[2] = 1; // sub-block 2 → second-quarter scale for l in 0..16
+        let mut ql = [0u8; 128];
+        ql[32] = 0x0B; // correct source: ql[ql_off + l + 32] for l=0 → weight[32]=11-32=-21
+        ql[16] = 0x07; // old buggy source: ql[idx/2] for idx=32 → would give 7-32=-25
+        let qh = [0u8; 64];
+
+        let block = make_q6_k_block(1.0, &scales, &ql, &qh);
+        let result = dequant_q6_k_to_f32(&block, 1, 256).expect("dequant");
+
+        assert!(
+            (result[32] - (-21.0)).abs() < 0.01,
+            "weight[32] = {}, expected -21.0",
+            result[32]
         );
     }
 

@@ -28,5 +28,9 @@ bytemuck = { workspace = true, optional = true }
 
 [dev-dependencies]
 naga = { workspace = true }
+# Used only as the upstream-pinned oracle for golden-vector / CPU-vs-GPU
+# cross-check tests (see src/kernels/golden_tests.rs and
+# tests/cpu_gpu_cross_check.rs) — never a runtime dependency of this crate.
+oxillama-quant = { path = "../oxillama-quant", default-features = false }
 
 

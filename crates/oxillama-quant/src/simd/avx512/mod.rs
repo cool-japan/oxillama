@@ -28,9 +28,50 @@
 //! | [`Iq2XsAvx512`]     | IQ2_XS     | 256 | 74  | ~2× |
 //! | [`Iq3SAvx512`]      | IQ3_S      | 256 | 110 | ~2× |
 //! | [`Iq4XsAvx512`]     | IQ4_XS     | 256 | 136 | ~2× |
+//!
+//! The "throughput vs AVX2" column records the *design intent* of the 512-bit
+//! rewrite (half as many passes over the same data).  It is **not** a measured
+//! number, and no measurement on AVX-512 hardware has been made — see
+//! "Verification status" below.
+//!
+//! ## Fused Q8_0-activation GEMV (`matvec_q8_fused`)
+//!
+//! `dispatch.rs` selects this tier *before* AVX2, so anything AVX2 overrides and
+//! AVX-512 does not is silently **lost** when the `simd-avx512` feature is
+//! enabled.  That is exactly what happened to the fused decode path.  The tier
+//! now covers every format AVX2 covers:
+//!
+//! | Format | AVX-512 `matvec_q8_fused` | Gate (`q8_fused_acts_blocks`) |
+//! |--------|---------------------------|-------------------------------|
+//! | Q8_0, Q8_1, Q5_0, Q5_1 | native 512-bit ([`fused`]) | `ceil(K/32)`, as AVX2 |
+//! | Q4_0                   | native 512-bit ([`fused`]) | none — mirrors AVX2, which also leaves Q4_0 ungated |
+//! | Q2_K, Q3_K, Q4_K, Q6_K | delegated to AVX2, deliberately | `ceil(K/256)*8`, as AVX2 |
+//! | Q5_K                   | delegated to AVX2, deliberately | none — mirrors AVX2 |
+//!
+//! The K-quant delegation is a decision, not an omission: their AVX2 row
+//! kernels interleave per-sub-block `f32` scale/min combinations with the
+//! integer dots, and re-deriving that in 512-bit lanes cannot be validated on
+//! the hardware available here.  Every AVX-512F CPU also has AVX2+FMA, so
+//! delegating costs nothing relative to the AVX2 tier and removes the
+//! regression.  See each K-quant kernel's `matvec_q8_fused` for the per-format
+//! note.
+//!
+//! ## Verification status
+//!
+//! **No code in this module has been executed on AVX-512 hardware.**  What has
+//! been verified: cross-compilation and Clippy for `x86_64-unknown-linux-gnu`
+//! with `simd-avx512` (alone and combined with `simd-avx2`), and golden tests
+//! that hold a scalar model of each fused kernel's lane arithmetic against
+//! constants produced by executing llama.cpp's C reference
+//! (`tests/avx512_fused_goldens.rs`).  The `#[test]`s inside these modules that
+//! call the intrinsics directly are gated on `is_x86_feature_detected!` and
+//! skip silently on the aarch64 development host; they are what a future
+//! AVX-512 CI run should exercise first.
 
 #![cfg(all(feature = "simd-avx512", target_arch = "x86_64"))]
 
+pub mod fused;
+pub mod int_dot;
 pub mod iq2_xs;
 pub mod iq2_xxs;
 pub mod iq3_s;

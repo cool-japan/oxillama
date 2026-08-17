@@ -74,6 +74,13 @@ impl LoraAdapter {
 
     /// Apply the LoRA correction in-place: `output += B @ (A @ input) * scale`.
     ///
+    /// Allocates a fresh `rank`-length scratch buffer for the intermediate
+    /// `A @ input` product on every call. For a linear layer that gets a LoRA
+    /// correction applied once per adapted layer per token, that is one heap
+    /// allocation per layer per token during decode. [`Self::apply_into`] is
+    /// the same computation with a caller-owned, reusable scratch buffer;
+    /// prefer it on any hot path that calls `apply` repeatedly.
+    ///
     /// # Arguments
     /// * `input`  – FP32 input vector, length ≥ `in_features`.
     /// * `output` – FP32 output vector, length ≥ `out_features`; modified in place.
@@ -81,6 +88,35 @@ impl LoraAdapter {
     /// # Errors
     /// Returns [`QuantError::DimensionMismatch`] if either slice is too short.
     pub fn apply(&self, input: &[f32], output: &mut [f32]) -> QuantResult<()> {
+        let mut scratch = Vec::new();
+        self.apply_into(input, output, &mut scratch)
+    }
+
+    /// Apply the LoRA correction in-place, reusing a caller-owned scratch
+    /// buffer for the intermediate `A @ input` product instead of allocating
+    /// one per call.
+    ///
+    /// `scratch` is resized to `self.rank` (growing its capacity at most
+    /// once across repeated calls with a non-shrinking rank) and fully
+    /// overwritten before use, so its incoming contents do not matter and it
+    /// carries no state between calls — a single buffer can be shared across
+    /// every adapted layer in a decode step as long as calls do not overlap
+    /// (each call both reads and writes the buffer, so it cannot be shared
+    /// across concurrently-running calls).
+    ///
+    /// # Arguments
+    /// * `input`   – FP32 input vector, length ≥ `in_features`.
+    /// * `output`  – FP32 output vector, length ≥ `out_features`; modified in place.
+    /// * `scratch` – reusable buffer for the `rank`-length intermediate product.
+    ///
+    /// # Errors
+    /// Returns [`QuantError::DimensionMismatch`] if either slice is too short.
+    pub fn apply_into(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        scratch: &mut Vec<f32>,
+    ) -> QuantResult<()> {
         if input.len() < self.in_features {
             return Err(QuantError::DimensionMismatch {
                 expected: self.in_features,
@@ -95,8 +131,9 @@ impl LoraAdapter {
         }
 
         // Step 1: r_vec = A @ input   (rank × 1)
-        let mut r_vec = vec![0.0f32; self.rank];
-        for (i, r) in r_vec.iter_mut().enumerate().take(self.rank) {
+        scratch.clear();
+        scratch.resize(self.rank, 0.0);
+        for (i, r) in scratch.iter_mut().enumerate().take(self.rank) {
             let row_start = i * self.in_features;
             let row = &self.a[row_start..row_start + self.in_features];
             *r = row
@@ -113,7 +150,7 @@ impl LoraAdapter {
             let row = &self.b[row_start..row_start + self.rank];
             let delta: f32 = row
                 .iter()
-                .zip(r_vec.iter())
+                .zip(scratch.iter())
                 .map(|(&b, &r)| b * r)
                 .sum::<f32>()
                 * s;
@@ -256,6 +293,65 @@ mod tests {
             "expected DimensionMismatch, got {:?}",
             result
         );
+    }
+
+    /// `apply_into` must produce results bit-identical to `apply` — `apply`
+    /// is now a thin wrapper around it with a fresh scratch buffer.
+    #[test]
+    fn test_apply_into_matches_apply() {
+        let a = vec![1.0f32, 0.5, -0.5, 1.0]; // 2×2
+        let b = vec![2.0f32, -1.0, 0.0, 3.0]; // 2×2
+        let adapter = LoraAdapter::new(a, b, 2, 0.75, 2, 2).expect("valid adapter");
+
+        let input = vec![3.0f32, -4.0];
+
+        let mut out_apply = vec![1.0f32, -2.0];
+        adapter.apply(&input, &mut out_apply).expect("apply ok");
+
+        let mut out_apply_into = vec![1.0f32, -2.0];
+        let mut scratch = Vec::new();
+        adapter
+            .apply_into(&input, &mut out_apply_into, &mut scratch)
+            .expect("apply_into ok");
+
+        assert_eq!(out_apply, out_apply_into);
+        assert_eq!(scratch.len(), 2, "scratch must be resized to rank");
+    }
+
+    /// A scratch buffer reused across adapters of different rank must not
+    /// leak stale elements from a previous, larger call into a smaller one —
+    /// `apply_into` truncates via `clear()` + `resize()` before writing.
+    #[test]
+    fn test_apply_into_scratch_reuse_is_stateless() {
+        let mut scratch = Vec::new();
+
+        // First call: rank 3.
+        let a1 = vec![1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]; // 3×3 identity
+        let b1 = vec![1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]; // 3×3 identity
+        let adapter1 = LoraAdapter::new(a1, b1, 3, 1.0, 3, 3).expect("valid adapter");
+        let input1 = vec![5.0f32, 6.0, 7.0];
+        let mut out1 = vec![0.0f32; 3];
+        adapter1
+            .apply_into(&input1, &mut out1, &mut scratch)
+            .expect("apply_into ok");
+        assert_eq!(scratch, vec![5.0, 6.0, 7.0]);
+
+        // Second call: rank 1, sharing the same (larger) scratch buffer.
+        let a2 = vec![1.0f32];
+        let b2 = vec![1.0f32];
+        let adapter2 = LoraAdapter::new(a2, b2, 1, 1.0, 1, 1).expect("valid adapter");
+        let input2 = vec![9.0f32];
+        let mut out2 = vec![0.0f32; 1];
+        adapter2
+            .apply_into(&input2, &mut out2, &mut scratch)
+            .expect("apply_into ok");
+
+        assert_eq!(
+            scratch,
+            vec![9.0],
+            "scratch must be truncated to the new rank, not left with stale elements"
+        );
+        assert!((out2[0] - 9.0).abs() < 1e-6);
     }
 
     /// Zero-rank adapter (rank=0) is handled without panicking.

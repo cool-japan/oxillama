@@ -14,10 +14,11 @@
 
 use crate::common::gelu::gelu_inplace;
 use crate::common::layer_norm::LayerNorm;
-use crate::common::linear::QuantLinear;
+use crate::common::linear::{gguf_linear_shape, QuantLinear};
+use crate::common::loader::dequant_to_f32;
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
-use crate::llama::{dequant_to_f32, softmax_inplace};
+use crate::lora::LoadedLora;
 use crate::traits::{ForwardPass, KvCacheAccess};
 use oxillama_quant::{KernelDispatcher, QuantTensor};
 
@@ -137,17 +138,40 @@ impl StarcoderModel {
     /// Embed a single token at a given position.
     ///
     /// `buf_hidden = token_embd[token] + position_embd[position]`
-    fn embed_token(&mut self, token: u32, position: usize) {
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::ConfigMismatch`] when `position >= max_position` — StarCoder
+    /// has no positional-encoding fallback past its trained context (unlike
+    /// RoPE-based architectures, which can extrapolate), so silently clamping
+    /// to the last learned embedding used to produce wrong-but-finite output
+    /// for every token past the training context instead of a clear error.
+    fn embed_token(&mut self, token: u32, position: usize) -> ArchResult<()> {
+        if position >= self.max_position {
+            return Err(ArchError::ConfigMismatch {
+                param: "position".to_string(),
+                expected: format!("< max_position ({})", self.max_position),
+                got: position.to_string(),
+            });
+        }
         let hidden_size = self.config.hidden_size;
         let tok_offset = token as usize * hidden_size;
-        // Clamp position to max_position to avoid out-of-bounds.
-        let pos = position.min(self.max_position.saturating_sub(1));
-        let pos_offset = pos * hidden_size;
+        let pos_offset = position * hidden_size;
+
+        let tok_row = self
+            .token_embd
+            .get(tok_offset..tok_offset + hidden_size)
+            .ok_or_else(|| ArchError::ConfigMismatch {
+                param: "token id".to_string(),
+                expected: format!("< {}", self.config.vocab_size),
+                got: token.to_string(),
+            })?;
+        let pos_row = &self.position_embd[pos_offset..pos_offset + hidden_size];
 
         for i in 0..hidden_size {
-            self.buf_hidden[i] =
-                self.token_embd[tok_offset + i] + self.position_embd[pos_offset + i];
+            self.buf_hidden[i] = tok_row[i] + pos_row[i];
         }
+        Ok(())
     }
 
     /// Run Multi-Query Attention for a single layer.
@@ -194,8 +218,10 @@ impl StarcoderModel {
         // kv_dim = head_dim (MQA: 1 K/V head)
         kv_cache.store_kv(layer_idx, &self.buf_k, &self.buf_v)?;
 
-        let cached_keys = kv_cache.get_keys(layer_idx)?;
-        let cached_values = kv_cache.get_values(layer_idx)?;
+        let cached_keys = crate::common::fetch_keys(&*kv_cache, layer_idx)?;
+        let cached_values = crate::common::fetch_values(&*kv_cache, layer_idx)?;
+        let cached_keys: &[f32] = &cached_keys;
+        let cached_values: &[f32] = &cached_values;
         let seq_len = position + 1;
 
         let scale = 1.0 / (head_dim as f32).sqrt();
@@ -295,12 +321,14 @@ impl ForwardPass for StarcoderModel {
         kv_cache: &mut dyn KvCacheAccess,
     ) -> ArchResult<Vec<f32>> {
         let start_pos = kv_cache.seq_len();
+        crate::common::validate_context_bounds(&self.config, start_pos, tokens.len())?;
+        crate::common::validate_token_ids(&self.config, tokens)?;
 
         for (i, &token) in tokens.iter().enumerate() {
             let position = start_pos + i;
 
             // Embed token + absolute position
-            self.embed_token(token, position);
+            self.embed_token(token, position)?;
 
             for layer_idx in 0..self.layers.len() {
                 // Pre-attention LayerNorm
@@ -336,10 +364,12 @@ impl ForwardPass for StarcoderModel {
 
     fn embed(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
         let start_pos = kv_cache.seq_len();
+        crate::common::validate_context_bounds(&self.config, start_pos, tokens.len())?;
+        crate::common::validate_token_ids(&self.config, tokens)?;
 
         for (i, &token) in tokens.iter().enumerate() {
             let position = start_pos + i;
-            self.embed_token(token, position);
+            self.embed_token(token, position)?;
 
             for layer_idx in 0..self.layers.len() {
                 self.layers[layer_idx]
@@ -373,6 +403,65 @@ impl ForwardPass for StarcoderModel {
     fn hidden_size(&self) -> usize {
         self.config.hidden_size
     }
+
+    /// Attach LoRA adapters to this model's linear layers.
+    ///
+    /// Delegates to [`Self::apply_lora_scaled`] with `scale = 1.0`.
+    fn apply_lora(&mut self, lora: &LoadedLora) -> ArchResult<()> {
+        self.apply_lora_scaled(lora, 1.0)
+    }
+
+    /// Attach LoRA adapters with an extra scale multiplier.
+    ///
+    /// StarCoder's four projections per layer — the fused `attn_qkv`, the
+    /// attention output projection, and the two FFN projections — are looked
+    /// up by their base GGUF tensor names and pushed (accumulating) rather
+    /// than replaced, so a second call — or an entry from
+    /// [`LoraStack`](crate::lora::LoraStack) — composes instead of clobbering.
+    fn apply_lora_scaled(&mut self, lora: &LoadedLora, scale: f32) -> ArchResult<()> {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let candidates: [(&str, &mut QuantLinear); 4] = [
+                (&format!("blk.{i}.attn_qkv.weight"), &mut layer.attn_qkv),
+                (&format!("blk.{i}.attn_output.weight"), &mut layer.attn_out),
+                (&format!("blk.{i}.ffn_up.weight"), &mut layer.ffn_up),
+                (&format!("blk.{i}.ffn_down.weight"), &mut layer.ffn_down),
+            ];
+            for (tensor_name, linear) in candidates {
+                if let Some(adapter) = lora.get(tensor_name) {
+                    linear.push_lora(adapter, scale);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn unapply_all_loras(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.attn_qkv.clear_lora();
+            layer.attn_out.clear_lora();
+            layer.ffn_up.clear_lora();
+            layer.ffn_down.clear_lora();
+        }
+    }
+}
+
+/// In-place numerically-stable softmax.
+fn softmax_inplace(x: &mut [f32]) {
+    if x.is_empty() {
+        return;
+    }
+    let max_val = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() {
+        *v = (*v - max_val).exp();
+        sum += *v;
+    }
+    if sum > 0.0 {
+        let inv_sum = 1.0 / sum;
+        for v in x.iter_mut() {
+            *v *= inv_sum;
+        }
+    }
 }
 
 /// Load a StarCoder model from a `GgufModel`.
@@ -393,9 +482,10 @@ pub fn load_starcoder_from_gguf(
     let position_embd = dequant_to_f32(pos_info, pos_data, &dispatcher)?;
 
     // Determine max_position from the position embedding tensor shape.
-    // Shape is [max_position, hidden_size]; take the first dimension.
+    // GGUF order is fastest-changing-first, so the tensor is stored as
+    // [hidden_size, max_position]; the position count is the second dimension.
     let max_position = if pos_info.dimensions.len() >= 2 {
-        pos_info.dimensions[0] as usize
+        pos_info.dimensions[1] as usize
     } else {
         config.max_context_length
     };
@@ -417,9 +507,14 @@ pub fn load_starcoder_from_gguf(
             load_f32_tensor(model, &format!("{prefix}.attn_qkv.bias"), &dispatcher)?;
 
         // Attention output projection + bias
-        let attn_out = load_starcoder_quant_linear(model, &format!("{prefix}.attn_out.weight"))?;
+        //
+        // GGUF names this `attn_output.weight`/`.bias` for every architecture
+        // (gguf-py's `TENSOR_NAMES[MODEL_TENSOR.ATTN_OUT] =
+        // "blk.{bid}.attn_output"`); a prior version of this loader read
+        // `attn_out.weight`, which never matches a real checkpoint.
+        let attn_out = load_starcoder_quant_linear(model, &format!("{prefix}.attn_output.weight"))?;
         let attn_out_bias =
-            load_f32_tensor(model, &format!("{prefix}.attn_out.bias"), &dispatcher)?;
+            load_f32_tensor(model, &format!("{prefix}.attn_output.bias"), &dispatcher)?;
 
         // Pre-FFN LayerNorm (weight + bias)
         let ffn_norm_w = load_f32_tensor(model, &format!("{prefix}.ffn_norm.weight"), &dispatcher)?;
@@ -454,7 +549,12 @@ pub fn load_starcoder_from_gguf(
     let output_norm_b = load_f32_tensor(model, "output_norm.bias", &dispatcher)?;
     let output_norm = LayerNorm::new(output_norm_w, Some(output_norm_b), config.rms_norm_eps);
 
-    let output = load_starcoder_quant_linear(model, "output.weight")?;
+    // GPT-BigCode defaults `tie_word_embeddings=true`, so most StarCoder
+    // checkpoints ship no standalone `output.weight` at all; llama.cpp
+    // duplicates `token_embd.weight` into `output` in that case
+    // (`llama-model.cpp`, `LLM_ARCH_STARCODER`: `create_tensor(..., OUTPUT,
+    // ..., TENSOR_NOT_REQUIRED)` then falls back to `TOKEN_EMBD` when null).
+    let output = crate::common::loader::load_lm_head(model, "output.weight", "token_embd.weight")?;
 
     Ok(StarcoderModel::new(
         config.clone(),
@@ -498,10 +598,13 @@ fn load_starcoder_quant_linear(
         .map_err(|_| ArchError::MissingTensor {
             name: name.to_string(),
         })?;
-    let data = model.tensor_data(name)?;
-
-    let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
-    let tensor = QuantTensor::new(data.to_vec(), shape, info.tensor_type);
+    let shape = gguf_linear_shape(&info.dimensions);
+    let tensor_type = info.tensor_type;
+    // Shared mmap-backed view, not a `to_vec()` copy: the GEMV kernels only
+    // ever read `&[u8]` out of the payload, so a private copy would double
+    // the checkpoint's resident cost for nothing.
+    let data = model.tensor_bytes(name)?;
+    let tensor = QuantTensor::from_shared(data, shape, tensor_type);
 
     Ok(QuantLinear::new(tensor, None))
 }

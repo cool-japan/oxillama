@@ -5,17 +5,19 @@
 //! Architecture: embedding → N×(RMSNorm → GQA → residual → RMSNorm → SwiGLU FFN → residual) → RMSNorm → LM head
 //!
 //! The main difference from LLaMA is that Q, K, V are packed into a single
-//! `attn_qkv.weight` tensor, and RoPE is applied to only a fraction of each
-//! head's dimensions (controlled by `partial_rotary_factor`).
+//! `attn_qkv.weight` tensor, and RoPE may be applied to only a fraction of
+//! each head's dimensions, controlled by `{arch}.rope.dimension_count`
+//! (`rope_dims`, defaulting to the full `head_dim` — see `load_phi_from_gguf`).
 
-use crate::common::linear::QuantLinear;
+use crate::common::linear::{gguf_linear_shape, QuantLinear};
 use crate::common::rms_norm::RmsNorm;
 use crate::common::rope::RopeTable;
 use crate::common::swiglu::swiglu_inplace;
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::traits::{ForwardPass, KvCacheAccess};
-use oxillama_quant::{KernelDispatcher, QuantTensor};
+use oxillama_quant::{KernelDispatcher, QuantKernel, QuantTensor};
+use std::sync::Arc;
 
 /// A single Phi transformer layer.
 pub struct PhiLayer {
@@ -33,6 +35,16 @@ pub struct PhiLayer {
     pub ffn_up: QuantLinear,
     /// FFN down projection [hidden_size, intermediate_size].
     pub ffn_down: QuantLinear,
+
+    // Resolved kernels — one per projection, looked up from the tensor's
+    // quantization type exactly once, in `load_phi_from_gguf`, instead of
+    // once per layer per token on the decode hot path. `pub` so a layer can
+    // be constructed outside the loader (e.g. from a test) too.
+    pub attn_qkv_kernel: Arc<dyn QuantKernel>,
+    pub attn_output_kernel: Arc<dyn QuantKernel>,
+    pub ffn_gate_kernel: Arc<dyn QuantKernel>,
+    pub ffn_up_kernel: Arc<dyn QuantKernel>,
+    pub ffn_down_kernel: Arc<dyn QuantKernel>,
 }
 
 /// Complete Phi model.
@@ -45,13 +57,20 @@ pub struct PhiModel {
     pub layers: Vec<PhiLayer>,
     /// Final RMSNorm before LM head.
     pub output_norm: RmsNorm,
-    /// LM head (unembedding) projection.
+    /// LM head (unembedding) projection. Falls back to a view over
+    /// `token_embd.weight` when the checkpoint ties input/output embeddings
+    /// and ships no standalone `output.weight` — see `load_lm_head`.
     pub output: QuantLinear,
+    /// Resolved kernel for `output` — see `PhiLayer`'s kernel fields.
+    output_kernel: Arc<dyn QuantKernel>,
     /// RoPE precomputed frequency table.
     pub rope: RopeTable,
     /// Kernel dispatcher for quantized ops.
     pub dispatcher: KernelDispatcher,
-    /// Number of head dimensions to apply RoPE to (partial rotary).
+    /// Number of head dimensions RoPE is applied to (partial rotary).
+    ///
+    /// Read from `{arch}.rope.dimension_count`; defaults to the full
+    /// `head_dim` (standard Phi-3 is full rotary — see `load_phi_from_gguf`).
     pub rope_dims: usize,
 
     // Scratch buffers
@@ -62,6 +81,10 @@ pub struct PhiModel {
     buf_k: Vec<f32>,
     buf_v: Vec<f32>,
     buf_attn_out: Vec<f32>,
+    /// Output of `attn_output`'s projection, added into `buf_hidden`.
+    /// Preallocated to `hidden_size` here instead of a fresh
+    /// `vec![0.0; hidden_size]` inside `attention()` on every call.
+    buf_proj_out: Vec<f32>,
     buf_gate: Vec<f32>,
     buf_up: Vec<f32>,
     buf_ffn_out: Vec<f32>,
@@ -72,15 +95,20 @@ pub struct PhiModel {
 impl PhiModel {
     /// Create a new PhiModel from preloaded weights.
     ///
-    /// `partial_rotary_factor`: fraction of head_dim to apply RoPE (e.g. 0.5 for Phi-3).
+    /// `rope_dims`: number of leading dimensions per head that RoPE rotates
+    /// (e.g. `head_dim` for full rotary, matching plain Phi-3).
+    ///
+    /// Fails if `output`'s tensor type — or any layer projection's — has no
+    /// registered [`oxillama_quant::QuantKernel`]: every kernel is resolved
+    /// once here rather than on every forward pass.
     pub fn new(
         config: ModelConfig,
         token_embd: Vec<f32>,
         layers: Vec<PhiLayer>,
         output_norm: RmsNorm,
         output: QuantLinear,
-        partial_rotary_factor: f32,
-    ) -> Self {
+        rope_dims: usize,
+    ) -> ArchResult<Self> {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_kv_heads;
@@ -89,8 +117,6 @@ impl PhiModel {
         let vocab_size = config.vocab_size;
         let max_ctx = config.max_context_length;
 
-        // Partial RoPE: only rotate this many dims per head
-        let rope_dims = ((head_dim as f32 * partial_rotary_factor) as usize).max(2);
         let rope = RopeTable::new(
             rope_dims,
             max_ctx,
@@ -99,17 +125,19 @@ impl PhiModel {
             config.rope_scaling_factor,
         );
         let dispatcher = KernelDispatcher::new();
+        let output_kernel = resolve_kernel(&dispatcher, &output)?;
 
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let qkv_dim = q_dim + 2 * kv_dim;
 
-        Self {
+        Ok(Self {
             config,
             token_embd,
             layers,
             output_norm,
             output,
+            output_kernel,
             rope,
             dispatcher,
             rope_dims,
@@ -120,25 +148,36 @@ impl PhiModel {
             buf_k: vec![0.0; kv_dim],
             buf_v: vec![0.0; kv_dim],
             buf_attn_out: vec![0.0; hidden_size],
+            buf_proj_out: vec![0.0; hidden_size],
             buf_gate: vec![0.0; intermediate_size],
             buf_up: vec![0.0; intermediate_size],
             buf_ffn_out: vec![0.0; hidden_size],
             buf_logits: vec![0.0; vocab_size],
             buf_attn_scores: vec![0.0; max_ctx],
-        }
+        })
     }
 
-    fn kernel_for(&self, linear: &QuantLinear) -> ArchResult<Box<dyn oxillama_quant::QuantKernel>> {
-        self.dispatcher
-            .get_kernel(linear.weight.tensor_type)
-            .map_err(ArchError::from)
-    }
-
-    fn embed_token(&mut self, token: u32) {
+    /// Load the residual stream with `token`'s embedding row.
+    ///
+    /// Bound-checked: an out-of-vocabulary `token` (possible whenever
+    /// `vocab_size` is over- or under-estimated from GGUF metadata) is
+    /// reported as an error instead of panicking on the slice index. This
+    /// path runs on every decoded token, including ones sourced from an
+    /// HTTP request body, so it must never panic.
+    fn embed_token(&mut self, token: u32) -> ArchResult<()> {
         let hidden_size = self.config.hidden_size;
-        let offset = token as usize * hidden_size;
-        self.buf_hidden
-            .copy_from_slice(&self.token_embd[offset..offset + hidden_size]);
+        let offset = (token as usize)
+            .checked_mul(hidden_size)
+            .ok_or_else(|| out_of_vocab_error(token, self.config.vocab_size))?;
+        let end = offset
+            .checked_add(hidden_size)
+            .ok_or_else(|| out_of_vocab_error(token, self.config.vocab_size))?;
+        let src = self
+            .token_embd
+            .get(offset..end)
+            .ok_or_else(|| out_of_vocab_error(token, self.config.vocab_size))?;
+        self.buf_hidden.copy_from_slice(src);
+        Ok(())
     }
 
     /// Split merged QKV output into separate Q, K, V buffers.
@@ -169,11 +208,12 @@ impl PhiModel {
         let kv_dim = num_kv_heads * head_dim;
         let heads_per_kv = num_heads / num_kv_heads;
 
-        // Merged QKV projection
-        let qkv_kernel = self.kernel_for(&layer.attn_qkv)?;
+        // Merged QKV projection. Kernel resolved once at load time — see the
+        // comment on `PhiLayer`'s kernel fields.
+        let qkv_kernel: &dyn QuantKernel = &*layer.attn_qkv_kernel;
         layer
             .attn_qkv
-            .forward(&*qkv_kernel, &self.buf_norm, &mut self.buf_qkv)?;
+            .forward(qkv_kernel, &self.buf_norm, &mut self.buf_qkv)?;
 
         // Split into Q, K, V
         self.split_qkv();
@@ -191,13 +231,31 @@ impl PhiModel {
         // Store K, V in cache
         kv_cache.store_kv(layer_idx, &self.buf_k[..kv_dim], &self.buf_v[..kv_dim])?;
 
-        let cached_keys = kv_cache.get_keys(layer_idx)?;
-        let cached_values = kv_cache.get_values(layer_idx)?;
+        let cached_keys = crate::common::fetch_keys(&*kv_cache, layer_idx)?;
+        let cached_values = crate::common::fetch_values(&*kv_cache, layer_idx)?;
+        let cached_keys: &[f32] = &cached_keys;
+        let cached_values: &[f32] = &cached_values;
         let seq_len = position + 1;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         self.buf_attn_out.fill(0.0);
 
+        // NOTE on sliding-window attention: Phi-3-mini/-small checkpoints
+        // carry a `{arch}.attention.sliding_window` value, but current
+        // llama.cpp (`llama-model.cpp`, `case LLM_ARCH_PHI3:`) forcibly
+        // disables SWA for this architecture — `swa_type = LLAMA_SWA_TYPE_NONE;
+        // n_swa = 0; set_swa_pattern(1);` — with the comment "Phi SWA is
+        // currently disabled - results might be suboptimal for some models"
+        // and a TODO citing ggml-org/llama.cpp#13676: the conversion scripts
+        // do not correctly populate `n_swa`/`n_swa_pattern`, so a window
+        // computed from that metadata could be actively wrong rather than
+        // merely absent. `llm_build_phi3<false>` (dense, no windowing) is
+        // therefore always instantiated for `LLM_ARCH_PHI3`/`LLM_ARCH_PHIMOE`
+        // regardless of the sliding_window key. This loop intentionally
+        // mirrors that: full causal attention over every cached position,
+        // not windowed. Do not wire `effective_attention_span`/
+        // `config.sliding_window` in here without re-checking whether
+        // upstream has fixed the converter.
         for h in 0..num_heads {
             let kv_head = h / heads_per_kv;
             let q_head = &self.buf_q[h * head_dim..(h + 1) * head_dim];
@@ -226,15 +284,15 @@ impl PhiModel {
             }
         }
 
-        // Project attention output
-        let o_kernel = self.kernel_for(&self.layers[layer_idx].attn_output)?;
+        // Project attention output. `buf_proj_out` is preallocated engine
+        // state (see its field doc) instead of a per-call `vec![0.0; ...]`.
+        let o_kernel: &dyn QuantKernel = &*self.layers[layer_idx].attn_output_kernel;
         let layer = &self.layers[layer_idx];
-        let mut proj_out = vec![0.0f32; self.config.hidden_size];
         layer
             .attn_output
-            .forward(&*o_kernel, &self.buf_attn_out, &mut proj_out)?;
+            .forward(o_kernel, &self.buf_attn_out, &mut self.buf_proj_out)?;
 
-        for (h, &p) in self.buf_hidden.iter_mut().zip(proj_out.iter()) {
+        for (h, &p) in self.buf_hidden.iter_mut().zip(self.buf_proj_out.iter()) {
             *h += p;
         }
 
@@ -244,22 +302,22 @@ impl PhiModel {
     fn feed_forward(&mut self, layer_idx: usize) -> ArchResult<()> {
         let layer = &self.layers[layer_idx];
 
-        let gate_kernel = self.kernel_for(&layer.ffn_gate)?;
-        let up_kernel = self.kernel_for(&layer.ffn_up)?;
-        let down_kernel = self.kernel_for(&layer.ffn_down)?;
+        let gate_kernel: &dyn QuantKernel = &*layer.ffn_gate_kernel;
+        let up_kernel: &dyn QuantKernel = &*layer.ffn_up_kernel;
+        let down_kernel: &dyn QuantKernel = &*layer.ffn_down_kernel;
 
         layer
             .ffn_gate
-            .forward(&*gate_kernel, &self.buf_norm, &mut self.buf_gate)?;
+            .forward(gate_kernel, &self.buf_norm, &mut self.buf_gate)?;
         layer
             .ffn_up
-            .forward(&*up_kernel, &self.buf_norm, &mut self.buf_up)?;
+            .forward(up_kernel, &self.buf_norm, &mut self.buf_up)?;
 
         swiglu_inplace(&mut self.buf_gate, &self.buf_up);
 
         layer
             .ffn_down
-            .forward(&*down_kernel, &self.buf_gate, &mut self.buf_ffn_out)?;
+            .forward(down_kernel, &self.buf_gate, &mut self.buf_ffn_out)?;
 
         for (h, &f) in self.buf_hidden.iter_mut().zip(self.buf_ffn_out.iter()) {
             *h += f;
@@ -276,11 +334,12 @@ impl ForwardPass for PhiModel {
         kv_cache: &mut dyn KvCacheAccess,
     ) -> ArchResult<Vec<f32>> {
         let start_pos = kv_cache.seq_len();
+        check_context_length(self.config.max_context_length, start_pos, tokens.len())?;
 
         for (i, &token) in tokens.iter().enumerate() {
             let position = start_pos + i;
 
-            self.embed_token(token);
+            self.embed_token(token)?;
 
             for layer_idx in 0..self.layers.len() {
                 self.layers[layer_idx]
@@ -301,11 +360,17 @@ impl ForwardPass for PhiModel {
 
         self.output_norm.forward(&mut self.buf_hidden);
 
-        let output_kernel = self.kernel_for(&self.output)?;
+        if self.buf_logits.len() != self.config.vocab_size {
+            self.buf_logits.resize(self.config.vocab_size, 0.0);
+        }
+        let output_kernel: &dyn QuantKernel = &*self.output_kernel;
         self.output
-            .forward(&*output_kernel, &self.buf_hidden, &mut self.buf_logits)?;
+            .forward(output_kernel, &self.buf_hidden, &mut self.buf_logits)?;
 
-        Ok(self.buf_logits.clone())
+        // Hand the freshly computed logits to the caller by ownership
+        // transfer instead of a `.clone()` allocation-and-memcpy on every
+        // decoded token; the resize above repairs `buf_logits` on next call.
+        Ok(std::mem::take(&mut self.buf_logits))
     }
 
     /// Extract the post-output-norm hidden state for embedding.
@@ -317,11 +382,12 @@ impl ForwardPass for PhiModel {
     /// L2-normalised semantic embeddings.
     fn embed(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
         let start_pos = kv_cache.seq_len();
+        check_context_length(self.config.max_context_length, start_pos, tokens.len())?;
 
         for (i, &token) in tokens.iter().enumerate() {
             let position = start_pos + i;
 
-            self.embed_token(token);
+            self.embed_token(token)?;
 
             for layer_idx in 0..self.layers.len() {
                 self.layers[layer_idx]
@@ -379,6 +445,42 @@ fn softmax_inplace(x: &mut [f32]) {
     }
 }
 
+/// Build the out-of-vocabulary error for a bad token id.
+fn out_of_vocab_error(token: u32, vocab_size: usize) -> ArchError {
+    ArchError::ConfigMismatch {
+        param: "token id".to_string(),
+        expected: format!("< {vocab_size}"),
+        got: token.to_string(),
+    }
+}
+
+/// Validate that a forward/embed call will not run any position past
+/// `max_context_length`.
+///
+/// `RopeTable::apply` and `buf_attn_scores` are both sized to
+/// `max_context_length` and indexed by raw position with no further
+/// checking; an over-long prompt at prefill time (the decode loop is
+/// separately guarded upstream, but prefill is reachable directly from the
+/// HTTP server with attacker-controlled input) would otherwise panic on the
+/// first out-of-range index instead of returning an error.
+fn check_context_length(
+    max_context_length: usize,
+    start_pos: usize,
+    n_tokens: usize,
+) -> ArchResult<()> {
+    let end = start_pos
+        .checked_add(n_tokens)
+        .filter(|&end| end <= max_context_length);
+    if end.is_some() {
+        return Ok(());
+    }
+    Err(ArchError::InvalidConfig {
+        detail: format!(
+            "context length exceeded: start_pos={start_pos} + {n_tokens} tokens > max_context_length={max_context_length}"
+        ),
+    })
+}
+
 /// Load a Phi model from a `GgufModel`.
 pub fn load_phi_from_gguf(
     model: &oxillama_gguf::GgufModel,
@@ -386,20 +488,42 @@ pub fn load_phi_from_gguf(
 ) -> ArchResult<PhiModel> {
     let dispatcher = KernelDispatcher::new();
 
-    // Read partial rotary factor from metadata (default 0.5 for Phi-3)
-    let partial_rotary_factor = model
+    // Number of rotated dimensions per head, from the standard GGUF key
+    // `{arch}.rope.dimension_count`. No GGUF converter writes
+    // `{arch}.rope.partial_rotary_factor` (that key does not exist in
+    // gguf-py's `Keys.Rope`); `convert_hf_to_gguf.py`'s `Phi3MiniModel`
+    // writes `add_rope_dimension_count(int(rot_pct * n_embd) // n_head)`,
+    // which is `head_dim` (full rotary) whenever the HF config has no
+    // `partial_rotary_factor` — true for plain Phi-3. Reading the old wrong
+    // key always missed and silently rotated only half of every head.
+    // `llama-model.cpp` defaults `hparams.n_rot` to `n_embd_head_k`
+    // (`head_dim`) before applying this same key, which this mirrors.
+    let rope_dims = model
         .file
         .metadata
-        .get_f32(&format!(
-            "{}.rope.partial_rotary_factor",
-            config.architecture
-        ))
-        .unwrap_or(0.5);
+        .get_u32(&format!("{}.rope.dimension_count", config.architecture))
+        .map(|v| v as usize)
+        .ok()
+        .filter(|&v| v > 0)
+        .unwrap_or(config.head_dim);
 
     // Load token embeddings
     let embd_data = model.tensor_data("token_embd.weight")?;
     let embd_info = model.file.tensors.get("token_embd.weight")?;
     let token_embd = dequant_to_f32(embd_info, embd_data, &dispatcher)?;
+
+    // The table must carry at least `vocab_size * hidden_size` rows (`>=`,
+    // not `==`: some converters keep padding rows beyond the tokenizer's
+    // declared vocabulary). Falling short turns an in-range `token` into an
+    // out-of-bounds `buf_hidden` copy.
+    let min_embd_len = config.vocab_size.saturating_mul(config.hidden_size);
+    if token_embd.len() < min_embd_len {
+        return Err(ArchError::InvalidShape {
+            name: "token_embd.weight".to_string(),
+            expected: vec![config.vocab_size, config.hidden_size],
+            got: vec![token_embd.len()],
+        });
+    }
 
     // Load transformer layers
     let mut layers = Vec::with_capacity(config.num_layers);
@@ -416,30 +540,68 @@ pub fn load_phi_from_gguf(
         let ffn_up = load_quant_linear(model, &format!("{prefix}.ffn_up.weight"))?;
         let ffn_down = load_quant_linear(model, &format!("{prefix}.ffn_down.weight"))?;
 
+        // Resolve every projection's kernel once, here, instead of on every
+        // token of every generation this model ever serves.
+        let attn_qkv_kernel = resolve_kernel(&dispatcher, &attn_qkv)?;
+        let attn_output_kernel = resolve_kernel(&dispatcher, &attn_output)?;
+        let ffn_gate_kernel = resolve_kernel(&dispatcher, &ffn_gate)?;
+        let ffn_up_kernel = resolve_kernel(&dispatcher, &ffn_up)?;
+        let ffn_down_kernel = resolve_kernel(&dispatcher, &ffn_down)?;
+
         layers.push(PhiLayer {
             attn_norm: RmsNorm::new(attn_norm, config.rms_norm_eps),
             attn_qkv,
+            attn_qkv_kernel,
             attn_output,
+            attn_output_kernel,
             ffn_norm: RmsNorm::new(ffn_norm, config.rms_norm_eps),
             ffn_gate,
+            ffn_gate_kernel,
             ffn_up,
+            ffn_up_kernel,
             ffn_down,
+            ffn_down_kernel,
         });
     }
 
     // Load final norm and output projection
     let output_norm_weight = load_rms_norm_weight(model, "output_norm.weight")?;
     let output_norm = RmsNorm::new(output_norm_weight, config.rms_norm_eps);
-    let output = load_quant_linear(model, "output.weight")?;
+    let output = load_lm_head(model)?;
 
-    Ok(PhiModel::new(
+    PhiModel::new(
         config.clone(),
         token_embd,
         layers,
         output_norm,
         output,
-        partial_rotary_factor,
-    ))
+        rope_dims,
+    )
+}
+
+/// Resolve `linear`'s kernel once, wrapped for cheap sharing.
+fn resolve_kernel(
+    dispatcher: &KernelDispatcher,
+    linear: &QuantLinear,
+) -> ArchResult<Arc<dyn QuantKernel>> {
+    Ok(dispatcher.get_kernel(linear.weight.tensor_type)?.into())
+}
+
+/// Load the LM head, falling back to the tied input embedding.
+///
+/// Some Phi checkpoints tie the input and output embeddings and ship no
+/// standalone `output.weight`. When it is absent, `token_embd.weight` is
+/// reused as the LM head (mirroring `qwen3::load_lm_head` and llama.cpp's
+/// own `if (output == NULL) { output = tok_embd; }` fallback for
+/// `LLM_ARCH_PHI3`). Both tensors carry the same dimensions, and the reuse
+/// goes through [`load_quant_linear`], so the head stays quantized.
+fn load_lm_head(model: &oxillama_gguf::GgufModel) -> ArchResult<QuantLinear> {
+    if !model.file.tensors.contains("output.weight")
+        && model.file.tensors.contains("token_embd.weight")
+    {
+        return load_quant_linear(model, "token_embd.weight");
+    }
+    load_quant_linear(model, "output.weight")
 }
 
 /// Load a quantized linear layer from GGUF.
@@ -451,9 +613,13 @@ fn load_quant_linear(model: &oxillama_gguf::GgufModel, name: &str) -> ArchResult
         .map_err(|_| ArchError::MissingTensor {
             name: name.to_string(),
         })?;
-    let data = model.tensor_data(name)?;
-    let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
-    let tensor = QuantTensor::new(data.to_vec(), shape, info.tensor_type);
+    let shape = gguf_linear_shape(&info.dimensions);
+    let tensor_type = info.tensor_type;
+    // Shared mmap-backed view, not a `to_vec()` copy: the GEMV kernels only
+    // ever read `&[u8]` out of the payload, so a private copy would double
+    // the checkpoint's resident cost for nothing.
+    let data = model.tensor_bytes(name)?;
+    let tensor = QuantTensor::from_shared(data, shape, tensor_type);
     Ok(QuantLinear::new(tensor, None))
 }
 

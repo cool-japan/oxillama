@@ -31,14 +31,16 @@ serde_json = { workspace = true }
 serde-wasm-bindgen = { workspace = true }
 # Pure-compute crates used regardless of feature set.
 # `parallel` is intentionally omitted so rayon is NOT compiled into WASM.
-oxillama-gguf = { workspace = true, default-features = false }
+# `std` is required unconditionally (not just under `inference`): `streaming_loader`
+# and `streaming_load` both use `StreamingGgufParser`, which is gated behind
+# `oxillama-gguf`'s `std` feature. Without it, `--no-default-features` (which
+# still compiles those two always-on modules) fails with "cannot find
+# `StreamingGgufParser` in `oxillama_gguf`" — the default build only worked
+# incidentally, via `inference` -> `oxillama-runtime` re-enabling `std` through
+# feature unification.
+oxillama-gguf = { workspace = true, default-features = false, features = ["std"] }
 oxillama-quant = { workspace = true, default-features = false }
 # Inference engine with pure-Rust tokenizer — compiled only when `inference`
 # feature is active.  Uses `tokenizer-wasm` (fancy-regex) instead of the
 # C-backed `tokenizer-onig` backend to remain wasm32-unknown-unknown clean.
 oxillama-runtime = { workspace = true, default-features = false, features = ["tokenizer-wasm", "llama", "qwen3", "mistral", "gemma", "phi"], optional = true }
-# wasm-streams bridges between Web Streams API (ReadableStream) and Rust async
-# iterators, used by StreamingGgufLoader for push-mode ReadableStream ingestion.
-wasm-streams = { workspace = true }
-
-

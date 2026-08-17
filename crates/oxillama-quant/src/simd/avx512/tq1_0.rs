@@ -29,25 +29,34 @@ const QH_BYTES: usize = 4;
 const QH_OFFSET: usize = QS_BYTES;
 /// Byte offset of FP16 scale `d`.
 const D_OFFSET: usize = QS_BYTES + QH_BYTES;
+/// Ternary digits packed into one `qs` byte.
+const QS_DIGITS: usize = 5;
+/// Ternary digits packed into one `qh` byte.
+const QH_DIGITS: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Compile-time LUT for qs byte → 5 ternary values
 // ---------------------------------------------------------------------------
 
-/// Precomputed LUT: `qs_byte` → 5 ternary values as `i8` ∈ {-1, 0, +1}.
+/// Precomputed LUT: packed byte → 5 ternary digits as `i8` ∈ {-1, 0, +1}.
 ///
-/// For byte `b`, the five base-3 digits are computed as:
-/// `digit[i] = (b / 3^i) % 3`, and the ternary value is `digit - 1`.
-static TQ1_0_QS_LUT: [[i8; 5]; 256] = {
+/// TQ1_0 stores the base-3 digit tuple in *fixed point*: the encoder writes
+/// `ceil(q * 256 / 243)` for the tuple value `q`, and `dequantize_row_tq1_0`
+/// recovers digit `n` with `q = (uint8_t)(byte * pow3[n])` followed by
+/// `xi = ((uint16_t) q * 3) >> 8`.  A naive `% 3` / `/ 3` decomposition of the
+/// stored byte gives different *values*, not just a different order.  `qh`
+/// uses the same scheme (four digits shifted up one position at encode time),
+/// so this table serves both, with `qh` reading digits `0..4`.
+static TQ1_0_TRIT_LUT: [[i8; 5]; 256] = {
+    let pow3: [u8; 5] = [1, 3, 9, 27, 81];
     let mut table = [[0i8; 5]; 256];
-    let mut b = 0u16;
+    let mut b = 0usize;
     while b < 256 {
-        let mut q = b;
-        let mut i = 0usize;
-        while i < 5 {
-            table[b as usize][i] = (q % 3) as i8 - 1;
-            q /= 3;
-            i += 1;
+        let mut n = 0usize;
+        while n < 5 {
+            let q = (b as u8).wrapping_mul(pow3[n]);
+            table[b][n] = (((q as u16) * 3) >> 8) as i8 - 1;
+            n += 1;
         }
         b += 1;
     }
@@ -112,7 +121,7 @@ impl QuantKernel for Tq1_0Avx512 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: bounds checked above; CPU feature guaranteed by KernelDispatcher.
             *out = unsafe {
@@ -123,7 +132,7 @@ impl QuantKernel for Tq1_0Avx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -170,24 +179,38 @@ impl QuantKernel for Tq1_0Avx512 {
 unsafe fn decode_vals(block: &[u8]) -> [i8; BLOCK_SIZE] {
     let mut vals = [0i8; BLOCK_SIZE];
 
-    // qs: 48 bytes → 240 ternary values via LUT.
-    for (i, &byte) in block[..QS_BYTES].iter().enumerate() {
-        let row = &TQ1_0_QS_LUT[byte as usize];
-        let base = i * 5;
-        vals[base] = row[0];
-        vals[base + 1] = row[1];
-        vals[base + 2] = row[2];
-        vals[base + 3] = row[3];
-        vals[base + 4] = row[4];
+    // qs: 48 bytes → 240 ternary values, digit-major within each group
+    // (one 32-byte group then one 16-byte group — upstream's
+    // `sizeof(qs) - sizeof(qs) % 32` split).
+    let mut out_idx = 0usize;
+    let mut j = 0usize;
+    let qs_head = QS_BYTES - QS_BYTES % 32;
+    while j < qs_head {
+        for digit in 0..QS_DIGITS {
+            for m in 0..32 {
+                vals[out_idx] = TQ1_0_TRIT_LUT[block[j + m] as usize][digit];
+                out_idx += 1;
+            }
+        }
+        j += 32;
+    }
+    while j < QS_BYTES {
+        for digit in 0..QS_DIGITS {
+            for m in 0..16 {
+                vals[out_idx] = TQ1_0_TRIT_LUT[block[j + m] as usize][digit];
+                out_idx += 1;
+            }
+        }
+        j += 16;
     }
 
-    // qh: 4 bytes → 16 ternary values (positions 240..256).
-    for (i, &byte) in block[QH_OFFSET..QH_OFFSET + QH_BYTES].iter().enumerate() {
-        let base = 240 + i * 4;
-        vals[base] = (byte & 0x03) as i8 - 1;
-        vals[base + 1] = ((byte >> 2) & 0x03) as i8 - 1;
-        vals[base + 2] = ((byte >> 4) & 0x03) as i8 - 1;
-        vals[base + 3] = ((byte >> 6) & 0x03) as i8 - 1;
+    // qh: 4 bytes → 16 ternary values (positions 240..256), also digit-major
+    // and using the same base-3 decode as `qs`.
+    for digit in 0..QH_DIGITS {
+        for m in 0..QH_BYTES {
+            vals[out_idx] = TQ1_0_TRIT_LUT[block[QH_OFFSET + m] as usize][digit];
+            out_idx += 1;
+        }
     }
 
     vals

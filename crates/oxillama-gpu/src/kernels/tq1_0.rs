@@ -68,38 +68,50 @@ const TQ1_0_QH_OFFSET: usize = TQ1_0_QS_BYTES; // 48
 #[cfg(any(feature = "gpu", test))]
 const TQ1_0_D_OFFSET: usize = TQ1_0_QS_BYTES + TQ1_0_QH_BYTES; // 52
 
-/// Decode a single `qs` byte into 5 ternary values (-1, 0, or +1).
-///
-/// The byte encodes 5 base-3 digits: `v[i] = (q / 3^i) % 3 - 1`.
+/// Ternary digits packed per `qs` byte (base-3, 3^5 = 243 ≤ 256).
 #[cfg(any(feature = "gpu", test))]
-#[inline]
-fn decode_qs_byte(byte: u8) -> [i8; 5] {
-    let mut q = byte as u16;
-    let mut out = [0i8; 5];
-    for v in &mut out {
-        *v = (q % 3) as i8 - 1;
-        q /= 3;
-    }
-    out
-}
+const TQ1_0_QS_DIGITS: usize = 5;
+/// Ternary digits packed per `qh` byte (base-3, shifted up one trit).
+#[cfg(any(feature = "gpu", test))]
+const TQ1_0_QH_DIGITS: usize = 4;
 
-/// Decode a single `qh` byte into 4 ternary values (-1, 0, or +1).
+/// Powers of three used by the fixed-point base-3 decode, as `u8` exactly as
+/// upstream declares them (`static const uint8_t pow3[6]`).
+#[cfg(any(feature = "gpu", test))]
+const POW3: [u8; 5] = [1, 3, 9, 27, 81];
+
+/// Recover ternary digit `digit` from a packed TQ1_0 byte.
 ///
-/// Each pair of bits encodes one value: `(bits & 3) - 1`.
+/// TQ1_0 is **not** a plain base-3 packing: `quantize_row_tq1_0_ref` builds
+/// the 5-digit value most-significant-digit-first,
+/// `q = Σ_n xi_n · 3^(4-n)` in `0..=242`, and stores the scaled ceiling
+/// `ceil(q · 256 / 243)`.  This is a literal port of upstream's decode:
+///
+/// ```c
+/// uint8_t q  = x[i].qs[j + m] * pow3[n];   // uint8_t: wraps mod 256
+/// int16_t xi = ((uint16_t) q * 3) >> 8;    // leading base-3 digit
+/// *y++ = (float) (xi - 1) * d;
+/// ```
+///
+/// Decoding the stored byte with naive `% 3` / `/ 3` arithmetic (the
+/// previous implementation here) produces *different values*, not merely a
+/// different order — see `oxillama_quant::reference::tq1_0`'s module doc for
+/// the worked example.  `qh` uses the same scheme with the four digits
+/// shifted up one trit.
 #[cfg(any(feature = "gpu", test))]
 #[inline]
-fn decode_qh_byte(byte: u8) -> [i8; 4] {
-    [
-        (byte & 0x03) as i8 - 1,
-        ((byte >> 2) & 0x03) as i8 - 1,
-        ((byte >> 4) & 0x03) as i8 - 1,
-        ((byte >> 6) & 0x03) as i8 - 1,
-    ]
+fn decode_trit(byte: u8, digit: usize) -> i8 {
+    let q = byte.wrapping_mul(POW3[digit]);
+    ((((q as u16) * 3) >> 8) as i8) - 1
 }
 
 /// Dequantise all TQ1_0 blocks to a flat f32 buffer.
 #[cfg(any(feature = "gpu", test))]
-fn dequant_tq1_0_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuResult<Vec<f32>> {
+pub(crate) fn dequant_tq1_0_to_f32(
+    weight_bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> GpuResult<Vec<f32>> {
     let blocks_per_row = cols.div_ceil(TQ1_0_BLOCK_SIZE);
     let expected_bytes = rows * blocks_per_row * TQ1_0_BLOCK_BYTES;
     if weight_bytes.len() < expected_bytes {
@@ -120,29 +132,56 @@ fn dequant_tq1_0_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuRes
                 .to_f32();
 
             let weight_base = blk * TQ1_0_BLOCK_SIZE;
-            let mut out_idx = weight_base;
+            // Block-local output index, 0..256.  Kept separate from
+            // `weight_base` (unlike the previous implementation, which
+            // computed `col = out_idx - weight_base` and therefore always
+            // canceled back to `0..256` regardless of `blk` — silently
+            // aliasing every block past the first onto columns `0..256`).
+            let mut local_idx = 0usize;
 
-            // Decode qs: 48 bytes → 240 ternary values
-            for &qs_byte in block.iter().take(TQ1_0_QS_BYTES) {
-                let vals = decode_qs_byte(qs_byte);
-                for &v in &vals {
-                    let col = out_idx - weight_base;
-                    if col < cols {
-                        f32_weights[row * cols + col] = d * v as f32;
+            // Decode qs: 48 bytes → 240 ternary values, digit-major within
+            // each group.  48 = one 32-byte group (bytes 0..32, digit-major
+            // over 32 → 160 values) + one 16-byte group (bytes 32..48,
+            // digit-major over 16 → 80 values), matching upstream's
+            // `sizeof(qs) - sizeof(qs) % 32` split.
+            let mut j = 0usize;
+            let qs_head = TQ1_0_QS_BYTES - TQ1_0_QS_BYTES % 32; // 32
+            while j < qs_head {
+                for digit in 0..TQ1_0_QS_DIGITS {
+                    for m in 0..32 {
+                        let col = weight_base + local_idx;
+                        if col < cols {
+                            let v = decode_trit(block[j + m], digit);
+                            f32_weights[row * cols + col] = d * v as f32;
+                        }
+                        local_idx += 1;
                     }
-                    out_idx += 1;
                 }
+                j += 32;
+            }
+            while j < TQ1_0_QS_BYTES {
+                for digit in 0..TQ1_0_QS_DIGITS {
+                    for m in 0..16 {
+                        let col = weight_base + local_idx;
+                        if col < cols {
+                            let v = decode_trit(block[j + m], digit);
+                            f32_weights[row * cols + col] = d * v as f32;
+                        }
+                        local_idx += 1;
+                    }
+                }
+                j += 16;
             }
 
-            // Decode qh: 4 bytes → 16 ternary values
-            for qh_idx in 0..TQ1_0_QH_BYTES {
-                let vals = decode_qh_byte(block[TQ1_0_QH_OFFSET + qh_idx]);
-                for &v in &vals {
-                    let col = out_idx - weight_base;
+            // Decode qh: 4 bytes → 16 ternary values, also digit-major.
+            for digit in 0..TQ1_0_QH_DIGITS {
+                for m in 0..TQ1_0_QH_BYTES {
+                    let col = weight_base + local_idx;
                     if col < cols {
+                        let v = decode_trit(block[TQ1_0_QH_OFFSET + m], digit);
                         f32_weights[row * cols + col] = d * v as f32;
                     }
-                    out_idx += 1;
+                    local_idx += 1;
                 }
             }
         }
@@ -333,26 +372,31 @@ fn bgl_uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
 mod tests {
     use super::*;
 
-    /// Encode 5 ternary values (-1, 0, +1) into a single qs byte (base-3).
+    /// Encode 5 ternary values into one `qs` byte — literal port of the inner
+    /// loop of upstream `quantize_row_tq1_0_ref`.  `vals[n]` becomes digit
+    /// `n`, i.e. the value [`decode_trit`] recovers with
+    /// `decode_trit(byte, n)`.  Digits accumulate most-significant-first and
+    /// the result is the fixed-point ceiling `ceil(q · 256 / 243)`, which is
+    /// what makes the `(·3) >> 8` decode exact (see [`decode_trit`]'s doc).
     fn encode_qs(vals: [i8; 5]) -> u8 {
-        let mut byte: u8 = 0;
-        let mut multiplier: u8 = 1;
+        let mut q: u8 = 0;
         for &v in &vals {
-            let encoded = (v + 1) as u8; // -1→0, 0→1, +1→2
-            byte = byte.wrapping_add(encoded.wrapping_mul(multiplier));
-            multiplier = multiplier.wrapping_mul(3);
+            q = q * 3 + (v + 1) as u8;
         }
-        byte
+        ((q as u16) * 256).div_ceil(243) as u8
     }
 
-    /// Encode 4 ternary values (-1, 0, +1) into a single qh byte (2-bit codes).
+    /// Encode 4 ternary values into one `qh` byte — the same base-3 scheme
+    /// as [`encode_qs`] but with the four digits shifted up one position
+    /// (`q *= 3`), leaving the least-significant trit unused, matching
+    /// upstream's `qh` encode loop.
     fn encode_qh(vals: [i8; 4]) -> u8 {
-        let mut byte: u8 = 0;
-        for (i, &v) in vals.iter().enumerate() {
-            let encoded = (v + 1) as u8;
-            byte |= encoded << (i * 2);
+        let mut q: u8 = 0;
+        for &v in &vals {
+            q = q * 3 + (v + 1) as u8;
         }
-        byte
+        q *= 3;
+        ((q as u16) * 256).div_ceil(243) as u8
     }
 
     fn make_tq1_0_block(scale: f32, qs: &[u8; 48], qh: &[u8; 4]) -> Vec<u8> {
@@ -418,12 +462,12 @@ mod tests {
 
     #[test]
     fn test_decode_roundtrip_qs() {
-        // Verify decode_qs_byte inverts encode_qs.
+        // Verify decode_trit(.., n) for n in 0..5 inverts encode_qs.
         for a in -1i8..=1 {
             for b in -1i8..=1 {
                 let vals = [a, b, 1, -1, 0];
                 let encoded = encode_qs(vals);
-                let decoded = decode_qs_byte(encoded);
+                let decoded: [i8; 5] = std::array::from_fn(|n| decode_trit(encoded, n));
                 assert_eq!(vals, decoded, "qs roundtrip failed for {vals:?}");
             }
         }
@@ -431,12 +475,12 @@ mod tests {
 
     #[test]
     fn test_decode_roundtrip_qh() {
-        // Verify decode_qh_byte inverts encode_qh.
+        // Verify decode_trit(.., n) for n in 0..4 inverts encode_qh.
         for a in -1i8..=1 {
             for b in -1i8..=1 {
                 let vals = [a, b, -1, 1];
                 let encoded = encode_qh(vals);
-                let decoded = decode_qh_byte(encoded);
+                let decoded: [i8; 4] = std::array::from_fn(|n| decode_trit(encoded, n));
                 assert_eq!(vals, decoded, "qh roundtrip failed for {vals:?}");
             }
         }

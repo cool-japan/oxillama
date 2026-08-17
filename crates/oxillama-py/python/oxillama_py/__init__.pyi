@@ -149,6 +149,10 @@ class KvCacheFullError(OxiLlamaError):
     """KV cache capacity exceeded during generation."""
     ...
 
+class GpuUnavailableError(OxiLlamaError):
+    """GPU offload was requested but no usable device could be bound."""
+    ...
+
 # ---------------------------------------------------------------------------
 # SamplerConfig
 # ---------------------------------------------------------------------------
@@ -166,6 +170,16 @@ class SamplerConfig:
     mirostat: int
     mirostat_tau: float
     mirostat_eta: float
+    frequency_penalty: float
+    """OpenAI-style frequency penalty: ``logit[t] -= count(t) * frequency_penalty``
+    (0.0 = disabled)."""
+    presence_penalty: float
+    """OpenAI-style presence penalty: a flat ``logit[t] -= presence_penalty``
+    for every distinct token seen at least once (0.0 = disabled)."""
+    eog_token_ids: list[int]
+    """End-of-generation token IDs consulted by grammar-constrained sampling.
+    Only meaningful together with a grammar (grammars are not exposed via
+    this class — use the string-grammar API on :class:`Engine` instead)."""
 
     def __init__(
         self,
@@ -180,11 +194,91 @@ class SamplerConfig:
         mirostat: int = 0,
         mirostat_tau: float = 5.0,
         mirostat_eta: float = 0.1,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        eog_token_ids: Optional[list[int]] = None,
     ) -> None: ...
     @staticmethod
     def greedy() -> SamplerConfig: ...
     @staticmethod
     def mirostat_v2(tau: float = 5.0, eta: float = 0.1) -> SamplerConfig: ...
+    def __repr__(self) -> str: ...
+
+# ---------------------------------------------------------------------------
+# FinishReason / GenerationConfig / GenerationOutcome
+# ---------------------------------------------------------------------------
+
+class FinishReason:
+    """Why generation stopped. A PyO3 "simple enum" — behaves like
+    :class:`enum.Enum` with variant class attributes and supports
+    ``==``/``int()`` (see :meth:`__eq__`/:meth:`__int__`)."""
+
+    Eos: "FinishReason"
+    """An end-of-generation token was sampled."""
+    MaxTokens: "FinishReason"
+    """The requested ``max_tokens`` budget was exhausted."""
+    ContextFull: "FinishReason"
+    """The KV cache reached the model's context length."""
+    Stopped: "FinishReason"
+    """A caller-supplied stop sequence was produced."""
+    Cancelled: "FinishReason"
+    """A ``CancellationToken`` passed as ``cancel_token=`` was cancelled.
+
+    The decode loop stops at the next token boundary and the outcome's
+    ``text`` holds everything produced up to that point."""
+
+    def as_openai_str(self) -> str:
+        """The OpenAI ``finish_reason`` string.
+
+        ``"stop"`` for ``Eos``/``Stopped``, ``"length"`` for
+        ``MaxTokens``/``ContextFull``, and ``"cancelled"`` for ``Cancelled``
+        (which has no OpenAI counterpart, so it is reported honestly rather
+        than laundered into ``"stop"``)."""
+        ...
+    def is_natural(self) -> bool:
+        """``True`` when the model chose to stop rather than being cut off."""
+        ...
+    def is_cancelled(self) -> bool:
+        """``True`` when generation ended because the caller cancelled it."""
+        ...
+    def __repr__(self) -> str: ...
+    def __str__(self) -> str: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __int__(self) -> int: ...
+
+class GenerationConfig:
+    """Per-request generation settings for :meth:`Engine.generate_detailed`."""
+
+    max_tokens: int
+    sampler: SamplerConfig
+    stop: list[str]
+    render_special: bool
+    add_special: bool
+    parse_special: bool
+
+    def __init__(
+        self,
+        max_tokens: int = 128,
+        *,
+        sampler: Optional[SamplerConfig] = None,
+        stop: Optional[list[str]] = None,
+        render_special: bool = False,
+        add_special: bool = True,
+        parse_special: bool = True,
+    ) -> None: ...
+    def __repr__(self) -> str: ...
+
+class GenerationOutcome:
+    """Everything describing a completed :meth:`Engine.generate_detailed` call."""
+
+    text: str
+    finish_reason: FinishReason
+    generated_tokens: list[int]
+    prompt_tokens: int
+    stop_sequence: Optional[str]
+
+    def completion_tokens(self) -> int: ...
+    def total_tokens(self) -> int: ...
     def __repr__(self) -> str: ...
 
 # ---------------------------------------------------------------------------
@@ -264,6 +358,15 @@ class Engine:
         progress_capture_text: bool = False,
         strict_progress: bool = False,
     ) -> str: ...
+    def generate_detailed(
+        self,
+        prompt: str,
+        config: GenerationConfig,
+        callback: Optional[Callable[[str], None]] = None,
+        *,
+        cancel_token: Optional["CancellationToken"] = None,
+    ) -> GenerationOutcome: ...
+    def eog_token_ids(self) -> list[int]: ...
     def embed(self, text: str) -> list[float]: ...
     def embed_numpy(self, text: str) -> "np.ndarray[tuple[int], np.dtype[np.float32]]": ...
     def embed_batch_numpy(self, texts: Sequence[str]) -> "np.ndarray[tuple[int, int], np.dtype[np.float32]]": ...

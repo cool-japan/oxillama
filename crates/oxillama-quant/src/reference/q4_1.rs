@@ -7,6 +7,10 @@
 //!
 //! Weight formula: `w = d * nibble + m` where nibble is 4-bit (0..15).
 //!
+//! Nibble layout is GGML's split-half convention (`dequantize_row_q4_1`):
+//! byte `j` holds weight `j` in its low nibble and weight `j + 16` in its
+//! high nibble.
+//!
 //! Effective: 5.0 bits/weight.
 
 use crate::error::{QuantError, QuantResult};
@@ -41,8 +45,8 @@ impl QuantKernel for Q4_1Ref {
             let byte = block[4 + i];
             let lo = (byte & 0x0F) as f32;
             let hi = ((byte >> 4) & 0x0F) as f32;
-            output[i * 2] = d * lo + m;
-            output[i * 2 + 1] = d * hi + m;
+            output[i] = d * lo + m;
+            output[i + Q4_1_BLOCK_SIZE / 2] = d * hi + m;
         }
 
         Ok(())
@@ -77,7 +81,7 @@ impl QuantKernel for Q4_1Ref {
         let blocks_per_row = n_cols.div_ceil(Q4_1_BLOCK_SIZE);
         let row_bytes = blocks_per_row * Q4_1_BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -92,11 +96,11 @@ impl QuantKernel for Q4_1Ref {
                 let inp = &input[input_offset..input_offset + n_remaining];
 
                 let mut input_sum = 0.0f32;
-                for (i, &q) in qs.iter().enumerate().take(16) {
+                for (i, &q) in qs.iter().enumerate().take(Q4_1_BLOCK_SIZE / 2) {
                     let lo = (q & 0x0F) as f32;
                     let hi = (q >> 4) as f32;
-                    let j0 = i * 2;
-                    let j1 = i * 2 + 1;
+                    let j0 = i;
+                    let j1 = i + Q4_1_BLOCK_SIZE / 2;
                     if j0 < n_remaining {
                         sum += d * lo * inp[j0];
                         input_sum += inp[j0];
@@ -110,7 +114,7 @@ impl QuantKernel for Q4_1Ref {
             }
 
             *out = sum;
-        }
+        });
 
         Ok(())
     }

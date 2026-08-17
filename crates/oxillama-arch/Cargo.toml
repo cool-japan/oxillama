@@ -12,7 +12,19 @@ categories = ["science", "algorithms"]
 readme = "README.md"
 
 [features]
-default = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "llava", "llava16", "falcon", "minicpm", "olmo2", "granite", "deepseek", "dbrx", "grok", "mamba2", "jamba", "qwen2-vl", "mixtral", "stablelm", "gptneox", "bloom", "phimoe"]
+# The workspace dependency table pins `oxillama-arch` to
+# `default-features = false`, so every in-workspace consumer names the
+# architectures it wants explicitly instead of inheriting them by feature
+# unification.  `all-architectures` exists so that list lives in exactly ONE
+# place: `ArchitectureRegistry::with_builtins()` registers each architecture
+# under its own `#[cfg(feature = ...)]`, so an architecture missing from a
+# consumer's feature list simply vanishes from the registry and the engine
+# rejects a perfectly valid GGUF with "unsupported architecture" at *run*
+# time.  Nothing at compile time catches that, which is why the list must not
+# be duplicated across manifests — adding a new architecture to
+# `all-architectures` is enough, no consumer manifest needs touching.
+default = ["all-architectures"]
+all-architectures = ["llama", "qwen3", "mistral", "gemma", "phi", "command-r", "starcoder", "llava", "llava16", "falcon", "minicpm", "olmo2", "granite", "deepseek", "dbrx", "grok", "mamba2", "qwen2-vl", "mixtral", "stablelm", "gptneox", "bloom", "phimoe"]
 llama = []
 qwen3 = []
 mistral = []
@@ -32,20 +44,37 @@ grok = []
 mamba2 = []
 jamba = ["mamba2"]
 qwen2-vl = []
-mixtral = []
+# Mixtral is LLaMA topology with a sparse MoE FFN: it reuses llama's NORM RoPE,
+# attention primitives, quantized-expert MoE and GGUF loading helpers.
+mixtral = ["llama"]
 stablelm = []
 gptneox = []
 bloom = []
 phimoe = []
 reference-f32 = []
+# ── SIMD / threading passthroughs ────────────────────────────────────────────
+# `simd-neon` and `simd-avx2` are already switched on unconditionally by the
+# `oxillama-quant` dependency below (they are no-ops off their target arch), so
+# these exist only so downstream crates can name them explicitly.
+simd-neon = ["oxillama-quant/simd-neon"]
+simd-avx2 = ["oxillama-quant/simd-avx2"]
+simd-avx512 = ["oxillama-quant/simd-avx512"]
+# Multi-threaded GEMV row splitting inside oxillama-quant.  NOT in `default`:
+# it pulls rayon, which must stay out of `wasm32-unknown-unknown` builds.
+# `oxillama-runtime/parallel` (default-on for native) turns it on.
+parallel = ["oxillama-quant/parallel"]
 
 [dependencies]
 oxillama-gguf = { workspace = true, features = ["std"] }
-oxillama-quant.workspace = true
+# The workspace table pins `default-features = false`, which would otherwise
+# strip the SIMD kernels back out; re-enable them here so every consumer of
+# oxillama-arch (runtime, cli, server, py, and out-of-tree path deps) gets the
+# vectorised GEMV without touching its own manifest.
+oxillama-quant = { workspace = true, features = ["simd-neon", "simd-avx2"] }
 half.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-oxillama-gguf = { workspace = true, features = ["test-utils"] }
+oxillama-gguf = { path = "../oxillama-gguf", default-features = false, features = ["test-utils"] }
 proptest.workspace = true

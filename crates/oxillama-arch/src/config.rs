@@ -1,9 +1,183 @@
 //! Model configuration extracted from GGUF metadata.
 
-use oxillama_gguf::{GgufTensorType, MetadataStore};
+use oxillama_gguf::{GgufTensorType, MetadataStore, MetadataValue, TensorStore};
 
-use crate::common::rope::RopeScalingType;
+use crate::common::attention::SwaPattern;
+use crate::common::rope::{RopeScalingType, RopeStyle};
 use crate::error::{ArchError, ArchResult};
+
+/// The RoPE element-pairing convention llama.cpp assigns to `arch_id`.
+///
+/// Reproduces `llama_model_rope_type()` in `src/llama-model.cpp`, keyed by the
+/// GGUF `general.architecture` string from `LLM_ARCH_NAMES` in
+/// `src/llama-arch.cpp`.
+///
+/// Architectures that do not use RoPE at all (`LLAMA_ROPE_TYPE_NONE`: bloom,
+/// mamba, mamba2, jamba, gpt2, mpt, rwkv*, t5, …) and the M-RoPE families
+/// (qwen2vl, qwen3vl) are **not** in either table; they fall through to the
+/// [`RopeStyle::Neox`] default, which is inert for them because they never
+/// build a [`RopeTable`](crate::common::rope::RopeTable).
+///
+/// Aliases that are not llama.cpp architecture ids but *are* registered by this
+/// crate (`mistral`, `mixtral`, `yi`, `internlm3`, `llava`, `llava16`) are
+/// mapped to the family their checkpoints actually ship as — all of which are
+/// written as `"llama"` and are therefore `Norm`.
+///
+/// # Name traps
+///
+/// `starcoder` is `Norm` but `starcoder2` is `Neox`; `minicpm` is `Norm` but
+/// `minicpm3` is `Neox`; `olmo` is `Norm` but `olmo2` is `Neox`.
+pub fn rope_style_for_arch(arch_id: &str) -> RopeStyle {
+    match arch_id {
+        // ── LLAMA_ROPE_TYPE_NORM: rotate (x[2i], x[2i+1]) ────────────────
+        // Q/K rows were permuted by convert_hf_to_gguf.py::permute().
+        "arcee"
+        | "arctic"
+        | "baichuan"
+        | "bailingmoe"
+        | "chameleon"
+        | "chatglm"
+        | "cohere2"
+        | "command-r"
+        | "deci"
+        | "deepseek"
+        | "deepseek2"
+        | "ernie4_5"
+        | "ernie4_5-moe"
+        | "glm-dsa"
+        | "granite"
+        | "granitehybrid"
+        | "granitemoe"
+        | "internlm2"
+        | "llada"
+        | "llama"
+        | "llama-embed"
+        | "llama4"
+        | "maincoder"
+        | "minicpm"
+        | "mistral3"
+        | "neo-bert"
+        | "olmo"
+        | "plm"
+        | "smollm3"
+        | "starcoder"
+        | "xverse"
+        // Registry aliases whose checkpoints ship as `llama`.
+        | "mistral"
+        | "mixtral"
+        | "yi"
+        | "internlm3"
+        | "llava"
+        | "llava16" => RopeStyle::Norm,
+
+        // ── LLAMA_ROPE_TYPE_NEOX: rotate (x[i], x[i + n/2]) ──────────────
+        // Everything else that ropes.  Listed explicitly so that an unknown
+        // architecture is visibly falling through to the default rather than
+        // matching by accident.
+        "afmoe" | "apertus" | "bailingmoe2" | "bert" | "bitnet" | "codeshell" | "cogvlm"
+        | "dbrx" | "dots1" | "dream" | "eurobert" | "exaone" | "exaone-moe" | "exaone4"
+        | "falcon" | "falcon-h1" | "gemma" | "gemma-embedding" | "gemma2" | "gemma3"
+        | "gemma3n" | "gpt-oss" | "gptneox" | "grok" | "grovemoe" | "hunyuan-dense"
+        | "hunyuan-moe" | "jais2" | "jina-bert-v3" | "lfm2" | "lfm2moe" | "llada-moe"
+        | "mimo2" | "minicpm3" | "minimax-m2" | "modern-bert" | "nemotron" | "nomic-bert"
+        | "nomic-bert-moe" | "olmo2" | "olmoe" | "openelm" | "orion" | "pangu-embedded"
+        | "phi2" | "phi3" | "phimoe" | "plamo" | "plamo2" | "plamo3" | "qwen" | "qwen2"
+        | "qwen2moe" | "qwen3" | "qwen3moe" | "qwen3next" | "rnd1" | "seed_oss"
+        | "smallthinker" | "stablelm" | "starcoder2" | "step35" => RopeStyle::Neox,
+
+        _ => RopeStyle::Neox,
+    }
+}
+
+/// The sliding-window layer pattern llama.cpp assigns to `arch_id`.
+///
+/// Reproduces the `hparams.set_swa_pattern(..)` call each architecture makes in
+/// `llama_model::load_hparams`.  Returns `None` for architectures that have no
+/// SWA at all (which includes Gemma **v1** — only Gemma-2 and later interleave).
+pub fn swa_pattern_for_arch(arch_id: &str) -> Option<SwaPattern> {
+    match arch_id {
+        // hparams.set_swa_pattern(2)
+        "gemma2" | "gpt-oss" => Some(SwaPattern::EveryNth(2)),
+        // hparams.set_swa_pattern(4) — "3 sliding, 1 full"
+        "cohere2" | "olmo2" | "exaone4" | "exaone-moe" | "llama4" | "afmoe" => {
+            Some(SwaPattern::EveryNth(4))
+        }
+        // hparams.set_swa_pattern(5)
+        "gemma3n" => Some(SwaPattern::EveryNth(5)),
+        // hparams.set_swa_pattern(6)
+        "gemma3" | "gemma-embedding" => Some(SwaPattern::EveryNth(6)),
+        // hparams.set_swa_pattern(4, dense_first = true)
+        "smallthinker" => Some(SwaPattern::EveryNthDenseFirst(4)),
+        // llama.cpp *disables* Phi SWA: `swa_type = NONE`, `n_swa = 0`,
+        // `set_swa_pattern(1)` — and `il % 1 < 0` is false for every layer, so
+        // nothing slides.  See the comment at `LLM_ARCH_PHI3` referencing
+        // ggml-org/llama.cpp#13676.
+        "phi3" => Some(SwaPattern::EveryNth(1)),
+        // Mistral ships as the `llama` architecture id; llama.cpp applies its
+        // sliding window uniformly (no `set_swa_pattern` call at all).  The
+        // `mistral*` ids are this crate's own.
+        "mistral" | "mistral3" => Some(SwaPattern::All),
+        _ => None,
+    }
+}
+
+/// Architectures whose FFN activation is GELU rather than SiLU/SwiGLU.
+///
+/// Derived from the `build_*` graphs in `src/llama-model.cpp`
+/// (`ggml_gelu` vs `ggml_silu`).  Only consulted when the checkpoint carries no
+/// explicit `{arch}.activation` / `general.activation` key — GGUF has no
+/// standard activation key, so this table is the only signal available.
+///
+/// # `falcon` is deliberately absent
+///
+/// llama.cpp's `falcon` graph does use GELU, but `falcon/config.rs` treats
+/// `ModelConfig::activation == "gelu"` as its **out-of-band discriminator**
+/// between Falcon-1 (ALiBi + parallel attention) and Falcon-2 (RoPE + GQA);
+/// both ship under the same `falcon` architecture id, so the activation cannot
+/// actually distinguish them.  Returning `"gelu"` here would flip every Falcon-2
+/// checkpoint onto the ALiBi path.  Falcon's owner must re-key that heuristic
+/// on the tensor set (`attn_norm_2` presence) before `falcon` can be added.
+fn default_activation_for_arch(arch_id: &str) -> &'static str {
+    match arch_id {
+        "gemma" | "gemma2" | "gemma3" | "gemma3n" | "gemma-embedding" => "gelu_pytorch_tanh",
+        "bloom" | "gpt2" | "gptneox" | "starcoder" | "starcoder2" | "phi2" | "codeshell"
+        | "jais" | "bert" | "nomic-bert" | "mpt" | "refact" => "gelu",
+        _ => "silu",
+    }
+}
+
+/// Map a GGUF `general.file_type` (llama.cpp's `LLAMA_FTYPE`) onto the
+/// predominant tensor quantization type it denotes.
+///
+/// Mirrors `gguf-py`'s `LlamaFileType` enum.  Returns `None` for
+/// `GUESSED` (1024) and for any value that is not a recognised file type.
+fn quant_type_from_file_type(file_type: u32) -> Option<GgufTensorType> {
+    Some(match file_type {
+        0 => GgufTensorType::F32,
+        1 => GgufTensorType::F16,
+        2 => GgufTensorType::Q4_0,
+        3 => GgufTensorType::Q4_1,
+        7 => GgufTensorType::Q8_0,
+        8 => GgufTensorType::Q5_0,
+        9 => GgufTensorType::Q5_1,
+        10 | 21 => GgufTensorType::Q2K,
+        11..=13 => GgufTensorType::Q3K,
+        14 | 15 => GgufTensorType::Q4K,
+        16 | 17 => GgufTensorType::Q5K,
+        18 => GgufTensorType::Q6K,
+        19 => GgufTensorType::Iq2Xxs,
+        20 => GgufTensorType::Iq2Xs,
+        22 | 23 => GgufTensorType::Iq3Xxs,
+        24 => GgufTensorType::Iq1S,
+        25 => GgufTensorType::Iq4Nl,
+        26 | 27 => GgufTensorType::Iq3S,
+        28 | 29 => GgufTensorType::Iq2S,
+        30 => GgufTensorType::Iq4Xs,
+        31 => GgufTensorType::Iq1M,
+        32 => GgufTensorType::Bf16,
+        _ => return None,
+    })
+}
 
 /// DeepSeek-V2/V3 specific configuration for Multi-head Latent Attention (MLA)
 /// and Mixture-of-Experts (MoE) layers.
@@ -233,6 +407,143 @@ pub struct VisionConfig {
     pub window_size: usize,
 }
 
+impl VisionConfig {
+    /// Parse a `VisionConfig` from GGUF metadata.
+    ///
+    /// Accepts both the current `clip.vision.*` key namespace written by
+    /// `gguf-py`'s `Keys.ClipVision` and the legacy `vision.*` prefix that
+    /// `ModelConfig`'s documentation has always promised.  Returns `None` when
+    /// neither namespace carries a block count — i.e. the checkpoint has no
+    /// vision tower.
+    ///
+    /// Keys (first match wins):
+    ///
+    /// | Field | `clip.vision.*` | legacy `vision.*` |
+    /// |-------|-----------------|-------------------|
+    /// | `num_layers`  | `clip.vision.block_count`           | `vision.block_count` |
+    /// | `hidden_size` | `clip.vision.embedding_length`      | `vision.embedding_length` |
+    /// | `num_heads`   | `clip.vision.attention.head_count`  | `vision.attention.head_count` |
+    /// | `image_size`  | `clip.vision.image_size`            | `vision.image_size` |
+    /// | `patch_size`  | `clip.vision.patch_size`            | `vision.patch_size` |
+    /// | `window_size` | `clip.vision.window_size`           | `vision.window_size` |
+    pub fn from_metadata(metadata: &MetadataStore) -> Option<Self> {
+        let read = |suffix: &str| -> Option<usize> {
+            metadata
+                .get_u32(&format!("clip.vision.{suffix}"))
+                .or_else(|_| metadata.get_u32(&format!("vision.{suffix}")))
+                .ok()
+                .map(|v| v as usize)
+        };
+
+        // The block count is the discriminator: without layers there is no tower.
+        let num_layers = read("block_count").filter(|&v| v > 0)?;
+
+        Some(Self {
+            image_size: read("image_size").unwrap_or(224),
+            patch_size: read("patch_size").unwrap_or(14),
+            hidden_size: read("embedding_length").unwrap_or(1024),
+            num_heads: read("attention.head_count").unwrap_or(16),
+            num_layers,
+            window_size: read("window_size").unwrap_or(0),
+        })
+    }
+}
+
+/// Hyperparameters that [`ModelConfig`] has no field for.
+///
+/// These keys exist in `gguf-py/gguf/constants.py` and are consumed by
+/// individual architectures.  They live in a side-car struct rather than as
+/// extra `ModelConfig` fields so that the per-architecture
+/// `ModelConfig { .. }` struct literals keep compiling; adding fields to
+/// `ModelConfig` would break 18 files owned by other architecture agents.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExtraHparams {
+    /// `{arch}.rope.dimension_count` — the rotary dimension count `n_rot`,
+    /// which is **not** always `head_dim` (partial-rotary models such as
+    /// GPT-NeoX, Phi-2 and StableLM rotate only a prefix of each head).
+    pub rope_dimension_count: Option<usize>,
+    /// `{arch}.rope.dimension_sections` — M-RoPE per-axis dimension split
+    /// (`[t, h, w, e]`), e.g. `[16, 24, 24, 0]` for Qwen2-VL.
+    pub rope_sections: Option<Vec<usize>>,
+    /// `{arch}.attn_logit_softcapping` — Gemma-2 attention logit soft cap.
+    pub attn_logit_softcapping: Option<f32>,
+    /// `{arch}.final_logit_softcapping` — Gemma-2/3 output logit soft cap.
+    pub final_logit_softcapping: Option<f32>,
+    /// `{arch}.attention.query_pre_attn_scalar` — Gemma's pre-attention query
+    /// scale (overrides `1 / sqrt(head_dim)`).
+    pub query_pre_attn_scalar: Option<f32>,
+    /// `{arch}.expert_group_count` — DeepSeek-V3 routing group count.
+    pub expert_group_count: Option<usize>,
+    /// `{arch}.expert_group_used_count` — DeepSeek-V3 groups selected per token.
+    pub expert_group_used_count: Option<usize>,
+    /// `{arch}.expert_weights_norm` — whether routed expert weights are
+    /// re-normalised after top-k selection.
+    pub expert_weights_norm: Option<bool>,
+    /// `{arch}.expert_weights_scale` — routed expert weight multiplier.
+    pub expert_weights_scale: Option<f32>,
+    /// `{arch}.attention.clamp_kqv` — MPT/DBRX QKV clamp magnitude.
+    pub clamp_kqv: Option<f32>,
+    /// `{arch}.attention.max_alibi_bias` — ALiBi maximum bias (BLOOM, MPT).
+    pub max_alibi_bias: Option<f32>,
+    /// `{arch}.attention.layer_norm_epsilon` — the **non**-RMS LayerNorm
+    /// epsilon needed by BLOOM / Falcon / StarCoder / GPT-NeoX / StableLM.
+    /// `ModelConfig::rms_norm_eps` only ever reads the `_rms_` variant.
+    pub layer_norm_eps: Option<f32>,
+    /// `{arch}.use_parallel_residual` — GPT-NeoX / Falcon parallel attention.
+    pub use_parallel_residual: Option<bool>,
+    /// `{arch}.attention.sliding_window_pattern` — explicit SWA period.
+    pub sliding_window_pattern: Option<u32>,
+    /// `{arch}.attention.scale` — explicit attention softmax scale.
+    pub attention_scale: Option<f32>,
+    /// `{arch}.attention.value_length` — V head dimension when it differs
+    /// from the K head dimension.
+    pub value_length: Option<usize>,
+}
+
+impl ExtraHparams {
+    /// Read every supplementary hyperparameter key for `arch`.
+    ///
+    /// All keys are optional; absent keys leave their field `None` so callers
+    /// can distinguish "not present" from "present and zero".
+    pub fn from_metadata(metadata: &MetadataStore, arch: &str) -> Self {
+        let u = |k: &str| metadata.get_u32(k).ok().map(|v| v as usize);
+        let f = |k: &str| metadata.get_f32(k).ok();
+        let b = |k: &str| metadata.get(k).and_then(MetadataValue::as_bool);
+
+        let rope_sections = metadata
+            .get(&format!("{arch}.rope.dimension_sections"))
+            .and_then(MetadataValue::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(MetadataValue::as_u32)
+                    .map(|v| v as usize)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<usize>| !v.is_empty());
+
+        Self {
+            rope_dimension_count: u(&format!("{arch}.rope.dimension_count")),
+            rope_sections,
+            attn_logit_softcapping: f(&format!("{arch}.attn_logit_softcapping")),
+            final_logit_softcapping: f(&format!("{arch}.final_logit_softcapping")),
+            query_pre_attn_scalar: f(&format!("{arch}.attention.query_pre_attn_scalar")),
+            expert_group_count: u(&format!("{arch}.expert_group_count")),
+            expert_group_used_count: u(&format!("{arch}.expert_group_used_count")),
+            expert_weights_norm: b(&format!("{arch}.expert_weights_norm")),
+            expert_weights_scale: f(&format!("{arch}.expert_weights_scale")),
+            clamp_kqv: f(&format!("{arch}.attention.clamp_kqv")),
+            max_alibi_bias: f(&format!("{arch}.attention.max_alibi_bias")),
+            layer_norm_eps: f(&format!("{arch}.attention.layer_norm_epsilon")),
+            use_parallel_residual: b(&format!("{arch}.use_parallel_residual")),
+            sliding_window_pattern: metadata
+                .get_u32(&format!("{arch}.attention.sliding_window_pattern"))
+                .ok(),
+            attention_scale: f(&format!("{arch}.attention.scale")),
+            value_length: u(&format!("{arch}.attention.value_length")),
+        }
+    }
+}
+
 impl ModelConfig {
     /// Construct a `ModelConfig` from GGUF metadata.
     ///
@@ -277,12 +588,35 @@ impl ModelConfig {
             .map(|v| v as usize)
             .unwrap_or(num_attention_heads);
 
-        let head_dim = hidden_size.checked_div(num_attention_heads).unwrap_or(128);
+        // `head_dim` is NOT always `hidden_size / num_attention_heads`.  Qwen3
+        // decouples the two: Qwen3-4B has `embedding_length = 2560` and
+        // `head_count = 32` (which would give 80) but ships 128-wide heads, so
+        // `attn_q.weight` projects 2560 → 32 × 128.  The GGUF states the true
+        // width in `{arch}.attention.key_length`; only fall back to the
+        // division when the checkpoint omits it.
+        let head_dim = metadata
+            .get_u32(&format!("{arch}.attention.key_length"))
+            .ok()
+            .map(|v| v as usize)
+            .filter(|&v| v > 0)
+            .or_else(|| hidden_size.checked_div(num_attention_heads))
+            .filter(|&v| v > 0)
+            .unwrap_or(128);
 
+        // `{arch}.vocab_size` is optional; most converters only ship the
+        // tokenizer token array, whose length is the authoritative vocabulary
+        // size (and matches the LM head's row count, padding included).
         let vocab_size = metadata
             .get_u32(&format!("{arch}.vocab_size"))
-            .or_else(|_| metadata.get_u32("tokenizer.ggml.tokens.length"))
             .map(|v| v as usize)
+            .ok()
+            .or_else(|| {
+                metadata
+                    .get("tokenizer.ggml.tokens")
+                    .and_then(|v| v.as_array())
+                    .map(<[MetadataValue]>::len)
+            })
+            .filter(|&v| v > 0)
             .unwrap_or(32000);
 
         let max_context_length = metadata
@@ -290,8 +624,13 @@ impl ModelConfig {
             .map(|v| v as usize)
             .unwrap_or(4096);
 
+        // `_rms_` is the LLaMA-family key; BLOOM / Falcon / StarCoder /
+        // GPT-NeoX / StableLM ship the plain LayerNorm epsilon instead.  Fall
+        // back to it so those architectures stop silently normalising with
+        // 1e-5 when the checkpoint says otherwise.
         let rms_norm_eps = metadata
             .get_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+            .or_else(|_| metadata.get_f32(&format!("{arch}.attention.layer_norm_epsilon")))
             .unwrap_or(1e-5);
 
         let rope_freq_base = metadata
@@ -305,9 +644,11 @@ impl ModelConfig {
 
         let swa_window = sliding_window.map(|v| v as u32);
 
-        // Gemma-family models use interleaved SWA (even layers = global).
-        // Detect by architecture name prefix.
-        let swa_interleaved = architecture.starts_with("gemma");
+        // Interleaved SWA is decided by llama.cpp's per-architecture
+        // `set_swa_pattern` call, not by a name prefix.  Gemma **v1** has no
+        // SWA at all, so `starts_with("gemma")` wrongly interleaved it.
+        let swa_interleaved =
+            swa_pattern_for_arch(&architecture).is_some_and(SwaPattern::is_interleaved);
 
         let logit_scale = metadata
             .get_f32(&format!("{arch}.logit_scale"))
@@ -327,14 +668,35 @@ impl ModelConfig {
             .get_f32(&format!("{arch}.rope.scaling.factor"))
             .unwrap_or(1.0);
 
-        let rope_scaling_type = metadata
-            .get_string(&format!("{arch}.rope.scaling.type"))
-            .map(|s| match s {
-                "linear" => RopeScalingType::Linear,
-                "yarn" => RopeScalingType::Yarn,
-                _ => RopeScalingType::Standard,
-            })
-            .unwrap_or(RopeScalingType::Standard);
+        // An unrecognised scaling type is an error rather than a silent
+        // downgrade to "no scaling": Phi-3.5's `longrope`/`su` and
+        // Llama-3.1's `llama3` used to fall through here and produce garbage
+        // past the training context with no warning.
+        let rope_scaling_type = match metadata.get_string(&format!("{arch}.rope.scaling.type")) {
+            Ok(s) => RopeScalingType::parse(s)?,
+            Err(_) => RopeScalingType::Standard,
+        };
+
+        let quant_type = metadata
+            .get_u32("general.file_type")
+            .ok()
+            .and_then(quant_type_from_file_type);
+
+        let activation = metadata
+            .get_string(&format!("{arch}.activation"))
+            .or_else(|_| metadata.get_string("general.activation"))
+            .map(str::to_string)
+            .unwrap_or_else(|_| default_activation_for_arch(arch).to_string());
+
+        let vision_config = VisionConfig::from_metadata(metadata);
+
+        validate_attention_shape(
+            arch,
+            hidden_size,
+            num_attention_heads,
+            num_kv_heads,
+            head_dim,
+        )?;
 
         Ok(Self {
             architecture,
@@ -349,10 +711,14 @@ impl ModelConfig {
             max_context_length,
             rms_norm_eps,
             rope_freq_base,
-            quant_type: None,
+            quant_type,
+            // GGUF has no bias key; presence of `blk.N.attn_q.bias` /
+            // `blk.N.ffn_up.bias` is the only signal, so these stay false here
+            // and are filled in by `apply_tensor_hints` /
+            // `from_metadata_and_tensors`.
             attention_bias: false,
             ffn_bias: false,
-            activation: "silu".to_string(),
+            activation,
             sliding_window,
             logit_scale,
             num_experts,
@@ -361,9 +727,157 @@ impl ModelConfig {
             swa_interleaved,
             rope_scaling_type,
             rope_scaling_factor,
-            vision_config: None,
+            vision_config,
         })
     }
+
+    /// Construct a `ModelConfig` from GGUF metadata **and** the tensor table.
+    ///
+    /// Preferred over [`Self::from_metadata`] whenever the `TensorStore` is
+    /// available: `attention_bias`, `ffn_bias` and `quant_type` can only be
+    /// determined from the tensors themselves.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every error from [`Self::from_metadata`].
+    pub fn from_metadata_and_tensors(
+        metadata: &MetadataStore,
+        tensors: &TensorStore,
+    ) -> ArchResult<Self> {
+        let mut config = Self::from_metadata(metadata)?;
+        config.apply_tensor_hints(tensors);
+        Ok(config)
+    }
+
+    /// Fill in the fields that can only be derived from the tensor table.
+    ///
+    /// * `attention_bias` — any `attn_q.bias` / `attn_k.bias` / `attn_v.bias` /
+    ///   `attn_qkv.bias` / `attn_output.bias` entry.
+    /// * `ffn_bias` — any `ffn_up.bias` / `ffn_down.bias` / `ffn_gate.bias`.
+    /// * `quant_type` — the most common non-`F32` tensor type, which is what
+    ///   `general.file_type` is supposed to record but frequently omits.
+    pub fn apply_tensor_hints(&mut self, tensors: &TensorStore) {
+        const ATTN_BIAS_SUFFIXES: [&str; 5] = [
+            "attn_q.bias",
+            "attn_k.bias",
+            "attn_v.bias",
+            "attn_qkv.bias",
+            "attn_output.bias",
+        ];
+        const FFN_BIAS_SUFFIXES: [&str; 3] = ["ffn_up.bias", "ffn_down.bias", "ffn_gate.bias"];
+
+        let mut counts: std::collections::HashMap<GgufTensorType, usize> =
+            std::collections::HashMap::new();
+
+        for (name, info) in tensors.iter() {
+            if ATTN_BIAS_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+                self.attention_bias = true;
+            }
+            if FFN_BIAS_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+                self.ffn_bias = true;
+            }
+            *counts.entry(info.tensor_type).or_insert(0) += 1;
+        }
+
+        if self.quant_type.is_none() {
+            self.quant_type = counts
+                .into_iter()
+                .filter(|(ty, _)| !matches!(ty, GgufTensorType::F32 | GgufTensorType::F16))
+                .max_by_key(|&(_, n)| n)
+                .map(|(ty, _)| ty);
+        }
+    }
+
+    /// The RoPE element-pairing convention this architecture requires.
+    ///
+    /// Delegates to [`rope_style_for_arch`].  Architectures build their
+    /// [`RopeTable`](crate::common::rope::RopeTable) with
+    /// `RopeTable::new_with_style(head_dim, ctx, base, ty, factor, config.rope_style())`.
+    pub fn rope_style(&self) -> RopeStyle {
+        rope_style_for_arch(&self.architecture)
+    }
+
+    /// The per-layer sliding-window pattern, or `None` when every layer is global.
+    ///
+    /// Resolution order:
+    /// 1. `None` when [`Self::swa_window`] is `None` (no window at all).
+    /// 2. The architecture's llama.cpp pattern via [`swa_pattern_for_arch`].
+    /// 3. Otherwise the legacy [`Self::swa_interleaved`] flag, which maps to
+    ///    `EveryNth(2)` when set and `All` when clear.
+    pub fn swa_pattern(&self) -> Option<SwaPattern> {
+        self.swa_window?;
+        Some(
+            swa_pattern_for_arch(&self.architecture).unwrap_or(if self.swa_interleaved {
+                SwaPattern::EveryNth(2)
+            } else {
+                SwaPattern::All
+            }),
+        )
+    }
+}
+
+/// Validate the attention-shape invariants that every architecture divides by.
+///
+/// Without these checks a checkpoint (or a hand-built `MetadataStore`) with
+/// `head_count_kv = 0` reaches `num_heads / num_kv_heads` and aborts the
+/// process; `num_kv_heads > num_heads` yields `heads_per_kv == 0` and then
+/// `h / 0`.
+fn validate_attention_shape(
+    arch: &str,
+    hidden_size: usize,
+    num_attention_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> ArchResult<()> {
+    let mismatch = |param: &str, expected: String, got: String| ArchError::ConfigMismatch {
+        param: format!("{arch}.{param}"),
+        expected,
+        got,
+    };
+
+    if num_attention_heads == 0 {
+        return Err(mismatch(
+            "attention.head_count",
+            "> 0".to_string(),
+            "0".to_string(),
+        ));
+    }
+    if num_kv_heads == 0 {
+        return Err(mismatch(
+            "attention.head_count_kv",
+            "> 0".to_string(),
+            "0".to_string(),
+        ));
+    }
+    if num_kv_heads > num_attention_heads {
+        return Err(mismatch(
+            "attention.head_count_kv",
+            format!("<= head_count ({num_attention_heads})"),
+            num_kv_heads.to_string(),
+        ));
+    }
+    if !num_attention_heads.is_multiple_of(num_kv_heads) {
+        return Err(mismatch(
+            "attention.head_count_kv",
+            format!("a divisor of head_count ({num_attention_heads})"),
+            num_kv_heads.to_string(),
+        ));
+    }
+    if head_dim == 0 {
+        return Err(mismatch(
+            "attention.key_length",
+            "> 0".to_string(),
+            "0".to_string(),
+        ));
+    }
+    if hidden_size == 0 {
+        return Err(mismatch(
+            "embedding_length",
+            "> 0".to_string(),
+            "0".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -510,6 +1024,80 @@ mod tests {
         );
         let cfg = ModelConfig::from_metadata(&store).expect("should succeed");
         assert_eq!(cfg.head_dim, 128); // 4096 / 32
+    }
+
+    /// `attention.key_length` wins over `hidden_size / head_count`.
+    ///
+    /// Qwen3-4B is exactly this shape: 2560 / 32 = 80, but the checkpoint's
+    /// heads are 128 wide and `attn_q.weight` projects 2560 → 32 × 128.
+    #[test]
+    fn test_from_metadata_head_dim_prefers_key_length() {
+        let mut store = minimal_store("qwen3");
+        store.insert(
+            "qwen3.embedding_length".to_string(),
+            MetadataValue::Uint32(2560),
+        );
+        store.insert(
+            "qwen3.attention.head_count".to_string(),
+            MetadataValue::Uint32(32),
+        );
+        store.insert(
+            "qwen3.attention.key_length".to_string(),
+            MetadataValue::Uint32(128),
+        );
+        let cfg = ModelConfig::from_metadata(&store).expect("should succeed");
+        assert_eq!(
+            cfg.head_dim, 128,
+            "head_dim must come from key_length, not 2560 / 32 = 80"
+        );
+    }
+
+    /// A zero `key_length` is ignored in favour of the division.
+    #[test]
+    fn test_from_metadata_head_dim_ignores_zero_key_length() {
+        let mut store = minimal_store("llama");
+        store.insert(
+            "llama.embedding_length".to_string(),
+            MetadataValue::Uint32(4096),
+        );
+        store.insert(
+            "llama.attention.head_count".to_string(),
+            MetadataValue::Uint32(32),
+        );
+        store.insert(
+            "llama.attention.key_length".to_string(),
+            MetadataValue::Uint32(0),
+        );
+        let cfg = ModelConfig::from_metadata(&store).expect("should succeed");
+        assert_eq!(cfg.head_dim, 128);
+    }
+
+    /// Without `{arch}.vocab_size`, the tokenizer token array supplies it.
+    ///
+    /// Most converters ship only the array; falling through to the 32000
+    /// default under-sizes the logit buffer and the LM head GEMV fails.
+    #[test]
+    fn test_from_metadata_vocab_size_from_tokenizer_tokens() {
+        let mut store = minimal_store("qwen3");
+        store.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            MetadataValue::Array(vec![MetadataValue::String("tok".to_string()); 7]),
+        );
+        let cfg = ModelConfig::from_metadata(&store).expect("should succeed");
+        assert_eq!(cfg.vocab_size, 7, "vocab_size must follow the token array");
+    }
+
+    /// An explicit `{arch}.vocab_size` still wins over the token array.
+    #[test]
+    fn test_from_metadata_vocab_size_prefers_explicit_key() {
+        let mut store = minimal_store("qwen3");
+        store.insert("qwen3.vocab_size".to_string(), MetadataValue::Uint32(11));
+        store.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            MetadataValue::Array(vec![MetadataValue::String("tok".to_string()); 7]),
+        );
+        let cfg = ModelConfig::from_metadata(&store).expect("should succeed");
+        assert_eq!(cfg.vocab_size, 11);
     }
 
     #[test]
@@ -691,19 +1279,22 @@ mod swa_tests {
         assert_eq!(effective_attention_span(&config, 3), 4096);
     }
 
+    /// llama.cpp's `set_swa_pattern(2)` marks `il % 2 < 1`, i.e. **even**
+    /// layers, as sliding.  This test previously asserted the inverse.
     #[test]
     fn test_gemma_interleaved_swa() {
         let config = ModelConfig {
+            architecture: "gemma2".to_string(),
             swa_window: Some(4096),
             swa_interleaved: true,
             ..ModelConfig::default()
         };
-        // Layer 0 is global (interleaved, even index)
-        assert_eq!(effective_attention_span(&config, 0), u32::MAX);
-        // Layer 1 is sliding window
-        assert_eq!(effective_attention_span(&config, 1), 4096);
-        // Layer 2 is global again
-        assert_eq!(effective_attention_span(&config, 2), u32::MAX);
+        // Layer 0 is the sliding-window layer (even index).
+        assert_eq!(effective_attention_span(&config, 0), 4096);
+        // Layer 1 is global.
+        assert_eq!(effective_attention_span(&config, 1), u32::MAX);
+        // Layer 2 is sliding again.
+        assert_eq!(effective_attention_span(&config, 2), 4096);
     }
 
     #[test]
@@ -723,8 +1314,27 @@ mod swa_tests {
         assert!(!cfg.swa_interleaved, "mistral is not interleaved");
     }
 
+    /// Gemma-**2** interleaves; Gemma **v1** does not.  Detecting by the
+    /// `"gemma"` name prefix wrongly interleaved v1 as well.
     #[test]
     fn test_gemma_swa_interleaved_from_metadata() {
+        use oxillama_gguf::MetadataValue;
+        let mut store = MetadataStore::new();
+        store.insert(
+            "general.architecture".to_string(),
+            MetadataValue::String("gemma2".to_string()),
+        );
+        store.insert(
+            "gemma2.attention.sliding_window".to_string(),
+            MetadataValue::Uint32(2048),
+        );
+        let cfg = ModelConfig::from_metadata(&store).expect("should succeed");
+        assert_eq!(cfg.swa_window, Some(2048));
+        assert!(cfg.swa_interleaved, "gemma2 should be interleaved");
+    }
+
+    #[test]
+    fn test_gemma_v1_is_not_interleaved() {
         use oxillama_gguf::MetadataValue;
         let mut store = MetadataStore::new();
         store.insert(
@@ -736,7 +1346,9 @@ mod swa_tests {
             MetadataValue::Uint32(2048),
         );
         let cfg = ModelConfig::from_metadata(&store).expect("should succeed");
-        assert_eq!(cfg.swa_window, Some(2048));
-        assert!(cfg.swa_interleaved, "gemma should be interleaved");
+        assert!(
+            !cfg.swa_interleaved,
+            "Gemma v1 has no SWA pattern in llama.cpp"
+        );
     }
 }

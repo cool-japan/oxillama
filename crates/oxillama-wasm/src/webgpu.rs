@@ -14,6 +14,24 @@ use wasm_bindgen::prelude::*;
 // ── WGSL shader source ──────────────────────────────────────────────────────
 
 /// Embedded Q4_0 dequantization compute shader for WebGPU.
+///
+/// # Layout notes
+///
+/// GGML packs Q4_0 in **split halves**, not interleaved pairs: byte `j` of
+/// the 16-byte nibble section carries weight `j` in its low nibble and
+/// weight `j + 16` in its high nibble (see `dequantize_row_q4_0` in
+/// `llama.cpp/ggml/src/ggml-quants.c`, and the module doc on
+/// `oxillama_quant::reference::q4_0`).  An earlier revision of this shader
+/// read nibbles interleaved (`weight[2i]`/`weight[2i+1]`) — the same defect
+/// found and fixed across every CPU and GPU kernel in the workspace for this
+/// pass.
+///
+/// It also addressed blocks with `block_idx * 5u` "approximate" 4-byte-word
+/// arithmetic, which is only valid for `block_idx == 0`: an 18-byte block
+/// does not sit on a `u32` boundary, so later blocks' bytes drift out of
+/// alignment with that formula.  This revision instead reads arbitrary
+/// byte offsets out of the packed `array<u32>` via [`read_byte`]-style
+/// shifting, which is correct for any block index.
 const Q4_0_DEQUANT_WGSL: &str = r#"
 // Q4_0 dequantization compute shader for WebGPU
 // Block layout: 2B FP16 scale + 16B nibbles = 18 bytes per 32 weights
@@ -35,6 +53,15 @@ fn fp16_to_f32(bits: u32) -> f32 {
     return select(f, -f, sign != 0u);
 }
 
+// Read byte `byte_idx` out of the packed little-endian `array<u32>`. Correct
+// for any byte offset, unlike a fixed "words per block" stride — an 18-byte
+// Q4_0 block does not sit on a 4-byte boundary.
+fn read_byte(byte_idx: u32) -> u32 {
+    let word = byte_idx / 4u;
+    let shift = (byte_idx % 4u) * 8u;
+    return (input_blocks[word] >> shift) & 0xFFu;
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let weight_idx = gid.x;
@@ -42,15 +69,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let local_idx = weight_idx % 32u;
     if block_idx >= params.n_blocks { return; }
 
-    // Each block is 18 bytes = 4.5 u32 words; use byte-addressable offset
-    let block_base_u32 = block_idx * 5u; // approximate; scale at word 0 bits [0:15]
-    let scale_raw = input_blocks[block_base_u32] & 0xFFFFu;
-    let d = fp16_to_f32(scale_raw);
+    let block_byte_base = block_idx * 18u;
 
-    // Nibble extraction: 16 bytes of nibbles start at byte 2
-    let nibble_word = (local_idx / 8u) + 1u;
-    let nibble_shift = (local_idx % 8u) * 4u;
-    let nibble_val = (input_blocks[block_base_u32 + nibble_word] >> nibble_shift) & 0xFu;
+    // Bytes [0..2) of the block: f16 scale, little-endian.
+    let d_lo = read_byte(block_byte_base);
+    let d_hi = read_byte(block_byte_base + 1u);
+    let d = fp16_to_f32(d_lo | (d_hi << 8u));
+
+    // Split-half layout: local_idx in [0, 16) reads the low nibble of qs
+    // byte `local_idx`; local_idx in [16, 32) reads the high nibble of qs
+    // byte `local_idx - 16`. qs starts at block byte offset 2.
+    let nibble_byte_idx = local_idx % 16u;
+    let is_high = local_idx >= 16u;
+    let qs_byte = read_byte(block_byte_base + 2u + nibble_byte_idx);
+    let nibble_val = select(qs_byte & 0xFu, (qs_byte >> 4u) & 0xFu, is_high);
     let q = i32(nibble_val) - 8;
     output[weight_idx] = d * f32(q);
 }

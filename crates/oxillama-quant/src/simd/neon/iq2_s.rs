@@ -152,12 +152,17 @@ impl QuantKernel for Iq2SNeon {
 
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
-        let mut scratch = [0.0f32; BLOCK_SIZE];
-
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
+            // Per-row scratch: the closure may run on several threads at once.
+            let mut scratch = [0.0f32; BLOCK_SIZE];
             let row_start = row * row_bytes;
             // SAFETY: AArch64 with NEON; vdupq_n_f32 is always safe on this target.
             let mut sum = unsafe { vdupq_n_f32(0.0) };
+            // Scalar accumulator for the tail elements (< 4 remaining per block).
+            // Kept separate from `sum` and added once after the horizontal
+            // reduction below — broadcasting a scalar into all four lanes of
+            // `sum` before `vaddvq_f32` would count it 4x.
+            let mut tail = 0.0f32;
 
             for blk in 0..blocks_per_row {
                 let bo = row_start + blk * BLOCK_BYTES;
@@ -180,15 +185,14 @@ impl QuantKernel for Iq2SNeon {
                         sum = vfmaq_f32(sum, wv, iv);
                     }
                     for k in (lanes * 4)..block_input_len {
-                        let s: f32 = scratch[k] * input[input_base + k];
-                        sum = vaddq_f32(sum, vdupq_n_f32(s));
+                        tail += scratch[k] * input[input_base + k];
                     }
                 }
             }
 
             // SAFETY: AArch64 with NEON.
-            *out = unsafe { vaddvq_f32(sum) };
-        }
+            *out = unsafe { vaddvq_f32(sum) } + tail;
+        });
 
         Ok(())
     }
@@ -246,7 +250,7 @@ mod tests {
         let block = make_zero_block();
         let data = block.clone();
         let tensor = QuantTensor {
-            data,
+            data: data.into(),
             shape: vec![1, BLOCK_SIZE],
             tensor_type: GgufTensorType::Iq2S,
         };
@@ -255,5 +259,54 @@ mod tests {
         Iq2SNeon
             .gemv(&tensor, &input, &mut out)
             .expect("gemv failed");
+    }
+
+    /// Regression test for the NEON tail-accumulation bug: the remainder loop
+    /// used to broadcast each scalar product into all four lanes of the FMA
+    /// accumulator, so `vaddvq_f32` summed it 4x. `n_cols` values are not
+    /// multiples of 4 (257 also crosses a block boundary) so every affected
+    /// row exercises a non-empty tail.
+    #[test]
+    fn test_gemv_matches_reference_ragged_tail() {
+        let mut block = make_zero_block();
+        block[2] = 0x07;
+        block[34] = 0x3F;
+        block[66] = 0xFF;
+        block[74] = 0x34;
+
+        for &n_cols in &[33usize, 34, 257] {
+            let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
+            let mut row_data = Vec::with_capacity(blocks_per_row * BLOCK_BYTES);
+            for _ in 0..blocks_per_row {
+                row_data.extend_from_slice(&block);
+            }
+            let mut data = row_data.clone();
+            data.extend_from_slice(&row_data);
+
+            let tensor = QuantTensor {
+                data: data.into(),
+                shape: vec![2, n_cols],
+                tensor_type: GgufTensorType::Iq2S,
+            };
+            let input: Vec<f32> = (0..n_cols).map(|i| (i as f32) * 0.01 - 1.0).collect();
+
+            let mut neon_out = vec![0.0f32; 2];
+            Iq2SNeon
+                .gemv(&tensor, &input, &mut neon_out)
+                .expect("neon gemv");
+
+            let mut ref_out = vec![0.0f32; 2];
+            Iq2SRef
+                .gemv(&tensor, &input, &mut ref_out)
+                .expect("ref gemv");
+
+            for (row, (&n, &r)) in neon_out.iter().zip(ref_out.iter()).enumerate() {
+                let scale = r.abs().max(1e-3);
+                assert!(
+                    (n - r).abs() / scale < 1e-3,
+                    "n_cols={n_cols} row={row}: neon={n} ref={r} (tail-accumulation bug?)"
+                );
+            }
+        }
     }
 }

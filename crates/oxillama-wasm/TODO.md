@@ -26,11 +26,11 @@ as typed `JsValue` rejections — no panics leak through.
 
 | Item                    | Value                                                       |
 |-------------------------|-------------------------------------------------------------|
-| Version                 | 0.1.1                                                       |
+| Version                 | 0.1.4                                                       |
 | Completion              | 95%                                                         |
-| Tests                   | 41 passing                                                  |
+| Tests                   | 59 passing (`cargo nextest run -p oxillama-wasm`)           |
 | Public API items        | 27                                                          |
-| Source files            | 6 (`src/lib.rs`, `src/gpu_bridge.rs`, `src/idb_cache.rs`, `src/streaming_load.rs`, `src/worker.rs`, `src/metadata.rs`) |
+| Source files            | 9 (`src/lib.rs`, `src/gpu_bridge.rs`, `src/idb_cache.rs`, `src/service_worker.rs`, `src/simd_check.rs`, `src/streaming_load.rs`, `src/streaming_loader.rs`, `src/webgpu.rs`, `src/worker.rs`) |
 | Release wasm size       | 3.5 MB (raw) / ~1.2 MB (brotli over HTTP)                   |
 | `wasm-bindgen` version  | workspace pinned                                            |
 | Tokenizer backend       | `tokenizers/unstable_wasm` (fancy-regex, no C deps)         |
@@ -44,11 +44,14 @@ as typed `JsValue` rejections — no panics leak through.
 
 | File                     | Role                                                                                    |
 |--------------------------|-----------------------------------------------------------------------------------------|
-| `src/lib.rs`             | Primary `#[wasm_bindgen]` surface: `init()` panic hook, `parseGgufHeader`, `listTensorNames`, `dequantQ4_0`/Q4K/Q5K/Q6K, `generate()` with `on_token` callback, `loadModelFromBytesWithProgress`, `WasmEngine`. |
-| `src/metadata.rs`        | `parseGgufMetadata()` returning typed `GgufMetadataJs` via `serde-wasm-bindgen`.       |
+| `src/lib.rs`             | Primary `#[wasm_bindgen]` surface: `init()` panic hook, `parseGgufHeader`, `listTensorNames`, `dequantQ4_0`/Q4K/Q5K/Q6K, `generate()` with `on_token` callback, `loadModelFromBytesWithProgress`, `parseGgufMetadata()` (typed `GgufMetadataJs` via `serde-wasm-bindgen`), `WasmEngine`. |
 | `src/gpu_bridge.rs`      | WebGPU async bridge: `initWebGpuDevice()`, `webgpuDequantQ4_0Async()`, `webgpuGemvAsync()` using `wasm_bindgen_futures::JsFuture`. |
 | `src/idb_cache.rs`       | IndexedDB model cache: `cacheModel`, `loadCachedModel`, `listCachedModels`, `deleteCachedModel`. |
-| `src/streaming_load.rs`  | `GgufChunkLoader` — incremental byte-chunk feeding; parses magic + tensor count from header. |
+| `src/service_worker.rs`  | Service-worker script generator/registration: `getServiceWorkerScript()`, `registerServiceWorker()`, `ServiceWorkerOptions`. |
+| `src/simd_check.rs`      | `getSimd128Status()` — runtime SIMD128 availability probe. |
+| `src/streaming_load.rs`  | `GgufChunkLoader` — minimal incremental byte-chunk header probe (magic + tensor count only). See its module doc for the split vs. `streaming_loader.rs`. |
+| `src/streaming_loader.rs`| `StreamingGgufLoader` — full push/pull-mode streaming loader with tensor index and LRU cache; supersedes `streaming_load.rs` for production tensor access. |
+| `src/webgpu.rs`          | WebGPU device/buffer plumbing backing `gpu_bridge.rs`. |
 | `src/worker.rs`          | Web-worker postMessage protocol: `parseWorkerMessage()` / `workerTokenEvent()`.         |
 
 The build exports both `cdylib` (for `wasm-pack` / the browser) and `rlib`
@@ -89,7 +92,7 @@ rayon, no filesystem I/O, and no Oniguruma ever reach the wasm32 target.
 
 ## 5. Known Gaps / Incomplete
 
-Accounting for the outstanding 13% toward 100% completion:
+Accounting for the outstanding 5% toward 100% completion:
 
 - ~~**No WebGPU path.**~~ ✅ Shipped: `src/gpu_bridge.rs` implements an async WebGPU bridge with `initWebGpuDevice()`, `webgpuDequantQ4_0Async()`, and `webgpuGemvAsync()` using `wasm_bindgen_futures::JsFuture` for proper async GPU dispatch in browsers with WebGPU support.
 - [x] **D1 — Streaming GGUF load (incremental ReadableStream) (done 2026-04-20)**
@@ -100,14 +103,21 @@ Accounting for the outstanding 13% toward 100% completion:
     - **LRU cache**: `LruTensorCache` with configurable capacity; `get()` refreshes eviction order; duplicate `put()` handled without corrupting the queue.
     - **Progress**: `progress()` returns `{ bytes_buffered, phase, tensor_count, cache_size }` as a JS `Object`.
     - **Tensor index**: maps name → `TensorMeta { file_offset (absolute), size_bytes, dtype, shape }` using `data_section_offset + info.offset`.
-    - **`wasm-streams` 0.5.0** added to workspace deps for future ReadableStream → Rust bridge.
     - **`StreamingLoadOptions`** helper struct exposed to JS.
-  - **Files:** `crates/oxillama-wasm/src/streaming_loader.rs` (820 LoC); `crates/oxillama-wasm/src/lib.rs` (exports); `crates/oxillama-wasm/Cargo.toml` (`wasm-streams = { workspace = true }`); workspace `Cargo.toml` (`wasm-streams = "0.5.0"`).
+  - **Files:** `crates/oxillama-wasm/src/streaming_loader.rs` (826 LoC); `crates/oxillama-wasm/src/lib.rs` (exports).
   - **Tests (10 added, all passing):** `lru_cache_evicts_oldest`, `lru_cache_get_refreshes_order`, `lru_cache_duplicate_put_no_corruption`, `lru_cache_zero_capacity_evicts_immediately`, `push_chunk_transitions_to_header_parsed_empty_gguf`, `push_chunk_partial_data_returns_false`, `push_chunk_invalid_magic_returns_error`, `tensor_index_populated_after_header`, `tensor_file_offset_is_absolute`, `try_parse_header_is_idempotent`.
+  - **Note (v0.1.4 cleanup):** the `wasm-streams` dependency that was added
+    here "for a future ReadableStream → Rust bridge" had zero actual uses
+    (`push_chunk`/`read_tensor` take plain `&[u8]` / a JS callback, not a
+    `wasm_streams::ReadableStream`) and has been removed from
+    `crates/oxillama-wasm/Cargo.toml`. Re-add it if/when that bridge is
+    actually implemented.
 - **Mobile browsers untested.** iOS Safari and Android Chrome are not in
   the validation matrix yet; memory limits and SIMD quirks unverified.
-- **No service-worker / IndexedDB cache.** Every page refresh re-downloads
-  the GGUF bytes; no persistent client-side model cache.
+- ~~**No service-worker / IndexedDB cache.**~~ ✅ Shipped: `src/service_worker.rs`
+  (`getServiceWorkerScript()`, `registerServiceWorker()`) and `src/idb_cache.rs`
+  (`cacheModel`, `loadCachedModel`, `listCachedModels`, `deleteCachedModel`)
+  together give a persistent client-side model cache across page reloads.
 - ~~**No web-worker offload helper.**~~ ✅ `worker.rs` message-passing API ships structured `postMessage` protocol.
 - ~~**No `onProgress` callback for load.**~~ ✅ `loadModelFromBytesWithProgress()`
   now accepts an `on_progress: Option<js_sys::Function>` and emits 0 / 25 / 100
@@ -167,4 +177,7 @@ Accounting for the outstanding 13% toward 100% completion:
 - **Offline-first demo app** packaged as a PWA, shipping a quantized
   Bonsai-8B under 2 GB of OPFS storage for air-gapped inference.
 
-*Last updated: 2026-04-20 (v0.1.1 — 41 tests, 27 public API items, WebGPU bridge, IndexedDB cache, streaming load, web-worker API, K-quant dequant bindings, loadModelFromBytesWithProgress, parseGgufMetadata)*
+*Last updated: 2026-08-17 (v0.1.4 — `parse_worker_message`'s `Generate` dispatch clarified: the
+previous stub placeholder response is now a typed `WorkerOutMessage::Error` directing callers to
+`WasmEngine.generate()` or the top-level `generate()` export, since this function is a stateless
+message router with no loaded model; 59 tests)*

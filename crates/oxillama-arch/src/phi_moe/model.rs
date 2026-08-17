@@ -46,12 +46,25 @@ use super::config::PhiMoeConfig;
 pub struct PhiMoeLayer {
     /// Pre-attention RMSNorm.
     pub attn_norm: RmsNorm,
+    /// Optional bias added after `attn_norm`'s weight multiply
+    /// (`x_norm * weight + bias`, matching llama.cpp's `build_norm`).
+    /// Phi-3.5-MoE (`LLM_ARCH_PHIMOE`) always ships this tensor
+    /// (`attn_norm.bias`, required — not `TENSOR_NOT_REQUIRED` — in
+    /// `llama-model.cpp`'s tensor map); `None` only for synthetic fixtures
+    /// that omit it.
+    pub attn_norm_bias: Option<Vec<f32>>,
     /// Fused QKV weight `[(num_q + 2*num_kv) * head_dim, hidden_size]` (f32).
     pub attn_qkv_weight: Vec<f32>,
     /// Attention output projection weight `[hidden_size, num_q * head_dim]` (f32).
     pub attn_output_weight: Vec<f32>,
+    /// Optional bias for `attn_output_weight` (`bo` in llama.cpp; always
+    /// present for `LLM_ARCH_PHIMOE`).
+    pub attn_output_bias: Option<Vec<f32>>,
     /// Pre-FFN RMSNorm.
     pub ffn_norm: RmsNorm,
+    /// Optional bias added after `ffn_norm`'s weight multiply (always
+    /// present for `LLM_ARCH_PHIMOE`).
+    pub ffn_norm_bias: Option<Vec<f32>>,
     /// Router weight matrix `[num_experts, hidden_size]` (f32).
     pub router_weight: Vec<f32>,
     /// Gate projections for all experts: `num_experts` rows of
@@ -78,12 +91,23 @@ pub struct PhiMoeModel {
     pub layers: Vec<PhiMoeLayer>,
     /// Final RMSNorm.
     pub output_norm: RmsNorm,
-    /// LM head weight `[vocab_size, hidden_size]` (f32).
+    /// Optional bias added after `output_norm`'s weight multiply (always
+    /// present for `LLM_ARCH_PHIMOE`, per `output_norm.bias` in
+    /// `llama-model.cpp`'s tensor map).
+    pub output_norm_bias: Option<Vec<f32>>,
+    /// LM head weight `[vocab_size, hidden_size]` (f32). Falls back to a
+    /// copy of `token_embd` when the checkpoint ties embeddings and ships no
+    /// standalone `output.weight` — see `load_phi_moe_from_gguf`.
     pub output_weight: Vec<f32>,
+    /// Optional bias for the LM head (`output.bias`; always present for
+    /// `LLM_ARCH_PHIMOE`).
+    pub output_bias: Option<Vec<f32>>,
     /// Precomputed partial RoPE frequency table.
     rope: RopeTable,
-    /// Number of head dimensions to apply RoPE to.
-    rope_dims: usize,
+    /// Number of head dimensions to apply RoPE to. `pub` (like
+    /// `PhiModel::rope_dims`) so a test can observe what
+    /// `load_phi_moe_from_gguf` resolved from `{arch}.rope.dimension_count`.
+    pub rope_dims: usize,
 
     // Scratch buffers
     buf_hidden: Vec<f32>,
@@ -105,13 +129,20 @@ pub struct PhiMoeModel {
 
 impl PhiMoeModel {
     /// Construct a Phi-MoE model from pre-loaded weights.
+    ///
+    /// `rope_dims`: number of leading dimensions per head that RoPE rotates,
+    /// already resolved by the caller from `{arch}.rope.dimension_count`
+    /// (defaulting to the full `head_dim`) — see `load_phi_moe_from_gguf`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: ModelConfig,
         token_embd: Vec<f32>,
         layers: Vec<PhiMoeLayer>,
         output_norm: RmsNorm,
+        output_norm_bias: Option<Vec<f32>>,
         output_weight: Vec<f32>,
-        partial_rotary_factor: f32,
+        output_bias: Option<Vec<f32>>,
+        rope_dims: usize,
     ) -> Self {
         let phi_moe_config = PhiMoeConfig::from(&config);
         let hidden_size = config.hidden_size;
@@ -126,8 +157,7 @@ impl PhiMoeModel {
         let max_ctx = config.max_context_length;
         let num_experts = phi_moe_config.num_experts;
 
-        let rope_dims = ((head_dim as f32 * partial_rotary_factor) as usize).max(2);
-        let rope_dims = (rope_dims & !1).min(head_dim); // must be even
+        let rope_dims = rope_dims.min(head_dim);
 
         let rope = RopeTable::new(
             rope_dims,
@@ -143,7 +173,9 @@ impl PhiMoeModel {
             token_embd,
             layers,
             output_norm,
+            output_norm_bias,
             output_weight,
+            output_bias,
             rope,
             rope_dims,
             buf_hidden: vec![0.0f32; hidden_size],
@@ -164,11 +196,27 @@ impl PhiMoeModel {
         }
     }
 
-    fn embed_token(&mut self, token: u32) {
+    /// Load the residual stream with `token`'s embedding row.
+    ///
+    /// Bound-checked: an out-of-vocabulary `token` (possible whenever
+    /// `vocab_size` is over- or under-estimated from GGUF metadata) is
+    /// reported as an error instead of panicking on the slice index. This
+    /// path runs on every decoded token, including ones sourced from an
+    /// HTTP request body, so it must never panic.
+    fn embed_token(&mut self, token: u32) -> ArchResult<()> {
         let h = self.config.hidden_size;
-        let offset = token as usize * h;
-        self.buf_hidden
-            .copy_from_slice(&self.token_embd[offset..offset + h]);
+        let offset = (token as usize)
+            .checked_mul(h)
+            .ok_or_else(|| out_of_vocab_error(token, self.config.vocab_size))?;
+        let end = offset
+            .checked_add(h)
+            .ok_or_else(|| out_of_vocab_error(token, self.config.vocab_size))?;
+        let src = self
+            .token_embd
+            .get(offset..end)
+            .ok_or_else(|| out_of_vocab_error(token, self.config.vocab_size))?;
+        self.buf_hidden.copy_from_slice(src);
+        Ok(())
     }
 
     /// Dense matrix-vector product: `out[i] = dot(W[i, :], x)`.
@@ -256,11 +304,26 @@ impl PhiMoeModel {
         // Store K, V
         kv_cache.store_kv(layer_idx, &self.buf_k[..kv_dim], &self.buf_v[..kv_dim])?;
 
-        let cached_keys = kv_cache.get_keys(layer_idx)?.to_vec();
-        let cached_values = kv_cache.get_values(layer_idx)?.to_vec();
+        // Borrowed, not `.to_vec()`-ed: `kv_cache` is a separate parameter
+        // from `self`, so there is no aliasing conflict with the `self.buf_*`
+        // accesses below, and the previous full-KV-cache copy here ran once
+        // per layer per token (qwen3::attention shows the same borrow with
+        // no clone).
+        let cached_keys = crate::common::fetch_keys(&*kv_cache, layer_idx)?;
+        let cached_values = crate::common::fetch_values(&*kv_cache, layer_idx)?;
+        let cached_keys: &[f32] = &cached_keys;
+        let cached_values: &[f32] = &cached_values;
 
         self.buf_attn_out.fill(0.0);
 
+        // Dense causal attention over every cached position — no sliding
+        // window. This matches current llama.cpp: `LLM_ARCH_PHIMOE` shares
+        // `LLM_ARCH_PHI3`'s hparams path, which forcibly sets
+        // `swa_type = LLAMA_SWA_TYPE_NONE` regardless of any sliding_window
+        // metadata (see the identical note in `phi::model::attention`, and
+        // `llama-model.cpp` `case LLM_ARCH_PHI3:` / `case LLM_ARCH_PHIMOE:`
+        // at `llm = ... swa_type != NONE ? llm_build_phi3<true> :
+        // llm_build_phi3<false>`).
         for h in 0..num_heads {
             let kv_head = h / heads_per_kv;
             let q_head = &self.buf_q[h * head_dim..(h + 1) * head_dim];
@@ -293,6 +356,10 @@ impl PhiMoeModel {
             &attn_out_copy,
             &mut self.buf_attn_proj,
             attn_in_dim,
+        );
+        add_bias_inplace(
+            &mut self.buf_attn_proj,
+            &self.layers[layer_idx].attn_output_bias,
         );
 
         Ok(())
@@ -408,6 +475,7 @@ impl PhiMoeModel {
             self.layers[layer_idx]
                 .attn_norm
                 .forward_to(&hidden, &mut self.buf_norm);
+            add_bias_inplace(&mut self.buf_norm, &self.layers[layer_idx].attn_norm_bias);
         }
 
         self.attention(layer_idx, position, kv_cache)?;
@@ -426,6 +494,7 @@ impl PhiMoeModel {
             self.layers[layer_idx]
                 .ffn_norm
                 .forward_to(&hidden, &mut self.buf_norm);
+            add_bias_inplace(&mut self.buf_norm, &self.layers[layer_idx].ffn_norm_bias);
         }
 
         // MoE FFN (residual add is inside moe_ffn)
@@ -471,6 +540,58 @@ fn softmax_inplace(x: &mut [f32]) {
     }
 }
 
+/// Add `bias` into `x` element-wise, in place. A no-op when `bias` is `None`.
+///
+/// Stands in for `RmsNorm`'s missing bias support (`common::rms_norm::RmsNorm`
+/// has no bias field) and for `QuantLinear`-less raw f32 projections here:
+/// llama.cpp's `build_norm`/linear-with-bias both add the bias AFTER the
+/// weight multiply (`x_norm * weight + bias`), which this mirrors by running
+/// right after the corresponding `forward_to`/`gemv` call.
+fn add_bias_inplace(x: &mut [f32], bias: &Option<Vec<f32>>) {
+    if let Some(bias) = bias {
+        for (v, &b) in x.iter_mut().zip(bias.iter()) {
+            *v += b;
+        }
+    }
+}
+
+/// Build the out-of-vocabulary error for a bad token id.
+fn out_of_vocab_error(token: u32, vocab_size: usize) -> ArchError {
+    ArchError::ConfigMismatch {
+        param: "token id".to_string(),
+        expected: format!("< {vocab_size}"),
+        got: token.to_string(),
+    }
+}
+
+/// Validate that a forward/embed call will not run any position past
+/// `max_context_length`.
+///
+/// `RopeTable::apply`-equivalent (`apply_partial_rope`, indexed through
+/// `self.rope.cos`/`self.rope.sin`) and `buf_attn_scores` are both sized to
+/// `max_context_length` and indexed by raw position with no further
+/// checking; an over-long prompt at prefill time (the decode loop is
+/// separately guarded upstream, but prefill is reachable directly from the
+/// HTTP server with attacker-controlled input) would otherwise panic on the
+/// first out-of-range index instead of returning an error.
+fn check_context_length(
+    max_context_length: usize,
+    start_pos: usize,
+    n_tokens: usize,
+) -> ArchResult<()> {
+    let end = start_pos
+        .checked_add(n_tokens)
+        .filter(|&end| end <= max_context_length);
+    if end.is_some() {
+        return Ok(());
+    }
+    Err(ArchError::InvalidConfig {
+        detail: format!(
+            "context length exceeded: start_pos={start_pos} + {n_tokens} tokens > max_context_length={max_context_length}"
+        ),
+    })
+}
+
 impl ForwardPass for PhiMoeModel {
     fn forward(
         &mut self,
@@ -478,10 +599,11 @@ impl ForwardPass for PhiMoeModel {
         kv_cache: &mut dyn KvCacheAccess,
     ) -> ArchResult<Vec<f32>> {
         let start_pos = kv_cache.seq_len();
+        check_context_length(self.config.max_context_length, start_pos, tokens.len())?;
 
         for (i, &token) in tokens.iter().enumerate() {
             let position = start_pos + i;
-            self.embed_token(token);
+            self.embed_token(token)?;
 
             for layer_idx in 0..self.layers.len() {
                 self.layer_forward(layer_idx, position, kv_cache)?;
@@ -491,12 +613,15 @@ impl ForwardPass for PhiMoeModel {
 
         // Final RMSNorm
         self.output_norm.forward(&mut self.buf_hidden);
+        add_bias_inplace(&mut self.buf_hidden, &self.output_norm_bias);
 
         // LM head
         let vocab_size = self.config.vocab_size;
         let hidden_size = self.config.hidden_size;
         let hidden_final = self.buf_hidden.clone();
-        self.buf_logits.fill(0.0);
+        if self.buf_logits.len() != vocab_size {
+            self.buf_logits.resize(vocab_size, 0.0);
+        }
         for v in 0..vocab_size {
             let row = &self.output_weight[v * hidden_size..(v + 1) * hidden_size];
             self.buf_logits[v] = row
@@ -505,16 +630,21 @@ impl ForwardPass for PhiMoeModel {
                 .map(|(w, &x)| w * x)
                 .sum();
         }
+        add_bias_inplace(&mut self.buf_logits, &self.output_bias);
 
-        Ok(self.buf_logits.clone())
+        // Hand the freshly computed logits to the caller by ownership
+        // transfer instead of a `.clone()` allocation-and-memcpy on every
+        // decoded token; the resize above repairs `buf_logits` on next call.
+        Ok(std::mem::take(&mut self.buf_logits))
     }
 
     fn embed(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
         let start_pos = kv_cache.seq_len();
+        check_context_length(self.config.max_context_length, start_pos, tokens.len())?;
 
         for (i, &token) in tokens.iter().enumerate() {
             let position = start_pos + i;
-            self.embed_token(token);
+            self.embed_token(token)?;
 
             for layer_idx in 0..self.layers.len() {
                 self.layer_forward(layer_idx, position, kv_cache)?;
@@ -523,6 +653,7 @@ impl ForwardPass for PhiMoeModel {
         }
 
         self.output_norm.forward(&mut self.buf_hidden);
+        add_bias_inplace(&mut self.buf_hidden, &self.output_norm_bias);
         Ok(self.buf_hidden.clone())
     }
 
@@ -663,40 +794,70 @@ pub fn load_phi_moe_from_gguf(model: &GgufModel, config: &ModelConfig) -> ArchRe
     let intermediate_size = config.intermediate_size;
     let num_experts = config.num_experts.max(1);
 
-    // Partial rotary factor from GGUF metadata
-    let partial_rotary_factor = model
+    // Number of rotated dimensions per head, from the standard GGUF key
+    // `{arch}.rope.dimension_count` (defaults to full `head_dim`) — see the
+    // identical, more fully documented lookup in `phi::model::load_phi_from_gguf`.
+    // No converter ever writes `{arch}.rope.partial_rotary_factor`.
+    let rope_dims = model
         .file
         .metadata
-        .get_f32(&format!(
-            "{}.rope.partial_rotary_factor",
-            config.architecture
-        ))
-        .unwrap_or(0.5);
+        .get_u32(&format!("{}.rope.dimension_count", config.architecture))
+        .map(|v| v as usize)
+        .ok()
+        .filter(|&v| v > 0)
+        .unwrap_or(head_dim);
 
     // Token embeddings
     let token_embd = load_f32_tensor(model, "token_embd.weight", &dispatcher)?;
+
+    // The table must carry at least `vocab_size * hidden_size` rows (`>=`,
+    // not `==`: some converters keep padding rows beyond the tokenizer's
+    // declared vocabulary). Falling short turns an in-range `token` into an
+    // out-of-bounds `buf_hidden` copy.
+    let min_embd_len = config.vocab_size.saturating_mul(hidden_size);
+    if token_embd.len() < min_embd_len {
+        return Err(ArchError::InvalidShape {
+            name: "token_embd.weight".to_string(),
+            expected: vec![config.vocab_size, hidden_size],
+            got: vec![token_embd.len()],
+        });
+    }
 
     // Transformer layers
     let mut layers = Vec::with_capacity(config.num_layers);
     for i in 0..config.num_layers {
         let prefix = format!("blk.{i}");
 
-        // Pre-attention RMSNorm
+        // Pre-attention RMSNorm. Phi-3.5-MoE (`LLM_ARCH_PHIMOE`) ships a
+        // required `attn_norm.bias` tensor (see `llama-model.cpp`'s
+        // `LLM_ARCH_PHIMOE` tensor map); loaded optionally here so synthetic
+        // fixtures without it still load.
         let attn_norm_w =
             load_f32_tensor(model, &format!("{prefix}.attn_norm.weight"), &dispatcher)?;
         let attn_norm = RmsNorm::new(attn_norm_w, config.rms_norm_eps);
+        let attn_norm_bias =
+            load_optional_f32_tensor(model, &format!("{prefix}.attn_norm.bias"), &dispatcher)?;
 
-        // Fused QKV
+        // Fused QKV. No bias tensor exists for the merged-QKV path in either
+        // `LLM_ARCH_PHI3` or `LLM_ARCH_PHIMOE`'s tensor map (the `bq`/`bk`/`bv`
+        // biases only appear in the unmerged fallback branch, which real
+        // Phi-3.5-MoE checkpoints — which always ship `attn_qkv.weight` — do
+        // not take).
         let attn_qkv_weight =
             load_f32_tensor(model, &format!("{prefix}.attn_qkv.weight"), &dispatcher)?;
 
-        // Attention output projection
+        // Attention output projection. `attn_output.bias` ("bo") is required
+        // for `LLM_ARCH_PHIMOE`.
         let attn_output_weight =
             load_f32_tensor(model, &format!("{prefix}.attn_output.weight"), &dispatcher)?;
+        let attn_output_bias =
+            load_optional_f32_tensor(model, &format!("{prefix}.attn_output.bias"), &dispatcher)?;
 
-        // Pre-FFN RMSNorm
+        // Pre-FFN RMSNorm. `ffn_norm.bias` is required for `LLM_ARCH_PHIMOE`.
         let ffn_norm_w = load_f32_tensor(model, &format!("{prefix}.ffn_norm.weight"), &dispatcher)?;
         let ffn_norm = RmsNorm::new(ffn_norm_w, config.rms_norm_eps);
+        let ffn_norm_bias =
+            load_optional_f32_tensor(model, &format!("{prefix}.ffn_norm.bias"), &dispatcher)?;
 
         // Router: [num_experts, hidden_size]
         let router_weight =
@@ -747,9 +908,12 @@ pub fn load_phi_moe_from_gguf(model: &GgufModel, config: &ModelConfig) -> ArchRe
 
         layers.push(PhiMoeLayer {
             attn_norm,
+            attn_norm_bias,
             attn_qkv_weight,
             attn_output_weight,
+            attn_output_bias,
             ffn_norm,
+            ffn_norm_bias,
             router_weight,
             ffn_gate_exps,
             ffn_up_exps,
@@ -757,19 +921,53 @@ pub fn load_phi_moe_from_gguf(model: &GgufModel, config: &ModelConfig) -> ArchRe
         });
     }
 
-    // Final RMSNorm and output projection
+    // Final RMSNorm and output projection. `output_norm.bias`/`output.bias`
+    // are both required for `LLM_ARCH_PHIMOE`; loaded optionally here so
+    // synthetic fixtures without them still load.
     let output_norm_w = load_f32_tensor(model, "output_norm.weight", &dispatcher)?;
     let output_norm = RmsNorm::new(output_norm_w, config.rms_norm_eps);
-    let output_weight = load_f32_tensor(model, "output.weight", &dispatcher)?;
+    let output_norm_bias = load_optional_f32_tensor(model, "output_norm.bias", &dispatcher)?;
+
+    // LM head, falling back to the tied input embedding when the checkpoint
+    // ships no standalone `output.weight` (mirrors `phi::model::load_lm_head`
+    // and `qwen3::load_lm_head`; llama.cpp does the same for `LLM_ARCH_PHI3`:
+    // `if (output == NULL) { output = tok_embd; }`). Reuses the already
+    // f32-dequantized `token_embd` table directly — this path stores raw f32
+    // rather than a quantized `QuantTensor`, so there is no view to share
+    // without an extra dequantization; a straight copy keeps this correct
+    // without introducing a new sharing scheme for one loader.
+    let output_weight = if model.file.tensors.contains("output.weight") {
+        load_f32_tensor(model, "output.weight", &dispatcher)?
+    } else {
+        token_embd.clone()
+    };
+    let output_bias = load_optional_f32_tensor(model, "output.bias", &dispatcher)?;
 
     Ok(PhiMoeModel::new(
         config.clone(),
         token_embd,
         layers,
         output_norm,
+        output_norm_bias,
         output_weight,
-        partial_rotary_factor,
+        output_bias,
+        rope_dims,
     ))
+}
+
+/// Load an optional tensor as f32. Returns `Ok(None)` when the tensor is
+/// genuinely absent (e.g. a checkpoint or fixture without bias tensors); when
+/// present but undecodable, the error is propagated rather than swallowed —
+/// see `gemma::model::load_optional_rms_norm` for the same reasoning.
+fn load_optional_f32_tensor(
+    model: &GgufModel,
+    name: &str,
+    dispatcher: &oxillama_quant::KernelDispatcher,
+) -> ArchResult<Option<Vec<f32>>> {
+    if !model.file.tensors.contains(name) {
+        return Ok(None);
+    }
+    Ok(Some(load_f32_tensor(model, name, dispatcher)?))
 }
 
 /// Load a tensor as f32, dequantizing if necessary.
@@ -936,9 +1134,12 @@ mod tests {
 
         let layer = PhiMoeLayer {
             attn_norm: RmsNorm::new(vec![1.0f32; h], 1e-5),
+            attn_norm_bias: None,
             attn_qkv_weight: vec![0.01f32; qkv_dim * h],
             attn_output_weight: vec![0.01f32; h * q_dim],
+            attn_output_bias: None,
             ffn_norm: RmsNorm::new(vec![1.0f32; h], 1e-5),
+            ffn_norm_bias: None,
             router_weight: vec![0.01f32; n_exp * h],
             ffn_gate_exps: vec![0.01f32; n_exp * ffn * h],
             ffn_up_exps: vec![0.01f32; n_exp * ffn * h],
@@ -954,8 +1155,10 @@ mod tests {
             token_embd,
             vec![layer],
             output_norm,
+            None,
             output_weight,
-            0.5,
+            None,
+            head_dim,
         )
     }
 
@@ -1032,15 +1235,19 @@ mod tests {
         }
     }
 
-    /// `partial_rotary_factor` stored in config should be 0.5 for Phi-3.5-MoE.
+    /// `PhiMoeModel::new`'s `rope_dims` parameter, not a hardcoded factor,
+    /// controls how many head dimensions RoPE rotates (G5/G13). The
+    /// end-to-end regression — verifying `load_phi_moe_from_gguf` resolves
+    /// this from `{arch}.rope.dimension_count`, defaulting to the full
+    /// `head_dim` when absent — lives in `tests/phi_regressions.rs` against
+    /// a hand-built GGUF, since it needs to observe the loader's behavior
+    /// rather than a hardcoded config field.
     #[test]
-    fn phi_moe_partial_rope_first_25pct() {
-        let config = minimal_phi_moe_config();
-        let phi_cfg = PhiMoeConfig::from(&config);
-        assert!(
-            (phi_cfg.partial_rotary_factor - 0.5).abs() < 1e-6,
-            "Phi-3.5-MoE partial_rotary_factor should be 0.5, got {}",
-            phi_cfg.partial_rotary_factor
+    fn phi_moe_rope_dims_matches_constructor_argument() {
+        let model = build_tiny_phi_moe();
+        assert_eq!(
+            model.rope_dims, model.config.head_dim,
+            "build_tiny_phi_moe() passes head_dim as rope_dims (full rotary)"
         );
     }
 

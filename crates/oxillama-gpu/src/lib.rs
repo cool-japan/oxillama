@@ -30,17 +30,19 @@ pub mod context;
 pub mod error;
 pub mod kernels;
 
+#[cfg(feature = "gpu")]
+pub use context::CachedPipeline;
 pub use context::GpuContext;
 pub use context::GpuDeviceInfo;
 pub use error::{GpuError, GpuResult};
 pub use kernels::sampling::SamplingKernel;
 pub use kernels::{
-    batched_gemv_f32, supports_f16, BatchedGemvConfig, BatchedGpuKernel, F16AccumulatorConfig,
-    FusedAttentionKernel, GpuKernel, Iq1MGpuKernel, Iq1SGpuKernel, Iq2SGpuKernel, Iq2XsGpuKernel,
-    Iq2XxsGpuKernel, Iq3SGpuKernel, Iq3XxsGpuKernel, Iq4NlGpuKernel, Iq4XsGpuKernel,
-    Q1_0_G128GpuKernel, Q2_KGpuKernel, Q3_KGpuKernel, Q4_0GpuKernel, Q4_1GpuKernel, Q4_KGpuKernel,
-    Q5_0GpuKernel, Q5_1GpuKernel, Q5_KGpuKernel, Q6_KGpuKernel, Q8_0GpuKernel, Q8_1GpuKernel,
-    Q8_KGpuKernel, TiledGemmKernel, Tq1_0GpuKernel, Tq2_0GpuKernel,
+    batched_gemv_f32, gemv_q4_0_resident, supports_f16, BatchedGemvConfig, BatchedGpuKernel,
+    F16AccumulatorConfig, FusedAttentionKernel, GpuKernel, Iq1MGpuKernel, Iq1SGpuKernel,
+    Iq2SGpuKernel, Iq2XsGpuKernel, Iq2XxsGpuKernel, Iq3SGpuKernel, Iq3XxsGpuKernel, Iq4NlGpuKernel,
+    Iq4XsGpuKernel, Q1_0_G128GpuKernel, Q2_KGpuKernel, Q3_KGpuKernel, Q4_0GpuKernel, Q4_0Resident,
+    Q4_1GpuKernel, Q4_KGpuKernel, Q5_0GpuKernel, Q5_1GpuKernel, Q5_KGpuKernel, Q6_KGpuKernel,
+    Q8_0GpuKernel, Q8_1GpuKernel, Q8_KGpuKernel, TiledGemmKernel, Tq1_0GpuKernel, Tq2_0GpuKernel,
 };
 #[cfg(any(feature = "gpu", test))]
 pub use kernels::{dequant_q4_0_to_f16, dequant_q8_0_to_f16};

@@ -50,7 +50,8 @@ impl QuantKernel for Iq3XxsAvx2 {
                 available: output.len(),
             });
         }
-        dequant_block_scalar(block, output)
+        decode_block_scalar(block, output);
+        Ok(())
     }
 
     fn gemv(
@@ -82,7 +83,7 @@ impl QuantKernel for Iq3XxsAvx2 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: bounds checked; avx2+fma guaranteed by dispatcher.
             *out = unsafe {
@@ -93,7 +94,7 @@ impl QuantKernel for Iq3XxsAvx2 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -133,7 +134,16 @@ impl QuantKernel for Iq3XxsAvx2 {
 // ---------------------------------------------------------------------------
 
 /// Decode one IQ3_XXS block (256 weights) into `output` using scalar arithmetic.
-fn dequant_block_scalar(block: &[u8], output: &mut [f32]) -> QuantResult<()> {
+///
+/// # Preconditions
+/// `block.len() >= BLOCK_BYTES` and `output.len() >= BLOCK_SIZE`. Both call
+/// sites ([`QuantKernel::dequant_block`] and `gemv_row_avx2`) check or
+/// guarantee this before calling. `qs_signs` is always sliced to exactly
+/// `BLOCK_BYTES - 2 - SIGNS_OFFSET = 32` bytes regardless of `block`'s actual
+/// length, so `signs_base + 3 < qs_signs.len()` holds for every
+/// `ib32 < N_SUPERBLOCKS = 8` (max `signs_base` is `7 * 4 = 28`). Decoding
+/// cannot fail, so there is no `Result` to swallow.
+fn decode_block_scalar(block: &[u8], output: &mut [f32]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let qs = &block[2..BLOCK_BYTES];
     let qs_grid = &qs[..SIGNS_OFFSET];
@@ -141,12 +151,6 @@ fn dequant_block_scalar(block: &[u8], output: &mut [f32]) -> QuantResult<()> {
 
     for ib32 in 0..N_SUPERBLOCKS {
         let signs_base = ib32 * 4;
-        if signs_base + 3 >= qs_signs.len() {
-            return Err(QuantError::BufferTooSmall {
-                needed: signs_base + 4,
-                available: qs_signs.len(),
-            });
-        }
         let aux32 = u32::from_le_bytes([
             qs_signs[signs_base],
             qs_signs[signs_base + 1],
@@ -187,8 +191,6 @@ fn dequant_block_scalar(block: &[u8], output: &mut [f32]) -> QuantResult<()> {
             }
         }
     }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +220,7 @@ unsafe fn gemv_row_avx2(
         let remaining = n_cols.saturating_sub(col_offset).min(BLOCK_SIZE);
 
         // Scalar decode — grid lookups cannot be vectorized.
-        let _ = dequant_block_scalar(block, &mut buf);
+        decode_block_scalar(block, &mut buf);
 
         let full_chunks = remaining / 8;
         for chunk in 0..full_chunks {

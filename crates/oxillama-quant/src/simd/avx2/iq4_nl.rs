@@ -78,7 +78,7 @@ impl QuantKernel for Iq4NlAvx2 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: bounds checked; avx2+fma guaranteed by dispatcher.
             *out = unsafe {
@@ -89,7 +89,7 @@ impl QuantKernel for Iq4NlAvx2 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -144,8 +144,10 @@ unsafe fn dequant_block_avx2(block: &[u8], output: &mut [f32]) {
         let byte = *block.get_unchecked(2 + i);
         let lo = (byte & 0x0F) as usize;
         let hi = ((byte >> 4) & 0x0F) as usize;
-        vals[i * 2] = *KVALUES_IQ4NL.get_unchecked(lo) as f32;
-        vals[i * 2 + 1] = *KVALUES_IQ4NL.get_unchecked(hi) as f32;
+        // GGML split-half layout: byte `i` holds weight `i` (low nibble) and
+        // weight `i + 16` (high nibble).
+        vals[i] = *KVALUES_IQ4NL.get_unchecked(lo) as f32;
+        vals[i + BLOCK_SIZE / 2] = *KVALUES_IQ4NL.get_unchecked(hi) as f32;
     }
 
     // Multiply in 4 chunks of 8 using AVX2.

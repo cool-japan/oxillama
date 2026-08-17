@@ -51,10 +51,13 @@ requests from any OpenAI client (requires the `server` feature, enabled by defau
 ```rust,no_run
 #[cfg(feature = "server")]
 fn main() -> anyhow::Result<()> {
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use oxillama::runtime::{EngineConfig, InferenceEngine};
     use oxillama::server::{
-        build_app, spawn_inference_worker, AppState, ServerConfig,
+        build_app_with_config, spawn_inference_worker, AppState, PrefixCacheRegistry,
+        ServerConfig, DEFAULT_MAX_NAMESPACES,
     };
 
     // 1. Load the model.
@@ -70,35 +73,57 @@ fn main() -> anyhow::Result<()> {
     let cached_sampler = engine.config().sampler.clone();
     let hidden_size = engine.hidden_size().unwrap_or(0);
     let vocab_bytes = engine.vocab_bytes().map(Arc::new);
+    // The model's real chat template, resolved from the GGUF metadata the
+    // engine already holds. Every chat-shaped route renders through it, so
+    // the model is prompted in the format it was actually trained on.
+    let chat_template = engine.chat_template().unwrap_or_default();
 
-    // 3. Spawn the background inference worker.
-    //    Route handlers communicate with it via an mpsc channel.
+    // 3. Spawn the background inference worker. `prefix_registry` and
+    //    `worker_alive` are shared `Arc`s between the worker and `AppState`
+    //    so both sides observe the same prefix-cache/liveness state.
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let prefix_cache = Arc::new(std::sync::Mutex::new(
-        oxillama::runtime::PrefixKvCache::new(oxillama::runtime::PrefixCacheConfig::default()),
+    let prefix_registry = Arc::new(PrefixCacheRegistry::new(
+        oxillama::runtime::PrefixCacheConfig::default(),
+        DEFAULT_MAX_NAMESPACES,
     ));
+    let worker_alive = Arc::new(AtomicBool::new(false));
     let loras: Arc<std::sync::RwLock<std::collections::HashMap<
         String,
         Arc<oxillama::arch::lora::LoadedLora>,
     >>> = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-    spawn_inference_worker(engine, rx, prefix_cache, loras);
+    spawn_inference_worker(
+        engine,
+        rx,
+        "llama-3-8b-instruct".to_string(),
+        Arc::clone(&prefix_registry),
+        loras,
+        Arc::clone(&worker_alive),
+    );
 
-    // 4. Build shared state + axum router.
+    // 4. Build shared state (fallible: fails if the batch spool directory
+    //    cannot be created) + the production axum router.
+    let server_config = ServerConfig {
+        host: "127.0.0.1".to_string(),
+        port: 8080,
+        ..ServerConfig::default()
+    };
     let state = Arc::new(AppState::new(
         tx,
         "llama-3-8b-instruct".to_string(),
         cached_sampler,
         vocab_bytes,
         hidden_size,
-    ));
-    let app = build_app(Arc::clone(&state));
+        chat_template,
+        prefix_registry,
+        worker_alive,
+        server_config.batch_spool_dir.clone().map(std::path::PathBuf::from),
+    )?);
+    // `build_app_with_config` (not the test-only `build_app`) applies the
+    // full production layer stack: admin auth, rate limiting, timeouts,
+    // CORS, metrics, and tracing, all driven by `server_config`.
+    let app = build_app_with_config(Arc::clone(&state), &server_config)?;
 
     // 5. Block on the Tokio runtime.
-    let server_config = ServerConfig {
-        host: "127.0.0.1".to_string(),
-        port: 8080,
-        ..ServerConfig::default()
-    };
     let bind_addr = format!("{}:{}", server_config.host, server_config.port);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -107,7 +132,10 @@ fn main() -> anyhow::Result<()> {
 
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-        axum::serve(listener, app)
+        // `with_connect_info` is required: the loopback-only admin fallback
+        // (no bearer token configured) reads `ConnectInfo<SocketAddr>` and
+        // fails closed if the service is built with plain `into_make_service()`.
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(oxillama::server::shutdown_signal())
             .await
             .map_err(anyhow::Error::from)

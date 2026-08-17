@@ -1,363 +1,217 @@
-//! Integration tests for the DeepSeek-V2 architecture.
+//! Integration tests for DeepSeek-V2 / V2-Lite.
 //!
-//! These tests exercise the full C1 (MLA primitive) and C2 (DeepSeek-V2 model)
-//! stack. They build a tiny in-memory model (all F32, random weights) and verify
-//! structural correctness: shapes, determinism, and registry presence.
-//!
-//! Note: `MlaLatentCache` is arch-internal — `KvCacheAccess` is stubbed with a
-//! no-op implementation; the DeepSeek model ignores it in favour of its own cache.
+//! Driven through the GGUF fixtures, which now carry the **real**
+//! `LLM_ARCH_DEEPSEEK2` tensor names.  The old fixture invented
+//! `blk.N.ffn_exp.{e}.ffn_gate.weight` / `blk.N.ffn_shared_exp.{e}.*`, names
+//! that appear nowhere in llama.cpp or `gguf-py`, so a loader written against it
+//! could not read a single real checkpoint.
 
-#[cfg(feature = "deepseek")]
-mod deepseek_tests {
-    use oxillama_arch::common::linear::QuantLinear;
-    use oxillama_arch::common::mla::{mla_forward, MlaConfig, MlaLatentCache, MlaWeights};
-    use oxillama_arch::common::rms_norm::RmsNorm;
-    use oxillama_arch::common::rope::RopeTable;
-    use oxillama_arch::config::{DeepSeekConfig, ModelConfig};
-    use oxillama_arch::deepseek::model::{
-        build_deepseek_model, DeepSeekLayer, DenseFfn, FfnKind, N_DENSE_LAYERS,
-    };
-    use oxillama_arch::deepseek::moe::{
-        moe_forward, DeepSeekExpert, MoeConfig, MoeWeights, ScoringMode,
-    };
-    use oxillama_arch::error::ArchResult;
-    use oxillama_arch::registry::ArchitectureRegistry;
-    use oxillama_arch::traits::{ForwardPass, KvCacheAccess};
-    use oxillama_gguf::GgufTensorType;
-    use oxillama_quant::QuantTensor;
+#![cfg(feature = "deepseek")]
 
-    // ─── No-op KvCacheAccess stub ─────────────────────────────────────────────
+use oxillama_arch::deepseek::{load_deepseek_from_gguf, DeepSeekModel, FfnKind, QProjection};
+use oxillama_arch::error::ArchResult;
+use oxillama_arch::registry::ArchitectureRegistry;
+use oxillama_arch::traits::{ForwardPass, KvCacheAccess};
 
-    /// Stub KV cache that satisfies the trait but never actually caches anything.
-    /// DeepSeek uses arch-internal `MlaLatentCache`; this stub is only needed
-    /// because `ForwardPass::forward` takes `&mut dyn KvCacheAccess`.
-    struct NullKv;
-
-    impl KvCacheAccess for NullKv {
-        fn seq_len(&self) -> usize {
-            0
-        }
-
-        fn store_kv(&mut self, _layer: usize, _keys: &[f32], _values: &[f32]) -> ArchResult<()> {
-            Ok(())
-        }
-
-        fn get_keys(&self, _layer: usize) -> ArchResult<&[f32]> {
-            Ok(&[])
-        }
-
-        fn get_values(&self, _layer: usize) -> ArchResult<&[f32]> {
-            Ok(&[])
-        }
-
-        fn advance(&mut self) {}
+/// DeepSeek keeps its own `MlaLatentCache`, so the external KV cache is unused.
+struct NoKv;
+impl KvCacheAccess for NoKv {
+    fn seq_len(&self) -> usize {
+        0
     }
-
-    // ─── Minimal LCG ─────────────────────────────────────────────────────────
-
-    struct Lcg {
-        state: u64,
+    fn store_kv(&mut self, _: usize, _: &[f32], _: &[f32]) -> ArchResult<()> {
+        Ok(())
     }
+    fn get_keys(&self, _: usize) -> ArchResult<&[f32]> {
+        Ok(&[])
+    }
+    fn get_values(&self, _: usize) -> ArchResult<&[f32]> {
+        Ok(&[])
+    }
+    fn advance(&mut self) {}
+}
 
-    impl Lcg {
-        fn new(seed: u64) -> Self {
-            Self { state: seed }
+fn load_v2() -> DeepSeekModel {
+    let bytes = oxillama_gguf::test_utils::build_minimal_deepseek_gguf();
+    let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("V2 fixture parses");
+    load_deepseek_from_gguf(&gguf).expect("load_deepseek_from_gguf")
+}
+
+fn load_lite() -> DeepSeekModel {
+    let bytes = oxillama_gguf::test_utils::build_minimal_deepseek_lite_gguf();
+    let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("Lite fixture parses");
+    load_deepseek_from_gguf(&gguf).expect("load_deepseek_from_gguf (Lite)")
+}
+
+#[test]
+fn deepseek_registered_in_registry() {
+    let reg = ArchitectureRegistry::with_builtins();
+    assert!(reg.contains("deepseek2"));
+    assert_eq!(reg.get("deepseek2").expect("get").arch_id(), "deepseek2");
+}
+
+/// The registry can now build DeepSeek; the default `build_from_gguf` returned
+/// `NotSupported`.
+#[test]
+fn deepseek_reachable_through_registry() {
+    let bytes = oxillama_gguf::test_utils::build_minimal_deepseek_gguf();
+    let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("fixture parses");
+    let config = oxillama_arch::config::ModelConfig::from_metadata(&gguf.file.metadata)
+        .expect("config parses");
+    let model = ArchitectureRegistry::with_builtins()
+        .get("deepseek2")
+        .expect("get deepseek2")
+        .build_from_gguf(&gguf, &config)
+        .expect("registry must be able to build DeepSeek from a GGUF");
+    assert_eq!(model.vocab_size(), 32);
+}
+
+#[test]
+fn v2_forward_shape_and_finiteness() {
+    let mut model = load_v2();
+    let mut kv = NoKv;
+    let logits = model.forward(&[1u32, 2], &mut kv).expect("forward");
+    assert_eq!(logits.len(), 32);
+    assert!(logits.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn v2_embed_returns_hidden_size() {
+    let mut model = load_v2();
+    let mut kv = NoKv;
+    assert_eq!(model.embed(&[1u32], &mut kv).expect("embed").len(), 32);
+}
+
+/// `leading_dense_block_count = 1`: layer 0 dense, layer 1 routed MoE.
+#[test]
+fn v2_layer_zero_is_dense_and_layer_one_is_moe() {
+    let model = load_v2();
+    assert!(matches!(model.layers[0].ffn, FfnKind::Dense(_)));
+    match &model.layers[1].ffn {
+        FfnKind::Moe(m) => {
+            assert_eq!(m.num_experts(), 2);
+            assert!(m.has_shared_expert(), "one shared expert of width n_ff_exp");
         }
-
-        fn next_f32(&mut self) -> f32 {
-            self.state = self
-                .state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let mantissa = (self.state >> 33) as u32 & 0x007f_ffff;
-            let bits = mantissa | 0x3f80_0000u32;
-            (f32::from_bits(bits) - 1.5) * 0.02
-        }
-
-        fn fill(&mut self, buf: &mut [f32]) {
-            for v in buf.iter_mut() {
-                *v = self.next_f32();
-            }
-        }
+        FfnKind::Dense(_) => panic!("layer 1 must be a MoE layer"),
     }
+}
 
-    // ─── Test helpers ─────────────────────────────────────────────────────────
-
-    const HIDDEN: usize = 16;
-    const VOCAB: usize = 32;
-    const INTERMEDIATE: usize = 32;
-    const N_LAYERS: usize = 2;
-    const MAX_SEQ: usize = 64;
-    const N_ROUTED: usize = 4;
-    const TOP_K: usize = 2;
-    const N_SHARED: usize = 1;
-    const MOE_INTER: usize = 16;
-
-    fn rand_f32_tensor(lcg: &mut Lcg, rows: usize, cols: usize) -> QuantTensor {
-        let n = rows * cols;
-        let mut vals = vec![0.0f32; n];
-        lcg.fill(&mut vals);
-        let mut data = Vec::with_capacity(n * 4);
-        for &v in &vals {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        QuantTensor::new(data, vec![rows, cols], GgufTensorType::F32)
+/// DeepSeek-V2 ships `norm_topk_prob = false`; without an explicit
+/// `expert_weights_norm` key the weights must **not** be re-normalised.
+#[test]
+fn v2_does_not_renormalise_top_k_weights_by_default() {
+    let model = load_v2();
+    match &model.layers[1].ffn {
+        FfnKind::Moe(m) => assert!(
+            !m.config().norm_weights,
+            "DeepSeek-V2 must not re-normalise the top-k weights"
+        ),
+        FfnKind::Dense(_) => panic!("layer 1 must be a MoE layer"),
     }
+}
 
-    fn test_mla_cfg() -> MlaConfig {
-        MlaConfig {
-            num_heads: 2,
-            q_lora_rank: 8,
-            kv_lora_rank: 8,
-            qk_nope_head_dim: 4,
-            qk_rope_head_dim: 4,
-            v_head_dim: 4,
-            rope_theta: 10000.0,
-            softmax_scale: 1.0 / (8.0f32).sqrt(),
-        }
+/// The V2 fixture uses the real tensor names.
+#[test]
+fn v2_fixture_uses_the_llama_cpp_tensor_names() {
+    let bytes = oxillama_gguf::test_utils::build_minimal_deepseek_gguf();
+    let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("fixture parses");
+    for name in [
+        "blk.0.attn_q_a.weight",
+        "blk.0.attn_q_a_norm.weight",
+        "blk.0.attn_q_b.weight",
+        "blk.0.attn_kv_a_mqa.weight",
+        "blk.1.ffn_gate_exps.weight",
+        "blk.1.ffn_down_shexp.weight",
+    ] {
+        assert!(gguf.file.tensors.contains(name), "missing {name}");
     }
-
-    fn build_mla_weights(lcg: &mut Lcg, cfg: &MlaConfig) -> MlaWeights {
-        let q_full = cfg.q_full_dim();
-        let kv_comb = cfg.kv_combined_dim();
-        let kv_b_full = cfg.kv_b_full_dim();
-        let attn_out = cfg.attn_out_dim();
-
-        let pos_weights = |lcg: &mut Lcg, n: usize| -> Vec<f32> {
-            let mut w = vec![0.0f32; n];
-            lcg.fill(&mut w);
-            w.iter_mut().for_each(|v| *v = v.abs() + 0.1);
-            w
-        };
-
-        MlaWeights {
-            w_q_a: QuantLinear::new(rand_f32_tensor(lcg, cfg.q_lora_rank, HIDDEN), None),
-            q_a_norm: RmsNorm::new(pos_weights(lcg, cfg.q_lora_rank), 1e-5),
-            w_q_b: QuantLinear::new(rand_f32_tensor(lcg, q_full, cfg.q_lora_rank), None),
-            w_kv_a: QuantLinear::new(rand_f32_tensor(lcg, kv_comb, HIDDEN), None),
-            kv_a_norm: RmsNorm::new(pos_weights(lcg, cfg.kv_lora_rank), 1e-5),
-            w_kv_b: QuantLinear::new(rand_f32_tensor(lcg, kv_b_full, cfg.kv_lora_rank), None),
-            w_o: QuantLinear::new(rand_f32_tensor(lcg, HIDDEN, attn_out), None),
-            rope: RopeTable::new_standard(cfg.qk_rope_head_dim, MAX_SEQ, cfg.rope_theta),
-        }
-    }
-
-    fn build_dense_ffn(lcg: &mut Lcg) -> DenseFfn {
-        DenseFfn {
-            gate: QuantLinear::new(rand_f32_tensor(lcg, INTERMEDIATE, HIDDEN), None),
-            up: QuantLinear::new(rand_f32_tensor(lcg, INTERMEDIATE, HIDDEN), None),
-            down: QuantLinear::new(rand_f32_tensor(lcg, HIDDEN, INTERMEDIATE), None),
-        }
-    }
-
-    fn make_expert(lcg: &mut Lcg, inter: usize) -> DeepSeekExpert {
-        let mut gate = vec![0.0f32; inter * HIDDEN];
-        let mut up = vec![0.0f32; inter * HIDDEN];
-        let mut down = vec![0.0f32; HIDDEN * inter];
-        lcg.fill(&mut gate);
-        lcg.fill(&mut up);
-        lcg.fill(&mut down);
-        DeepSeekExpert {
-            gate,
-            up,
-            down,
-            hidden_size: HIDDEN,
-            intermediate_size: inter,
-        }
-    }
-
-    fn build_moe_ffn(lcg: &mut Lcg) -> (MoeWeights, MoeConfig) {
-        let moe_cfg = MoeConfig {
-            hidden_size: HIDDEN,
-            expert_intermediate_size: MOE_INTER,
-            n_shared_experts: N_SHARED,
-            n_routed_experts: N_ROUTED,
-            top_k: TOP_K,
-            routed_scaling_factor: 1.0,
-            scoring_mode: ScoringMode::Softmax,
-            shared_expert_intermediate_size: MOE_INTER,
-        };
-        let mut router = vec![0.0f32; N_ROUTED * HIDDEN];
-        lcg.fill(&mut router);
-        let moe_weights = MoeWeights {
-            router,
-            routed_experts: (0..N_ROUTED).map(|_| make_expert(lcg, MOE_INTER)).collect(),
-            shared_experts: (0..N_SHARED).map(|_| make_expert(lcg, MOE_INTER)).collect(),
-            expert_bias: None,
-        };
-        (moe_weights, moe_cfg)
-    }
-
-    fn build_test_model(lcg: &mut Lcg) -> impl ForwardPass {
-        let mla_cfg = test_mla_cfg();
-
-        let pos_weights = |lcg: &mut Lcg, n: usize| -> Vec<f32> {
-            let mut w = vec![0.0f32; n];
-            lcg.fill(&mut w);
-            w.iter_mut().for_each(|v| *v = v.abs() + 0.1);
-            w
-        };
-
-        let layers = (0..N_LAYERS)
-            .map(|idx| {
-                let ffn = if idx < N_DENSE_LAYERS {
-                    FfnKind::Dense(Box::new(build_dense_ffn(lcg)))
-                } else {
-                    let (moe_weights, moe_cfg) = build_moe_ffn(lcg);
-                    FfnKind::Moe {
-                        weights: Box::new(moe_weights),
-                        config: moe_cfg,
-                    }
-                };
-                DeepSeekLayer {
-                    attn_norm: RmsNorm::new(pos_weights(lcg, HIDDEN), 1e-5),
-                    mla_weights: build_mla_weights(lcg, &mla_cfg),
-                    mla_config: mla_cfg.clone(),
-                    mla_cache: MlaLatentCache::new(MAX_SEQ, &mla_cfg),
-                    ffn_norm: RmsNorm::new(pos_weights(lcg, HIDDEN), 1e-5),
-                    ffn,
-                }
-            })
-            .collect();
-
-        let mut token_embd = vec![0.0f32; VOCAB * HIDDEN];
-        lcg.fill(&mut token_embd);
-
-        let ds_config = DeepSeekConfig {
-            q_lora_rank: mla_cfg.q_lora_rank,
-            kv_lora_rank: mla_cfg.kv_lora_rank,
-            qk_nope_head_dim: mla_cfg.qk_nope_head_dim,
-            qk_rope_head_dim: mla_cfg.qk_rope_head_dim,
-            v_head_dim: mla_cfg.v_head_dim,
-            n_shared_experts: N_SHARED,
-            n_routed_experts: N_ROUTED,
-            top_k_routed: TOP_K,
-            shared_expert_intermediate_size: MOE_INTER,
-            routed_scaling_factor: 1.0,
-            first_k_dense_replace: 1,
-        };
-
-        let model_config = ModelConfig {
-            architecture: "deepseek2".to_string(),
-            model_name: "test-deepseek".to_string(),
-            hidden_size: HIDDEN,
-            intermediate_size: INTERMEDIATE,
-            num_layers: N_LAYERS,
-            num_attention_heads: mla_cfg.num_heads,
-            num_kv_heads: mla_cfg.num_heads,
-            head_dim: mla_cfg.qk_head_dim(),
-            vocab_size: VOCAB,
-            max_context_length: MAX_SEQ,
-            rms_norm_eps: 1e-5,
-            rope_freq_base: 10000.0,
-            ..ModelConfig::default()
-        };
-
-        let output_norm = RmsNorm::new(pos_weights(lcg, HIDDEN), 1e-5);
-        let output = QuantLinear::new(rand_f32_tensor(lcg, VOCAB, HIDDEN), None);
-
-        build_deepseek_model(
-            model_config,
-            ds_config,
-            token_embd,
-            layers,
-            output_norm,
-            output,
-        )
-    }
-
-    // ─── Integration tests ────────────────────────────────────────────────────
-
-    /// DeepSeek-V2 is registered in the architecture registry under "deepseek2".
-    #[test]
-    fn test_deepseek_registered_in_registry() {
-        let reg = ArchitectureRegistry::with_builtins();
+    for gone in [
+        "blk.0.attn_q_a_proj.weight",
+        "blk.0.attn_kv_a_proj.weight",
+        "blk.1.ffn_exp.0.ffn_gate.weight",
+        "blk.1.ffn_shared_exp.0.ffn_gate.weight",
+    ] {
         assert!(
-            reg.contains("deepseek2"),
-            "registry must contain 'deepseek2'"
+            !gguf.file.tensors.contains(gone),
+            "{gone} is not a llama.cpp tensor name"
         );
-        let arch = reg.get("deepseek2").expect("get deepseek2 must succeed");
-        assert_eq!(arch.arch_id(), "deepseek2");
     }
+}
 
-    /// Forward pass produces logits of vocab_size length.
-    #[test]
-    fn test_forward_shape() {
-        let mut lcg = Lcg::new(42);
-        let mut model = build_test_model(&mut lcg);
-        let mut kv = NullKv;
-        let logits = model
-            .forward(&[1u32, 2, 3], &mut kv)
-            .expect("forward must succeed");
+/// D2: `qk_nope_head_dim = key_length − rope.dimension_count`.
+///
+/// The fixture declares `key_length = 8` and `rope.dimension_count = 4`, so the
+/// nope slice is 4 wide.  Reading `qk_nope_head_dim` straight off `key_length`
+/// (what `config.rs` does) would give 8 and split `attn_q_b`'s 16 outputs into
+/// two heads of 12 — past the end of the row.
+#[test]
+fn head_dims_come_from_key_length_minus_rope_dimension_count() {
+    let model = load_v2();
+    let mla = &model.layers[0].mla_config;
+    assert_eq!(mla.qk_nope_head_dim, 4, "8 - 4");
+    assert_eq!(mla.qk_rope_head_dim, 4);
+    assert_eq!(mla.qk_head_dim(), 8);
+}
+
+/// D3: DeepSeek-V2-Lite has `q_lora_rank = null` and one `blk.N.attn_q.weight`.
+///
+/// This could not be loaded at all before: `load_mla_weights` unconditionally
+/// required `attn_q_a*` / `attn_q_b*` and `mla_forward` unconditionally ran
+/// `w_q_a → q_a_norm → w_q_b`.  There is no "failing before" to show — the
+/// capability did not exist.
+#[test]
+fn lite_variant_loads_and_runs() {
+    let mut model = load_lite();
+    assert!(
+        model.layers[0].mla_weights.q.is_lite(),
+        "a checkpoint with blk.0.attn_q.weight must take the dense Q path"
+    );
+    assert!(matches!(
+        model.layers[0].mla_weights.q,
+        QProjection::Dense { .. }
+    ));
+    let mut kv = NoKv;
+    let logits = model.forward(&[1u32, 2], &mut kv).expect("Lite forward");
+    assert_eq!(logits.len(), 32);
+    assert!(logits.iter().all(|v| v.is_finite()));
+}
+
+/// `reset_sequence()` clears the latent cache, so two identical requests give
+/// identical logits without rebuilding the model.
+///
+/// The old test worked around the missing reset by constructing a second model
+/// from the same RNG seed.
+#[test]
+fn reset_sequence_makes_a_second_request_reproducible() {
+    let mut model = load_v2();
+    let mut kv = NoKv;
+    let first = model.forward(&[0u32, 1], &mut kv).expect("first");
+    model.reset_sequence();
+    let second = model.forward(&[0u32, 1], &mut kv).expect("second");
+    assert_eq!(first.len(), second.len());
+    for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
         assert_eq!(
-            logits.len(),
-            VOCAB,
-            "logits length must equal vocab_size={VOCAB}"
+            a.to_bits(),
+            b.to_bits(),
+            "logit {i} must be bit-identical after reset_sequence(): {a} vs {b}"
         );
     }
+}
 
-    /// Forward pass is deterministic: same input after cache reset → same output.
-    #[test]
-    fn test_forward_determinism() {
-        let mut lcg = Lcg::new(7777);
-        let mut model = build_test_model(&mut lcg);
+/// Without a reset the latent cache keeps growing, and a prompt longer than the
+/// declared context must be reported rather than overrunning the cache.
+#[test]
+fn overlong_prompt_is_reported() {
+    let mut model = load_v2();
+    let mut kv = NoKv;
+    let max = model.max_context_length();
+    let tokens: Vec<u32> = (0..=max as u32).map(|t| t % 4).collect();
+    assert!(model.forward(&tokens, &mut kv).is_err());
+}
 
-        let mut kv = NullKv;
-        let out1 = model.forward(&[0u32, 1], &mut kv).expect("first forward");
-
-        // Cast to DeepSeekModel to call reset_position (returns impl ForwardPass)
-        // We can't directly call reset_position via dyn ForwardPass.
-        // Instead, rebuild with the same seed:
-        let mut lcg2 = Lcg::new(7777);
-        let mut model2 = build_test_model(&mut lcg2);
-        let mut kv2 = NullKv;
-        let out2 = model2
-            .forward(&[0u32, 1], &mut kv2)
-            .expect("second forward");
-
-        assert_eq!(out1.len(), out2.len());
-        for (i, (a, b)) in out1.iter().zip(out2.iter()).enumerate() {
-            let a_bits = a.to_bits();
-            let b_bits = b.to_bits();
-            assert_eq!(a_bits, b_bits, "logits[{i}] must be bit-for-bit identical");
-        }
-    }
-
-    /// MLA forward pass: shape coherence for a single token.
-    #[test]
-    fn test_mla_shape() {
-        let cfg = test_mla_cfg();
-        let mut lcg = Lcg::new(100);
-        let mut kv_cache = MlaLatentCache::new(MAX_SEQ, &cfg);
-        let weights = build_mla_weights(&mut lcg, &cfg);
-
-        let mut x = vec![0.0f32; HIDDEN];
-        lcg.fill(&mut x);
-
-        let out =
-            mla_forward(&x, &weights, &cfg, &mut kv_cache, 0).expect("mla_forward must succeed");
-        assert_eq!(
-            out.len(),
-            HIDDEN,
-            "MLA output must have hidden_size={HIDDEN} elements"
-        );
-        assert_eq!(kv_cache.seq_len, 1, "cache must have 1 entry after 1 token");
-    }
-
-    /// MoE forward pass: shape coherence.
-    #[test]
-    fn test_moe_shape() {
-        let mut lcg = Lcg::new(200);
-        let (weights, cfg) = build_moe_ffn(&mut lcg);
-
-        let mut x = vec![0.0f32; HIDDEN];
-        lcg.fill(&mut x);
-
-        let out = moe_forward(&x, &weights, &cfg).expect("moe_forward must succeed");
-        assert_eq!(
-            out.len(),
-            HIDDEN,
-            "MoE output must have hidden_size={HIDDEN} elements"
-        );
-    }
+#[test]
+fn out_of_vocab_token_is_reported() {
+    let mut model = load_v2();
+    let mut kv = NoKv;
+    assert!(model.forward(&[9999u32], &mut kv).is_err());
 }

@@ -87,18 +87,22 @@ pub(crate) fn dequant_q4_1_to_f32(
             let d = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
             let m = half::f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
 
-            // 16 nibble bytes, each encodes 2 weights: lo nibble = w[2i], hi = w[2i+1].
+            // GGML packs Q4_1 in split halves, not interleaved pairs: byte `i`
+            // carries weight `i` in its low nibble and weight `i + 16` in its
+            // high nibble (same convention as Q4_0/Q5_0 one level up — see
+            // `oxillama_quant::reference::q4_0`'s module doc).
             for i in 0..(Q4_1_BLOCK_SIZE / 2) {
                 let byte = block[4 + i];
                 let lo = (byte & 0x0F) as f32;
                 let hi = ((byte >> 4) & 0x0F) as f32;
 
-                let base_col = blk * Q4_1_BLOCK_SIZE + i * 2;
-                if base_col < cols {
-                    f32_weights[row * cols + base_col] = d * lo + m;
+                let col0 = blk * Q4_1_BLOCK_SIZE + i;
+                let col1 = col0 + 16;
+                if col0 < cols {
+                    f32_weights[row * cols + col0] = d * lo + m;
                 }
-                if base_col + 1 < cols {
-                    f32_weights[row * cols + base_col + 1] = d * hi + m;
+                if col1 < cols {
+                    f32_weights[row * cols + col1] = d * hi + m;
                 }
             }
         }
@@ -346,16 +350,20 @@ mod tests {
     #[test]
     fn test_dequant_q4_1_known_values() {
         // d=1.0, m=0.0; first byte = 0x30 → lo=0, hi=3.
-        // weight[0] = 1.0*0 + 0 = 0.0; weight[1] = 1.0*3 + 0 = 3.0.
+        // Split-half layout: weight[0] = 1.0*0 + 0 = 0.0 (byte 0's low
+        // nibble); weight[16] = 1.0*3 + 0 = 3.0 (byte 0's high nibble).
         let mut nibbles = [0x00u8; 16];
         nibbles[0] = 0x30; // lo=0, hi=3
         let block = make_q4_1_block(1.0, 0.0, &nibbles);
         let result = dequant_q4_1_to_f32(&block, 1, 32).expect("dequant");
         assert!((result[0] - 0.0).abs() < 1e-5, "weight[0]={}", result[0]);
-        assert!((result[1] - 3.0).abs() < 1e-5, "weight[1]={}", result[1]);
+        assert!((result[16] - 3.0).abs() < 1e-5, "weight[16]={}", result[16]);
         // Remaining nibbles are 0 → d*0+m = 0.0
-        for &v in &result[2..] {
-            assert!(v.abs() < 1e-5, "expected 0.0, got {v}");
+        for (i, &v) in result.iter().enumerate() {
+            if i == 0 || i == 16 {
+                continue;
+            }
+            assert!(v.abs() < 1e-5, "weight[{i}]: expected 0.0, got {v}");
         }
     }
 
@@ -377,22 +385,23 @@ mod tests {
         let result = dequant_q4_1_to_f32(&block, 1, 32).expect("dequant");
         assert_eq!(result.len(), 32);
 
+        // Split-half layout: byte i's low nibble is weight[i], high nibble
+        // is weight[i + 16].
         for i in 0..16usize {
             let lo = (nibbles[i] & 0x0F) as f32;
             let hi = ((nibbles[i] >> 4) & 0x0F) as f32;
             let expected_lo = 0.5 * lo + 1.0;
             let expected_hi = 0.5 * hi + 1.0;
             assert!(
-                (result[i * 2] - expected_lo).abs() < 1e-5,
-                "weight[{}]: got {}, expected {expected_lo}",
-                i * 2,
-                result[i * 2],
+                (result[i] - expected_lo).abs() < 1e-5,
+                "weight[{i}]: got {}, expected {expected_lo}",
+                result[i],
             );
             assert!(
-                (result[i * 2 + 1] - expected_hi).abs() < 1e-5,
+                (result[i + 16] - expected_hi).abs() < 1e-5,
                 "weight[{}]: got {}, expected {expected_hi}",
-                i * 2 + 1,
-                result[i * 2 + 1],
+                i + 16,
+                result[i + 16],
             );
         }
     }

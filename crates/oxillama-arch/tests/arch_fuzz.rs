@@ -58,10 +58,20 @@ proptest! {
         for arch_id in registry.list() {
             prop_assert!(!arch_id.is_empty(), "registered arch_id must not be empty");
             let arch = registry.get(arch_id).expect("arch must exist after list()");
+            // A key is either the implementation's own `arch_id()` or an alias
+            // registered via `register_with_aliases`; in both cases the
+            // implementation's own id must itself resolve to the same impl.
+            let primary = arch.arch_id();
+            prop_assert!(!primary.is_empty(), "arch_id() must not be empty");
+            let via_primary = registry
+                .get(primary)
+                .expect("an implementation's own arch_id() must be registered");
             prop_assert_eq!(
-                arch.arch_id(),
+                via_primary.arch_id(),
+                primary,
+                "registry key '{}' resolves to '{}', whose own id does not round-trip",
                 arch_id,
-                "arch_id() must match the registry key"
+                primary
             );
         }
     }

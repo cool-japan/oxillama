@@ -2,8 +2,9 @@
 //!
 //! Block format (18 bytes / 32 weights):
 //! - bytes[0..2]:  FP16 scale `d`
-//! - bytes[2..18]: 16 nibble-bytes encoding 32 four-bit weights
-//!   Low nibble = weight\[2i\], High nibble = weight\[2i+1\]
+//! - bytes[2..18]: 16 nibble-bytes encoding 32 four-bit weights, in GGML's
+//!   split-half layout: low nibble of byte `j` = weight\[j\],
+//!   high nibble of byte `j` = weight\[j + 16\]
 //!
 //! Dequant: `w = d * KVALUES_IQ4NL[nibble]`
 
@@ -28,8 +29,8 @@ fn decode_block(block: &[u8], output: &mut [f32]) {
         let byte = block[2 + i];
         let lo = (byte & 0x0F) as usize;
         let hi = ((byte >> 4) & 0x0F) as usize;
-        output[i * 2] = d * KVALUES_IQ4NL[lo] as f32;
-        output[i * 2 + 1] = d * KVALUES_IQ4NL[hi] as f32;
+        output[i] = d * KVALUES_IQ4NL[lo] as f32;
+        output[i + BLOCK_SIZE / 2] = d * KVALUES_IQ4NL[hi] as f32;
     }
 }
 
@@ -106,12 +107,18 @@ impl QuantKernel for Iq4NlNeon {
 
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
-        let mut scratch = [0.0f32; BLOCK_SIZE];
-
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
+            // Per-row scratch: the closure may run on several threads at once.
+            let mut scratch = [0.0f32; BLOCK_SIZE];
             let row_start = row * row_bytes;
             // SAFETY: AArch64 with NEON.
             let mut sum = unsafe { vdupq_n_f32(0.0) };
+            // Separate scalar accumulator for the sub-4-lane remainder.
+            // Folding it in as `vaddq_f32(sum, vdupq_n_f32(s))` would put `s`
+            // in all four lanes, and the closing `vaddvq_f32` would then count
+            // it four times — the same tail-accumulation bug already fixed in
+            // `simd/neon/iq2_xxs.rs`.
+            let mut scalar_tail = 0.0f32;
 
             for blk in 0..blocks_per_row {
                 let bo = row_start + blk * BLOCK_BYTES;
@@ -133,15 +140,14 @@ impl QuantKernel for Iq4NlNeon {
                         sum = vfmaq_f32(sum, wv, iv);
                     }
                     for k in (lanes * 4)..block_input_len {
-                        let s: f32 = scratch[k] * input[input_base + k];
-                        sum = vaddq_f32(sum, vdupq_n_f32(s));
+                        scalar_tail += scratch[k] * input[input_base + k];
                     }
                 }
             }
 
             // SAFETY: AArch64 with NEON.
-            *out = unsafe { vaddvq_f32(sum) };
-        }
+            *out = unsafe { vaddvq_f32(sum) } + scalar_tail;
+        });
 
         Ok(())
     }
@@ -198,7 +204,7 @@ mod tests {
         let block = make_zero_block();
         let data = block.clone();
         let tensor = QuantTensor {
-            data,
+            data: data.into(),
             shape: vec![1, BLOCK_SIZE],
             tensor_type: GgufTensorType::Iq4Nl,
         };

@@ -23,6 +23,10 @@ pub const BLOCK_SIZE: usize = 256;
 pub const BLOCK_BYTES: usize = 66;
 /// Byte offset of the FP16 scale `d`.
 const D_OFFSET: usize = 64;
+/// Bytes per decode group (upstream's `j += 32` stride).
+const GROUP_BYTES: usize = 32;
+/// Weights produced by one decode group (4 × 2-bit fields per byte).
+const GROUP_WEIGHTS: usize = GROUP_BYTES * 4;
 
 /// AVX-512 accelerated TQ2_0 kernel.
 ///
@@ -78,7 +82,7 @@ impl QuantKernel for Tq2_0Avx512 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: bounds checked above; CPU feature guaranteed by KernelDispatcher.
             *out = unsafe {
@@ -89,7 +93,7 @@ impl QuantKernel for Tq2_0Avx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -135,11 +139,14 @@ impl QuantKernel for Tq2_0Avx512 {
 #[inline(always)]
 unsafe fn decode_vals(block: &[u8]) -> [i8; BLOCK_SIZE] {
     let mut vals = [0i8; BLOCK_SIZE];
+    // Digit-major within 32-byte groups: digit `l` of byte `i` lands at
+    // `128 * (i / 32) + 32 * l + (i % 32)` (upstream `dequantize_row_tq2_0`).
     for (i, &byte) in block[..64].iter().enumerate() {
-        vals[i * 4] = (byte & 0x03) as i8 - 1;
-        vals[i * 4 + 1] = ((byte >> 2) & 0x03) as i8 - 1;
-        vals[i * 4 + 2] = ((byte >> 4) & 0x03) as i8 - 1;
-        vals[i * 4 + 3] = ((byte >> 6) & 0x03) as i8 - 1;
+        let base = (i / GROUP_BYTES) * GROUP_WEIGHTS + (i % GROUP_BYTES);
+        vals[base] = (byte & 0x03) as i8 - 1;
+        vals[base + GROUP_BYTES] = ((byte >> 2) & 0x03) as i8 - 1;
+        vals[base + 2 * GROUP_BYTES] = ((byte >> 4) & 0x03) as i8 - 1;
+        vals[base + 3 * GROUP_BYTES] = ((byte >> 6) & 0x03) as i8 - 1;
     }
     vals
 }

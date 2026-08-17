@@ -89,7 +89,11 @@ fn unpack_sub_scale(scales_h_u16: u16, scales_l: &[u8], i: usize) -> i32 {
 
 /// Dequantise all IQ4_XS blocks to a flat f32 buffer.
 #[cfg(any(feature = "gpu", test))]
-fn dequant_iq4_xs_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuResult<Vec<f32>> {
+pub(crate) fn dequant_iq4_xs_to_f32(
+    weight_bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> GpuResult<Vec<f32>> {
     let blocks_per_row = cols.div_ceil(IQ4_XS_BLOCK_SIZE);
     let expected_bytes = rows * blocks_per_row * IQ4_XS_BLOCK_BYTES;
     if weight_bytes.len() < expected_bytes {
@@ -115,7 +119,11 @@ fn dequant_iq4_xs_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuRe
                 let ls_signed = unpack_sub_scale(scales_h_u16, scales_l, sub);
                 let scale = d * ls_signed as f32;
 
-                // 16 nibble-bytes per sub-block → 32 weights.
+                // 16 nibble-bytes per sub-block → 32 weights, split-half
+                // *within the sub-block*: `dequantize_row_iq4_xs` applies the
+                // same `j` / `j + 16` convention as Q4_0/IQ4_NL but re-based
+                // at each 32-weight sub-block boundary (see
+                // `oxillama_quant::reference::iq4_xs`'s module doc).
                 let nibble_offset = sub * (IQ4_XS_SUB_BLOCK_SIZE / 2);
                 let weight_offset = blk * IQ4_XS_BLOCK_SIZE + sub * IQ4_XS_SUB_BLOCK_SIZE;
 
@@ -124,8 +132,8 @@ fn dequant_iq4_xs_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuRe
                     let lo = (byte & 0x0F) as usize;
                     let hi = ((byte >> 4) & 0x0F) as usize;
 
-                    let col0 = weight_offset + i * 2;
-                    let col1 = col0 + 1;
+                    let col0 = weight_offset + i;
+                    let col1 = col0 + 16;
 
                     if col0 < cols {
                         f32_weights[row * cols + col0] = scale * KVALUES_IQ4NL[lo] as f32;

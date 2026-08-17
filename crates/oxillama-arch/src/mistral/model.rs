@@ -1,19 +1,36 @@
 //! Mistral transformer forward pass implementation.
 //!
-//! Structurally identical to LLaMA with one key addition: sliding window
-//! attention. Each attention layer only attends to the last `window_size`
-//! positions, reducing memory usage from O(seq_len) to O(window_size).
+//! Structurally identical to LLaMA (sequential `RMSNorm -> attn -> residual
+//! -> RMSNorm -> SwiGLU FFN -> residual` blocks — verified against
+//! `llm_build_llama` in llama.cpp's `src/models/llama.cpp`, since Mistral
+//! checkpoints convert to GGUF arch `"llama"`; see
+//! `convert_hf_to_gguf.py`'s `@ModelBase.register("MistralForCausalLM", ...)`
+//! → `model_arch = gguf.MODEL_ARCH.LLAMA`) with one key addition: sliding
+//! window attention. Each attention layer only attends to the last
+//! `window_size` positions, reducing memory usage from O(seq_len) to
+//! O(window_size).
 //!
 //! Architecture: embedding → N×(RMSNorm → SWA-GQA → residual → RMSNorm → SwiGLU FFN → residual) → RMSNorm → LM head
+//!
+//! RoPE uses llama.cpp's NORM convention (interleaved pairs `(x[2i],
+//! x[2i+1])`), the same one LLaMA uses — NOT the NeoX half-split. See
+//! `apply_rope_norm`.
 
 use crate::common::linear::QuantLinear;
+use crate::common::loader::{
+    dequant_to_f32, load_lm_head, load_quant_linear, load_rms_norm_weight,
+};
 use crate::common::rms_norm::RmsNorm;
 use crate::common::rope::RopeTable;
 use crate::common::swiglu::swiglu_inplace;
+use crate::common::{swa_attend_start, validate_context_bounds, validate_token_ids};
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
+use crate::llama::apply_rope_norm;
+use crate::lora::LoadedLora;
 use crate::traits::{ForwardPass, KvCacheAccess};
-use oxillama_quant::{KernelDispatcher, QuantTensor};
+use oxillama_quant::QuantKernel;
+use std::sync::Arc;
 
 /// A single Mistral transformer layer (same structure as LLaMA).
 pub struct MistralLayer {
@@ -49,12 +66,13 @@ pub struct MistralModel {
     pub layers: Vec<MistralLayer>,
     /// Final RMSNorm before LM head.
     pub output_norm: RmsNorm,
-    /// LM head (unembedding) projection [vocab_size, hidden_size].
+    /// LM head (unembedding) projection [vocab_size, hidden_size]. Falls
+    /// back to the tied `token_embd` when the checkpoint ships no standalone
+    /// `output.weight` (see [`load_mistral_from_gguf`]).
     pub output: QuantLinear,
-    /// RoPE precomputed frequency table.
+    /// RoPE precomputed frequency table (NORM/interleaved convention — see
+    /// `apply_rope_norm`).
     pub rope: RopeTable,
-    /// Kernel dispatcher for quantized ops.
-    pub dispatcher: KernelDispatcher,
 
     // Scratch buffers
     buf_hidden: Vec<f32>,
@@ -62,7 +80,13 @@ pub struct MistralModel {
     buf_q: Vec<f32>,
     buf_k: Vec<f32>,
     buf_v: Vec<f32>,
+    /// Concatenated per-head attention output, `[num_heads * head_dim]` —
+    /// NOT always `hidden_size` (see `qwen3::model::Qwen3Model::buf_attn_out`'s
+    /// doc comment for a worked example of the two diverging).
     buf_attn_out: Vec<f32>,
+    /// Attention output projection, `[hidden_size]` — pre-allocated once
+    /// instead of `vec![0.0f32; hidden_size]` per layer per token.
+    buf_proj_out: Vec<f32>,
     buf_gate: Vec<f32>,
     buf_up: Vec<f32>,
     buf_ffn_out: Vec<f32>,
@@ -95,7 +119,6 @@ impl MistralModel {
             config.rope_scaling_type,
             config.rope_scaling_factor,
         );
-        let dispatcher = KernelDispatcher::new();
 
         Self {
             config,
@@ -105,13 +128,13 @@ impl MistralModel {
             output_norm,
             output,
             rope,
-            dispatcher,
             buf_hidden: vec![0.0; hidden_size],
             buf_norm: vec![0.0; hidden_size],
             buf_q: vec![0.0; num_heads * head_dim],
             buf_k: vec![0.0; num_kv_heads * head_dim],
             buf_v: vec![0.0; num_kv_heads * head_dim],
-            buf_attn_out: vec![0.0; hidden_size],
+            buf_attn_out: vec![0.0; num_heads * head_dim],
+            buf_proj_out: vec![0.0; hidden_size],
             buf_gate: vec![0.0; intermediate_size],
             buf_up: vec![0.0; intermediate_size],
             buf_ffn_out: vec![0.0; hidden_size],
@@ -120,24 +143,49 @@ impl MistralModel {
         }
     }
 
-    fn kernel_for(&self, linear: &QuantLinear) -> ArchResult<Box<dyn oxillama_quant::QuantKernel>> {
-        self.dispatcher
+    /// Resolve the kernel for a `QuantLinear`'s tensor type through the
+    /// process-global cache (`Arc<dyn QuantKernel>`, cheap `Arc::clone` after
+    /// the first lookup per type) instead of `KernelDispatcher::get_kernel`
+    /// (a fresh `Box<dyn QuantKernel>` allocation on every call — this used
+    /// to run 7× per layer per token).
+    fn kernel_for(&self, linear: &QuantLinear) -> ArchResult<Arc<dyn QuantKernel>> {
+        oxillama_quant::global_dispatcher()
             .get_kernel(linear.weight.tensor_type)
             .map_err(ArchError::from)
     }
 
-    fn embed_token(&mut self, token: u32) {
+    /// Write `token`'s embedding row into `buf_hidden`.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchError::ConfigMismatch`] when `token >= vocab_size` (or the
+    /// embedding table is shorter than the declared vocabulary — an
+    /// over-estimated `vocab_size` is a real failure mode: `config.rs` falls
+    /// back to the tokenizer token-array length, then a hard-coded 32000,
+    /// when the GGUF omits `{arch}.vocab_size`). This path must never panic —
+    /// it runs on every token, including attacker-controlled HTTP input.
+    fn embed_token(&mut self, token: u32) -> ArchResult<()> {
         let hidden_size = self.config.hidden_size;
         let offset = token as usize * hidden_size;
-        self.buf_hidden
-            .copy_from_slice(&self.token_embd[offset..offset + hidden_size]);
+        let row = self
+            .token_embd
+            .get(offset..offset + hidden_size)
+            .ok_or_else(|| ArchError::ConfigMismatch {
+                param: "token id".to_string(),
+                expected: format!("< {}", self.config.vocab_size),
+                got: token.to_string(),
+            })?;
+        self.buf_hidden.copy_from_slice(row);
+        Ok(())
     }
 
     /// Run sliding window grouped-query attention for a single layer.
     ///
     /// When `sliding_window` is set, attention is restricted to the last W
-    /// positions. This means we only compute Q·K^T for positions in
-    /// [max(0, pos - W + 1) .. pos + 1] instead of [0 .. pos + 1].
+    /// positions: `swa_attend_start` (the same helper every sliding-window
+    /// architecture in this crate routes through) gives the first visible
+    /// key index, so this computes Q·K^T for positions in
+    /// `[swa_attend_start(..) ..= pos]` instead of `[0 ..= pos]`.
     fn attention(
         &mut self,
         layer_idx: usize,
@@ -166,28 +214,30 @@ impl MistralModel {
             .attn_v
             .forward(&*v_kernel, &self.buf_norm, &mut self.buf_v)?;
 
-        // Apply RoPE
+        // Apply RoPE — NORM/interleaved convention (see module doc comment).
         for h in 0..num_heads {
             let q_head = &mut self.buf_q[h * head_dim..(h + 1) * head_dim];
-            self.rope.apply(q_head, position);
+            apply_rope_norm(&self.rope, q_head, position);
         }
         for h in 0..num_kv_heads {
             let k_head = &mut self.buf_k[h * head_dim..(h + 1) * head_dim];
-            self.rope.apply(k_head, position);
+            apply_rope_norm(&self.rope, k_head, position);
         }
 
         // Store K, V in cache
         kv_cache.store_kv(layer_idx, &self.buf_k[..kv_dim], &self.buf_v[..kv_dim])?;
 
-        let cached_keys = kv_cache.get_keys(layer_idx)?;
-        let cached_values = kv_cache.get_values(layer_idx)?;
+        let cached_keys = crate::common::fetch_keys(&*kv_cache, layer_idx)?;
+        let cached_values = crate::common::fetch_values(&*kv_cache, layer_idx)?;
+        let cached_keys: &[f32] = &cached_keys;
+        let cached_values: &[f32] = &cached_values;
         let seq_len = position + 1;
 
-        // Sliding window: only attend to the last `window_size` positions
-        let window_start = match self.sliding_window {
-            Some(w) => seq_len.saturating_sub(w),
-            None => 0,
-        };
+        // Sliding window: only attend to the last `window_size` positions,
+        // via the same `swa_attend_start` every other sliding-window
+        // architecture in this crate uses (`effective_attention_span`'s
+        // sibling), not a hand-rolled duplicate of the window arithmetic.
+        let window_start = swa_attend_start(&self.config, layer_idx, position);
 
         let scale = 1.0 / (head_dim as f32).sqrt();
 
@@ -225,16 +275,16 @@ impl MistralModel {
             }
         }
 
-        // Project attention output back to hidden_size
+        // Project attention output back to hidden_size, into the
+        // pre-allocated `buf_proj_out` (no per-layer-per-token `vec!`).
         let o_kernel = self.kernel_for(&self.layers[layer_idx].attn_output)?;
         let layer = &self.layers[layer_idx];
-        let mut proj_out = vec![0.0f32; self.config.hidden_size];
         layer
             .attn_output
-            .forward(&*o_kernel, &self.buf_attn_out, &mut proj_out)?;
+            .forward(&*o_kernel, &self.buf_attn_out, &mut self.buf_proj_out)?;
 
         // Add to residual
-        for (h, &p) in self.buf_hidden.iter_mut().zip(proj_out.iter()) {
+        for (h, &p) in self.buf_hidden.iter_mut().zip(self.buf_proj_out.iter()) {
             *h += p;
         }
 
@@ -267,20 +317,18 @@ impl MistralModel {
 
         Ok(())
     }
-}
 
-impl ForwardPass for MistralModel {
-    fn forward(
-        &mut self,
-        tokens: &[u32],
-        kv_cache: &mut dyn KvCacheAccess,
-    ) -> ArchResult<Vec<f32>> {
+    /// Run every token of `tokens` through all layers, leaving the last
+    /// token's pre-output-norm hidden state in `self.buf_hidden`.
+    fn run_layers(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<()> {
         let start_pos = kv_cache.seq_len();
+        validate_context_bounds(&self.config, start_pos, tokens.len())?;
+        validate_token_ids(&self.config, tokens)?;
 
         for (i, &token) in tokens.iter().enumerate() {
             let position = start_pos + i;
 
-            self.embed_token(token);
+            self.embed_token(token)?;
 
             for layer_idx in 0..self.layers.len() {
                 self.layers[layer_idx]
@@ -299,13 +347,32 @@ impl ForwardPass for MistralModel {
             kv_cache.advance();
         }
 
+        Ok(())
+    }
+}
+
+impl ForwardPass for MistralModel {
+    fn forward(
+        &mut self,
+        tokens: &[u32],
+        kv_cache: &mut dyn KvCacheAccess,
+    ) -> ArchResult<Vec<f32>> {
+        self.run_layers(tokens, kv_cache)?;
+
         self.output_norm.forward(&mut self.buf_hidden);
+
+        // `buf_logits` may have been handed to the caller by ownership
+        // (`std::mem::take`, below) on a previous call, leaving it empty —
+        // restore its capacity before writing into it.
+        if self.buf_logits.len() != self.config.vocab_size {
+            self.buf_logits.resize(self.config.vocab_size, 0.0);
+        }
 
         let output_kernel = self.kernel_for(&self.output)?;
         self.output
             .forward(&*output_kernel, &self.buf_hidden, &mut self.buf_logits)?;
 
-        Ok(self.buf_logits.clone())
+        Ok(std::mem::take(&mut self.buf_logits))
     }
 
     /// Extract the post-output-norm hidden state for embedding.
@@ -316,29 +383,7 @@ impl ForwardPass for MistralModel {
     /// the normal forward pass. Returns a `hidden_size`-dimensional vector
     /// suitable for L2-normalised semantic embeddings.
     fn embed(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
-        let start_pos = kv_cache.seq_len();
-
-        for (i, &token) in tokens.iter().enumerate() {
-            let position = start_pos + i;
-
-            self.embed_token(token);
-
-            for layer_idx in 0..self.layers.len() {
-                self.layers[layer_idx]
-                    .attn_norm
-                    .forward_to(&self.buf_hidden, &mut self.buf_norm);
-
-                self.attention(layer_idx, position, kv_cache)?;
-
-                self.layers[layer_idx]
-                    .ffn_norm
-                    .forward_to(&self.buf_hidden, &mut self.buf_norm);
-
-                self.feed_forward(layer_idx)?;
-            }
-
-            kv_cache.advance();
-        }
+        self.run_layers(tokens, kv_cache)?;
 
         // Final norm on the last token's hidden state.
         // Does NOT project through the LM head — returns hidden state directly.
@@ -361,6 +406,55 @@ impl ForwardPass for MistralModel {
 
     fn swa_config(&self) -> Option<(u32, bool)> {
         self.config.swa_window.map(|w| (w, false))
+    }
+
+    /// Attach LoRA adapters to this model's linear layers.
+    ///
+    /// Delegates to [`Self::apply_lora_scaled`] with `scale = 1.0`.
+    fn apply_lora(&mut self, lora: &LoadedLora) -> ArchResult<()> {
+        self.apply_lora_scaled(lora, 1.0)
+    }
+
+    /// Attach LoRA adapters with an extra scale multiplier.
+    ///
+    /// Uses the same `blk.{i}.*` naming convention as LLaMA/Command-R, and
+    /// [`QuantLinear::push_lora`] (accumulating) rather than `set_lora`
+    /// (replacing), so a second call — or an entry from
+    /// [`LoraStack`](crate::lora::LoraStack) — composes instead of
+    /// clobbering.
+    fn apply_lora_scaled(&mut self, lora: &LoadedLora, scale: f32) -> ArchResult<()> {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let candidates: [(&str, &mut QuantLinear); 7] = [
+                (&format!("blk.{i}.attn_q.weight"), &mut layer.attn_q),
+                (&format!("blk.{i}.attn_k.weight"), &mut layer.attn_k),
+                (&format!("blk.{i}.attn_v.weight"), &mut layer.attn_v),
+                (
+                    &format!("blk.{i}.attn_output.weight"),
+                    &mut layer.attn_output,
+                ),
+                (&format!("blk.{i}.ffn_gate.weight"), &mut layer.ffn_gate),
+                (&format!("blk.{i}.ffn_up.weight"), &mut layer.ffn_up),
+                (&format!("blk.{i}.ffn_down.weight"), &mut layer.ffn_down),
+            ];
+            for (tensor_name, linear) in candidates {
+                if let Some(adapter) = lora.get(tensor_name) {
+                    linear.push_lora(adapter, scale);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn unapply_all_loras(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.attn_q.clear_lora();
+            layer.attn_k.clear_lora();
+            layer.attn_v.clear_lora();
+            layer.attn_output.clear_lora();
+            layer.ffn_gate.clear_lora();
+            layer.ffn_up.clear_lora();
+            layer.ffn_down.clear_lora();
+        }
     }
 }
 
@@ -388,9 +482,12 @@ pub fn load_mistral_from_gguf(
     model: &oxillama_gguf::GgufModel,
     config: &ModelConfig,
 ) -> ArchResult<MistralModel> {
-    let dispatcher = KernelDispatcher::new();
+    let dispatcher = oxillama_quant::KernelDispatcher::new();
 
-    // Load token embeddings
+    // Load token embeddings. `dequant_to_f32` (common::loader) validates the
+    // payload against the declared element count instead of indexing
+    // `data[data_offset..data_offset + block_bytes]` unchecked — a truncated
+    // GGUF used to panic here.
     let embd_data = model.tensor_data("token_embd.weight")?;
     let embd_info = model.file.tensors.get("token_embd.weight")?;
     let token_embd = dequant_to_f32(embd_info, embd_data, &dispatcher)?;
@@ -428,7 +525,10 @@ pub fn load_mistral_from_gguf(
     // Load final norm and output projection
     let output_norm_weight = load_rms_norm_weight(model, "output_norm.weight")?;
     let output_norm = RmsNorm::new(output_norm_weight, config.rms_norm_eps);
-    let output = load_quant_linear(model, "output.weight")?;
+
+    // Falls back to the tied `token_embd.weight` when the checkpoint ships no
+    // standalone `output.weight` (common for smaller Mistral fine-tunes).
+    let output = load_lm_head(model, "output.weight", "token_embd.weight")?;
 
     Ok(MistralModel::new(
         config.clone(),
@@ -439,74 +539,301 @@ pub fn load_mistral_from_gguf(
     ))
 }
 
-/// Load a quantized linear layer from GGUF.
-fn load_quant_linear(model: &oxillama_gguf::GgufModel, name: &str) -> ArchResult<QuantLinear> {
-    let info = model
-        .file
-        .tensors
-        .get(name)
-        .map_err(|_| ArchError::MissingTensor {
-            name: name.to_string(),
-        })?;
-    let data = model.tensor_data(name)?;
-    let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
-    let tensor = QuantTensor::new(data.to_vec(), shape, info.tensor_type);
-    Ok(QuantLinear::new(tensor, None))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Load an RMSNorm weight vector from GGUF.
-fn load_rms_norm_weight(model: &oxillama_gguf::GgufModel, name: &str) -> ArchResult<Vec<f32>> {
-    let info = model
-        .file
-        .tensors
-        .get(name)
-        .map_err(|_| ArchError::MissingTensor {
-            name: name.to_string(),
-        })?;
-    let data = model.tensor_data(name)?;
-    let dispatcher = KernelDispatcher::new();
-    dequant_to_f32(info, data, &dispatcher)
-}
+    /// MI5: Mistral checkpoints convert to GGUF arch `"llama"` and are
+    /// `LLAMA_ROPE_TYPE_NORM` (interleaved `(x[2i], x[2i+1])` pairs) — the
+    /// same convention llama.cpp uses for LLaMA/Command-R — NOT the NeoX
+    /// half-split every other RoPE-using architecture in this crate defaults
+    /// to ([`RopeStyle::Neox`](crate::common::rope::RopeStyle)). This rotates
+    /// a one-hot head vector both ways and confirms only NORM
+    /// (`apply_rope_norm`, what `attention()` actually calls) leaves the
+    /// interleaved partner non-zero.
+    #[test]
+    fn mi5_rope_uses_norm_not_neox_convention() {
+        let table = RopeTable::new(
+            16,
+            8,
+            10000.0,
+            crate::common::rope::RopeScalingType::Standard,
+            1.0,
+        );
 
-/// Dequantize tensor data to f32.
-fn dequant_to_f32(
-    info: &oxillama_gguf::TensorInfo,
-    data: &[u8],
-    dispatcher: &KernelDispatcher,
-) -> ArchResult<Vec<f32>> {
-    let n_elements = info.n_elements() as usize;
-    let tensor_type = info.tensor_type;
+        let mut norm_x = vec![0.0f32; 16];
+        norm_x[0] = 1.0;
+        apply_rope_norm(&table, &mut norm_x, 3);
+        assert!(
+            norm_x[1].abs() > 1e-6,
+            "NORM convention must rotate x[0] into consecutive partner x[1], got {norm_x:?}"
+        );
+        assert!(
+            norm_x[8].abs() < 1e-12,
+            "NORM convention must NOT touch the NeoX partner x[8], got {norm_x:?}"
+        );
 
-    if tensor_type == oxillama_gguf::GgufTensorType::F32 {
-        let mut out = vec![0.0f32; n_elements];
-        for (i, chunk) in data.chunks_exact(4).enumerate().take(n_elements) {
-            out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mut neox_x = vec![0.0f32; 16];
+        neox_x[0] = 1.0;
+        table.apply(&mut neox_x, 3);
+        assert!(
+            neox_x[8].abs() > 1e-6,
+            "sanity: NeoX convention DOES rotate x[0] into x[half], got {neox_x:?}"
+        );
+    }
+
+    // ─── MI5 call-site discriminator ───────────────────────────────────────
+    //
+    // `mi5_rope_uses_norm_not_neox_convention` (above) only proves
+    // `apply_rope_norm` itself rotates interleaved pairs — it never calls
+    // `attention()`, so it cannot catch a wrong per-head slice offset or a
+    // wrong `position` argument at the real call site. This test drives the
+    // actual model (`attn_q.weight` projects the normed input to a
+    // one-hot-per-head vector) and inspects `buf_q` after a real
+    // `attention()` call at a NONZERO position, closing that gap.
+
+    struct RopeCallSiteKv {
+        kv_dim: usize,
+        position: usize,
+        keys: Vec<f32>,
+        values: Vec<f32>,
+    }
+
+    impl RopeCallSiteKv {
+        fn new(kv_dim: usize, max_seq: usize) -> Self {
+            Self {
+                kv_dim,
+                position: 0,
+                keys: vec![0.0f32; max_seq * kv_dim],
+                values: vec![0.0f32; max_seq * kv_dim],
+            }
         }
-        return Ok(out);
     }
 
-    if tensor_type == oxillama_gguf::GgufTensorType::F16 {
-        let mut out = vec![0.0f32; n_elements];
-        for (i, chunk) in data.chunks_exact(2).enumerate().take(n_elements) {
-            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            out[i] = half::f16::from_bits(bits).to_f32();
+    impl KvCacheAccess for RopeCallSiteKv {
+        fn seq_len(&self) -> usize {
+            self.position
         }
-        return Ok(out);
+        fn store_kv(&mut self, _layer: usize, key: &[f32], value: &[f32]) -> ArchResult<()> {
+            let offset = self.position * self.kv_dim;
+            self.keys[offset..offset + self.kv_dim].copy_from_slice(key);
+            self.values[offset..offset + self.kv_dim].copy_from_slice(value);
+            Ok(())
+        }
+        fn get_keys(&self, _layer: usize) -> ArchResult<&[f32]> {
+            Ok(&self.keys[..(self.position + 1) * self.kv_dim])
+        }
+        fn get_values(&self, _layer: usize) -> ArchResult<&[f32]> {
+            Ok(&self.values[..(self.position + 1) * self.kv_dim])
+        }
+        fn advance(&mut self) {
+            self.position += 1;
+        }
     }
 
-    let kernel = dispatcher.get_kernel(tensor_type)?;
-    let block_size = tensor_type.block_size();
-    let block_bytes = tensor_type.block_bytes();
-    let n_blocks = n_elements.div_ceil(block_size);
-
-    let mut out = vec![0.0f32; n_elements];
-    for blk in 0..n_blocks {
-        let data_offset = blk * block_bytes;
-        let out_offset = blk * block_size;
-        let block_data = &data[data_offset..data_offset + block_bytes];
-        let out_slice = &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
-        kernel.dequant_block(block_data, out_slice)?;
+    fn ramp(n: usize) -> Vec<f32> {
+        (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect()
     }
 
-    Ok(out)
+    /// Build a 2-head, `head_dim = 4` model whose `attn_q.weight` is zero
+    /// everywhere except output row 0 (head 0, index 0) and output row 4
+    /// (head 1, index 0), each picking input index 0 with weight 1.0. Since
+    /// `attn_norm` is `RmsNorm` with unit weights, `buf_norm[0]` is generically
+    /// non-zero for a non-zero embedding row, so pre-RoPE `buf_q` is
+    /// `[c, 0, 0, 0, c, 0, 0, 0]` for some non-zero `c` — an exact
+    /// one-hot-per-head vector.
+    fn build_rope_call_site_test_model() -> MistralModel {
+        const H: usize = 8;
+        const HEADS: usize = 2; // head_dim = H / HEADS = 4
+        const FFN: usize = 8;
+        const VOCAB: usize = 3;
+
+        let mut w = oxillama_gguf::GgufWriter::new();
+        w.add_metadata(
+            "general.architecture",
+            oxillama_gguf::MetadataValue::String("mistral".to_string()),
+        );
+        w.add_metadata(
+            "mistral.embedding_length",
+            oxillama_gguf::MetadataValue::Uint32(H as u32),
+        );
+        w.add_metadata(
+            "mistral.feed_forward_length",
+            oxillama_gguf::MetadataValue::Uint32(FFN as u32),
+        );
+        w.add_metadata(
+            "mistral.block_count",
+            oxillama_gguf::MetadataValue::Uint32(1),
+        );
+        w.add_metadata(
+            "mistral.attention.head_count",
+            oxillama_gguf::MetadataValue::Uint32(HEADS as u32),
+        );
+        w.add_metadata(
+            "mistral.attention.head_count_kv",
+            oxillama_gguf::MetadataValue::Uint32(HEADS as u32),
+        );
+        w.add_metadata(
+            "mistral.context_length",
+            oxillama_gguf::MetadataValue::Uint32(64),
+        );
+        w.add_metadata(
+            "mistral.vocab_size",
+            oxillama_gguf::MetadataValue::Uint32(VOCAB as u32),
+        );
+        w.add_metadata(
+            "mistral.rope.freq_base",
+            oxillama_gguf::MetadataValue::Float32(10000.0),
+        );
+
+        let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let ones = |n: usize| f32_bytes(&vec![1.0f32; n]);
+        let zeros = |n: usize| f32_bytes(&vec![0.0f32; n]);
+
+        // attn_q: zero except out_idx {0, 4} <- in_idx 0, weight 1.0.
+        let mut q_weight = vec![0.0f32; H * H];
+        q_weight[0] = 1.0; // out_idx 0 (head 0, index 0) <- in_idx 0
+        q_weight[4 * H] = 1.0; // out_idx 4 (head 1, index 0) <- in_idx 0
+
+        w.add_tensor(
+            "token_embd.weight",
+            &[H as u64, VOCAB as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &f32_bytes(&ramp(VOCAB * H)),
+        );
+        w.add_tensor(
+            "blk.0.attn_norm.weight",
+            &[H as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &ones(H),
+        );
+        w.add_tensor(
+            "blk.0.attn_q.weight",
+            &[H as u64, H as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &f32_bytes(&q_weight),
+        );
+        w.add_tensor(
+            "blk.0.attn_k.weight",
+            &[H as u64, H as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &zeros(H * H),
+        );
+        w.add_tensor(
+            "blk.0.attn_v.weight",
+            &[H as u64, H as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &zeros(H * H),
+        );
+        w.add_tensor(
+            "blk.0.attn_output.weight",
+            &[H as u64, H as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &zeros(H * H),
+        );
+        w.add_tensor(
+            "blk.0.ffn_norm.weight",
+            &[H as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &ones(H),
+        );
+        w.add_tensor(
+            "blk.0.ffn_gate.weight",
+            &[H as u64, FFN as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &zeros(H * FFN),
+        );
+        w.add_tensor(
+            "blk.0.ffn_up.weight",
+            &[H as u64, FFN as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &zeros(H * FFN),
+        );
+        w.add_tensor(
+            "blk.0.ffn_down.weight",
+            &[FFN as u64, H as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &zeros(FFN * H),
+        );
+        w.add_tensor(
+            "output_norm.weight",
+            &[H as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &ones(H),
+        );
+        w.add_tensor(
+            "output.weight",
+            &[H as u64, VOCAB as u64],
+            oxillama_gguf::GgufTensorType::F32,
+            &zeros(VOCAB * H),
+        );
+
+        let mut bytes = Vec::new();
+        w.write_to(&mut bytes)
+            .expect("synthetic mistral GGUF must serialize");
+        let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("must parse");
+        let config =
+            ModelConfig::from_metadata(&gguf.file.metadata).expect("fixture metadata must parse");
+        load_mistral_from_gguf(&gguf, &config).expect("load")
+    }
+
+    /// MI5 (call site): at a non-zero position, `attention()` must rotate
+    /// EACH head's index-0 value into that SAME head's index-1 (the
+    /// interleaved NORM partner), never into index `head_dim/2` (the NeoX
+    /// partner), and must do so identically for every head (proving the
+    /// per-head slice offset `h * head_dim..(h + 1) * head_dim` — not a
+    /// fixed or off-by-one slice — is what gets passed to `apply_rope_norm`).
+    #[test]
+    fn mi5_attention_rotates_every_head_with_norm_convention_at_the_real_call_site() {
+        let mut model = build_rope_call_site_test_model();
+        let mut kv = RopeCallSiteKv::new(4 * 2, 8);
+
+        // Position 0: RoPE angle is 0 for every frequency, so this call must
+        // leave buf_q un-rotated — confirms the one-hot-per-head setup itself
+        // (not yet informative about NORM vs NeoX).
+        model.forward(&[0u32], &mut kv).expect("forward @ pos 0");
+        let c = model.buf_q[0];
+        assert!(
+            c.abs() > 1e-6,
+            "buf_q[0] must be non-zero (attn_norm(embedding)[0] projected through \
+             the one-hot attn_q weight), got {c}"
+        );
+        assert!(
+            (model.buf_q[4] - c).abs() < 1e-6,
+            "head 1 index 0 must equal head 0 index 0 pre-RoPE (same one-hot \
+             weight row), got buf_q[4]={} vs buf_q[0]={c}",
+            model.buf_q[4]
+        );
+
+        // Position 1: RoPE angle is non-zero, so both heads' index 0 must
+        // have rotated into THAT SAME head's index 1.
+        model.forward(&[1u32], &mut kv).expect("forward @ pos 1");
+        assert!(
+            model.buf_q[1].abs() > 1e-6,
+            "head 0: index 0 must rotate into index 1 (NORM/interleaved \
+             partner) at a non-zero position, got buf_q={:?}",
+            model.buf_q
+        );
+        assert!(
+            model.buf_q[5].abs() > 1e-6,
+            "head 1: index 0 (buf_q[4]) must rotate into index 1 of THAT HEAD \
+             (buf_q[5]) — this fails if attention() uses a wrong per-head \
+             slice offset, got buf_q={:?}",
+            model.buf_q
+        );
+        for &untouched in &[
+            model.buf_q[2],
+            model.buf_q[3],
+            model.buf_q[6],
+            model.buf_q[7],
+        ] {
+            assert!(
+                untouched.abs() < 1e-6,
+                "the OTHER pair in each head (indices 2,3) must stay zero — a \
+                 non-zero value there would mean NeoX half-split rotation \
+                 leaked in at the call site, got buf_q={:?}",
+                model.buf_q
+            );
+        }
+    }
 }

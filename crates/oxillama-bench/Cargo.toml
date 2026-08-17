@@ -14,6 +14,18 @@ readme = "README.md"
 [dependencies]
 oxillama-quant = { workspace = true, features = ["parallel"] }
 oxillama-gguf = { workspace = true, features = ["mmap"] }
+# `llama`/`qwen3` so `ArchitectureRegistry::with_builtins()` can actually build
+# a forward pass for the two reference models this crate benchmarks
+# end-to-end (see MODEL_ENV_VAR docs in real_e2e.rs — Llama-3-8B and the
+# Qwen3-4B regression canary); `parallel` so the GEMV thread pool is
+# multi-threaded — without it every decode tok/s number the real E2E bench
+# reports is a single-core figure, not a representative one; `mmap` to match
+# how `oxillama-cli`/`oxillama-py` load real GGUF files; `tokenizer-wasm` so
+# `real_e2e` also works against models that ship a `tokenizer.json` sidecar
+# instead of a GGUF-embedded vocabulary (the two CONTEXT models don't need
+# it, but a general-purpose "point this at any GGUF" bench should not be
+# narrower than that).
+oxillama-runtime = { workspace = true, features = ["llama", "qwen3", "parallel", "mmap", "tokenizer-wasm"] }
 anyhow.workspace = true
 criterion.workspace = true
 half.workspace = true
@@ -23,6 +35,14 @@ tokio = { workspace = true }
 tracing.workspace = true
 sysinfo = { workspace = true }
 tabled = { workspace = true }
+
+[dev-dependencies]
+# `test-utils` adds `oxillama_gguf::test_utils::build_minimal_llama_gguf()` —
+# a tiny synthetic on-disk GGUF used by `real_e2e.rs`'s tests to exercise the
+# real `InferenceEngine::load_model()` file path without a multi-gigabyte
+# model. Cargo unions this with the plain `mmap`-only `[dependencies]` entry
+# above for test/bench builds; release library builds are unaffected.
+oxillama-gguf = { path = "../oxillama-gguf", default-features = false, features = ["mmap", "test-utils"] }
 
 [[bench]]
 name = "batch_heatmap"
@@ -62,5 +82,13 @@ harness = false
 
 [[bench]]
 name = "speculative"
+harness = false
+
+[[bench]]
+name = "real_e2e"
+harness = false
+
+[[bench]]
+name = "long_context"
 harness = false
 

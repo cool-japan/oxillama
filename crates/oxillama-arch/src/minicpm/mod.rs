@@ -1,9 +1,22 @@
 //! MiniCPM model architecture plugin.
 //!
-//! MiniCPM is a scaled-embedding variant of LLaMA: the token embeddings are
-//! multiplied by `hidden_size / dim_model_base` before the first transformer
-//! layer.  All other components (RMSNorm, RoPE, GQA, SwiGLU) are identical
-//! to standard LLaMA.
+//! MiniCPM (base) is tensor-for-tensor identical to LLaMA — llama.cpp puts
+//! `LLM_ARCH_MINICPM` in the same `load_tensors()` case as `LLM_ARCH_LLAMA`
+//! and builds its graph with `llm_build_granite`.  The only differences are
+//! three scalar hyper-parameters read from GGUF metadata:
+//!
+//! * `minicpm.embedding_scale` — multiplies the embedded token vector once,
+//!   before layer 0;
+//! * `minicpm.residual_scale` — multiplies the attention output *and* the FFN
+//!   output, each immediately before its residual add;
+//! * `minicpm.logit_scale` — the LM head's logits are multiplied by
+//!   `1.0 / logit_scale`.
+//!
+//! See [`config::MiniCpmConfig`] for the primary-source citations and the
+//! backward-compatibility defaults used by GGUFs that predate those keys.
+//!
+//! MiniCPM3 (`general.architecture = "minicpm3"`) is a *different*
+//! architecture (MLA attention, NeoX-style RoPE) and is not handled here.
 //!
 //! ## Tensor naming (GGUF)
 //!
@@ -26,16 +39,20 @@
 
 pub mod config;
 pub mod forward;
+pub mod loader;
 pub mod tensor_names;
 
-pub use config::MiniCpmConfig;
+pub use config::{
+    default_logit_scale, default_residual_scale, MiniCpmConfig, DEFAULT_EMBEDDING_SCALE,
+};
 pub use forward::{MiniCpmForward, MiniCpmLayer};
+pub use loader::load_minicpm_from_gguf;
 pub use tensor_names::minicpm_tensor_name_patterns;
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::traits::{ForwardPass, ModelArchitecture, TensorNamePattern};
-use oxillama_gguf::TensorStore;
+use oxillama_gguf::{GgufModel, TensorStore};
 
 /// MiniCPM architecture plugin for the [`ArchitectureRegistry`](crate::registry::ArchitectureRegistry).
 ///
@@ -83,8 +100,22 @@ impl ModelArchitecture for MiniCpmArchitecture {
         let _cfg = MiniCpmConfig::from_model_config(config)?;
 
         Err(ArchError::MissingTensor {
-            name: "token_embd.weight (use MiniCpmForward::new for full loading)".to_string(),
+            name: "token_embd.weight (use load_minicpm_from_gguf for full loading)".to_string(),
         })
+    }
+
+    /// Build a runnable MiniCPM model from a fully-loaded GGUF file.
+    ///
+    /// [`Self::build`] only receives the tensor *metadata* table and therefore
+    /// cannot read a single weight; this entry point receives the payload, so
+    /// the registry can construct MiniCPM without the engine hard-coding a
+    /// match on the architecture name.
+    fn build_from_gguf(
+        &self,
+        model: &GgufModel,
+        config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Ok(Box::new(load_minicpm_from_gguf(model, config)?))
     }
 
     fn tensor_names(&self) -> Vec<TensorNamePattern> {

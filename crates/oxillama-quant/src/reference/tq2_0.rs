@@ -6,6 +6,21 @@
 //!
 //! Each 2-bit code encodes a ternary value: 0→-1, 1→0, 2→+1.
 //! Weight formula: `w = d * (q_2bit - 1)`
+//!
+//! # Decode order
+//!
+//! Upstream `dequantize_row_tq2_0` is **digit-major within 32-byte groups**:
+//!
+//! ```c
+//! for (size_t j = 0; j < sizeof(x->qs); j += 32)
+//!     for (size_t l = 0; l < 4; ++l)
+//!         for (size_t m = 0; m < 32; ++m)
+//!             *y++ = (float)(((x[i].qs[j + m] >> (l*2)) & 3) - 1) * d;
+//! ```
+//!
+//! so the four 2-bit fields of `qs[m]` land at output indices `m`, `m + 32`,
+//! `m + 64`, `m + 96` (offset by 128 for the second 32-byte group) — 32 apart,
+//! not adjacent.  Emitting them as `y[4m + l]` permutes every TQ2_0 tensor.
 
 use crate::error::{QuantError, QuantResult};
 use crate::traits::QuantKernel;
@@ -15,6 +30,12 @@ use crate::types::QuantTensor;
 const TQ2_0_BLOCK_SIZE: usize = 256;
 /// Bytes per TQ2_0 block: 64 (qs) + 2 (d).
 const TQ2_0_BLOCK_BYTES: usize = 66;
+/// Bytes per decode group (upstream's `j += 32` stride).
+const TQ2_0_GROUP_BYTES: usize = 32;
+/// 2-bit fields per `qs` byte.
+const TQ2_0_DIGITS: usize = 4;
+/// Weights produced by one decode group: `TQ2_0_GROUP_BYTES * TQ2_0_DIGITS`.
+const TQ2_0_GROUP_WEIGHTS: usize = TQ2_0_GROUP_BYTES * TQ2_0_DIGITS;
 
 /// Reference (naive scalar) TQ2_0 kernel.
 pub struct Tq2_0Ref;
@@ -38,16 +59,15 @@ impl QuantKernel for Tq2_0Ref {
         let qs = &block[0..64];
         let d = f16_to_f32(u16::from_le_bytes([block[64], block[65]]));
 
-        // Each byte holds 4 × 2-bit codes
+        // Each byte holds 4 × 2-bit codes, emitted digit-major inside its
+        // 32-byte group: digit `l` of byte `m` lands at
+        // `128 * (m / 32) + 32 * l + (m % 32)`.
         for (i, &byte) in qs.iter().enumerate() {
-            let v0 = (byte & 3) as i32 - 1;
-            let v1 = ((byte >> 2) & 3) as i32 - 1;
-            let v2 = ((byte >> 4) & 3) as i32 - 1;
-            let v3 = ((byte >> 6) & 3) as i32 - 1;
-            output[i * 4] = d * v0 as f32;
-            output[i * 4 + 1] = d * v1 as f32;
-            output[i * 4 + 2] = d * v2 as f32;
-            output[i * 4 + 3] = d * v3 as f32;
+            let base = (i / TQ2_0_GROUP_BYTES) * TQ2_0_GROUP_WEIGHTS + (i % TQ2_0_GROUP_BYTES);
+            for l in 0..TQ2_0_DIGITS {
+                let v = ((byte >> (2 * l)) & 3) as i32 - 1;
+                output[base + l * TQ2_0_GROUP_BYTES] = d * v as f32;
+            }
         }
 
         Ok(())
@@ -82,7 +102,7 @@ impl QuantKernel for Tq2_0Ref {
         let blocks_per_row = n_cols.div_ceil(TQ2_0_BLOCK_SIZE);
         let row_bytes = blocks_per_row * TQ2_0_BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -93,31 +113,23 @@ impl QuantKernel for Tq2_0Ref {
                 let d = f16_to_f32(u16::from_le_bytes([data[bo + 64], data[bo + 65]]));
                 let inp = &input[blk * TQ2_0_BLOCK_SIZE..];
 
-                // Inline dequant + dot product
+                // Inline dequant + dot product, in the same digit-major order
+                // `dequant_block` writes.
+                let remaining = n_cols.saturating_sub(blk * TQ2_0_BLOCK_SIZE);
                 for (i, &byte) in qs.iter().enumerate() {
-                    let v0 = (byte & 3) as i32 - 1;
-                    let v1 = ((byte >> 2) & 3) as i32 - 1;
-                    let v2 = ((byte >> 4) & 3) as i32 - 1;
-                    let v3 = ((byte >> 6) & 3) as i32 - 1;
-                    let base = i * 4;
-                    if base + 3 < n_cols.saturating_sub(blk * TQ2_0_BLOCK_SIZE) {
-                        sum += d * v0 as f32 * inp[base];
-                        sum += d * v1 as f32 * inp[base + 1];
-                        sum += d * v2 as f32 * inp[base + 2];
-                        sum += d * v3 as f32 * inp[base + 3];
-                    } else {
-                        let remaining = n_cols.saturating_sub(blk * TQ2_0_BLOCK_SIZE);
-                        let vals = [v0, v1, v2, v3];
-                        for (j, &v) in vals.iter().enumerate() {
-                            if base + j < remaining {
-                                sum += d * v as f32 * inp[base + j];
-                            }
+                    let base =
+                        (i / TQ2_0_GROUP_BYTES) * TQ2_0_GROUP_WEIGHTS + (i % TQ2_0_GROUP_BYTES);
+                    for l in 0..TQ2_0_DIGITS {
+                        let col = base + l * TQ2_0_GROUP_BYTES;
+                        if col < remaining {
+                            let v = ((byte >> (2 * l)) & 3) as i32 - 1;
+                            sum += d * v as f32 * inp[col];
                         }
                     }
                 }
             }
             *out = sum;
-        }
+        });
 
         Ok(())
     }
@@ -247,9 +259,12 @@ mod tests {
 
     #[test]
     fn test_dequant_mixed() {
-        // First byte: pack_2bit(0,1,2,0) = 0 | (1<<2) | (2<<4) | (0<<6) = 0+4+32+0 = 36 = 0x24
-        // → ternary values: -1, 0, +1, -1
-        // d = 2.0 → weights: -2.0, 0.0, 2.0, -2.0
+        // First byte: pack_2bit(0,1,2,0) = 0 | (1<<2) | (2<<4) | (0<<6) = 36 = 0x24
+        // → ternary values: -1, 0, +1, -1 for digits 0..4.
+        //
+        // Upstream is digit-major: digit `l` of byte `m` lands at output index
+        // `128*(m/32) + 32*l + (m%32)`, so byte 0's four digits are 32 weights
+        // apart (0, 32, 64, 96) rather than adjacent.
         let mut qs = [0x55u8; 64]; // default all ternary-zero
         qs[0] = pack_2bit(0, 1, 2, 0);
         qs[1] = pack_2bit(2, 2, 0, 1);
@@ -260,21 +275,22 @@ mod tests {
             .dequant_block(&block, &mut output)
             .expect("test: dequant_mixed");
 
-        // Byte 0: codes 0,1,2,0 → ternary -1,0,+1,-1 → -2.0, 0.0, 2.0, -2.0
-        assert!((output[0] - (-2.0)).abs() < 1e-3, "got {}", output[0]);
-        assert!((output[1]).abs() < 1e-3, "got {}", output[1]);
-        assert!((output[2] - 2.0).abs() < 1e-3, "got {}", output[2]);
-        assert!((output[3] - (-2.0)).abs() < 1e-3, "got {}", output[3]);
+        // Byte 0: codes 0,1,2,0 → ternary -1,0,+1,-1 at indices 0, 32, 64, 96.
+        let byte0 = [-2.0f32, 0.0, 2.0, -2.0];
+        // Byte 1: codes 2,2,0,1 → ternary +1,+1,-1,0 at indices 1, 33, 65, 97.
+        let byte1 = [2.0f32, 2.0, -2.0, 0.0];
 
-        // Byte 1: codes 2,2,0,1 → ternary +1,+1,-1,0 → 2.0, 2.0, -2.0, 0.0
-        assert!((output[4] - 2.0).abs() < 1e-3, "got {}", output[4]);
-        assert!((output[5] - 2.0).abs() < 1e-3, "got {}", output[5]);
-        assert!((output[6] - (-2.0)).abs() < 1e-3, "got {}", output[6]);
-        assert!((output[7]).abs() < 1e-3, "got {}", output[7]);
+        let mut expected = [0.0f32; 256];
+        for l in 0..4 {
+            expected[32 * l] = byte0[l];
+            expected[32 * l + 1] = byte1[l];
+        }
 
-        // Remaining bytes are all 0x55 (code 1 → ternary 0 → 0.0)
-        for (i, val) in output.iter().enumerate().take(256).skip(8) {
-            assert!(val.abs() < 1e-5, "output[{i}] = {}", val);
+        for (i, (&got, &exp)) in output.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-3,
+                "output[{i}] = {got}, expected {exp}"
+            );
         }
     }
 
@@ -282,16 +298,24 @@ mod tests {
     fn test_gemv_tq2_0() {
         let kernel = Tq2_0Ref;
 
-        // Build a 1-row, 256-col matrix with known ternary values
-        // Use a pattern: first 4 weights = +1, next 4 = -1, rest = 0
+        // Build a 1-row, 256-col matrix with known ternary values.
+        //
+        // Decode is digit-major: digit `l` of byte `m` is weight `32l + m`.
+        // So byte 0's four digits are weights 0, 32, 64, 96 and byte 1's are
+        // weights 1, 33, 65, 97 — *not* weights 0..4 and 4..8.
+        const PLUS_ONE: [usize; 4] = [0, 32, 64, 96];
+        // Byte 1's four digits land at 1, 33, 65, 97 — the second asymmetric
+        // probe below relies on those positions holding zero input.
+        const MINUS_ONE: [usize; 4] = [1, 33, 65, 97];
+
         let mut qs = [0x55u8; 64]; // all ternary 0
-        qs[0] = pack_2bit(2, 2, 2, 2); // indices 0..4 → ternary +1
-        qs[1] = pack_2bit(0, 0, 0, 0); // indices 4..8 → ternary -1
+        qs[0] = pack_2bit(2, 2, 2, 2); // → +1 at PLUS_ONE
+        qs[1] = pack_2bit(0, 0, 0, 0); // → -1 at MINUS_ONE
         let scale = 0.5f32;
         let block = make_tq2_0_block(scale, &qs);
         let tensor = QuantTensor::new(block, vec![1, 256], oxillama_gguf::GgufTensorType::Tq2_0);
 
-        // Input: all 1.0 for the first 8, rest 1.0 too (but ternary 0 → no contribution)
+        // Input: all 1.0.  Every other weight is ternary 0 → no contribution.
         let input = vec![1.0f32; 256];
         let mut output = vec![0.0f32; 1];
         kernel
@@ -305,14 +329,15 @@ mod tests {
             output[0]
         );
 
-        // Now try with asymmetric input to get a non-zero result
+        // Asymmetric input: excite only the four +1 weights.
         let mut input2 = vec![0.0f32; 256];
-        // First 4 weights = +0.5 (+1 ternary * 0.5 scale), next 4 = -0.5 (-1 ternary * 0.5)
-        input2[0] = 2.0;
-        input2[1] = 2.0;
-        input2[2] = 2.0;
-        input2[3] = 2.0;
-        // Indices 4..8 have ternary -1, input = 0 → contribute 0
+        for &i in &PLUS_ONE {
+            input2[i] = 2.0;
+        }
+        // The -1 weights sit at MINUS_ONE, where input2 is 0 → contribute 0.
+        for &i in &MINUS_ONE {
+            assert_eq!(input2[i], 0.0, "MINUS_ONE index {i} must stay unexcited");
+        }
         let mut output2 = vec![0.0f32; 1];
         kernel
             .gemv(&tensor, &input2, &mut output2)

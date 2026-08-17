@@ -29,7 +29,7 @@
 
 mod model;
 
-pub use model::{load_mistral_from_gguf, MistralModel};
+pub use model::{load_mistral_from_gguf, MistralLayer, MistralModel};
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
@@ -81,6 +81,14 @@ impl ModelArchitecture for MistralArchitecture {
         })
     }
 
+    fn build_from_gguf(
+        &self,
+        model: &oxillama_gguf::GgufModel,
+        config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Ok(Box::new(model::load_mistral_from_gguf(model, config)?))
+    }
+
     fn tensor_names(&self) -> Vec<TensorNamePattern> {
         let mut patterns = vec![
             TensorNamePattern {
@@ -95,8 +103,9 @@ impl ModelArchitecture for MistralArchitecture {
             },
             TensorNamePattern {
                 pattern: "output.weight".to_string(),
-                description: "LM head / unembedding".to_string(),
-                required: true,
+                description: "LM head / unembedding (falls back to tied token_embd.weight)"
+                    .to_string(),
+                required: false,
             },
         ];
 
@@ -180,9 +189,17 @@ mod tests {
             required.contains(&"token_embd.weight"),
             "token_embd.weight must be required"
         );
+
+        // `output.weight` is listed but NOT required: many Mistral
+        // fine-tunes tie the LM head to `token_embd.weight` and ship no
+        // standalone tensor (see `load_lm_head` in `model.rs`).
+        let output = names
+            .iter()
+            .find(|p| p.pattern == "output.weight")
+            .expect("output.weight pattern should be present");
         assert!(
-            required.contains(&"output.weight"),
-            "output.weight must be required"
+            !output.required,
+            "output.weight should be optional (tied-embedding fallback)"
         );
     }
 

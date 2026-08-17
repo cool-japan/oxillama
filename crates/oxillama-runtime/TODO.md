@@ -41,15 +41,15 @@ into `arch` unless they have a concrete reason.
 
 | Field | Value |
 |---|---|
-| Version | 0.1.3 |
+| Version | 0.1.4 |
 | Completion | ~98% |
-| Source files | 17 (`src/**/*.rs`) |
-| Largest file | `src/engine.rs` (~1.4K lines, under 2000-line policy) |
+| Source files | 48 (`src/**/*.rs`) |
+| Largest file | `src/sampling/grammar/json_schema.rs` (~1.46K lines, under 2000-line policy) |
 | Default tokenizer backend | `tokenizer-wasm` (pure Rust, wasm32-safe) |
 | Alternate backend | `tokenizer-onig` (C regex, native only) |
 | Per-arch features | `llama`, `qwen3`, `mistral`, `gemma`, `phi`, `command-r`, `starcoder` |
-| Default features | all 7 archs + `tokenizer-wasm` |
-| Deps | `oxillama-gguf`, `oxillama-quant`, `oxillama-arch`, `half`, `thiserror`, `tracing`, `rayon`, `serde`, `serde_json`, optional `tokenizers` |
+| Default features | all 7 archs + `tokenizer-wasm`, `parallel`, `native-async`, `mmap`, `offload` |
+| Deps | `oxillama-gguf`, `oxillama-quant`, `oxillama-arch`, `half`, `thiserror`, `tracing`, `fancy-regex` (workspace-managed; look-around for GGUF pre-tokenizer patterns), `serde`, `serde_json`, `oxicode`, `blake3`, `tempfile`, optional `rayon`, `tokenizers`, `tokio`/`tokio-util`, `memmap2`, `oxillama-gpu` |
 | Dev deps | `criterion`, `oxillama-gguf/test-utils` |
 | Benches | `sampling` (criterion) |
 | `unwrap()` in production | 0 (policy: zero unwrap outside tests) |
@@ -59,7 +59,7 @@ into `arch` unless they have a concrete reason.
 | Path | Role |
 |---|---|
 | `src/lib.rs` | Module declarations and public re-exports |
-| `src/engine.rs` | `InferenceEngine`, `EngineConfig`; load, prefill, decode, `generate`, `generate_with_config`, `embed`, `embed_batch`, `forward_one`, `tokenize`, `decode_token`, `apply_lora_adapters`, `reset`, `is_eos` |
+| `src/engine/mod.rs` | `InferenceEngine`, `EngineConfig`; load, prefill, decode, `generate`, `generate_with_config`, `embed`, `embed_batch`, `forward_one`, `tokenize`, `decode_token`, `apply_lora_adapters`, `reset`, `is_eos` |
 | `src/kv_cache/mod.rs` | `KvCache` (contiguous pre-allocated) implementing `KvCacheAccess`; `stored_len` invariant that lets attention read back K/V written in the same forward pass |
 | `src/kv_cache/paged.rs` | `PagedKvCache` with 16-token pages, `get_keys_into`, `get_values_into`, `iter_keys`, `iter_values`, `shrink_to_fit`, `memory_bytes` |
 | `src/sampling/mod.rs` | Stateless `sample()`, stateful `Sampler`, `SamplerConfig`, `Xorshift64` PRNG; greedy, top-K, top-P, min-P, temperature, repetition penalty, mirostat-v2 |
@@ -165,7 +165,7 @@ Cached vocabulary
   score matrices, so memory bandwidth dominates at long context.~~
   **A1 — FlashAttention tiled CPU kernel** ✅ **Done (2026-04-20)**
   - **Shipped:** `flash_attention_forward(q, k, v, num_heads, head_dim, softmax_scale, causal_mask) -> RuntimeResult<Vec<f32>>` in `flash_attention.rs`. Seq-major layout `[seq_len, num_heads, head_dim]`. Internally transposes to head-major, dispatches per-head via `rayon::par_chunks_mut`, uses `BQ=64 / BK=64` tile loop with online softmax. Causal mask uses absolute positions with `q_offset = seq_len_kv - seq_len_q` for decode-step asymmetry.
-  - **Constants:** `FLASH_ATTN_THRESHOLD = 512` in `engine.rs` (exported from `lib.rs`).
+  - **Constants:** `FLASH_ATTN_THRESHOLD = 512` in `engine/mod.rs` (exported from `lib.rs`).
   - **Tests (5 new):** `flash_matches_reference_causal_short` (tol 1e-5), `flash_matches_reference_causal_long` 512×1024 (tol 1e-4), `flash_matches_reference_non_causal` (tol 1e-5), `flash_determinism` (bit-equal), `flash_single_token_decode` seq_len_q=1 seq_len_kv=1024 (tol 1e-5).
 - [x] ~~Scheduler resets the KV cache between requests in practice; per-request
   KV slots are not yet wired through, so the scheduler is effectively
@@ -178,14 +178,42 @@ Cached vocabulary
   adapter selection.~~ ✅ **Done**: `LoraStack` integrated into `InferenceEngine`; `push_lora`, `pop_lora`, `clear_loras`, `apply_lora_stack` support hot-swap without restart. Server wiring shipped v0.1.3 (`AppState::loras` registry + per-request `lora_selection`, `engine.unapply_all_loras()` reverts `QuantLinear.lora` fields after generation).
 - No CPU offload / lazy paging — entire model must fit in RAM.
 - ~~Speculative decoding has no delta-sync optimisation; KV resync
-  re-prefills the full accepted history each round.~~ ✅ Shipped:
-  `SpeculativeDeltaSync` checkpoints verified KV state and restores
-  on rejection, wired into `SpeculativeEngine::generate`.
-- ~~`PagedKvCache` has no pool / free-list across engines.~~ ✅ Shipped:
-  `KvCachePool` free-list pool with `alloc`/`free`/`page`/`page_mut`.
+  re-prefills the full accepted history each round.~~ ✅ Shipped (2026-06-13):
+  `SpeculativeEngine::generate` keeps the draft cache aligned with the
+  committed context and resyncs via an `O(1)` `truncate` + a single
+  `forward_one` for the new bonus token — no full re-prefill. The duplicate
+  "re-forward the last committed token" pattern was removed by carrying
+  `draft_next_logits`/`target_next_logits` across rounds; this also fixed the
+  residual distribution to use the correct per-position draft logits.
+  `SpeculativeDeltaSync` now performs the truncation rollback and tracks reuse
+  statistics. Gold test proves the delta-synced KV state is byte-identical to a
+  full re-prefill.
+- `PagedKvCache` has no pool / free-list across engines. `KvCachePool` exists
+  (`alloc`/`free`/`page`/`page_mut`, unit-tested) but is **implemented, not
+  integrated**: nothing in the engine, server or CLI constructs one — its only
+  consumer is `SequencePool`, which has no callers either. Note the motivation
+  shrank when the KV cache moved to lazy block growth (1024 MiB eager → 64 MiB
+  for a 20-token conversation), so paging is no longer needed to avoid the
+  eager allocation.
 - ~~No public metrics surface (tokens/sec, prefill vs decode split,
   cache-hit rate).~~ ✅ Shipped: `EngineMetrics` + `MetricsSnapshot`
   wired into `InferenceEngine`; `engine.metrics()` exposes live counters.
+- ~~`KvCacheDtype::F16` halves the KV cache but is unreachable: every
+  architecture reads through `get_keys()`, which cannot lend `&[f32]` from
+  `Vec<f16>`, so selecting it errors on the first layer of the first token.~~
+  ✅ Shipped (0.1.4): `oxillama_arch::common::fetch_keys`/`fetch_values` borrow
+  f32 storage with no copy and gather everything else; `EngineConfig::kv_dtype`
+  and `oxillama run|serve --kv-dtype {f32,f16}` select it. Default stays `f32`.
+  Remaining asymmetry: `EngineSnapshot` restore pins the rebuilt cache to `f32`
+  (the payload is f32), so a session snapshotted under `--kv-dtype f16` resumes
+  on f32. Defensible today (correctness is unaffected — `f32` is the more
+  precise of the two), but silent: nothing tells the caller their `f16`
+  memory savings vanished on resume. Fix direction: add a `kv_dtype` field to
+  `EngineSnapshot`'s header (`src/snapshot.rs`), populate it from
+  `EngineConfig::kv_dtype` at `snapshot()` time, and have `resume()` rebuild
+  the `KvCache` with that recorded dtype instead of hardcoding `F32` — a
+  version bump on the `b"OXISNAP1"` envelope, since old snapshots have no such
+  field to read.
 
 ## 6. v1.1 Roadmap
 
@@ -196,13 +224,15 @@ Cached vocabulary
   tracking, hit/miss counters, `KvCache::restore_from_snapshot()`
   (v0.1.2). Server wiring completed v0.1.3: `prime_with_prefix`,
   `generate_with_logits`, `store_kv_in_prefix_cache`, `CachedKvState::new`.
-- ~~Delta KV resync for speculative decoding.~~ ✅ Shipped:
-  `SpeculativeDeltaSync` with `checkpoint`/`restore`, wired into
-  `SpeculativeEngine`; draft only re-runs corrected token on rejection.
+- ~~Delta KV resync for speculative decoding.~~ ✅ Shipped (2026-06-13):
+  truncation-based `SpeculativeDeltaSync::rollback` wired into
+  `SpeculativeEngine::generate`; the draft reuses the verified prefix and
+  recomputes only the single committed token per round (`O(1)` rollback +
+  one forward), independent of context length.
 - ~~Public metrics surface.~~ ✅ Shipped: `EngineMetrics`/`MetricsSnapshot`
   in `src/metrics.rs`; `InferenceEngine::metrics()` / `metrics_snapshot()`.
-- ~~KV cache pool / free-list.~~ ✅ Shipped: `KvCachePool` in
-  `src/kv_pool.rs` with `alloc`/`free`/`page`/`page_mut`.
+- KV cache pool / free-list: `KvCachePool` in `src/kv_pool.rs` is written and
+  unit-tested but **not wired into any inference path**.
 
 ## 7. v2.0+ Vision
 
@@ -289,7 +319,7 @@ Cached vocabulary
     - Grammar snapshot: serialise `{ grammar_source: String, current_state_id: u32 }`, reparse on resume.
     - API: `InferenceEngine::snapshot(&self) -> RuntimeResult<Vec<u8>>`, `InferenceEngine::resume(snapshot: &[u8], model_path: &Path) -> RuntimeResult<Self>`.
     - New errors: `RuntimeError::SnapshotIncompatible { detail }`, `RuntimeError::ModelFingerprintMismatch { expected, found, detail }`.
-  - **Files:** `src/snapshot.rs`, `src/engine.rs` (+80 LoC), `src/error.rs` (2 new variants), `src/kv_cache/mod.rs` (+100 LoC), `src/kv_cache/paged.rs`, `src/sampling/mod.rs` (Xorshift64 accessors), `src/sampling/grammar/machine.rs` (GrammarState::from_state_id), `crates/oxillama-arch/src/common/sequence_state.rs` (additive trait methods + Mamba2/Jamba overrides), `Cargo.toml` (oxicode dep), `tests/snapshot.rs`.
+  - **Files:** `src/snapshot.rs`, `src/engine/mod.rs` (+80 LoC), `src/error.rs` (2 new variants), `src/kv_cache/mod.rs` (+100 LoC), `src/kv_cache/paged.rs`, `src/sampling/mod.rs` (Xorshift64 accessors), `src/sampling/grammar/machine.rs` (GrammarState::from_state_id), `crates/oxillama-arch/src/common/sequence_state.rs` (additive trait methods + Mamba2/Jamba overrides), `Cargo.toml` (oxicode dep), `tests/snapshot.rs`.
   - **Tests:** `snapshot_roundtrip_small`, `snapshot_rejects_wrong_model_fingerprint`, `snapshot_rejects_incompatible_version`, `snapshot_preserves_mirostat_mu`, `snapshot_preserves_grammar_state`, `snapshot_ssm_roundtrip`, `snapshot_paged_kv_roundtrip`, `snapshot_cross_process_determinism`.
 
 - [x] SpeculativeEngine snapshot/restore (Track E, v0.1.3) ✅ **Done (2026-05-05)**
@@ -348,4 +378,9 @@ Cached vocabulary
   - **Tests (8):** `pooling_last_matches_last_row`, `pooling_mean_is_arithmetic_mean`, `pooling_max_is_elementwise_max`, `pooling_cls_matches_first_row`, plus 4 edge-case tests.
   - **Re-exported** from `lib.rs`: `PoolingMode`.
 
-*Last updated: 2026-05-05 (v0.1.3 Track B)*
+*Last updated: 2026-08-17 (v0.1.4 — GPU offload backend: new `gpu_backend` module
+(`GpuPolicy`/`GpuOptions`/`GpuStatus`) wired through `EngineConfig::gpu` and
+`InferenceEngine::gpu_status()`, offloading Q4_0 decode-time weight matrices via
+`oxillama_gpu::gemv_q4_0_resident`; delta-sync speculative decoding
+(`InferenceEngine::truncate`-based, O(1) per round); GGUF-embedded tokenizer
+(`src/gguf_vocab/`); 701 tests)*

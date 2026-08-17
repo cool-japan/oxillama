@@ -11,8 +11,20 @@
 //! `oxiblas::gemm`.  The result is read back from the column-major output
 //! matrix into the caller's row-major `output` slice.
 //!
-//! GEMV (single-vector case) is handled with a scalar dot-product loop to
-//! avoid the overhead of two transposes for M = 1.
+//! GEMV (single-vector case, `m == 1`) decodes each weight row lazily,
+//! in place, as it is consumed — it never materializes the weight matrix.
+//! `gemm` (`m > 1`) keeps the eager `decode_weights` + oxiblas path: oxiblas
+//! needs the whole matrix in a `Mat` regardless, and batching `m` tokens
+//! amortizes that one decode instead of paying it per token.
+//!
+//! GEMV used to call the same eager `decode_weights` as `gemm` — decoding
+//! the *entire* N×K matrix into a fresh `Vec<f32>` on every single-token
+//! call, which is a full extra matrix-sized allocation and a scalar decode
+//! pass on top of what `gemv`'s own triple loop then read from it. For an F16
+//! LM head that is a full-matrix allocation and decode PER TOKEN — strictly
+//! worse than the reference kernel this replaced, which reads bytes straight
+//! out of the mapping. `dot_row_unrolled` is the shared lazy per-row dot
+//! product `gemv` now uses instead.
 //!
 //! Tolerances achieved vs. reference:
 //! - F32 → 1e-6 (no precision loss)
@@ -37,13 +49,65 @@ use crate::types::QuantTensor;
 fn row_major_to_colmaj_mat(data: &[f32], n_rows: usize, n_cols: usize) -> Mat<f32> {
     let mut mat = Mat::<f32>::zeros(n_rows, n_cols);
     let rs = mat.row_stride();
-    let raw = unsafe { std::slice::from_raw_parts_mut(mat.as_mut_ptr(), rs * n_cols) };
+    // SAFETY: replaced by the safe `Mat::raw_data_mut()` accessor below —
+    // no unsafe pointer reconstruction needed. `raw_data_mut()` returns the
+    // full underlying buffer (`row_stride * ncols` elements, including
+    // alignment padding — see `Mat::zeros`), matching the `rs * n_cols`
+    // length this function indexes with `raw[r + c * rs]`.
+    let raw = mat.raw_data_mut();
     for r in 0..n_rows {
         for c in 0..n_cols {
             raw[r + c * rs] = data[r * n_cols + c];
         }
     }
     mat
+}
+
+/// Lazily decode one weight row and dot-product it with `input`, without
+/// materializing the row (let alone the whole matrix) as a `Vec<f32>` first.
+///
+/// `elem_bytes` is the per-weight byte width in `row_bytes` (4 for F32, 2 for
+/// F16/BF16); `decode` converts one such little-endian element to `f32`.
+///
+/// Uses 8 independent accumulator lanes so the summation has no single
+/// dependency chain — this is what lets the compiler auto-vectorize the loop
+/// (checked at `opt-level >= 2`) despite this module carrying no
+/// `#[target_feature]` of its own (see the module doc: it is architecture-
+/// agnostic by design, always available with no CPU-feature gate).
+///
+/// # Panics
+/// Debug-asserts `row_bytes.len() >= n_cols * elem_bytes` and
+/// `input.len() >= n_cols`; callers must uphold both.
+#[inline]
+fn dot_row_unrolled(
+    row_bytes: &[u8],
+    input: &[f32],
+    n_cols: usize,
+    elem_bytes: usize,
+    decode: impl Fn(&[u8]) -> f32,
+) -> f32 {
+    debug_assert!(row_bytes.len() >= n_cols * elem_bytes);
+    debug_assert!(input.len() >= n_cols);
+
+    const LANES: usize = 8;
+    let mut acc = [0.0f32; LANES];
+    let mut col = 0usize;
+    while col + LANES <= n_cols {
+        for (lane, a) in acc.iter_mut().enumerate() {
+            let off = (col + lane) * elem_bytes;
+            let w = decode(&row_bytes[off..off + elem_bytes]);
+            *a += w * input[col + lane];
+        }
+        col += LANES;
+    }
+    let mut sum: f32 = acc.iter().sum();
+    while col < n_cols {
+        let off = col * elem_bytes;
+        let w = decode(&row_bytes[off..off + elem_bytes]);
+        sum += w * input[col];
+        col += 1;
+    }
+    sum
 }
 
 // ---------------------------------------------------------------------------
@@ -120,14 +184,28 @@ impl QuantKernel for F32OxiblasKernel {
                 got: output.len(),
             });
         }
-        let w = self.decode_weights(quant_matrix, n_rows, n_cols)?;
-        for (r, out_val) in output.iter_mut().enumerate().take(n_rows) {
-            let mut sum = 0.0f32;
-            for c in 0..n_cols {
-                sum += w[r * n_cols + c] * input[c];
-            }
-            *out_val = sum;
+        // Lazy per-row decode — see the module doc. No `decode_weights` call
+        // here: that would allocate and scalar-decode the *entire* N×K
+        // matrix for a single-vector product.
+        let row_bytes = n_cols * 4;
+        if quant_matrix.data.len() < n_rows * row_bytes {
+            return Err(QuantError::FloatGemmFailed(format!(
+                "F32 weight buffer too small: need {} bytes, have {}",
+                n_rows * row_bytes,
+                quant_matrix.data.len()
+            )));
         }
+        let data = &quant_matrix.data;
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
+            let row_start = row * row_bytes;
+            *out = dot_row_unrolled(
+                &data[row_start..row_start + row_bytes],
+                input,
+                n_cols,
+                4,
+                |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            );
+        });
         Ok(())
     }
 
@@ -168,7 +246,7 @@ impl QuantKernel for F32OxiblasKernel {
         let mut b = Mat::<f32>::zeros(k, m);
         {
             let rs_b = b.row_stride();
-            let raw_b = unsafe { std::slice::from_raw_parts_mut(b.as_mut_ptr(), rs_b * m) };
+            let raw_b = b.raw_data_mut();
             for r in 0..k {
                 for c in 0..m {
                     raw_b[r + c * rs_b] = input[c * k + r];
@@ -187,7 +265,7 @@ impl QuantKernel for F32OxiblasKernel {
         // C result: row=weight_row (j), col=input_row (i). So C(j, i) maps to output[i][j].
         {
             let rs_c = c.row_stride();
-            let raw_c = unsafe { std::slice::from_raw_parts(c.as_ptr(), rs_c * m) };
+            let raw_c = c.raw_data();
             for i in 0..m {
                 // input row
                 for j in 0..n {
@@ -285,14 +363,28 @@ impl QuantKernel for F16OxiblasKernel {
                 got: output.len(),
             });
         }
-        let w = self.decode_weights(quant_matrix, n_rows, n_cols)?;
-        for (r, out_val) in output.iter_mut().enumerate().take(n_rows) {
-            let mut sum = 0.0f32;
-            for c in 0..n_cols {
-                sum += w[r * n_cols + c] * input[c];
-            }
-            *out_val = sum;
+        // Lazy per-row decode — see the module doc. No `decode_weights` call
+        // here: that would allocate and scalar-decode the *entire* N×K
+        // matrix for a single-vector product.
+        let row_bytes = n_cols * 2;
+        if quant_matrix.data.len() < n_rows * row_bytes {
+            return Err(QuantError::FloatGemmFailed(format!(
+                "F16 weight buffer too small: need {} bytes, have {}",
+                n_rows * row_bytes,
+                quant_matrix.data.len()
+            )));
         }
+        let data = &quant_matrix.data;
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
+            let row_start = row * row_bytes;
+            *out = dot_row_unrolled(
+                &data[row_start..row_start + row_bytes],
+                input,
+                n_cols,
+                2,
+                |b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32(),
+            );
+        });
         Ok(())
     }
 
@@ -325,7 +417,7 @@ impl QuantKernel for F16OxiblasKernel {
         let mut b = Mat::<f32>::zeros(k, m);
         {
             let rs_b = b.row_stride();
-            let raw_b = unsafe { std::slice::from_raw_parts_mut(b.as_mut_ptr(), rs_b * m) };
+            let raw_b = b.raw_data_mut();
             for r in 0..k {
                 for c in 0..m {
                     raw_b[r + c * rs_b] = input[c * k + r];
@@ -336,7 +428,7 @@ impl QuantKernel for F16OxiblasKernel {
         gemm(1.0_f32, a.as_ref(), b.as_ref(), 0.0_f32, c.as_mut());
         {
             let rs_c = c.row_stride();
-            let raw_c = unsafe { std::slice::from_raw_parts(c.as_ptr(), rs_c * m) };
+            let raw_c = c.raw_data();
             for i in 0..m {
                 for j in 0..n {
                     output[i * n + j] = raw_c[j + i * rs_c];
@@ -441,14 +533,28 @@ impl QuantKernel for Bf16OxiblasKernel {
                 got: output.len(),
             });
         }
-        let w = self.decode_weights(quant_matrix, n_rows, n_cols)?;
-        for (r, out_val) in output.iter_mut().enumerate().take(n_rows) {
-            let mut sum = 0.0f32;
-            for c in 0..n_cols {
-                sum += w[r * n_cols + c] * input[c];
-            }
-            *out_val = sum;
+        // Lazy per-row decode — see the module doc. No `decode_weights` call
+        // here: that would allocate and scalar-decode the *entire* N×K
+        // matrix for a single-vector product.
+        let row_bytes = n_cols * 2;
+        if quant_matrix.data.len() < n_rows * row_bytes {
+            return Err(QuantError::FloatGemmFailed(format!(
+                "BF16 weight buffer too small: need {} bytes, have {}",
+                n_rows * row_bytes,
+                quant_matrix.data.len()
+            )));
         }
+        let data = &quant_matrix.data;
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
+            let row_start = row * row_bytes;
+            *out = dot_row_unrolled(
+                &data[row_start..row_start + row_bytes],
+                input,
+                n_cols,
+                2,
+                |b| bf16_bits_to_f32(u16::from_le_bytes([b[0], b[1]])),
+            );
+        });
         Ok(())
     }
 
@@ -481,7 +587,7 @@ impl QuantKernel for Bf16OxiblasKernel {
         let mut b = Mat::<f32>::zeros(k, m);
         {
             let rs_b = b.row_stride();
-            let raw_b = unsafe { std::slice::from_raw_parts_mut(b.as_mut_ptr(), rs_b * m) };
+            let raw_b = b.raw_data_mut();
             for r in 0..k {
                 for c in 0..m {
                     raw_b[r + c * rs_b] = input[c * k + r];
@@ -492,7 +598,7 @@ impl QuantKernel for Bf16OxiblasKernel {
         gemm(1.0_f32, a.as_ref(), b.as_ref(), 0.0_f32, c.as_mut());
         {
             let rs_c = c.row_stride();
-            let raw_c = unsafe { std::slice::from_raw_parts(c.as_ptr(), rs_c * m) };
+            let raw_c = c.raw_data();
             for i in 0..m {
                 for j in 0..n {
                     output[i * n + j] = raw_c[j + i * rs_c];
@@ -640,6 +746,7 @@ mod tests {
 
     // ------ F16 ------
 
+    #[cfg_attr(miri, ignore)] // half crate aarch64 asm not supported in Miri
     #[test]
     fn test_f16_gemv_matches_reference() {
         let vals = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -661,6 +768,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)] // half crate aarch64 asm not supported in Miri
     #[test]
     fn test_f16_gemm_matches_reference() {
         let w_vals: Vec<f32> = (1..=12).map(|x| x as f32).collect();
@@ -686,6 +794,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)] // half crate aarch64 asm not supported in Miri
     #[test]
     fn test_f16_kernel_metadata() {
         assert_eq!(F16OxiblasKernel.block_size(), 1);
@@ -693,6 +802,7 @@ mod tests {
         assert_eq!(F16OxiblasKernel.name(), "F16-oxiblas");
     }
 
+    #[cfg_attr(miri, ignore)] // half crate aarch64 asm not supported in Miri
     #[test]
     fn test_f16_dequant_block() {
         let val = 3.125f32; // exact in f16
@@ -787,6 +897,7 @@ mod tests {
         assert_eq!(kernel.name(), "F32-oxiblas");
     }
 
+    #[cfg_attr(miri, ignore)] // half crate aarch64 asm not supported in Miri
     #[test]
     fn test_dispatch_routes_f16_to_oxiblas() {
         use crate::dispatch::KernelDispatcher;
@@ -809,5 +920,128 @@ mod tests {
             .get_kernel(GgufTensorType::Bf16)
             .expect("dispatch BF16");
         assert_eq!(kernel.name(), "BF16-oxiblas");
+    }
+
+    // ------ T7: lazy per-row gemv (regression) ------
+    //
+    // `gemv` used to call `decode_weights`, allocating and scalar-decoding
+    // the entire N×K matrix on every single-vector call. These tests target
+    // exactly the shapes that bug's replacement (`dot_row_unrolled` +
+    // `for_each_row`) must get right: a tail that is not a multiple of the
+    // 8-lane unrolled width, and enough rows to cross
+    // `parallel::PARALLEL_ROW_THRESHOLD` so the multi-threaded path runs.
+
+    #[test]
+    fn test_f32_gemv_ragged_cols_matches_reference() {
+        // n_cols = 13 = 8 (one unrolled pass) + 5 (scalar tail).
+        let n_rows = 3usize;
+        let n_cols = 13usize;
+        let vals: Vec<f32> = (0..n_rows * n_cols)
+            .map(|i| (i as f32) * 0.37 - 4.0)
+            .collect();
+        let tensor = make_f32_tensor(&vals, vec![n_rows, n_cols]);
+        let input: Vec<f32> = (0..n_cols).map(|i| (i as f32) * 0.11 - 1.0).collect();
+
+        let mut out_ref = vec![0.0f32; n_rows];
+        F32Ref.gemv(&tensor, &input, &mut out_ref).expect("ref");
+        let mut out_oxi = vec![0.0f32; n_rows];
+        F32OxiblasKernel
+            .gemv(&tensor, &input, &mut out_oxi)
+            .expect("oxi");
+
+        for (r, o) in out_ref.iter().zip(out_oxi.iter()) {
+            assert!((r - o).abs() < 1e-4, "ref={r}, oxi={o}");
+        }
+    }
+
+    #[cfg_attr(miri, ignore)] // half crate aarch64 asm not supported in Miri
+    #[test]
+    fn test_f16_gemv_ragged_cols_matches_reference() {
+        let n_rows = 3usize;
+        let n_cols = 13usize;
+        let vals: Vec<f32> = (0..n_rows * n_cols)
+            .map(|i| (i as f32) * 0.37 - 4.0)
+            .collect();
+        let tensor = make_f16_tensor(&vals, vec![n_rows, n_cols]);
+        let input: Vec<f32> = (0..n_cols).map(|i| (i as f32) * 0.11 - 1.0).collect();
+
+        let mut out_ref = vec![0.0f32; n_rows];
+        F16Ref.gemv(&tensor, &input, &mut out_ref).expect("ref");
+        let mut out_oxi = vec![0.0f32; n_rows];
+        F16OxiblasKernel
+            .gemv(&tensor, &input, &mut out_oxi)
+            .expect("oxi");
+
+        for (r, o) in out_ref.iter().zip(out_oxi.iter()) {
+            assert!((r - o).abs() < 1e-2, "ref={r}, oxi={o}");
+        }
+    }
+
+    #[test]
+    fn test_bf16_gemv_ragged_cols_matches_reference() {
+        let n_rows = 3usize;
+        let n_cols = 13usize;
+        let vals: Vec<f32> = (0..n_rows * n_cols)
+            .map(|i| (i as f32) * 0.37 - 4.0)
+            .collect();
+        let tensor = make_bf16_tensor(&vals, vec![n_rows, n_cols]);
+        let input: Vec<f32> = (0..n_cols).map(|i| (i as f32) * 0.11 - 1.0).collect();
+
+        let mut out_ref = vec![0.0f32; n_rows];
+        Bf16Ref.gemv(&tensor, &input, &mut out_ref).expect("ref");
+        let mut out_oxi = vec![0.0f32; n_rows];
+        Bf16OxiblasKernel
+            .gemv(&tensor, &input, &mut out_oxi)
+            .expect("oxi");
+
+        for (r, o) in out_ref.iter().zip(out_oxi.iter()) {
+            assert!((r - o).abs() < 1e-1, "ref={r}, oxi={o}");
+        }
+    }
+
+    /// A row count/column count large enough to cross
+    /// `parallel::PARALLEL_ROW_THRESHOLD` (64 rows, 256+ cols) — this is the
+    /// LM-head-shaped case the bug report singled out: `gemv` must decode
+    /// each row lazily inside `for_each_row`, not eagerly allocate the whole
+    /// matrix up front, and the parallel path must still match the scalar
+    /// reference row for row.
+    #[test]
+    fn test_f32_gemv_many_rows_matches_reference() {
+        let n_rows = 200usize;
+        let n_cols = 300usize;
+        let vals: Vec<f32> = (0..n_rows * n_cols)
+            .map(|i| ((i % 97) as f32) * 0.05 - 2.4)
+            .collect();
+        let tensor = make_f32_tensor(&vals, vec![n_rows, n_cols]);
+        let input: Vec<f32> = (0..n_cols)
+            .map(|i| ((i % 53) as f32) * 0.02 - 0.5)
+            .collect();
+
+        let mut out_ref = vec![0.0f32; n_rows];
+        F32Ref.gemv(&tensor, &input, &mut out_ref).expect("ref");
+        let mut out_oxi = vec![0.0f32; n_rows];
+        F32OxiblasKernel
+            .gemv(&tensor, &input, &mut out_oxi)
+            .expect("oxi");
+
+        for (row, (r, o)) in out_ref.iter().zip(out_oxi.iter()).enumerate() {
+            assert!((r - o).abs() < 1e-3, "row {row}: ref={r}, oxi={o}");
+        }
+    }
+
+    /// `gemv`'s new buffer-too-small check must still fire (as
+    /// `FloatGemmFailed`) instead of panicking on an out-of-bounds slice —
+    /// the lazy path computes its own `row_bytes` bound now instead of
+    /// inheriting `decode_weights`'s check.
+    #[test]
+    fn test_f32_gemv_buffer_too_small_errors_cleanly() {
+        let tensor = QuantTensor::new(vec![0u8; 4], vec![2, 3], GgufTensorType::F32); // needs 24 bytes, has 4
+        let input = vec![0.0f32; 3];
+        let mut out = vec![0.0f32; 2];
+        let result = F32OxiblasKernel.gemv(&tensor, &input, &mut out);
+        assert!(
+            matches!(result, Err(QuantError::FloatGemmFailed(_))),
+            "expected FloatGemmFailed, got {result:?}"
+        );
     }
 }

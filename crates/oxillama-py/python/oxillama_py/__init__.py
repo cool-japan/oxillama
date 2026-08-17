@@ -204,10 +204,16 @@ class AsyncEngine:
 # importable even when the compiled extension has not been built yet.
 try:
     from oxillama_py.oxillama_py import (  # type: ignore[import-untyped]
+        CancellationToken,
         Engine,
         EngineConfig,
+        FinishReason,
         GenerateError,
+        GenerationConfig,
+        GenerationOutcome,
+        GpuUnavailableError,
         GrammarError,
+        KvCacheFullError,
         LoadError,
         Lora,
         OxiLlamaError,
@@ -221,10 +227,16 @@ try:
     )
 except ImportError:
     # Native extension not yet built. Only the pure-Python symbols are available.
+    CancellationToken = None  # type: ignore[assignment,misc]
     Engine = None  # type: ignore[assignment,misc]
     EngineConfig = None  # type: ignore[assignment,misc]
+    FinishReason = None  # type: ignore[assignment,misc]
     GenerateError = None  # type: ignore[assignment,misc]
+    GenerationConfig = None  # type: ignore[assignment,misc]
+    GenerationOutcome = None  # type: ignore[assignment,misc]
+    GpuUnavailableError = None  # type: ignore[assignment,misc]
     GrammarError = None  # type: ignore[assignment,misc]
+    KvCacheFullError = None  # type: ignore[assignment,misc]
     LoadError = None  # type: ignore[assignment,misc]
     Lora = None  # type: ignore[assignment,misc]
     OxiLlamaError = None  # type: ignore[assignment,misc]
@@ -240,7 +252,7 @@ from oxillama_py import snapshot
 from oxillama_py.snapshot import SnapshotError
 from oxillama_py import torch_helper as _torch_helper
 
-__version__ = "0.1.0"
+__version__ = "0.1.4"
 
 # Patch torch interop helpers onto Engine (no-op if torch is not installed).
 import sys as _sys
@@ -287,10 +299,14 @@ __all__ = [
     "EngineConfig",
     "Engine",
     "SamplerConfig",
+    "FinishReason",
+    "GenerationConfig",
+    "GenerationOutcome",
     "SpeculativeConfig",
     "SpeculativeEngine",
     "Lora",
     "Tokenizer",
+    "CancellationToken",
     # Async engine (v0.1.5)
     "AsyncEngine",
     # Snapshot API (v0.1.3)
@@ -303,6 +319,8 @@ __all__ = [
     "TokenizerError",
     "GrammarError",
     "QuantError",
+    "KvCacheFullError",
+    "GpuUnavailableError",
     "SnapshotError",
     # Callback protocol
     "StreamingCallback",

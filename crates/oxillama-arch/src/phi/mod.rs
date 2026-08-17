@@ -26,7 +26,7 @@
 
 mod model;
 
-pub use model::{load_phi_from_gguf, PhiModel};
+pub use model::{load_phi_from_gguf, PhiLayer, PhiModel};
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};

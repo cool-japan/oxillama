@@ -1,13 +1,42 @@
-//! InternLM3 architecture.
+//! InternLM3 architecture — a registry alias, **not** a GGUF architecture id.
 //!
-//! Dense decoder-only Transformer following the LLaMA topology with:
-//! - RMSNorm pre-normalization (no bias)
-//! - Grouped-query attention (GQA) from GGUF `internlm3.attention.head_count_kv`
-//! - RoPE positional embeddings
-//! - SwiGLU feed-forward network (ReLU² variant treated as SwiGLU for struct purposes)
-//! - Tied input/output embeddings
+//! InternLM3 is dense decoder-only LLaMA topology: RMSNorm pre-normalisation,
+//! grouped-query attention, NORM-convention RoPE, SwiGLU FFN, optionally tied
+//! embeddings.
 //!
-//! GGUF `general.architecture` = `"internlm3"` (also sometimes `"internlm2"`).
+//! # `general.architecture` is never `"internlm3"`
+//!
+//! Verified against the reference checkout:
+//!
+//! * `convert_hf_to_gguf.py`:
+//!   ```python
+//!   @ModelBase.register("InternLM3ForCausalLM")
+//!   class InternLM3Model(TextModel):
+//!       model_arch = gguf.MODEL_ARCH.LLAMA
+//!   ```
+//!   — the converter writes `general.architecture = "llama"` for every
+//!   InternLM3 checkpoint.
+//! * `gguf-py/gguf/constants.py` has no `MODEL_ARCH.INTERNLM3` and
+//!   `src/llama-arch.cpp`'s `LLM_ARCH_NAMES` has no `"internlm3"` entry; the
+//!   only InternLM id llama.cpp knows is `internlm2`, which is a **different**
+//!   graph (fused `attn_qkv`, its own `llm_build_internlm2`) and is
+//!   deliberately not aliased here.
+//!
+//! A real InternLM3 checkpoint therefore loads through
+//! `crate::llama::load_llama_from_gguf`, and this plugin can only be reached
+//! by an explicit `ArchitectureRegistry::get("internlm3")` — never by
+//! architecture dispatch.  `crate::registry` documents the same thing at its
+//! `register` call.
+//!
+//! # Why this is an error and not an implementation
+//!
+//! [`InternLm3Architecture::build`] used to return
+//! `MissingTensor { name: "token_embd.weight (use InternLm3Model::from_gguf
+//! for full loading)" }`, pointing at an `InternLm3Model` type that **did not
+//! exist anywhere in the tree**.  Building one would have produced a duplicate
+//! of `crate::llama::LlamaModel` that no checkpoint can route to, so both
+//! entry points now return an accurate [`ArchError::NotSupported`] naming the
+//! `llama` path instead.
 
 mod model;
 
@@ -16,13 +45,33 @@ pub use model::InternLm3Architecture;
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::traits::{ForwardPass, ModelArchitecture, TensorNamePattern};
-use oxillama_gguf::TensorStore;
+use oxillama_gguf::{GgufModel, TensorStore};
+
+/// The message both entry points report, kept in one place.
+const UNREACHABLE_ARCH: &str =
+    "architecture id 'internlm3' is not written by any GGUF converter: convert_hf_to_gguf.py \
+     registers InternLM3ForCausalLM with model_arch = gguf.MODEL_ARCH.LLAMA, and llama.cpp has \
+     no LLM_ARCH_INTERNLM3, so InternLM3 checkpoints ship as general.architecture = \"llama\" \
+     and must be loaded through the llama path (`crate::llama::load_llama_from_gguf`). This \
+     registry entry exists only for an explicit \
+     `ArchitectureRegistry::get(\"internlm3\")` lookup";
 
 impl ModelArchitecture for InternLm3Architecture {
     fn arch_id(&self) -> &str {
         "internlm3"
     }
 
+    /// Always reports failure.
+    ///
+    /// The geometry checks run first so a genuinely malformed
+    /// [`ModelConfig`] is still reported as such; a well-formed one then gets
+    /// [`ArchError::NotSupported`] explaining that the id is unreachable.
+    ///
+    /// # Errors
+    ///
+    /// * [`ArchError::ConfigMismatch`] for a zero head count or hidden size.
+    /// * [`ArchError::NotSupported`] otherwise, explaining that real
+    ///   checkpoints load through the `llama` path.
     fn build(
         &self,
         config: &ModelConfig,
@@ -43,8 +92,28 @@ impl ModelArchitecture for InternLm3Architecture {
             });
         }
 
-        Err(ArchError::MissingTensor {
-            name: "token_embd.weight (use InternLm3Model::from_gguf for full loading)".to_string(),
+        Err(ArchError::NotSupported {
+            detail: UNREACHABLE_ARCH.to_string(),
+        })
+    }
+
+    /// Also reports failure, with the same explanation.
+    ///
+    /// Overriding the default matters: without it the registry would report
+    /// the generic `"architecture 'internlm3' has not implemented
+    /// build_from_gguf()"`, which reads like an unfinished port rather than a
+    /// deliberate alias.
+    ///
+    /// # Errors
+    ///
+    /// Always [`ArchError::NotSupported`].
+    fn build_from_gguf(
+        &self,
+        _model: &GgufModel,
+        _config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Err(ArchError::NotSupported {
+            detail: UNREACHABLE_ARCH.to_string(),
         })
     }
 
@@ -166,5 +235,52 @@ mod tests {
             registry.contains("internlm3"),
             "internlm3 must be present in the default registry"
         );
+    }
+
+    /// Regression: `build()` used to point at `InternLm3Model::from_gguf`, and
+    /// no `InternLm3Model` existed anywhere in the tree.
+    #[test]
+    fn build_does_not_name_a_nonexistent_type() {
+        let arch = InternLm3Architecture::new();
+        let tensors = TensorStore::new();
+        let err = arch
+            .build(&make_config(), &tensors)
+            .err()
+            .expect("the `internlm3` arch id is unreachable and must never build");
+        match err {
+            ArchError::NotSupported { detail } => {
+                assert!(
+                    !detail.contains("InternLm3Model"),
+                    "must not reference a type that does not exist: {detail}"
+                );
+                assert!(
+                    detail.contains("llama"),
+                    "must point the caller at the llama path: {detail}"
+                );
+            }
+            other => panic!("expected NotSupported, got {other}"),
+        }
+    }
+
+    /// The registry's GGUF entry point must give the same accurate answer, not
+    /// the trait default's "has not implemented build_from_gguf()".
+    #[test]
+    fn build_from_gguf_reports_the_same_reason() {
+        let arch = InternLm3Architecture::new();
+        let bytes = oxillama_gguf::test_utils::build_minimal_llama_gguf();
+        let model = oxillama_gguf::GgufModel::from_bytes(bytes).expect("test: parse fixture");
+        let err = arch
+            .build_from_gguf(&model, &make_config())
+            .err()
+            .expect("the `internlm3` arch id is unreachable and must never build");
+        match err {
+            ArchError::NotSupported { detail } => {
+                assert!(
+                    detail.contains("llama") && !detail.contains("has not implemented"),
+                    "expected the alias explanation, got: {detail}"
+                );
+            }
+            other => panic!("expected NotSupported, got {other}"),
+        }
     }
 }

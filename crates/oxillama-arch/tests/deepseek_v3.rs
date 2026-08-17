@@ -1,509 +1,276 @@
-//! Integration tests for DeepSeek-V3 sigmoid-with-bias MoE scoring.
+//! DeepSeek-V3 regression tests: sigmoid+bias routing, group-limited routing,
+//! `expert_weights_norm`, `expert_weights_scale`.
 //!
-//! Tests verify that `ScoringMode::SigmoidWithBias` correctly:
-//! (a) normalises selected routing weights to sum to 1 after top-k selection.
-//! (b) produces different expert selections than softmax when a bias value
-//!     flips which expert lands in top-k.
-//! (c) runs a full forward pass with an exp_probs_b (bias) fixture.
+//! # What changed here and why
+//!
+//! `sigmoid_bias_topk_weights` used to recompute the expected weights as
+//! `sigmoid(logit) + bias`, re-normalised — i.e. it *encoded the bug*.
+//! `llm_graph_context::build_moe_ffn` keeps selection and combination apart:
+//!
+//! ```text
+//! probs           = sigmoid(logits)
+//! selection_probs = probs + exp_probs_b   // "leave probs unbiased as it's
+//! selected        = top_k(selection_probs) //  later used to get expert weights"
+//! weights         = probs[selected]        // UNBIASED
+//! ```
+//!
+//! The new expectation is the unbiased `sigmoid(logit)`, because `exp_probs_b`
+//! is DeepSeek-V3's *load-balancing* term: it exists to steer which experts are
+//! picked, not to change how much each contributes.  It can be negative, so
+//! using it as a weight can drive the combination weight below zero — and the
+//! old `weight_sum > 0.0` guard then zeroed the entire routed branch.
 
-#[cfg(feature = "deepseek")]
-mod deepseek_v3_tests {
-    use oxillama_arch::deepseek::moe::{
-        moe_forward, DeepSeekExpert, MoeConfig, MoeWeights, ScoringMode,
+#![cfg(feature = "deepseek")]
+
+use oxillama_arch::deepseek::moe::{
+    moe_forward, DeepSeekExpert, MoeConfig, MoeWeights, ScoringMode,
+};
+use oxillama_arch::deepseek::{load_deepseek_from_gguf, DeepSeekModel, FfnKind};
+use oxillama_arch::error::ArchResult;
+use oxillama_arch::traits::{ForwardPass, KvCacheAccess};
+
+const H: usize = 8;
+const INTER: usize = 8;
+const N_EXPERTS: usize = 4;
+const TOP_K: usize = 2;
+
+struct NoKv;
+impl KvCacheAccess for NoKv {
+    fn seq_len(&self) -> usize {
+        0
+    }
+    fn store_kv(&mut self, _: usize, _: &[f32], _: &[f32]) -> ArchResult<()> {
+        Ok(())
+    }
+    fn get_keys(&self, _: usize) -> ArchResult<&[f32]> {
+        Ok(&[])
+    }
+    fn get_values(&self, _: usize) -> ArchResult<&[f32]> {
+        Ok(&[])
+    }
+    fn advance(&mut self) {}
+}
+
+fn expert(scale: f32) -> DeepSeekExpert {
+    let mut gate = vec![0.0f32; INTER * H];
+    let mut up = vec![0.0f32; INTER * H];
+    let mut down = vec![0.0f32; H * INTER];
+    for i in 0..INTER.min(H) {
+        gate[i * H + i] = 1.0;
+        up[i * H + i] = 1.0;
+        down[i * INTER + i] = scale;
+    }
+    DeepSeekExpert {
+        gate,
+        up,
+        down,
+        hidden_size: H,
+        intermediate_size: INTER,
+    }
+}
+
+/// Router row `e` puts weight `e` on input dim 0, so for `x = e0` the logits are
+/// `[0, 1, 2, 3]`.
+fn router() -> Vec<f32> {
+    let mut r = vec![0.0f32; N_EXPERTS * H];
+    for e in 0..N_EXPERTS {
+        r[e * H] = e as f32;
+    }
+    r
+}
+
+fn cfg(mode: ScoringMode) -> MoeConfig {
+    MoeConfig {
+        hidden_size: H,
+        expert_intermediate_size: INTER,
+        n_shared_experts: 0,
+        n_routed_experts: N_EXPERTS,
+        top_k: TOP_K,
+        routed_scaling_factor: 1.0,
+        scoring_mode: mode,
+        shared_expert_intermediate_size: INTER,
+    }
+}
+
+/// (a) The combination weight is the **unbiased** `sigmoid(logit)`.
+///
+/// Bias `[10, 0, 0, 0]` makes expert 0 (lowest logit) win selection.  With the
+/// old semantics its weight would have been `sigmoid(0) + 10 = 10.5`; with the
+/// reference semantics it is `sigmoid(0) = 0.5`.
+#[test]
+fn sigmoid_bias_weights_are_unbiased() {
+    let bias = vec![10.0f32, 0.0, 0.0, 0.0];
+    let weights = MoeWeights {
+        router: router(),
+        routed_experts: (0..N_EXPERTS).map(|_| expert(1.0)).collect(),
+        shared_experts: vec![],
+        expert_bias: Some(bias),
     };
+    let mut c = cfg(ScoringMode::SigmoidWithBias);
+    c.top_k = 1;
 
-    // ─── Minimal LCG ─────────────────────────────────────────────────────────
+    let mut x = vec![0.0f32; H];
+    x[0] = 1.0;
+    let out = moe_forward(&x, &weights, &c).expect("moe_forward");
 
-    struct Lcg {
-        state: u64,
+    // top-1 → the single weight normalises to exactly 1, so the output is the
+    // expert's own response: silu(1) * 1 * 1.
+    let expected = 1.0f32 / (1.0 + (-1.0f32).exp());
+    assert!(
+        (out[0] - expected).abs() < 1e-5,
+        "expected the unbiased routing to give {expected}, got {}",
+        out[0]
+    );
+}
+
+/// (b) A negative `exp_probs_b` must not be able to zero the routed branch.
+///
+/// With the old code the bias landed in the weights, so an all-negative bias
+/// drove `weight_sum` below zero, `inv_weight_sum` became `0.0`, and every
+/// routed expert contributed exactly nothing.
+#[test]
+fn negative_bias_does_not_zero_the_routed_branch() {
+    let weights = MoeWeights {
+        router: router(),
+        routed_experts: (0..N_EXPERTS).map(|_| expert(1.0)).collect(),
+        shared_experts: vec![],
+        expert_bias: Some(vec![-5.0f32; N_EXPERTS]),
+    };
+    let c = cfg(ScoringMode::SigmoidWithBias);
+    let mut x = vec![0.0f32; H];
+    x[0] = 1.0;
+    let out = moe_forward(&x, &weights, &c).expect("moe_forward");
+    assert!(
+        out.iter().any(|v| v.abs() > 1e-6),
+        "an all-negative selection bias must not zero the routed output: {out:?}"
+    );
+}
+
+/// (c) `top_k == 0` is an error, not an arithmetic underflow panic.
+///
+/// `top_k` comes straight from `deepseek2.expert_used_count`, so a malformed
+/// checkpoint used to take the process down inside
+/// `select_nth_unstable_by(top_k - 1, …)`.
+#[test]
+fn zero_top_k_is_an_error_not_a_panic() {
+    let weights = MoeWeights {
+        router: router(),
+        routed_experts: (0..N_EXPERTS).map(|_| expert(1.0)).collect(),
+        shared_experts: vec![],
+        expert_bias: None,
+    };
+    let mut c = cfg(ScoringMode::Softmax);
+    c.top_k = 0;
+    let x = vec![1.0f32; H];
+    assert!(
+        moe_forward(&x, &weights, &c).is_err(),
+        "top_k = 0 must return an error"
+    );
+}
+
+/// (d) Selection still follows the biased score even though the weight does not.
+#[test]
+fn bias_still_steers_selection() {
+    // Bias makes expert 0 (the lowest logit) the top-1 pick.
+    let weights = MoeWeights {
+        router: router(),
+        routed_experts: (0..N_EXPERTS)
+            .map(|e| expert(if e == 0 { 7.0 } else { 0.0 }))
+            .collect(),
+        shared_experts: vec![],
+        expert_bias: Some(vec![10.0f32, 0.0, 0.0, 0.0]),
+    };
+    let mut c = cfg(ScoringMode::SigmoidWithBias);
+    c.top_k = 1;
+    let mut x = vec![0.0f32; H];
+    x[0] = 1.0;
+    let out = moe_forward(&x, &weights, &c).expect("moe_forward");
+    // Only expert 0 has a non-zero `down`, so a non-zero output proves it was
+    // the one selected.
+    assert!(
+        out[0].abs() > 1e-6,
+        "the bias must steer selection to expert 0, got {out:?}"
+    );
+}
+
+// ─── V3 GGUF fixture ─────────────────────────────────────────────────────────
+
+fn load_v3() -> DeepSeekModel {
+    let bytes = oxillama_gguf::test_utils::build_minimal_deepseek_v3_gguf();
+    let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("V3 fixture parses");
+    load_deepseek_from_gguf(&gguf).expect("load_deepseek_from_gguf")
+}
+
+/// The V3 fixture now carries the real llama.cpp tensor names, including
+/// `blk.1.exp_probs_b.bias` (a `.bias` suffix, per
+/// `tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i)`) and the stacked expert pool.
+#[test]
+fn v3_fixture_uses_the_llama_cpp_tensor_names() {
+    let bytes = oxillama_gguf::test_utils::build_minimal_deepseek_v3_gguf();
+    let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("fixture parses");
+    for name in [
+        "blk.1.ffn_gate_exps.weight",
+        "blk.1.ffn_up_exps.weight",
+        "blk.1.ffn_down_exps.weight",
+        "blk.1.ffn_gate_shexp.weight",
+        "blk.1.exp_probs_b.bias",
+        "blk.1.attn_kv_a_mqa.weight",
+        "blk.1.attn_q_a.weight",
+        "blk.1.attn_q_b.weight",
+    ] {
+        assert!(gguf.file.tensors.contains(name), "missing {name}");
     }
+    assert!(
+        !gguf
+            .file
+            .tensors
+            .contains("blk.1.ffn_exp.0.ffn_gate.weight"),
+        "the invented per-expert 2-D names must be gone"
+    );
+}
 
-    impl Lcg {
-        fn new(seed: u64) -> Self {
-            Self { state: seed }
-        }
+#[test]
+fn v3_loads_and_runs() {
+    let mut model = load_v3();
+    let mut kv = NoKv;
+    let logits = model.forward(&[1u32, 2], &mut kv).expect("forward");
+    assert_eq!(logits.len(), model.config.vocab_size);
+    assert!(logits.iter().all(|v| v.is_finite()));
+}
 
-        fn next_f32(&mut self) -> f32 {
-            self.state = self
-                .state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let mantissa = (self.state >> 33) as u32 & 0x007f_ffff;
-            let bits = mantissa | 0x3f80_0000u32;
-            (f32::from_bits(bits) - 1.5) * 0.1
-        }
+/// Layer 1 must be a routed MoE with the shared expert attached, and its
+/// routing must reflect the V3 metadata: sigmoid gating, weight
+/// re-normalisation, `expert_weights_scale = 2.5`, and group-limited routing.
+#[test]
+fn v3_routing_config_reaches_the_layer() {
+    let model = load_v3();
+    let moe = match &model.layers[1].ffn {
+        FfnKind::Moe(m) => m,
+        FfnKind::Dense(_) => panic!("layer 1 must be a MoE layer"),
+    };
+    let cfg = moe.config();
+    assert_eq!(
+        cfg.gating,
+        oxillama_arch::deepseek::GatingFunc::Sigmoid,
+        "deepseek2.expert_gating_func = 2"
+    );
+    assert!(cfg.norm_weights, "deepseek2.expert_weights_norm = true");
+    assert!(
+        (cfg.weight_scale - 2.5).abs() < 1e-6,
+        "deepseek2.expert_weights_scale = 2.5, got {}",
+        cfg.weight_scale
+    );
+    assert_eq!(cfg.n_group, 2, "deepseek2.expert_group_count");
+    assert_eq!(cfg.topk_group, 1, "deepseek2.expert_group_used_count");
+    assert!(
+        moe.has_shared_expert(),
+        "DeepSeek always runs one shared expert"
+    );
+}
 
-        fn fill(&mut self, buf: &mut [f32]) {
-            for v in buf.iter_mut() {
-                *v = self.next_f32();
-            }
-        }
-    }
-
-    fn make_expert(hidden: usize, intermediate: usize) -> DeepSeekExpert {
-        DeepSeekExpert {
-            gate: vec![0.0f32; intermediate * hidden],
-            up: vec![0.0f32; intermediate * hidden],
-            down: vec![0.0f32; hidden * intermediate],
-            hidden_size: hidden,
-            intermediate_size: intermediate,
-        }
-    }
-
-    // ─── (a) sigmoid_bias_topk_sums_to_one_after_normalisation ───────────────
-
-    /// After sigmoid+bias scoring and top-k selection, the selected routing
-    /// weights are normalised by their sum → they must sum to exactly 1.0.
-    #[test]
-    fn sigmoid_bias_topk_sums_to_one_after_normalisation() {
-        const H: usize = 8;
-        const N_EXPERTS: usize = 6;
-        const TOP_K: usize = 2;
-        const INTER: usize = 8;
-
-        let mut lcg = Lcg::new(1234);
-
-        // Build router weights.
-        let mut router = vec![0.0f32; N_EXPERTS * H];
-        lcg.fill(&mut router);
-
-        // Build per-expert bias (varied so different experts are favoured).
-        // Expert 0 gets a large positive bias, expert 5 gets a large negative bias.
-        let mut expert_bias = vec![0.0f32; N_EXPERTS];
-        expert_bias[0] = 2.0;
-        expert_bias[5] = -2.0;
-
-        let experts: Vec<DeepSeekExpert> = (0..N_EXPERTS).map(|_| make_expert(H, INTER)).collect();
-
-        let weights = MoeWeights {
-            router,
-            routed_experts: experts,
-            shared_experts: vec![],
-            expert_bias: Some(expert_bias),
-        };
-
-        let cfg = MoeConfig {
-            hidden_size: H,
-            expert_intermediate_size: INTER,
-            n_shared_experts: 0,
-            n_routed_experts: N_EXPERTS,
-            top_k: TOP_K,
-            routed_scaling_factor: 1.0,
-            scoring_mode: ScoringMode::SigmoidWithBias,
-            shared_expert_intermediate_size: INTER,
-        };
-
-        // Use a simple input to produce deterministic router logits.
-        let x: Vec<f32> = (0..H).map(|i| i as f32 * 0.1).collect();
-
-        // Run the MoE forward pass.
-        let out = moe_forward(&x, &weights, &cfg).expect("moe_forward must succeed");
-        assert_eq!(out.len(), H, "output length must equal hidden_size");
-
-        // Verify: recompute routing manually to check weight normalisation.
-        // Router logits for each expert.
-        let mut logits: Vec<f32> = (0..N_EXPERTS).map(|_| 0.0f32).collect();
-        for (e, logit) in logits.iter_mut().enumerate() {
-            *logit = weights.router[e * H..(e + 1) * H]
-                .iter()
-                .zip(x.iter())
-                .map(|(w, xi)| w * xi)
-                .sum();
-        }
-
-        // Apply sigmoid + bias.
-        let bias = weights.expert_bias.as_ref().expect("bias must be present");
-        let scores: Vec<f32> = logits
-            .iter()
-            .zip(bias.iter())
-            .map(|(l, b)| 1.0 / (1.0 + (-l).exp()) + b)
-            .collect();
-
-        // Top-k selection (find the top-2 by score).
-        let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
-        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let top_k_scores: Vec<f32> = indexed[..TOP_K].iter().map(|(_, s)| *s).collect();
-        let selected_sum: f32 = top_k_scores.iter().sum();
-
-        // Verify normalised sum.
-        let normalised_sum: f32 = top_k_scores.iter().map(|s| s / selected_sum).sum();
-        assert!(
-            (normalised_sum - 1.0).abs() < 1e-5,
-            "normalised top-k weights must sum to 1.0, got {normalised_sum}"
-        );
-    }
-
-    // ─── (b) sigmoid_bias_routing_vs_softmax_differs ─────────────────────────
-
-    /// Construct logits where a bias flips which expert is in top-k.
-    /// With softmax, expert A wins. With sigmoid+bias, expert B wins.
-    /// Assert that the two modes select different experts.
-    #[test]
-    fn sigmoid_bias_routing_vs_softmax_differs() {
-        const H: usize = 4;
-        const N_EXPERTS: usize = 4;
-        const INTER: usize = 4;
-
-        // Craft router rows so that:
-        // - For input x = [1, 0, 0, 0]:
-        //   expert 0 logit = 3.0 (highest logit → softmax prefers it)
-        //   expert 1 logit = 1.0
-        //   expert 2 logit = 0.0
-        //   expert 3 logit = 0.0
-        // With sigmoid+bias:
-        //   expert 0 bias = -10.0 (drives sigmoid score very low)
-        //   expert 1 bias = +5.0  (drives expert 1 score to top)
-        // → sigmoid+bias should flip the top-1 from expert 0 to expert 1.
-
-        let mut router = vec![0.0f32; N_EXPERTS * H];
-        // Expert 0: first dim = 3.0
-        router[0] = 3.0;
-        // Expert 1: first dim = 1.0
-        router[H] = 1.0;
-        // Experts 2,3: zero
-
-        // Shared zero experts (contributions are zero regardless of routing).
-        let make_zero_expert = || DeepSeekExpert {
-            gate: vec![0.0f32; INTER * H],
-            up: vec![0.0f32; INTER * H],
-            down: vec![0.0f32; H * INTER],
-            hidden_size: H,
-            intermediate_size: INTER,
-        };
-
-        // ── Softmax mode: top-1 should pick expert 0 ──────────────────────────
-        let weights_softmax = MoeWeights {
-            router: router.clone(),
-            routed_experts: (0..N_EXPERTS).map(|_| make_zero_expert()).collect(),
-            shared_experts: vec![],
-            expert_bias: None,
-        };
-        let cfg_softmax = MoeConfig {
-            hidden_size: H,
-            expert_intermediate_size: INTER,
-            n_shared_experts: 0,
-            n_routed_experts: N_EXPERTS,
-            top_k: 1,
-            routed_scaling_factor: 1.0,
-            scoring_mode: ScoringMode::Softmax,
-            shared_expert_intermediate_size: INTER,
-        };
-
-        let x = vec![1.0f32, 0.0, 0.0, 0.0];
-
-        // Verify softmax selects expert 0 by inspecting logits directly.
-        let logit_0 = router[0]; // 3.0
-        let logit_1 = router[H]; // 1.0
-        assert!(
-            logit_0 > logit_1,
-            "softmax test: expert 0 must have higher raw logit"
-        );
-
-        let _out_softmax = moe_forward(&x, &weights_softmax, &cfg_softmax)
-            .expect("softmax moe_forward must succeed");
-
-        // ── SigmoidWithBias mode: bias flips expert selection ─────────────────
-        let mut expert_bias = vec![0.0f32; N_EXPERTS];
-        expert_bias[0] = -10.0; // drives expert 0 score way down
-        expert_bias[1] = 5.0; // drives expert 1 score way up
-
-        let weights_sigmoid = MoeWeights {
-            router: router.clone(),
-            routed_experts: (0..N_EXPERTS).map(|_| make_zero_expert()).collect(),
-            shared_experts: vec![],
-            expert_bias: Some(expert_bias.clone()),
-        };
-        let cfg_sigmoid = MoeConfig {
-            hidden_size: H,
-            expert_intermediate_size: INTER,
-            n_shared_experts: 0,
-            n_routed_experts: N_EXPERTS,
-            top_k: 1,
-            routed_scaling_factor: 1.0,
-            scoring_mode: ScoringMode::SigmoidWithBias,
-            shared_expert_intermediate_size: INTER,
-        };
-
-        let _out_sigmoid = moe_forward(&x, &weights_sigmoid, &cfg_sigmoid)
-            .expect("sigmoid+bias moe_forward must succeed");
-
-        // Verify by computing scores manually.
-        // Softmax selects by logit: expert 0 (logit=3.0) wins.
-        let softmax_top_expert = 0usize; // known from construction
-
-        // SigmoidWithBias: sigmoid(logit_e) + bias_e
-        let score_0 = 1.0 / (1.0 + (-3.0f32).exp()) + expert_bias[0]; // sigmoid(3) - 10 ≈ -9.05
-        let score_1 = 1.0 / (1.0 + (-1.0f32).exp()) + expert_bias[1]; // sigmoid(1) + 5 ≈ 5.73
-        let sigmoid_top_expert = if score_1 > score_0 { 1usize } else { 0usize };
-
-        assert_ne!(
-            softmax_top_expert, sigmoid_top_expert,
-            "sigmoid+bias routing (top={sigmoid_top_expert}) must differ from \
-             softmax routing (top={softmax_top_expert}): bias must flip the selection. \
-             scores: 0={score_0}, 1={score_1}"
-        );
-    }
-
-    // ─── (c) deepseek_v3_forward_with_bias ───────────────────────────────────
-
-    /// Full forward pass using the DeepSeek-V2 model with SigmoidWithBias routing.
-    ///
-    /// Builds a minimal model directly (following the pattern in tests/deepseek.rs)
-    /// with SigmoidWithBias MoE and verifies that:
-    /// - The output shape equals vocab_size.
-    /// - All output values are finite.
-    #[test]
-    fn deepseek_v3_forward_with_bias() {
-        use oxillama_arch::common::linear::QuantLinear;
-        use oxillama_arch::common::mla::{MlaConfig, MlaLatentCache, MlaWeights};
-        use oxillama_arch::common::rms_norm::RmsNorm;
-        use oxillama_arch::common::rope::RopeTable;
-        use oxillama_arch::config::{DeepSeekConfig, ModelConfig};
-        use oxillama_arch::deepseek::model::{
-            build_deepseek_model, DeepSeekLayer, DenseFfn, FfnKind, N_DENSE_LAYERS,
-        };
-        use oxillama_arch::error::ArchResult;
-        use oxillama_arch::traits::{ForwardPass, KvCacheAccess};
-        use oxillama_gguf::GgufTensorType;
-        use oxillama_quant::QuantTensor;
-
-        struct NullKv;
-        impl KvCacheAccess for NullKv {
-            fn seq_len(&self) -> usize {
-                0
-            }
-            fn store_kv(&mut self, _: usize, _: &[f32], _: &[f32]) -> ArchResult<()> {
-                Ok(())
-            }
-            fn get_keys(&self, _: usize) -> ArchResult<&[f32]> {
-                Ok(&[])
-            }
-            fn get_values(&self, _: usize) -> ArchResult<&[f32]> {
-                Ok(&[])
-            }
-            fn advance(&mut self) {}
-        }
-
-        struct Lcg2 {
-            state: u64,
-        }
-        impl Lcg2 {
-            fn new(seed: u64) -> Self {
-                Self { state: seed }
-            }
-            fn next_f32(&mut self) -> f32 {
-                self.state = self
-                    .state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                let mantissa = (self.state >> 33) as u32 & 0x007f_ffff;
-                let bits = mantissa | 0x3f80_0000u32;
-                (f32::from_bits(bits) - 1.5) * 0.02
-            }
-            fn fill(&mut self, buf: &mut [f32]) {
-                for v in buf.iter_mut() {
-                    *v = self.next_f32();
-                }
-            }
-        }
-
-        fn rand_qt(lcg: &mut Lcg2, rows: usize, cols: usize) -> QuantTensor {
-            let n = rows * cols;
-            let mut vals = vec![0.0f32; n];
-            lcg.fill(&mut vals);
-            let mut data = Vec::with_capacity(n * 4);
-            for &v in &vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-            QuantTensor::new(data, vec![rows, cols], GgufTensorType::F32)
-        }
-
-        const H: usize = 16;
-        const VOCAB: usize = 32;
-        const INTERMEDIATE: usize = 32;
-        const N_LAYERS: usize = 2;
-        const MAX_SEQ: usize = 64;
-        const N_ROUTED: usize = 4;
-        const TOP_K: usize = 2;
-        const N_SHARED: usize = 1;
-        const MOE_INTER: usize = 16;
-
-        let mut lcg = Lcg2::new(999);
-
-        let mla_cfg = MlaConfig {
-            num_heads: 2,
-            q_lora_rank: 8,
-            kv_lora_rank: 8,
-            qk_nope_head_dim: 4,
-            qk_rope_head_dim: 4,
-            v_head_dim: 4,
-            rope_theta: 10000.0,
-            softmax_scale: 1.0 / (8.0f32).sqrt(),
-        };
-
-        let pos_w = |lcg: &mut Lcg2, n: usize| -> Vec<f32> {
-            let mut w = vec![0.0f32; n];
-            lcg.fill(&mut w);
-            w.iter_mut().for_each(|v| *v = v.abs() + 0.1);
-            w
-        };
-
-        let build_mla = |lcg: &mut Lcg2| -> MlaWeights {
-            MlaWeights {
-                w_q_a: QuantLinear::new(rand_qt(lcg, mla_cfg.q_lora_rank, H), None),
-                q_a_norm: RmsNorm::new(pos_w(lcg, mla_cfg.q_lora_rank), 1e-5),
-                w_q_b: QuantLinear::new(
-                    rand_qt(lcg, mla_cfg.q_full_dim(), mla_cfg.q_lora_rank),
-                    None,
-                ),
-                w_kv_a: QuantLinear::new(rand_qt(lcg, mla_cfg.kv_combined_dim(), H), None),
-                kv_a_norm: RmsNorm::new(pos_w(lcg, mla_cfg.kv_lora_rank), 1e-5),
-                w_kv_b: QuantLinear::new(
-                    rand_qt(lcg, mla_cfg.kv_b_full_dim(), mla_cfg.kv_lora_rank),
-                    None,
-                ),
-                w_o: QuantLinear::new(rand_qt(lcg, H, mla_cfg.attn_out_dim()), None),
-                rope: RopeTable::new_standard(
-                    mla_cfg.qk_rope_head_dim,
-                    MAX_SEQ,
-                    mla_cfg.rope_theta,
-                ),
-            }
-        };
-
-        let make_ds_expert = |lcg: &mut Lcg2, inter: usize| -> DeepSeekExpert {
-            let mut gate = vec![0.0f32; inter * H];
-            let mut up = vec![0.0f32; inter * H];
-            let mut down = vec![0.0f32; H * inter];
-            lcg.fill(&mut gate);
-            lcg.fill(&mut up);
-            lcg.fill(&mut down);
-            DeepSeekExpert {
-                gate,
-                up,
-                down,
-                hidden_size: H,
-                intermediate_size: inter,
-            }
-        };
-
-        let build_moe_with_bias = |lcg: &mut Lcg2| -> (MoeWeights, MoeConfig) {
-            let moe_cfg = MoeConfig {
-                hidden_size: H,
-                expert_intermediate_size: MOE_INTER,
-                n_shared_experts: N_SHARED,
-                n_routed_experts: N_ROUTED,
-                top_k: TOP_K,
-                routed_scaling_factor: 1.0,
-                scoring_mode: ScoringMode::SigmoidWithBias,
-                shared_expert_intermediate_size: MOE_INTER,
-            };
-            let mut router = vec![0.0f32; N_ROUTED * H];
-            lcg.fill(&mut router);
-            // Small bias values so routing remains numerically stable.
-            let mut bias = vec![0.0f32; N_ROUTED];
-            lcg.fill(&mut bias);
-            let moe_weights = MoeWeights {
-                router,
-                routed_experts: (0..N_ROUTED)
-                    .map(|_| make_ds_expert(lcg, MOE_INTER))
-                    .collect(),
-                shared_experts: (0..N_SHARED)
-                    .map(|_| make_ds_expert(lcg, MOE_INTER))
-                    .collect(),
-                expert_bias: Some(bias),
-            };
-            (moe_weights, moe_cfg)
-        };
-
-        let mut token_embd = vec![0.0f32; VOCAB * H];
-        lcg.fill(&mut token_embd);
-
-        let ds_config = DeepSeekConfig {
-            q_lora_rank: mla_cfg.q_lora_rank,
-            kv_lora_rank: mla_cfg.kv_lora_rank,
-            qk_nope_head_dim: mla_cfg.qk_nope_head_dim,
-            qk_rope_head_dim: mla_cfg.qk_rope_head_dim,
-            v_head_dim: mla_cfg.v_head_dim,
-            n_shared_experts: N_SHARED,
-            n_routed_experts: N_ROUTED,
-            top_k_routed: TOP_K,
-            shared_expert_intermediate_size: MOE_INTER,
-            routed_scaling_factor: 1.0,
-            first_k_dense_replace: 1,
-        };
-
-        let model_config = ModelConfig {
-            architecture: "deepseek2".to_string(),
-            model_name: "test-deepseek-v3".to_string(),
-            hidden_size: H,
-            intermediate_size: INTERMEDIATE,
-            num_layers: N_LAYERS,
-            num_attention_heads: mla_cfg.num_heads,
-            num_kv_heads: mla_cfg.num_heads,
-            head_dim: mla_cfg.qk_head_dim(),
-            vocab_size: VOCAB,
-            max_context_length: MAX_SEQ,
-            rms_norm_eps: 1e-5,
-            rope_freq_base: 10000.0,
-            ..ModelConfig::default()
-        };
-
-        let build_dense_ffn = |lcg: &mut Lcg2| -> FfnKind {
-            FfnKind::Dense(Box::new(DenseFfn {
-                gate: QuantLinear::new(rand_qt(lcg, INTERMEDIATE, H), None),
-                up: QuantLinear::new(rand_qt(lcg, INTERMEDIATE, H), None),
-                down: QuantLinear::new(rand_qt(lcg, H, INTERMEDIATE), None),
-            }))
-        };
-
-        let layers: Vec<DeepSeekLayer> = (0..N_LAYERS)
-            .map(|idx| {
-                let ffn = if idx < N_DENSE_LAYERS {
-                    build_dense_ffn(&mut lcg)
-                } else {
-                    let (moe_weights, moe_cfg) = build_moe_with_bias(&mut lcg);
-                    FfnKind::Moe {
-                        weights: Box::new(moe_weights),
-                        config: moe_cfg,
-                    }
-                };
-                DeepSeekLayer {
-                    attn_norm: RmsNorm::new(pos_w(&mut lcg, H), 1e-5),
-                    mla_weights: build_mla(&mut lcg),
-                    mla_config: mla_cfg.clone(),
-                    mla_cache: MlaLatentCache::new(MAX_SEQ, &mla_cfg),
-                    ffn_norm: RmsNorm::new(pos_w(&mut lcg, H), 1e-5),
-                    ffn,
-                }
-            })
-            .collect();
-
-        let output_norm = RmsNorm::new(pos_w(&mut lcg, H), 1e-5);
-        let output = QuantLinear::new(rand_qt(&mut lcg, VOCAB, H), None);
-
-        let mut model = build_deepseek_model(
-            model_config,
-            ds_config,
-            token_embd,
-            layers,
-            output_norm,
-            output,
-        );
-
-        let mut kv = NullKv;
-        let logits = model
-            .forward(&[1u32, 2, 3], &mut kv)
-            .expect("forward with sigmoid+bias must succeed");
-
-        assert_eq!(
-            logits.len(),
-            VOCAB,
-            "output logits must have vocab_size={VOCAB} elements"
-        );
-        assert!(
-            logits.iter().all(|v| v.is_finite()),
-            "all output logits must be finite"
-        );
-    }
+/// Layer 0 is dense (`leading_dense_block_count = 1`).
+#[test]
+fn v3_leading_layer_is_dense() {
+    let model = load_v3();
+    assert!(matches!(model.layers[0].ffn, FfnKind::Dense(_)));
 }

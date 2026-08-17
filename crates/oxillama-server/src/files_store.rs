@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::error::ServerError;
+use crate::resource_id::validate_resource_id;
 
 /// Result type for file store operations.
 pub type FilesStoreResult<T> = Result<T, ServerError>;
@@ -131,7 +132,7 @@ impl FilesStore {
         }
 
         let file_id = format!("file-{}", uuid::Uuid::new_v4().as_simple());
-        let file_dir = self.file_dir(&file_id);
+        let file_dir = self.file_dir(&file_id)?;
         fs::create_dir_all(&file_dir).map_err(|e| ServerError::IoError {
             context: format!("create file directory {}", file_dir.display()),
             source: e,
@@ -165,7 +166,7 @@ impl FilesStore {
     ///
     /// Returns `FileNotFound` if no entry with this ID exists.
     pub fn get(&self, file_id: &str) -> FilesStoreResult<OxiFile> {
-        let path = self.file_dir(file_id).join("meta.json");
+        let path = self.file_dir(file_id)?.join("meta.json");
         let content = fs::read_to_string(&path)
             .map_err(|_| ServerError::FileNotFound(file_id.to_string()))?;
         serde_json::from_str(&content).map_err(ServerError::Serialization)
@@ -208,7 +209,7 @@ impl FilesStore {
     ///
     /// Returns `FileNotFound` if the file does not exist.
     pub fn get_content(&self, file_id: &str) -> FilesStoreResult<Vec<u8>> {
-        let dir = self.file_dir(file_id);
+        let dir = self.file_dir(file_id)?;
         // Check that the meta exists first for a clean error message.
         if !dir.join("meta.json").exists() {
             return Err(ServerError::FileNotFound(file_id.to_string()));
@@ -224,10 +225,17 @@ impl FilesStore {
     ///
     /// Returns `FileNotFound` if no such file exists.
     pub fn delete(&self, file_id: &str) -> FilesStoreResult<()> {
-        let dir = self.file_dir(file_id);
+        let dir = self.file_dir(file_id)?;
         if !dir.join("meta.json").exists() {
             return Err(ServerError::FileNotFound(file_id.to_string()));
         }
+        // Defense in depth: even though `file_dir` already validated
+        // `file_id` against the resource-id charset, re-verify (after
+        // canonicalization) that the directory we are about to
+        // recursively delete actually lives under our store root before
+        // calling `remove_dir_all`. This is the destructive sink, so it
+        // gets the belt-and-suspenders check.
+        self.verify_within_root(&dir, file_id)?;
         fs::remove_dir_all(&dir).map_err(|e| ServerError::IoError {
             context: format!("delete file directory for {file_id}"),
             source: e,
@@ -237,8 +245,32 @@ impl FilesStore {
 
     // ── Path helpers ──────────────────────────────────────────────────────────
 
-    fn file_dir(&self, file_id: &str) -> PathBuf {
-        self.root.join(file_id)
+    /// Build the per-file directory path, rejecting any `file_id` that is
+    /// not a single safe path component (see [`crate::resource_id`]).
+    fn file_dir(&self, file_id: &str) -> FilesStoreResult<PathBuf> {
+        validate_resource_id(file_id).map_err(|message| ServerError::InvalidRequest { message })?;
+        Ok(self.root.join(file_id))
+    }
+
+    /// Canonicalize both `dir` and the store root and verify `dir` is
+    /// actually contained within the root. Called immediately before the
+    /// recursive delete as a second, independent line of defense beyond
+    /// `validate_resource_id`.
+    fn verify_within_root(&self, dir: &Path, file_id: &str) -> FilesStoreResult<()> {
+        let root_canon = self.root.canonicalize().map_err(|e| ServerError::IoError {
+            context: format!("canonicalize files store root {}", self.root.display()),
+            source: e,
+        })?;
+        let dir_canon = dir.canonicalize().map_err(|e| ServerError::IoError {
+            context: format!("canonicalize file directory {}", dir.display()),
+            source: e,
+        })?;
+        if !dir_canon.starts_with(&root_canon) {
+            return Err(ServerError::InvalidRequest {
+                message: format!("file id resolves outside the files store root: {file_id:?}"),
+            });
+        }
+        Ok(())
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -426,5 +458,42 @@ mod tests {
         assert_eq!(meta.filename, "data.bin");
         let content = store2.get_content(&file_id).expect("content after reopen");
         assert_eq!(content.as_slice(), b"persisted bytes");
+    }
+
+    /// D2 regression: a `file_id` containing `../` segments must not let a
+    /// caller read arbitrary files outside the store root.
+    #[test]
+    fn files_get_content_rejects_path_traversal() {
+        let store = make_store("traversal_content");
+        let err = store
+            .get_content("../../../../etc/passwd")
+            .expect_err("path traversal id must be rejected");
+        assert!(
+            matches!(err, ServerError::InvalidRequest { .. }),
+            "expected InvalidRequest, got: {err}"
+        );
+    }
+
+    /// D2 regression: an id that looks like an absolute path must be
+    /// rejected rather than silently discarding the store root via
+    /// `PathBuf::join`.
+    #[test]
+    fn files_get_content_rejects_absolute_looking_id() {
+        let store = make_store("traversal_absolute");
+        let err = store
+            .get_content("/etc/passwd")
+            .expect_err("absolute-looking id must be rejected");
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    /// D2 regression: the destructive `delete` path must also reject
+    /// traversal ids, not just read paths.
+    #[test]
+    fn files_delete_rejects_path_traversal() {
+        let store = make_store("traversal_delete");
+        let err = store
+            .delete("../../../../tmp")
+            .expect_err("path traversal id must be rejected on delete");
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
 }

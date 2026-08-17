@@ -78,7 +78,7 @@ impl QuantKernel for Q4_0Avx2 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row and block bounds are checked above (n_rows, n_cols).
             // CPU avx2+fma support is guaranteed by KernelDispatcher.
@@ -90,7 +90,7 @@ impl QuantKernel for Q4_0Avx2 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -222,9 +222,11 @@ unsafe fn fused_q4_0_q8_0_row_avx2(
             let lo_bytes = _mm_and_si128(raw, mask_lo);
             let hi_bytes = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo);
 
-            // Interleave lo/hi to match sequential Q8_0 layout.
-            let weights_0_15 = _mm_unpacklo_epi8(lo_bytes, hi_bytes);
-            let weights_16_31 = _mm_unpackhi_epi8(lo_bytes, hi_bytes);
+            // Split-half layout: the low nibbles are weights 0..16 and the
+            // high nibbles weights 16..32, matching the sequential Q8_0
+            // activation layout without any interleave.
+            let weights_0_15 = lo_bytes;
+            let weights_16_31 = hi_bytes;
 
             // Load Q8_0 i8 activations.
             // SAFETY: a_block[2..34] = 32 valid i8 bytes.
@@ -268,20 +270,21 @@ unsafe fn fused_q4_0_q8_0_row_avx2(
             let q8_bytes = &a_block[2..];
             let valid = remaining;
 
-            for i in 0..(valid / 2) {
+            // Split-half layout: nibble `i` pairs with activation `i` and
+            // nibble `i + 16` with activation `i + 16`.
+            for i in 0..(BLOCK_SIZE / 2) {
                 let byte = w_block[2 + i];
-                let q_lo = (byte & 0x0F) as i32 - 8;
-                let q_hi = ((byte >> 4) & 0x0F) as i32 - 8;
-                let a_lo = q8_bytes[i * 2] as i8 as i32;
-                let a_hi = q8_bytes[i * 2 + 1] as i8 as i32;
-                row_sum += scale * (q_lo * a_lo + q_hi * a_hi) as f32;
-            }
-            if valid % 2 == 1 {
-                let i = valid / 2;
-                let byte = w_block[2 + i];
-                let q_lo = (byte & 0x0F) as i32 - 8;
-                let a_lo = q8_bytes[i * 2] as i8 as i32;
-                row_sum += scale * (q_lo * a_lo) as f32;
+                if i < valid {
+                    let q_lo = (byte & 0x0F) as i32 - 8;
+                    let a_lo = q8_bytes[i] as i8 as i32;
+                    row_sum += scale * (q_lo * a_lo) as f32;
+                }
+                let hi_idx = i + BLOCK_SIZE / 2;
+                if hi_idx < valid {
+                    let q_hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                    let a_hi = q8_bytes[hi_idx] as i8 as i32;
+                    row_sum += scale * (q_hi * a_hi) as f32;
+                }
             }
         }
     }
@@ -337,10 +340,13 @@ unsafe fn dequant_block_avx2(block: &[u8], output: &mut [f32]) {
     let lo_bytes = _mm_and_si128(raw, mask_lo); // low nibbles in each byte
     let hi_bytes = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo); // high nibbles
 
-    // Interleave: first16 = [lo0,hi0,lo1,hi1,...,lo7,hi7]  (weights 0-15)
-    //             last16  = [lo8,hi8,...,lo15,hi15]         (weights 16-31)
-    let first16 = _mm_unpacklo_epi8(lo_bytes, hi_bytes);
-    let last16 = _mm_unpackhi_epi8(lo_bytes, hi_bytes);
+    // GGML's split-half layout: the 16 low nibbles *are* weights 0..16 and the
+    // 16 high nibbles *are* weights 16..32, both already in byte order, so no
+    // `_mm_unpacklo_epi8` / `_mm_unpackhi_epi8` interleave is needed — that
+    // step existed only to build the (incorrect) `weight[2j] / weight[2j+1]`
+    // ordering.
+    let first16 = lo_bytes; // weights 0..16
+    let last16 = hi_bytes; // weights 16..32
 
     // Convert i8→i32→f32 in four groups of 8, subtract 8, scale by d.
     // Groups: first16[0..8], first16[8..16], last16[0..8], last16[8..16]
@@ -410,8 +416,10 @@ unsafe fn gemv_row_avx2(
         let lo_bytes = _mm_and_si128(raw, mask_lo);
         let hi_bytes = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo);
 
-        let first16 = _mm_unpacklo_epi8(lo_bytes, hi_bytes);
-        let last16 = _mm_unpackhi_epi8(lo_bytes, hi_bytes);
+        // Split-half layout — see `dequant_block_avx2`: the masked and shifted
+        // nibble vectors are already weights 0..16 and 16..32.
+        let first16 = lo_bytes;
+        let last16 = hi_bytes;
 
         // Check whether this block is fully within bounds.
         let remaining = n_cols.saturating_sub(input_offset);
@@ -456,12 +464,13 @@ unsafe fn gemv_row_avx2(
                 let byte = *block.get_unchecked(2 + i);
                 let lo = (byte & 0x0F) as i32 - 8;
                 let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-                let idx = input_offset + i * 2;
-                if idx + 1 < n_cols {
-                    partial_sum += lo as f32 * input[idx];
-                    partial_sum += hi as f32 * input[idx + 1];
-                } else if idx < n_cols {
-                    partial_sum += lo as f32 * input[idx];
+                let idx_lo = input_offset + i;
+                let idx_hi = idx_lo + BLOCK_SIZE / 2;
+                if idx_lo < n_cols {
+                    partial_sum += lo as f32 * input[idx_lo];
+                }
+                if idx_hi < n_cols {
+                    partial_sum += hi as f32 * input[idx_hi];
                 }
             }
             row_sum += partial_sum * d;

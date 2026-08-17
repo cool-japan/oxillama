@@ -1,7 +1,30 @@
 //! GGUF tensor name patterns for OLMo2.
 //!
-//! OLMo2 uses post-norm style with per-head QK-norm tensors.  The naming
-//! follows the llama.cpp GGUF convention for OLMo2.
+//! OLMo2 uses post-norm style with QK-norm tensors.  The naming follows the
+//! llama.cpp GGUF convention for OLMo2.
+//!
+//! # The post-norm names are NOT `attn_post_norm` / `ffn_post_norm`
+//!
+//! `LLM_TENSOR_NAMES` in `~/work/refs/llama.cpp/src/llama-arch.cpp` is a single
+//! table shared by every architecture, and it resolves the two post-norm slots
+//! to Gemma-2's original spellings:
+//!
+//! ```text
+//! llama-arch.cpp:355  { LLM_TENSOR_ATTN_POST_NORM, "blk.%d.post_attention_norm" }
+//! llama-arch.cpp:359  { LLM_TENSOR_FFN_POST_NORM,  "blk.%d.post_ffw_norm"       }
+//! ```
+//!
+//! `gguf-py/gguf/constants.py` agrees verbatim (lines 964 / 969:
+//! `MODEL_TENSOR.ATTN_POST_NORM: "blk.{bid}.post_attention_norm"`,
+//! `MODEL_TENSOR.FFN_POST_NORM: "blk.{bid}.post_ffw_norm"`), and
+//! `gguf-py/gguf/tensor_mapping.py` maps HF's `post_attention_layernorm` /
+//! `post_feedforward_layernorm` onto them with the comment `# gemma2 olmo2`.
+//! `LLM_ARCH_OLMO2` in `llama-arch.cpp:1507` lists both enum slots, so a real
+//! OLMo2 checkpoint ships exactly those two literal names.
+//!
+//! This module previously declared `blk.{i}.attn_post_norm.weight` and
+//! `blk.{i}.ffn_post_norm.weight`, which match no checkpoint that has ever been
+//! produced.
 
 use crate::traits::TensorNamePattern;
 
@@ -28,15 +51,17 @@ pub fn olmo2_tensor_name_patterns() -> Vec<TensorNamePattern> {
     ];
 
     let layer_patterns: &[(&str, &str, bool)] = &[
-        // Per-head QK-norm (OLMo2 unique)
+        // QK-norm (OLMo2 unique).  Applied to the WHOLE projected vector, so
+        // the widths differ under GQA: Q is `n_embd`, K is `n_head_kv *
+        // n_embd_head` (llama-model.cpp, `case LLM_ARCH_OLMO2:`).
         (
             "blk.{i}.attn_q_norm.weight",
-            "Per-head query RMSNorm scale",
+            "Query RMSNorm scale [n_embd]",
             true,
         ),
         (
             "blk.{i}.attn_k_norm.weight",
-            "Per-head key RMSNorm scale",
+            "Key RMSNorm scale [n_head_kv * n_embd_head]",
             true,
         ),
         // Attention projections (no pre-attn norm on x — norms applied after)
@@ -48,9 +73,10 @@ pub fn olmo2_tensor_name_patterns() -> Vec<TensorNamePattern> {
             "Attention output projection weight",
             true,
         ),
-        // Post-attn norm (unique to OLMo2)
+        // Post-attn norm.  `LLM_TENSOR_ATTN_POST_NORM` →
+        // `"blk.%d.post_attention_norm"` (llama-arch.cpp:355).
         (
-            "blk.{i}.attn_post_norm.weight",
+            "blk.{i}.post_attention_norm.weight",
             "Post-attention RMSNorm scale",
             true,
         ),
@@ -66,9 +92,10 @@ pub fn olmo2_tensor_name_patterns() -> Vec<TensorNamePattern> {
             "FFN down projection weight",
             true,
         ),
-        // Post-FFN norm (unique to OLMo2)
+        // Post-FFN norm.  `LLM_TENSOR_FFN_POST_NORM` →
+        // `"blk.%d.post_ffw_norm"` (llama-arch.cpp:359).
         (
-            "blk.{i}.ffn_post_norm.weight",
+            "blk.{i}.post_ffw_norm.weight",
             "Post-FFN RMSNorm scale",
             true,
         ),
@@ -107,21 +134,38 @@ mod tests {
         assert!(p.iter().any(|t| t.pattern == "output.weight"));
     }
 
+    /// O4: the post-attention norm is `blk.{i}.post_attention_norm.weight`.
+    ///
+    /// This assertion FAILS against the pre-fix table, which declared
+    /// `blk.{i}.attn_post_norm.weight` — a name no OLMo2 checkpoint contains.
     #[test]
-    fn test_attn_post_norm_present() {
+    fn test_attn_post_norm_uses_llama_cpp_name() {
         let p = olmo2_tensor_name_patterns();
         assert!(
-            p.iter().any(|t| t.pattern.contains("attn_post_norm")),
-            "OLMo2 must have attn_post_norm"
+            p.iter()
+                .any(|t| t.pattern == "blk.{i}.post_attention_norm.weight"),
+            "OLMo2 post-attention norm is 'blk.%d.post_attention_norm' (llama-arch.cpp:355)"
+        );
+        assert!(
+            !p.iter()
+                .any(|t| t.pattern == "blk.{i}.attn_post_norm.weight"),
+            "'attn_post_norm' is not a GGUF tensor name for any architecture"
         );
     }
 
+    /// O4: the post-FFN norm is `blk.{i}.post_ffw_norm.weight`.
     #[test]
-    fn test_ffn_post_norm_present() {
+    fn test_ffn_post_norm_uses_llama_cpp_name() {
         let p = olmo2_tensor_name_patterns();
         assert!(
-            p.iter().any(|t| t.pattern.contains("ffn_post_norm")),
-            "OLMo2 must have ffn_post_norm"
+            p.iter()
+                .any(|t| t.pattern == "blk.{i}.post_ffw_norm.weight"),
+            "OLMo2 post-FFN norm is 'blk.%d.post_ffw_norm' (llama-arch.cpp:359)"
+        );
+        assert!(
+            !p.iter()
+                .any(|t| t.pattern == "blk.{i}.ffn_post_norm.weight"),
+            "'ffn_post_norm' is not a GGUF tensor name for any architecture"
         );
     }
 

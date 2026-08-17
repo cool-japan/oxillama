@@ -6,7 +6,16 @@
 //! Key differences from Phi-3 (dense):
 //! - `num_experts`: total number of expert FFN modules per layer.
 //! - `num_experts_per_tok`: how many experts are selected per token (default 2).
-//! - `partial_rotary_factor`: fraction of head_dim to apply RoPE (default 0.5 for Phi-3.5).
+//!
+//! The number of RoPE-rotated dimensions per head is read directly from GGUF
+//! metadata (`{arch}.rope.dimension_count`, defaulting to the full
+//! `head_dim`) by `load_phi_moe_from_gguf` / `PhiMoeModel::new`, not derived
+//! from a `partial_rotary_factor` here — no GGUF converter ever writes that
+//! key (see `super::model::load_phi_moe_from_gguf` for the verified reference
+//! trail). A `partial_rotary_factor` field used to live on this struct but
+//! was always overwritten with a hardcoded `0.5` and never actually consulted
+//! by `PhiMoeModel::new` (which took its own `partial_rotary_factor`
+//! parameter instead) — it has been removed as dead configuration.
 
 use crate::config::ModelConfig;
 
@@ -29,12 +38,6 @@ pub struct PhiMoeConfig {
     pub num_experts: usize,
     /// Top-K experts activated per token (default 2 for Phi-3.5-MoE).
     pub num_experts_per_tok: usize,
-    /// Fraction of `head_dim` to apply RoPE (default 0.5 for Phi-3.5-MoE).
-    ///
-    /// Only the first `round(partial_rotary_factor * head_dim)` dimensions of
-    /// each Q/K head vector receive rotary positional embeddings. The remainder
-    /// are passed through unchanged.
-    pub partial_rotary_factor: f32,
 }
 
 impl From<&ModelConfig> for PhiMoeConfig {
@@ -47,17 +50,7 @@ impl From<&ModelConfig> for PhiMoeConfig {
             intermediate_size: cfg.intermediate_size,
             num_experts: cfg.num_experts.max(1),
             num_experts_per_tok: cfg.num_experts_used.max(1),
-            partial_rotary_factor: 0.5, // Phi-3.5-MoE default
         }
-    }
-}
-
-impl PhiMoeConfig {
-    /// Return the number of rotated dimensions per head (always even for RoPE pairing).
-    pub fn rotary_dims(&self, head_dim: usize) -> usize {
-        let raw = (self.partial_rotary_factor * head_dim as f32) as usize;
-        // Must be even for RoPE pair rotation.
-        (raw & !1).min(head_dim)
     }
 }
 
@@ -71,7 +64,6 @@ impl Default for PhiMoeConfig {
             intermediate_size: 6400,
             num_experts: 16,
             num_experts_per_tok: 2,
-            partial_rotary_factor: 0.5,
         }
     }
 }
@@ -99,26 +91,29 @@ mod tests {
         assert_eq!(pc.num_key_value_heads, 4);
         assert_eq!(pc.num_experts, 4);
         assert_eq!(pc.num_experts_per_tok, 2);
-        assert!((pc.partial_rotary_factor - 0.5).abs() < 1e-6);
     }
 
+    /// `partial_rotary_factor`/`rotary_dims()` were removed (G13): the field
+    /// was always overwritten with a hardcoded `0.5` and never actually
+    /// consulted by `PhiMoeModel::new`, which took its own
+    /// `partial_rotary_factor` parameter instead — dead configuration.
+    /// `load_phi_moe_from_gguf` now reads `{arch}.rope.dimension_count`
+    /// directly. This test exists to document the removal for anyone
+    /// tempted to re-add it.
     #[test]
-    fn phi_moe_rotary_dims_half_factor() {
+    fn phi_moe_config_has_no_rotary_dims_field() {
         let cfg = PhiMoeConfig::default();
-        // 0.5 * head_dim(= 4096/32=128) = 64, already even
-        let head_dim = 128usize;
-        let rot = cfg.rotary_dims(head_dim);
-        assert_eq!(rot, 64);
-    }
-
-    #[test]
-    fn phi_moe_rotary_dims_is_always_even() {
-        let cfg = PhiMoeConfig {
-            partial_rotary_factor: 0.3,
-            ..PhiMoeConfig::default()
-        };
-        let head_dim = 64;
-        let rot = cfg.rotary_dims(head_dim);
-        assert_eq!(rot % 2, 0, "rotary_dims must always be even, got {rot}");
+        // Compiles iff `PhiMoeConfig` has exactly these fields — a stray
+        // `partial_rotary_factor` would make this a "missing field" error,
+        // and an extra field would make it a "field not covered" error.
+        let PhiMoeConfig {
+            num_hidden_layers: _,
+            hidden_size: _,
+            num_attention_heads: _,
+            num_key_value_heads: _,
+            intermediate_size: _,
+            num_experts: _,
+            num_experts_per_tok: _,
+        } = cfg;
     }
 }

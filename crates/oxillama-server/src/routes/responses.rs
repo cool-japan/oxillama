@@ -18,12 +18,15 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{ServerError, ServerResult};
-use crate::queue::{BatchRequest, UsageStats};
+use crate::queue::{BatchRequest, GenerateReply, GenerateStreamReply};
 use crate::responses_store::{ResponseRecord, ResponseStatus, ResponseStore};
 use crate::state::AppState;
+use oxillama_runtime::{ChatTemplate, Turn};
 
 // ── Request types ─────────────────────────────────────────────────────────────
 
@@ -140,48 +143,42 @@ fn input_to_messages(input: ResponseInput) -> Vec<serde_json::Value> {
     }
 }
 
-/// Format a sequence of message objects into a chat-style prompt string.
+/// Render a sequence of message objects through the loaded model's own chat
+/// template.
 ///
-/// The format mirrors `routes/chat.rs::format_chat_prompt` to keep prompt
-/// templates consistent across endpoints.
-fn format_prompt(messages: &[serde_json::Value], instructions: Option<&str>) -> String {
-    let mut prompt = String::new();
+/// Same renderer as `routes/chat.rs::format_chat_prompt` — this used to be a
+/// fourth hand-rolled copy of the fabricated `<|system|>…<|end|>` skeleton, so
+/// the Responses API reproduced the identical defect independently. An
+/// unrecognised `role` is normalised to `"user"`, preserving the previous
+/// behaviour.
+fn format_prompt(
+    messages: &[serde_json::Value],
+    instructions: Option<&str>,
+    template: ChatTemplate,
+) -> String {
+    let mut turns: Vec<Turn<'_>> = Vec::with_capacity(messages.len() + 1);
 
     if let Some(sys) = instructions {
-        prompt.push_str("<|system|>\n");
-        prompt.push_str(sys);
-        prompt.push_str("\n<|end|>\n");
+        turns.push(Turn {
+            role: "system",
+            content: sys,
+        });
     }
 
     for msg in messages {
-        let role = msg["role"].as_str().unwrap_or("user");
-        let content = msg["content"].as_str().unwrap_or("");
-        match role {
-            "system" => {
-                prompt.push_str("<|system|>\n");
-                prompt.push_str(content);
-                prompt.push_str("\n<|end|>\n");
-            }
-            "assistant" => {
-                prompt.push_str("<|assistant|>\n");
-                prompt.push_str(content);
-                prompt.push_str("\n<|end|>\n");
-            }
-            "tool" => {
-                prompt.push_str("<|tool|>\n");
-                prompt.push_str(content);
-                prompt.push_str("\n<|end|>\n");
-            }
-            _ => {
-                // "user" and anything unknown
-                prompt.push_str("<|user|>\n");
-                prompt.push_str(content);
-                prompt.push_str("\n<|end|>\n");
-            }
-        }
+        let role = match msg["role"].as_str().unwrap_or("user") {
+            known @ ("system" | "assistant" | "tool" | "user") => known,
+            // Anything unrecognised is normalised to "user", matching the
+            // behaviour of the hand-rolled formatter this replaced.
+            _ => "user",
+        };
+        turns.push(Turn {
+            role,
+            content: msg["content"].as_str().unwrap_or(""),
+        });
     }
-    prompt.push_str("<|assistant|>\n");
-    prompt
+
+    template.render(&turns, true)
 }
 
 /// Require the responses store from `AppState`, returning 503 if absent.
@@ -236,7 +233,12 @@ pub async fn create_response(
     }
 
     // Build the prompt string.
-    let prompt = format_prompt(&input_messages, request.instructions.as_deref());
+    let prompt = format_prompt(
+        &input_messages,
+        request.instructions.as_deref(),
+        state.chat_template,
+    );
+    let add_special = !state.chat_template.emits_literal_bos();
 
     // Build per-request sampler config.
     let mut sampler_config = state.default_sampler.clone();
@@ -258,7 +260,11 @@ pub async fn create_response(
         // ── SSE streaming path ────────────────────────────────────────────
         let (sse_tx, sse_rx) =
             tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
-        let (reply_tx, reply_rx) = oneshot::channel::<Result<UsageStats, String>>();
+        let (reply_tx, reply_rx) = oneshot::channel::<GenerateStreamReply>();
+
+        // D3/D4: cancelled once the SSE channel can no longer accept
+        // events (client stopped reading / disconnected).
+        let cancel = CancellationToken::new();
 
         // Fire `response.created` immediately.
         let created_payload = serde_json::json!({
@@ -272,41 +278,71 @@ pub async fn create_response(
             .await;
 
         // Build streaming callback.
+        //
+        // D3 fix: `try_send` instead of `blocking_send` — a full/closed SSE
+        // channel (client stalled or gone) no longer parks the sole
+        // blocking worker thread; it cancels the request instead.
         let sse_tx_cb = sse_tx.clone();
+        let cancel_cb = cancel.clone();
         let callback: crate::queue::StreamCallback = Box::new(move |token_text: &str| {
             let delta_payload = DeltaPayload {
                 r#type: "response.output_text.delta".to_string(),
                 delta: token_text.to_string(),
             };
-            let _ = sse_tx_cb.blocking_send(Ok(Event::default()
+            let event = Ok(Event::default()
                 .event("response.output_text.delta")
-                .data(serde_json::to_string(&delta_payload).unwrap_or_default())));
+                .data(serde_json::to_string(&delta_payload).unwrap_or_default()));
+            match sse_tx_cb.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                    cancel_cb.cancel();
+                }
+            }
         });
 
         // Dispatch to worker.
+        //
+        // D5 fix: `try_send` + map `Full` to `QueueFull` (429) instead of
+        // `.send(...).await`, which would park the caller when the queue
+        // is saturated instead of shedding load.
         state
             .queue
-            .send(BatchRequest::GenerateStream {
+            .try_send(BatchRequest::GenerateStream {
                 prompt,
                 max_tokens,
                 config: sampler_config,
                 cache_prompt: true,
                 lora_selection: vec![],
+                add_special,
+                cancel: cancel.clone(),
                 callback,
                 reply: reply_tx,
             })
-            .await
-            .map_err(|_| ServerError::WorkerDead)?;
+            .map_err(|e| match e {
+                TrySendError::Full(_) => ServerError::QueueFull,
+                TrySendError::Closed(_) => ServerError::WorkerDead,
+            })?;
 
         // Spawn finaliser task.
         let store_clone = Arc::clone(&store);
         let resp_id_finish = response_id.clone();
         let model_id_finish = model_id.clone();
+        let metrics = Arc::clone(&state.metrics);
+        let cancel_finish = cancel.clone();
         tokio::spawn(async move {
             // Collect all tokens that were already sent (we can't replay them)
             // — instead we record the final status and emit `response.completed`.
             let (final_status, output_text) = match reply_rx.await {
-                Ok(Ok(_usage)) => (ResponseStatus::Completed, None),
+                Ok(Ok((usage, _finish_reason))) => {
+                    metrics
+                        .record_usage(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                    if cancel_finish.is_cancelled() {
+                        (ResponseStatus::Cancelled, None)
+                    } else {
+                        (ResponseStatus::Completed, None)
+                    }
+                }
+                _ if cancel_finish.is_cancelled() => (ResponseStatus::Cancelled, None),
                 _ => (ResponseStatus::Failed, None),
             };
 
@@ -339,25 +375,31 @@ pub async fn create_response(
         Ok(sse.into_response())
     } else {
         // ── Non-streaming path ────────────────────────────────────────────
-        let (reply_tx, reply_rx) = oneshot::channel::<Result<(String, UsageStats), String>>();
+        let (reply_tx, reply_rx) = oneshot::channel::<GenerateReply>();
 
         state
             .queue
-            .send(BatchRequest::Generate {
+            .try_send(BatchRequest::Generate {
                 prompt,
                 max_tokens,
                 config: sampler_config,
                 cache_prompt: true,
                 lora_selection: vec![],
+                add_special,
                 reply: reply_tx,
             })
-            .await
-            .map_err(|_| ServerError::WorkerDead)?;
+            .map_err(|e| match e {
+                TrySendError::Full(_) => ServerError::QueueFull,
+                TrySendError::Closed(_) => ServerError::WorkerDead,
+            })?;
 
-        let (generated, _usage) = reply_rx
+        let (generated, usage, _finish_reason) = reply_rx
             .await
             .map_err(|_| ServerError::WorkerDead)?
             .map_err(|e| ServerError::InvalidRequest { message: e })?;
+        state
+            .metrics
+            .record_usage(usage.prompt_tokens as u64, usage.completion_tokens as u64);
 
         // Persist output.
         store.update_output(&response_id, generated, ResponseStatus::Completed)?;
@@ -414,8 +456,8 @@ mod tests {
     use crate::queue::BatchRequest;
     use crate::queue::UsageStats;
     use crate::responses_store::ResponseStore;
-    use crate::state::AppState;
     use oxillama_runtime::sampling::SamplerConfig;
+    use oxillama_runtime::FinishReason;
 
     // ── Test app factory ──────────────────────────────────────────────────
 
@@ -432,7 +474,11 @@ mod tests {
                             completion_tokens: 3,
                             total_tokens: 8,
                         };
-                        let _ = reply.send(Ok(("mock response text".to_string(), usage)));
+                        let _ = reply.send(Ok((
+                            "mock response text".to_string(),
+                            usage,
+                            FinishReason::Eos,
+                        )));
                     }
                     BatchRequest::GenerateStream {
                         mut callback,
@@ -444,11 +490,14 @@ mod tests {
                             callback("token");
                         })
                         .await;
-                        let _ = reply.send(Ok(UsageStats {
-                            prompt_tokens: 5,
-                            completion_tokens: 2,
-                            total_tokens: 7,
-                        }));
+                        let _ = reply.send(Ok((
+                            UsageStats {
+                                prompt_tokens: 5,
+                                completion_tokens: 2,
+                                total_tokens: 7,
+                            },
+                            FinishReason::Eos,
+                        )));
                     }
                     BatchRequest::Embed { reply, .. } => {
                         let _ = reply.send(Ok(vec![0.1_f32; 32]));
@@ -457,9 +506,9 @@ mod tests {
             }
         });
 
-        let mut state = AppState::new(
+        let mut state = crate::test_helpers::new_test_state(
             tx,
-            "test-model".to_string(),
+            "test-model",
             SamplerConfig::default(),
             None,
             0,
@@ -472,9 +521,9 @@ mod tests {
     /// Build a dead-worker test app that still has the responses store.
     async fn build_responses_dead_app() -> axum::Router {
         let (tx, _rx) = tokio::sync::mpsc::channel::<BatchRequest>(1);
-        let mut state = AppState::new(
+        let mut state = crate::test_helpers::new_test_state(
             tx,
-            "test-model".to_string(),
+            "test-model",
             SamplerConfig::default(),
             None,
             0,
@@ -679,7 +728,11 @@ mod tests {
                         completion_tokens: 3,
                         total_tokens: 8,
                     };
-                    let _ = reply.send(Ok(("chained response".to_string(), usage)));
+                    let _ = reply.send(Ok((
+                        "chained response".to_string(),
+                        usage,
+                        FinishReason::Eos,
+                    )));
                 }
             }
         });
@@ -703,9 +756,9 @@ mod tests {
             )
             .expect("update prev");
 
-        let mut state = AppState::new(
+        let mut state = crate::test_helpers::new_test_state(
             tx,
-            "test-model".to_string(),
+            "test-model",
             SamplerConfig::default(),
             None,
             0,

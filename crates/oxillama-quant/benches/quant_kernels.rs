@@ -61,7 +61,7 @@ fn make_synthetic_tensor(tensor_type: GgufTensorType, rows: usize, cols: usize) 
     }
 
     QuantTensor {
-        data,
+        data: data.into(),
         shape: vec![rows, cols],
         tensor_type,
     }

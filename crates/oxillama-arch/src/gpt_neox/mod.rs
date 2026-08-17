@@ -1,49 +1,65 @@
-//! GPT-NeoX model architecture implementation.
+//! GPT-NeoX model architecture (EleutherAI GPT-NeoX-20B, the Pythia suite,
+//! Dolly-v2, RedPajama-INCITE, …).
 //!
-//! GPT-NeoX (EleutherAI, 2022) is a large-scale autoregressive decoder model
-//! that introduced the **parallel residual** computation pattern later adopted
-//! by StableLM and others.
+//! GPT-NeoX introduced the **parallel residual** block later adopted by
+//! StableLM, Falcon and PaLM.  This implementation is transcribed from
+//! `~/work/refs/llama.cpp`:
+//!
+//! * `src/models/gptneox.cpp` — `llm_build_gptneox`, the graph.
+//! * `src/llama-model.cpp` — `case LLM_ARCH_GPTNEOX:` in `load_hparams()`
+//!   (`f_norm_eps`, `use_par_res`) and in `load_tensors()` (the tensor list).
+//! * `convert_hf_to_gguf.py` — `class GPTNeoXModel` (metadata keys and the
+//!   one-time QKV de-interleave).
 //!
 //! ## Key architectural features
 //!
-//! 1. **Parallel residual**: attention and FFN share the same pre-norm input
-//!    and both outputs are added together to form the single residual update:
-//!    `y = x + Attention(LN1(x)) + FFN(LN2(x))`.
-//!
-//! 2. **Two learned-bias LayerNorms** per layer: `ln1` (pre-attention) and
-//!    `ln2` (pre-FFN), each with an independent bias parameter.
-//!
-//! 3. **Partial RoPE** (same fraction convention as StableLM): only the first
-//!    `partial_rotary_factor × head_dim` dimensions of each Q/K head are
-//!    rotated; the rest pass through unmodified.
-//!
-//! 4. **GELU FFN** (not SwiGLU): the FFN is a single gated layer
-//!    `GELU(W_up @ x)` followed by a down projection, without a separate gate.
+//! 1. **Parallel residual (selectable).**  `{arch}.use_parallel_residual`
+//!    picks between `x = ffn(ffn_norm(x)) + x + attn(attn_norm(x))` and the
+//!    sequential pre-norm block.  In the parallel form both norms read the
+//!    *same* original residual stream.
+//! 2. **Fused QKV.**  One `blk.{i}.attn_qkv` tensor per layer; its output
+//!    splits into contiguous `Q | K | V` blocks.  There are no separate
+//!    `attn_q`/`attn_k`/`attn_v` tensors.
+//! 3. **Bias on every projection.**  QKV, output, FFN up, FFN down and all
+//!    three LayerNorms carry a required bias.
+//! 4. **Plain LayerNorm**, not RMSNorm.
+//! 5. **Partial NeoX RoPE.**  Only the leading `{arch}.rope.dimension_count`
+//!    (`rotary_pct × head_dim`, 0.25 for Pythia) elements of each head are
+//!    rotated, and the frequency ladder is derived from that count — not from
+//!    `head_dim`.
+//! 6. **Gate-free GELU FFN.**
 //!
 //! ## Tensor naming convention (GGUF)
 //!
-//! - `token_embd.weight` — Token embedding matrix
-//! - `blk.{i}.ln1.weight` / `.bias` — Pre-attention LayerNorm
-//! - `blk.{i}.ln2.weight` / `.bias` — Pre-FFN LayerNorm
-//! - `blk.{i}.attn_q.weight` — Q projection
-//! - `blk.{i}.attn_k.weight` — K projection
-//! - `blk.{i}.attn_v.weight` — V projection
-//! - `blk.{i}.attn_output.weight` — Attention output projection
-//! - `blk.{i}.ffn_up.weight` — FFN up/gate projection
-//! - `blk.{i}.ffn_down.weight` — FFN down projection
-//! - `output_norm.weight` / `.bias` — Final LayerNorm
-//! - `output.weight` — LM head / unembedding
+//! See [`tensor_names`] for the full, citation-annotated list:
+//!
+//! - `token_embd.weight`
+//! - `blk.{i}.attn_norm.weight` / `.bias`
+//! - `blk.{i}.attn_qkv.weight` / `.bias`   (fused)
+//! - `blk.{i}.attn_output.weight` / `.bias`
+//! - `blk.{i}.ffn_norm.weight` / `.bias`
+//! - `blk.{i}.ffn_up.weight` / `.bias`
+//! - `blk.{i}.ffn_down.weight` / `.bias`
+//! - `output_norm.weight` / `.bias`
+//! - `output.weight`
 
+mod loader;
 mod model;
+pub mod tensor_names;
 
+pub use loader::load_gpt_neox_from_gguf;
 #[cfg(test)]
-pub use model::make_test_layer;
-pub use model::{GptNeoxLayer, GptNeoxModel, DEFAULT_PARTIAL_ROTARY_FACTOR};
+pub use model::{f32_linear, make_test_layer};
+pub use model::{
+    validate_gpt_neox_shapes, validate_rotary_dims, GptNeoxLayer, GptNeoxLayerWeights,
+    GptNeoxModel, DEFAULT_USE_PARALLEL_RESIDUAL,
+};
+pub use tensor_names::gpt_neox_tensor_name_patterns;
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::traits::{ForwardPass, ModelArchitecture, TensorNamePattern};
-use oxillama_gguf::TensorStore;
+use oxillama_gguf::{GgufModel, TensorStore};
 
 /// GPT-NeoX architecture plugin.
 pub struct GptNeoxArchitecture;
@@ -66,95 +82,35 @@ impl ModelArchitecture for GptNeoxArchitecture {
         "gptneox"
     }
 
+    /// Metadata-only build.
+    ///
+    /// [`TensorStore`] carries tensor *descriptors*, not payload, so no weight
+    /// can be materialised here.  The configuration is still validated so a
+    /// caller that only has metadata gets a useful diagnostic, and the error
+    /// then points at [`Self::build_from_gguf`] — which is what the registry
+    /// and the runtime engine actually call.
     fn build(
         &self,
         config: &ModelConfig,
         _tensors: &TensorStore,
     ) -> ArchResult<Box<dyn ForwardPass>> {
-        if config.num_attention_heads == 0 {
-            return Err(ArchError::ConfigMismatch {
-                param: "num_attention_heads".to_string(),
-                expected: ">0".to_string(),
-                got: "0".to_string(),
-            });
-        }
-        if config.hidden_size == 0 {
-            return Err(ArchError::ConfigMismatch {
-                param: "hidden_size".to_string(),
-                expected: ">0".to_string(),
-                got: "0".to_string(),
-            });
-        }
+        validate_gpt_neox_shapes(config)?;
         Err(ArchError::MissingTensor {
-            name: "token_embd.weight (use GptNeoxModel::new for full loading)".to_string(),
+            name: "token_embd.weight (use GptNeoxArchitecture::build_from_gguf \
+                   or load_gpt_neox_from_gguf for full loading)"
+                .to_string(),
         })
     }
 
+    fn build_from_gguf(
+        &self,
+        model: &GgufModel,
+        config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Ok(Box::new(load_gpt_neox_from_gguf(model, config)?))
+    }
+
     fn tensor_names(&self) -> Vec<TensorNamePattern> {
-        let mut patterns = vec![
-            TensorNamePattern {
-                pattern: "token_embd.weight".to_string(),
-                description: "Token embedding matrix".to_string(),
-                required: true,
-            },
-            TensorNamePattern {
-                pattern: "output_norm.weight".to_string(),
-                description: "Final LayerNorm scale".to_string(),
-                required: true,
-            },
-            TensorNamePattern {
-                pattern: "output_norm.bias".to_string(),
-                description: "Final LayerNorm bias".to_string(),
-                required: true,
-            },
-            TensorNamePattern {
-                pattern: "output.weight".to_string(),
-                description: "LM head / unembedding projection".to_string(),
-                required: true,
-            },
-        ];
-
-        let layer_tensors = [
-            (
-                "blk.{i}.ln1.weight",
-                "Pre-attention LayerNorm scale (gamma)",
-                true,
-            ),
-            (
-                "blk.{i}.ln1.bias",
-                "Pre-attention LayerNorm bias (beta)",
-                true,
-            ),
-            (
-                "blk.{i}.ln2.weight",
-                "Pre-FFN LayerNorm scale (gamma)",
-                true,
-            ),
-            ("blk.{i}.ln2.bias", "Pre-FFN LayerNorm bias (beta)", true),
-            ("blk.{i}.attn_q.weight", "Query projection", true),
-            ("blk.{i}.attn_k.weight", "Key projection", true),
-            ("blk.{i}.attn_v.weight", "Value projection", true),
-            (
-                "blk.{i}.attn_output.weight",
-                "Attention output projection",
-                true,
-            ),
-            (
-                "blk.{i}.ffn_up.weight",
-                "FFN up/gate projection (GELU)",
-                true,
-            ),
-            ("blk.{i}.ffn_down.weight", "FFN down projection", true),
-        ];
-
-        for (pat, desc, req) in layer_tensors {
-            patterns.push(TensorNamePattern {
-                pattern: pat.to_string(),
-                description: desc.to_string(),
-                required: req,
-            });
-        }
-
-        patterns
+        gpt_neox_tensor_name_patterns()
     }
 }

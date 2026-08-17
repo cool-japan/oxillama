@@ -68,8 +68,10 @@ These MUST be used instead of C-backed alternatives (no OpenBLAS, MKL, FFTW, etc
 
 - Use `cargo nextest` (not `cargo test`)
 - Property-based tests with `proptest` for quantization kernels
-- Reference comparison against llama.cpp output for correctness
 - Each crate has its own unit tests in `#[cfg(test)]` modules
+- No test in the repository currently compares output against llama.cpp — reference-comparison
+  correctness testing is a goal, not a shipped capability. (See TODO.md's Success Criteria
+  section for the same caveat on the "bit-level parity" claim.)
 
 ## Feature Flags
 
@@ -77,9 +79,9 @@ These MUST be used instead of C-backed alternatives (no OpenBLAS, MKL, FFTW, etc
 |---------|-------------|---------|
 | `server` | Enable HTTP API server | Yes |
 | `bench` | Enable benchmark crate | No |
-| `simd-avx2` | AVX2 SIMD kernels | No |
+| `simd-avx2` | AVX2 SIMD kernels | Yes |
 | `simd-avx512` | AVX-512 SIMD kernels | No |
-| `simd-neon` | ARM NEON SIMD kernels | No |
+| `simd-neon` | ARM NEON SIMD kernels | Yes |
 
 ## OxiBonsai Absorption
 

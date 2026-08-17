@@ -87,7 +87,7 @@ impl QuantKernel for Q4_1Avx512 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row and block bounds are checked above.
             // CPU avx512f support is guaranteed by KernelDispatcher.
@@ -99,7 +99,7 @@ impl QuantKernel for Q4_1Avx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -165,8 +165,10 @@ unsafe fn dequant_block_avx512(block: &[u8], output: &mut [f32]) {
 
     // Interleave: first16 = [lo0,hi0,lo1,hi1,...,lo7,hi7]  (weights 0-15)
     //             last16  = [lo8,hi8,...,lo15,hi15]         (weights 16-31)
-    let first16 = _mm_unpacklo_epi8(lo_bytes, hi_bytes);
-    let last16 = _mm_unpackhi_epi8(lo_bytes, hi_bytes);
+    // GGML split-half layout: the 16 low nibbles are weights 0..16 and the 16
+    // high nibbles are weights 16..32, already in byte order — no interleave.
+    let first16 = lo_bytes; // weights 0..16
+    let last16 = hi_bytes; // weights 16..32
 
     // Convert u8→u32→f32, then FMA: d * nibble + m — 2 AVX-512 passes.
 
@@ -226,8 +228,9 @@ unsafe fn gemv_row_avx512(
         let lo_bytes = _mm_and_si128(raw, mask_lo);
         let hi_bytes = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo);
 
-        let first16 = _mm_unpacklo_epi8(lo_bytes, hi_bytes);
-        let last16 = _mm_unpackhi_epi8(lo_bytes, hi_bytes);
+        // Split-half layout — see `dequant_block_avx512`.
+        let first16 = lo_bytes; // weights 0..16
+        let last16 = hi_bytes; // weights 16..32
 
         let remaining = n_cols.saturating_sub(input_offset);
 

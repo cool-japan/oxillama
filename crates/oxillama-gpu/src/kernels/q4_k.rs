@@ -135,27 +135,44 @@ fn dequant_q4_k_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuResu
             // Bytes 16-143: qs (128 bytes, 4-bit nibbles for 256 values)
             let qs = &block[16..144];
 
-            for j in 0..Q4_K_NUM_SUB_BLOCKS {
-                let scale_val = d * sc[j] as f32;
-                let min_val = dmin * m[j] as f32;
+            // Upstream `dequantize_row_q4_K` (and this crate's CPU reference,
+            // `oxillama_quant::reference::q4_k`) walks the block in four
+            // 64-weight groups: within group `g`, sub-block `2g`'s 32
+            // weights come from the LOW nibbles of `qs[32g .. 32g+32]`, and
+            // sub-block `2g+1`'s 32 weights come from the HIGH nibbles of
+            // the *same* 32 bytes.  This is NOT the same as reading
+            // `qs[idx/2]` nibble `idx%2` for a flat weight index `idx`
+            // (which was this function's previous — and independently
+            // buggy — implementation, caught by
+            // `tests/cpu_gpu_cross_check.rs` against real hardware).
+            let mut is = 0usize;
+            let mut qs_offset = 0usize;
+            let mut out_offset = 0usize;
 
-                for k in 0..Q4_K_SUB_BLOCK_SIZE {
-                    let idx = j * Q4_K_SUB_BLOCK_SIZE + k;
-                    let col = blk * Q4_K_BLOCK_SIZE + idx;
-                    if col >= cols {
-                        break;
+            for _group in 0..(Q4_K_NUM_SUB_BLOCKS / 2) {
+                let d1 = d * sc[is] as f32;
+                let m1 = dmin * m[is] as f32;
+                let d2 = d * sc[is + 1] as f32;
+                let m2 = dmin * m[is + 1] as f32;
+
+                for l in 0..Q4_K_SUB_BLOCK_SIZE {
+                    let col = blk * Q4_K_BLOCK_SIZE + out_offset + l;
+                    if col < cols {
+                        let q = (qs[qs_offset + l] & 0x0F) as f32;
+                        f32_weights[row * cols + col] = d1 * q - m1;
                     }
-
-                    // Each byte in qs holds two 4-bit nibbles.
-                    let byte_idx = idx / 2;
-                    let nibble = if idx.is_multiple_of(2) {
-                        qs[byte_idx] & 0x0F
-                    } else {
-                        (qs[byte_idx] >> 4) & 0x0F
-                    };
-
-                    f32_weights[row * cols + col] = scale_val * nibble as f32 - min_val;
                 }
+                for l in 0..Q4_K_SUB_BLOCK_SIZE {
+                    let col = blk * Q4_K_BLOCK_SIZE + out_offset + Q4_K_SUB_BLOCK_SIZE + l;
+                    if col < cols {
+                        let q = ((qs[qs_offset + l] >> 4) & 0x0F) as f32;
+                        f32_weights[row * cols + col] = d2 * q - m2;
+                    }
+                }
+
+                is += 2;
+                qs_offset += Q4_K_SUB_BLOCK_SIZE;
+                out_offset += 2 * Q4_K_SUB_BLOCK_SIZE;
             }
         }
     }
@@ -429,6 +446,30 @@ mod tests {
             (result[1] - expected_1).abs() < 0.01,
             "got {}, expected {expected_1}",
             result[1]
+        );
+    }
+
+    /// Discriminates the old buggy flat `qs[idx/2]` mapping from the correct
+    /// group-based mapping: for weight index 32 (the first weight of the
+    /// HIGH-nibble half of group 0), the two mappings read different qs
+    /// bytes — new reads `qs[0]` high nibble, old read `qs[16]` low nibble
+    /// — even though both agree on which sub-block scale applies.
+    #[test]
+    fn test_dequant_q4_k_group_boundary_byte_mapping() {
+        let mut scales = [0u8; 8];
+        scales[1] = 1; // sub-block 1 (high-nibble half of group 0): scale=1
+        let mins = [0u8; 8];
+        let mut qs = [0u8; 128];
+        qs[0] = 0xB0; // low nibble 0, high nibble 0xB=11 → correct weight[32]=11.0
+        qs[16] = 0x07; // low nibble 7 → what the old buggy mapping would read
+
+        let block = make_q4_k_block(1.0, 0.0, &scales, &mins, &qs);
+        let result = dequant_q4_k_to_f32(&block, 1, 256).expect("dequant");
+
+        assert!(
+            (result[32] - 11.0).abs() < 0.01,
+            "weight[32] = {}, expected 11.0 (qs[0] high nibble)",
+            result[32]
         );
     }
 

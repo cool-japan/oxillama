@@ -19,9 +19,12 @@ pub enum HubError {
     NotFound(String),
 
     /// hf-hub API error.
+    ///
+    /// hf-hub 1.0 collapsed the old per-backend error enums (`api::sync::ApiError`,
+    /// `api::tokio::ApiError`) into a single crate-level [`hf_hub::HFError`].
     #[cfg(feature = "hub")]
     #[error("hub API error: {0}")]
-    Api(#[from] hf_hub::api::sync::ApiError),
+    Api(#[from] hf_hub::HFError),
 
     /// SHA-256 digest mismatch after download.
     #[error("SHA-256 mismatch: expected {expected}, got {actual}")]
@@ -135,10 +138,10 @@ pub struct PullOptions {
     pub file: Option<String>,
     /// Git revision / branch.
     pub revision: String,
-    /// Force re-download even if already cached (evicts cache entry before fetching).
+    /// Force re-download even if already cached.
     ///
-    /// Currently this causes the sidecar lock file to be removed before the
-    /// download so that `hf-hub` treats it as a fresh download.
+    /// Forwarded to hf-hub's `download_file().force_download(true)`, which
+    /// refetches the blob instead of reusing the cached one.
     pub force: bool,
     /// Override cache directory.
     pub cache: Option<PathBuf>,
@@ -151,70 +154,46 @@ pub struct PullOptions {
 /// Only available when compiled with `feature = "hub"`.
 #[cfg(feature = "hub")]
 pub fn pull(opts: PullOptions) -> HubResult<PathBuf> {
-    use hf_hub::{api::sync::ApiBuilder, Cache, Repo, RepoType};
+    use hf_hub::HFClient;
     use sha2::{Digest, Sha256};
 
     let cache_dir = opts.cache.unwrap_or_else(default_cache_dir);
     std::fs::create_dir_all(&cache_dir)?;
 
-    // Keep an owned copy of cache_dir before moving it into `Cache::new`.
-    let cache_dir_owned = cache_dir.clone();
-    let cache = Cache::new(cache_dir);
-    let api = ApiBuilder::from_cache(cache)
-        .with_progress(true)
-        .build()
-        .map_err(HubError::Api)?;
+    // hf-hub 1.0 configures the cache on the client itself — the separate
+    // `Cache` handle and `ApiBuilder::from_cache` are gone. `build_sync()`
+    // (feature = "blocking") returns the synchronous facade over the now-async
+    // core, so this function stays blocking. The on-disk layout is unchanged
+    // (`models--{org}--{name}/blobs|snapshots/…`), so `list_cached` and
+    // `remove_cached` above still understand the cache this writes.
+    let client = HFClient::builder().cache_dir(&cache_dir).build_sync()?;
 
-    let repo = api.repo(Repo::with_revision(
-        opts.repo.clone(),
-        RepoType::Model,
-        opts.revision.clone(),
-    ));
+    // Repo handles are typed by repo kind in 1.0 and take `(owner, name)`
+    // instead of a `"{owner}/{name}"` string plus a `RepoType` enum value;
+    // `split_id` performs exactly the split the old `Repo::with_revision`
+    // string form implied. The revision is no longer bound to the handle —
+    // it is passed per request instead.
+    let (owner, name) = hf_hub::split_id(&opts.repo);
+    let repo = client.model(owner, name);
 
     // Discover which GGUF file to download.
     let filename = match opts.file {
         Some(f) => f,
-        None => select_gguf_file(&repo)?,
+        None => select_gguf_file(&repo, &opts.revision)?,
     };
 
-    // When --force, genuinely evict the cached blob so that hf-hub treats
-    // this as a fresh download.  Strategy:
-    //   1. Fetch file metadata (HEAD request) to retrieve the ETag.
-    //   2. Derive the blob path using hf-hub's cache layout:
-    //      <cache>/<folder_name>/blobs/<etag>
-    //   3. Remove the blob file and its in-progress sidecar (best-effort;
-    //      errors are logged at debug level and ignored).
-    if opts.force {
-        let file_url = repo.url(&filename);
-        match api.metadata(&file_url) {
-            Ok(meta) => {
-                let etag = meta.etag();
-                // hf-hub folder_name: "models--{repo_id}" with '/' → "--"
-                let folder_name = format!("models--{}", opts.repo.replace('/', "--"));
-                let blob_path = cache_dir_owned.join(&folder_name).join("blobs").join(etag);
-                // Also remove the resumable-download sidecar (.part).
-                let part_path = blob_path.with_extension("part");
-                for path in [&blob_path, &part_path] {
-                    if path.exists() {
-                        match std::fs::remove_file(path) {
-                            Ok(()) => tracing::debug!("force-evicted blob {}", path.display()),
-                            Err(e) => {
-                                tracing::debug!("force-evict skipped {}: {e}", path.display())
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::debug!(
-                    "force-evict: metadata fetch failed ({e}); \
-                     proceeding without eviction"
-                );
-            }
-        }
-    }
-
-    let local_path = repo.get(&filename)?;
+    // `--force` is a first-class parameter in 1.0: `force_download(true)`
+    // refetches the blob instead of reusing the cached one. This replaces the
+    // manual eviction 0.5 required (metadata HEAD → derive `blobs/{etag}` →
+    // unlink the blob and its `.part` sidecar), which reached into hf-hub's
+    // cache layout from outside.
+    let local_path = repo
+        .download_file()
+        .filename(filename.as_str())
+        .revision(opts.revision.as_str())
+        .force_download(opts.force)
+        .progress(PullProgress::new())
+        .send()?;
 
     // Optional SHA-256 verification.
     if let Some(expected_hex) = opts.verify_sha256 {
@@ -237,16 +216,105 @@ pub fn pull(opts: PullOptions) -> HubResult<PathBuf> {
 }
 
 /// Query the repo manifest and pick the first GGUF file found.
+///
+/// `revision` is threaded through explicitly because hf-hub 1.0 repo handles no
+/// longer carry one (`Repo::with_revision` is gone); every request takes it.
 #[cfg(feature = "hub")]
-fn select_gguf_file(repo: &hf_hub::api::sync::ApiRepo) -> HubResult<String> {
-    let info = repo.info()?;
-    let gguf = info
-        .siblings
-        .iter()
-        .find(|s| s.rfilename.ends_with(".gguf"))
-        .map(|s| s.rfilename.clone())
-        .ok_or_else(|| HubError::NotFound("no .gguf file found in repository".into()))?;
-    Ok(gguf)
+fn select_gguf_file(
+    repo: &hf_hub::HFRepositorySync<hf_hub::RepoTypeModel>,
+    revision: &str,
+) -> HubResult<String> {
+    // `siblings` is `Option<Vec<RepoSibling>>` in 1.0 (the Hub omits it for
+    // some expansions); an absent listing is treated as "no GGUF here", the
+    // same outcome the old empty-`Vec` scan produced.
+    let info = repo.info().revision(revision).send()?;
+    info.siblings
+        .unwrap_or_default()
+        .into_iter()
+        .map(|sibling| sibling.rfilename)
+        .find(|rfilename| rfilename.ends_with(".gguf"))
+        .ok_or_else(|| HubError::NotFound("no .gguf file found in repository".into()))
+}
+
+/// Renders `hub pull` download progress as an `indicatif` bar.
+///
+/// hf-hub 0.5 drew this bar itself — `ApiBuilder::with_progress(true)` selected
+/// a built-in `indicatif` handler. 1.0 dropped the built-in renderer in favour
+/// of the [`ProgressHandler`](hf_hub::progress::ProgressHandler) callback, so
+/// the bar (and 0.5's template) now lives here.
+#[cfg(feature = "hub")]
+struct PullProgress {
+    bar: indicatif::ProgressBar,
+}
+
+#[cfg(feature = "hub")]
+impl PullProgress {
+    /// Longest filename rendered in the bar's message; longer names are shown
+    /// as `..{tail}` — the elision rule hf-hub 0.5 applied.
+    const MAX_MESSAGE_CHARS: usize = 30;
+
+    fn new() -> Self {
+        // The total is unknown until the `Start` event reports the HEAD size.
+        let bar = indicatif::ProgressBar::new(0);
+        bar.set_style(
+            indicatif::ProgressStyle::with_template(
+                "{msg} [{elapsed_precise}] [{wide_bar}] {bytes}/{total_bytes} {bytes_per_sec} ({eta})",
+            )
+            .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar()),
+        );
+        Self { bar }
+    }
+
+    /// Elide `filename` from the left so the message stays one line wide.
+    ///
+    /// Split on `char` boundaries rather than bytes: repo paths are arbitrary
+    /// UTF-8, and byte slicing would panic mid-codepoint.
+    fn shorten(filename: &str) -> String {
+        let chars = filename.chars().count();
+        if chars <= Self::MAX_MESSAGE_CHARS {
+            return filename.to_string();
+        }
+        let tail: String = filename
+            .chars()
+            .skip(chars - Self::MAX_MESSAGE_CHARS)
+            .collect();
+        format!("..{tail}")
+    }
+}
+
+#[cfg(feature = "hub")]
+impl hf_hub::progress::ProgressHandler for PullProgress {
+    fn on_progress(&self, event: &hf_hub::progress::ProgressEvent) {
+        use hf_hub::progress::{DownloadEvent, ProgressEvent};
+
+        // `pull` only ever downloads, so upload events cannot reach here.
+        let ProgressEvent::Download(download) = event else {
+            return;
+        };
+
+        match download {
+            DownloadEvent::Start { total_bytes, .. } => self.bar.set_length(*total_bytes),
+            // Per-file deltas. `pull` fetches exactly one file, so the most
+            // recent entry always describes it.
+            DownloadEvent::Progress { files } => {
+                if let Some(file) = files.last() {
+                    self.bar.set_message(Self::shorten(&file.filename));
+                    self.bar.set_position(file.bytes_completed);
+                }
+            }
+            // Xet-backed blobs report batch aggregates instead of per-file
+            // deltas, and the batch here is that single file.
+            DownloadEvent::AggregateProgress {
+                bytes_completed,
+                total_bytes,
+                ..
+            } => {
+                self.bar.set_length(*total_bytes);
+                self.bar.set_position(*bytes_completed);
+            }
+            DownloadEvent::Complete => self.bar.finish(),
+        }
+    }
 }
 
 /// Stub for non-hub builds — compile-time guard only.

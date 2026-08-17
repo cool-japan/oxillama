@@ -34,6 +34,41 @@ pub struct GrokConfig {
     pub rope_theta: f32,
     /// RMSNorm epsilon.
     pub rms_norm_eps: f32,
+    /// Multiplier applied to the token embedding (`grok.embedding_scale`).
+    ///
+    /// llama.cpp hard-codes `78.38367176906169` for `LLM_ARCH_GROK` and lets a
+    /// GGUF key override it.  That constant is `sqrt(6144)` — the square root of
+    /// Grok-1's hidden size — which is why omitting it scaled every hidden state
+    /// down by ~78x before the first layer.
+    pub embedding_scale: f32,
+    /// Multiplier applied to the final logits (`grok.logit_scale`).
+    ///
+    /// llama.cpp default `0.5773502691896257` = `1/sqrt(3)`.
+    pub logit_scale: f32,
+    /// Pre-softmax attention score multiplier (`grok.attention.output_scale`).
+    ///
+    /// llama.cpp default `0.08838834764831845` = `1/sqrt(128)`.  Note this is a
+    /// **constant**, not `1/sqrt(head_dim)`: `build_grok` passes `kq_scale =
+    /// 1.0f` to `build_attn` and the multiplier is folded into the tanh
+    /// soft-cap at `llm_graph_context::build_attn_mha`.
+    pub attn_output_scale: f32,
+    /// Attention logit soft-cap (`grok.attn_logit_softcapping`, default 30.0).
+    ///
+    /// `kq = cap * tanh(kq * attn_output_scale / cap)`.  A non-positive value
+    /// disables the cap (and then `attn_output_scale` is applied directly).
+    pub attn_logit_softcapping: f32,
+    /// Final logit soft-cap (`grok.final_logit_softcapping`).
+    ///
+    /// **0.0 for Grok-1** — llama.cpp comments "no final_logit_softcapping in
+    /// grok-1" — but the key exists for later Grok releases.
+    pub final_logit_softcapping: f32,
+    /// Router logit soft-cap (`grok.router_logit_softcapping`, default 30.0).
+    ///
+    /// Parsed for completeness.  The reference **reads this key and never uses
+    /// it**: `f_router_logit_softcapping` appears only in the hparams loader and
+    /// the model saver, never in `build_moe_ffn`.  It is therefore recorded here
+    /// and deliberately not applied.
+    pub router_logit_softcapping: f32,
 }
 
 impl GrokConfig {
@@ -99,6 +134,25 @@ impl GrokConfig {
             .get_f32("grok.attention.layer_norm_rms_epsilon")
             .unwrap_or(1e-5);
 
+        // Defaults straight out of `case LLM_ARCH_GROK:` in
+        // `llama_model::load_hparams`; each is overridable by a GGUF key.
+        let embedding_scale = metadata
+            .get_f32("grok.embedding_scale")
+            .unwrap_or(78.383_67);
+        let logit_scale = metadata.get_f32("grok.logit_scale").unwrap_or(0.577_350_26);
+        let attn_output_scale = metadata
+            .get_f32("grok.attention.output_scale")
+            .unwrap_or(0.088_388_35);
+        let attn_logit_softcapping = metadata
+            .get_f32("grok.attn_logit_softcapping")
+            .unwrap_or(30.0);
+        let router_logit_softcapping = metadata
+            .get_f32("grok.router_logit_softcapping")
+            .unwrap_or(30.0);
+        let final_logit_softcapping = metadata
+            .get_f32("grok.final_logit_softcapping")
+            .unwrap_or(0.0);
+
         Self {
             hidden_size,
             num_layers,
@@ -112,6 +166,12 @@ impl GrokConfig {
             ffn_hidden_size,
             rope_theta,
             rms_norm_eps,
+            embedding_scale,
+            logit_scale,
+            attn_output_scale,
+            attn_logit_softcapping,
+            final_logit_softcapping,
+            router_logit_softcapping,
         }
     }
 }
@@ -157,5 +217,51 @@ mod tests {
         assert_eq!(cfg.expert_count, 8);
         assert_eq!(cfg.expert_used_count, 2);
         assert_eq!(cfg.head_dim, 16); // 32 / 2
+    }
+
+    /// Grok's distinctive scalars had no fields at all, so the embedding was
+    /// ~78x too small and the logits ~1.73x too large.
+    #[test]
+    fn distinctive_scales_default_to_the_llama_cpp_constants() {
+        let cfg = GrokConfig::from_metadata(&MetadataStore::new());
+        assert!(
+            (cfg.embedding_scale - 78.383_67).abs() < 1e-3,
+            "embedding_scale = {}",
+            cfg.embedding_scale
+        );
+        assert!(
+            (cfg.logit_scale - 0.577_350_26).abs() < 1e-6,
+            "logit_scale = {}",
+            cfg.logit_scale
+        );
+        assert!(
+            (cfg.attn_output_scale - 0.088_388_35).abs() < 1e-7,
+            "attn_output_scale = {}",
+            cfg.attn_output_scale
+        );
+        assert!((cfg.attn_logit_softcapping - 30.0).abs() < 1e-6);
+        assert!((cfg.router_logit_softcapping - 30.0).abs() < 1e-6);
+        assert_eq!(
+            cfg.final_logit_softcapping, 0.0,
+            "grok-1 has no final logit soft-cap"
+        );
+    }
+
+    #[test]
+    fn scales_can_be_overridden_by_gguf() {
+        let mut store = MetadataStore::new();
+        store.insert(
+            "grok.embedding_scale".to_string(),
+            MetadataValue::Float32(2.0),
+        );
+        store.insert("grok.logit_scale".to_string(), MetadataValue::Float32(3.0));
+        store.insert(
+            "grok.attention.output_scale".to_string(),
+            MetadataValue::Float32(0.25),
+        );
+        let cfg = GrokConfig::from_metadata(&store);
+        assert!((cfg.embedding_scale - 2.0).abs() < 1e-6);
+        assert!((cfg.logit_scale - 3.0).abs() < 1e-6);
+        assert!((cfg.attn_output_scale - 0.25).abs() < 1e-6);
     }
 }

@@ -99,7 +99,9 @@ pub(crate) fn download_f32(
             detail: format!("{e:?}"),
         })?;
 
-    let view = slice.get_mapped_range();
+    let view = slice.get_mapped_range().map_err(|e| GpuError::BufferMap {
+        detail: format!("{e:?}"),
+    })?;
     let result: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
     drop(view);
     staging.unmap();
@@ -177,7 +179,9 @@ pub(crate) fn download_u32(
             detail: format!("{e:?}"),
         })?;
 
-    let view = slice.get_mapped_range();
+    let view = slice.get_mapped_range().map_err(|e| GpuError::BufferMap {
+        detail: format!("{e:?}"),
+    })?;
     let result: Vec<u32> = bytemuck::cast_slice(&view).to_vec();
     drop(view);
     staging.unmap();

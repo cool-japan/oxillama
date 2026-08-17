@@ -24,6 +24,79 @@ use crate::source::Source;
 use crate::tensor_info::{TensorInfo, TensorStore};
 use crate::types::{GgufTensorType, GgufValueType, GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC};
 
+/// Maximum nesting depth allowed for `Array`-of-`Array` metadata values.
+/// See the identical constant in `parser.rs` for the full rationale — this
+/// module mirrors that parser over a generic [`Source`] instead of an
+/// in-memory slice.
+const MAX_METADATA_ARRAY_DEPTH: u32 = 8;
+
+/// Maximum number of tensor dimensions accepted (mirrors `parser.rs`).
+const MAX_TENSOR_DIMS: u32 = 4;
+
+/// Hard fallback cap (in bytes) for a single string's declared length when
+/// the source cannot report how many bytes remain (`remaining_hint()`
+/// returns `None`, e.g. a network stream that has not reached EOF). No
+/// legitimate GGUF string (a tensor name or a metadata string value) is
+/// anywhere near this size; it exists purely to stop `bytes.resize(len, 0)`
+/// from being handed an attacker-controlled length in the gigabytes,
+/// which can abort the process via `handle_alloc_error` from just 8 bytes
+/// of input.
+const MAX_STRING_LEN_FALLBACK: u64 = 64 * 1024 * 1024;
+
+/// Fallback cap on a metadata array's element count when the source cannot
+/// report remaining bytes. Deliberately generous (legitimate GGUF arrays —
+/// e.g. a 250k-entry tokenizer vocabulary — can be large) since rejecting
+/// count alone is not the defense in this branch; not preallocating that
+/// capacity is (see `read_metadata_value` below).
+const ARRAY_COUNT_HARD_CEILING: u64 = 64 * 1024 * 1024;
+
+/// Minimum number of encoded bytes a single metadata value of `value_type`
+/// can possibly occupy (mirrors `parser.rs::min_encoded_value_size`).
+fn min_encoded_value_size(value_type: GgufValueType, version: u32) -> u64 {
+    match value_type {
+        GgufValueType::Uint8 | GgufValueType::Int8 | GgufValueType::Bool => 1,
+        GgufValueType::Uint16 | GgufValueType::Int16 => 2,
+        GgufValueType::Uint32 | GgufValueType::Int32 | GgufValueType::Float32 => 4,
+        GgufValueType::Uint64 | GgufValueType::Int64 | GgufValueType::Float64 => 8,
+        GgufValueType::String => {
+            if version >= 3 {
+                8
+            } else {
+                4
+            }
+        }
+        GgufValueType::Array => {
+            if version >= 3 {
+                12
+            } else {
+                8
+            }
+        }
+    }
+}
+
+/// Maximum alignment value accepted from `general.alignment` metadata
+/// (mirrors `parser.rs::MAX_GGUF_ALIGNMENT`).
+const MAX_GGUF_ALIGNMENT: u64 = 1 << 30;
+
+/// Validate a `general.alignment` metadata value before it is used to
+/// compute the tensor data-section offset. See `parser.rs::validate_alignment`
+/// for the full rationale.
+fn validate_alignment(alignment: u64) -> GgufResult<()> {
+    if alignment == 0 {
+        return Ok(());
+    }
+    if !alignment.is_power_of_two() || alignment > MAX_GGUF_ALIGNMENT {
+        return Err(GgufError::InvalidMetadata {
+            key: "general.alignment".to_string(),
+            reason: format!(
+                "alignment must be a power of two no greater than {MAX_GGUF_ALIGNMENT}, got {alignment}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 // ── Source-error bridging ───────────────────────────────────────────────────
 
 /// Helper: convert a source read error into a `GgufError::UnexpectedEof`.
@@ -131,13 +204,40 @@ where
     Ok(read_u8(src)? != 0)
 }
 
+/// Validate a file-declared byte length before it drives an allocation.
+///
+/// When `src.remaining_hint()` is known (e.g. a `SliceSource` over an
+/// in-memory buffer), `len` is rejected outright if it cannot possibly fit
+/// — this can never false-positive on a legitimate file. When the source's
+/// remaining length is unknown (e.g. a streaming network source),
+/// `len` is instead checked against a generous hard cap: no legitimate
+/// single GGUF string needs anywhere near that much space, so this closes
+/// the allocation-bomb / `handle_alloc_error` abort without needing to
+/// know the stream's true length.
+fn validate_len_before_alloc<S: Source>(src: &S, len: u64, offset: u64) -> GgufResult<()>
+where
+    S::Error: fmt::Debug + fmt::Display,
+{
+    let max_len = src.remaining_hint().unwrap_or(MAX_STRING_LEN_FALLBACK);
+    if len > max_len {
+        return Err(eof_at(offset));
+    }
+    Ok(())
+}
+
 /// Read a GGUF v3 string: u64 length prefix + UTF-8 bytes (no null terminator).
 fn read_string_v3<S: Source>(src: &mut S) -> GgufResult<String>
 where
     S::Error: fmt::Debug + fmt::Display,
 {
     let str_offset = src.position();
-    let len = read_u64_le(src)? as usize;
+    let len_u64 = read_u64_le(src)?;
+    validate_len_before_alloc(src, len_u64, str_offset)?;
+    // Safe: `validate_len_before_alloc` bounded `len_u64` to at most
+    // `MAX_STRING_LEN_FALLBACK` (comfortably inside `usize` on every
+    // supported target) or to the source's known remaining byte count
+    // (itself derived from a `usize`), so the cast below cannot truncate.
+    let len = len_u64 as usize;
     let mut bytes = Vec::with_capacity(len.min(1_024 * 1_024));
     bytes.resize(len, 0u8);
     src.read_exact(&mut bytes).map_err(|_| eof_at(str_offset))?;
@@ -153,7 +253,9 @@ where
     S::Error: fmt::Debug + fmt::Display,
 {
     let str_offset = src.position();
-    let len = read_u32_le(src)? as usize;
+    let len_u64 = u64::from(read_u32_le(src)?);
+    validate_len_before_alloc(src, len_u64, str_offset)?;
+    let len = len_u64 as usize;
     let mut bytes = Vec::with_capacity(len.min(1_024 * 1_024));
     bytes.resize(len, 0u8);
     src.read_exact(&mut bytes).map_err(|_| eof_at(str_offset))?;
@@ -250,7 +352,7 @@ where
                 reason: format!("unknown value type: {value_type_id}"),
             })?;
 
-        let value = read_metadata_value(src, value_type, version)?;
+        let value = read_metadata_value(src, value_type, version, 0)?;
         store.insert(key, value);
     }
 
@@ -258,14 +360,24 @@ where
 }
 
 /// Read a single typed metadata value.
+///
+/// `depth` counts `Array`-of-`Array` nesting levels; see
+/// `MAX_METADATA_ARRAY_DEPTH` for why this is bounded.
 fn read_metadata_value<S: Source>(
     src: &mut S,
     value_type: GgufValueType,
     version: u32,
+    depth: u32,
 ) -> GgufResult<MetadataValue>
 where
     S::Error: fmt::Debug + fmt::Display,
 {
+    if depth > MAX_METADATA_ARRAY_DEPTH {
+        return Err(GgufError::InvalidMetadata {
+            key: "<array>".to_string(),
+            reason: format!("array nesting depth exceeds the limit of {MAX_METADATA_ARRAY_DEPTH}"),
+        });
+    }
     match value_type {
         GgufValueType::Uint8 => Ok(MetadataValue::Uint8(read_u8(src)?)),
         GgufValueType::Int8 => Ok(MetadataValue::Int8(read_u8(src)? as i8)),
@@ -291,15 +403,54 @@ where
                 }
             })?;
 
-            let count = if version >= 3 {
-                read_u64_le(src)? as usize
+            let count_u64 = if version >= 3 {
+                read_u64_le(src)?
             } else {
-                read_u32_le(src)? as usize
+                u64::from(read_u32_le(src)?)
             };
 
-            let mut elements = Vec::with_capacity(count.min(1_000_000));
+            let min_elem_size = min_encoded_value_size(elem_type, version);
+            let (count, prealloc_cap) = match src.remaining_hint() {
+                // Remaining length is known (e.g. `SliceSource`): reject a
+                // count that could not possibly fit — this can never
+                // false-positive on a legitimate array.
+                Some(remaining) => {
+                    let max_count = remaining / min_elem_size;
+                    if count_u64 > max_count {
+                        return Err(GgufError::InvalidMetadata {
+                            key: "<array>".to_string(),
+                            reason: format!(
+                                "array count {count_u64} cannot fit in the {remaining} bytes remaining (min {min_elem_size} bytes/element)"
+                            ),
+                        });
+                    }
+                    let count = count_u64 as usize; // safe: bounded by `remaining`, itself a usize
+                    (count, count.min(4096))
+                }
+                // Remaining length is unknown (e.g. a network stream that
+                // has not hit EOF): don't reject on count alone — large
+                // legitimate arrays exist (a 150k-250k entry tokenizer
+                // vocabulary). Instead cap it against a generous hard
+                // ceiling and, crucially, don't preallocate that much
+                // capacity; a truncated/malicious stream fails fast on the
+                // next `read_exact` regardless.
+                None => {
+                    if count_u64 > ARRAY_COUNT_HARD_CEILING {
+                        return Err(GgufError::InvalidMetadata {
+                            key: "<array>".to_string(),
+                            reason: format!(
+                                "array count {count_u64} exceeds the hard ceiling of {ARRAY_COUNT_HARD_CEILING} (stream length unknown)"
+                            ),
+                        });
+                    }
+                    let count = count_u64 as usize; // safe: bounded by the u64 ceiling above
+                    (count, count.min(64))
+                }
+            };
+
+            let mut elements = Vec::with_capacity(prealloc_cap);
             for _ in 0..count {
-                elements.push(read_metadata_value(src, elem_type, version)?);
+                elements.push(read_metadata_value(src, elem_type, version, depth + 1)?);
             }
             Ok(MetadataValue::Array(elements))
         }
@@ -323,6 +474,14 @@ where
         let name = read_string_versioned(src, version)?;
 
         let n_dims = read_u32_le(src)?;
+        if n_dims == 0 || n_dims > MAX_TENSOR_DIMS {
+            return Err(GgufError::IntegrityError {
+                tensor_name: name,
+                reason: format!(
+                    "tensor declares {n_dims} dimensions, expected 1..={MAX_TENSOR_DIMS}"
+                ),
+            });
+        }
 
         let mut dimensions = Vec::with_capacity(n_dims as usize);
         for _ in 0..n_dims {
@@ -344,12 +503,19 @@ where
             read_u32_le(src)? as u64
         };
 
-        store.insert(TensorInfo {
+        store.try_insert(TensorInfo {
             name,
             n_dims,
             dimensions,
             tensor_type,
             offset,
+        })?;
+    }
+
+    if store.len() as u64 != count {
+        return Err(GgufError::IntegrityError {
+            tensor_name: "<tensor_infos>".to_string(),
+            reason: format!("expected {count} tensors, parsed {}", store.len()),
         });
     }
 
@@ -384,10 +550,15 @@ pub fn align_up(value: u64, alignment: u64) -> u64 {
     }
     let rem = value % alignment;
     if rem == 0 {
-        value
-    } else {
-        value + alignment - rem
+        return value;
     }
+    // See `parser.rs::align_up` for why this is `checked_add` rather than
+    // the original `value + alignment - rem` (which overflows `u64` for
+    // large, attacker-controlled `alignment`). This function is publicly
+    // exported, so it stays panic-free regardless of what callers outside
+    // this crate's own validated parse path pass in.
+    let pad = alignment - rem;
+    value.saturating_add(pad)
 }
 
 /// Parse a complete GGUF file from any [`Source`].
@@ -408,6 +579,7 @@ where
         .get("general.alignment")
         .and_then(|v| v.as_u64())
         .unwrap_or(GGUF_DEFAULT_ALIGNMENT);
+    validate_alignment(alignment)?;
 
     let mut tensors = read_tensor_infos(src, header.tensor_count, header.version)?;
 
@@ -634,5 +806,157 @@ mod tests {
     #[test]
     fn align_up_zero_alignment() {
         assert_eq!(align_up(17, 0), 17);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Vulnerability regression tests (V1-V6) — Source-generic parse path.
+    // Mirrors parser.rs's regression tests; see that module for the full
+    // rationale behind each one.
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn build_nested_array_kv_gguf(nesting: usize) -> Vec<u8> {
+        let mut data = build_minimal_v3_header(0, 1);
+        write_string_v3(&mut data, "deep");
+        data.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+        for _ in 0..nesting {
+            data.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+            data.extend_from_slice(&1u64.to_le_bytes());
+        }
+        data.extend_from_slice(&(GgufValueType::Uint8 as u32).to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn test_v2_moderate_nested_array_depth_rejected() {
+        let data = build_nested_array_kv_gguf(20);
+        let mut src = SliceSource::new(&data);
+        let err = parse_gguf(&mut src).expect_err("nesting beyond the depth limit must error");
+        assert!(matches!(err, GgufError::InvalidMetadata { .. }));
+    }
+
+    #[test]
+    fn test_v2_shallow_nested_array_still_parses() {
+        let data = build_nested_array_kv_gguf(3);
+        let mut src = SliceSource::new(&data);
+        let result = parse_gguf(&mut src).expect("shallow nesting must still parse");
+        assert!(result.metadata.get("deep").is_some());
+    }
+
+    /// Exact-repro regression matching the auditor's ~2.4 MB / 200,000-level
+    /// file; see `parser.rs`'s identical test for the full rationale.
+    #[test]
+    fn test_v2_deeply_nested_array_200k_levels_does_not_abort() {
+        let data = build_nested_array_kv_gguf(200_000);
+        assert!(data.len() > 2_000_000);
+        let mut src = SliceSource::new(&data);
+        let err =
+            parse_gguf(&mut src).expect_err("200,000 levels of nesting must be rejected fast");
+        assert!(matches!(err, GgufError::InvalidMetadata { .. }));
+    }
+
+    #[test]
+    fn test_v4_n_dims_exceeds_max_rejected() {
+        let mut data = build_minimal_v3_header(1, 0);
+        write_string_v3(&mut data, "w");
+        data.extend_from_slice(&5u32.to_le_bytes()); // n_dims = 5, exceeds the cap of 4
+        for _ in 0..5 {
+            data.extend_from_slice(&2u64.to_le_bytes());
+        }
+        data.extend_from_slice(&(GgufTensorType::F32 as u32).to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut src = SliceSource::new(&data);
+        let err = parse_gguf(&mut src).expect_err("n_dims > 4 must be rejected");
+        assert!(matches!(err, GgufError::IntegrityError { .. }));
+    }
+
+    #[test]
+    fn test_v4_n_dims_zero_rejected() {
+        let mut data = build_minimal_v3_header(1, 0);
+        write_string_v3(&mut data, "w");
+        data.extend_from_slice(&0u32.to_le_bytes()); // n_dims = 0
+        data.extend_from_slice(&(GgufTensorType::F32 as u32).to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut src = SliceSource::new(&data);
+        let err = parse_gguf(&mut src).expect_err("n_dims == 0 must be rejected");
+        assert!(matches!(err, GgufError::IntegrityError { .. }));
+    }
+
+    /// V4 allocation-bomb defused by construction: the dimension count
+    /// check runs *before* `Vec::with_capacity(n_dims as usize)`, so an
+    /// absurd `n_dims` (which would otherwise request billions of `u64`
+    /// slots from 4 bytes of input) never reaches the allocator at all.
+    /// Deliberately not exercised with the true `u32::MAX` value here — see
+    /// the task report for why that specific case was reasoned about
+    /// rather than empirically reproduced in this sandbox.
+    #[test]
+    fn test_v4_n_dims_huge_rejected_before_allocating() {
+        let mut data = build_minimal_v3_header(1, 0);
+        write_string_v3(&mut data, "w");
+        data.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // n_dims = u32::MAX
+                                                               // No further bytes — if the fix didn't run before allocating, the
+                                                               // huge `Vec::with_capacity` attempt would come first anyway.
+
+        let mut src = SliceSource::new(&data);
+        let err = parse_gguf(&mut src).expect_err("must reject before attempting to allocate");
+        assert!(matches!(err, GgufError::IntegrityError { .. }));
+    }
+
+    /// V4 string-length allocation-bomb: a length wildly exceeding the
+    /// source's known remaining bytes must be rejected immediately via
+    /// `remaining_hint()`, never handed to `bytes.resize(len, 0)`.
+    #[test]
+    fn test_v4_string_length_exceeding_remaining_rejected() {
+        let mut data = build_minimal_v3_header(0, 1);
+        data.extend_from_slice(&10_000_000u64.to_le_bytes()); // declared key length: 10 MB
+        data.extend_from_slice(b"tiny"); // actual remaining bytes: nowhere close
+
+        let mut src = SliceSource::new(&data);
+        let err =
+            parse_gguf(&mut src).expect_err("oversized length vs. known remaining must error");
+        assert!(matches!(err, GgufError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn test_v6_duplicate_tensor_names_rejected() {
+        let mut data = build_minimal_v3_header(2, 0);
+        for offset in [0u64, 4u64] {
+            write_string_v3(&mut data, "x");
+            data.extend_from_slice(&1u32.to_le_bytes());
+            data.extend_from_slice(&1u64.to_le_bytes());
+            data.extend_from_slice(&(GgufTensorType::F32 as u32).to_le_bytes());
+            data.extend_from_slice(&offset.to_le_bytes());
+        }
+
+        let mut src = SliceSource::new(&data);
+        let err = parse_gguf(&mut src).expect_err("duplicate tensor name must be rejected");
+        assert!(matches!(err, GgufError::IntegrityError { .. }));
+    }
+
+    #[test]
+    fn test_alignment_overflow_value_rejected_not_panicking() {
+        let mut data = build_minimal_v3_header(0, 1);
+        write_string_v3(&mut data, "general.alignment");
+        data.extend_from_slice(&(GgufValueType::Uint64 as u32).to_le_bytes());
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+
+        let mut src = SliceSource::new(&data);
+        let err = parse_gguf(&mut src)
+            .expect_err("astronomically large alignment must be rejected, not panic");
+        assert!(matches!(err, GgufError::InvalidMetadata { .. }));
+    }
+
+    #[test]
+    fn test_alignment_non_power_of_two_rejected() {
+        let mut data = build_minimal_v3_header(0, 1);
+        write_string_v3(&mut data, "general.alignment");
+        data.extend_from_slice(&(GgufValueType::Uint64 as u32).to_le_bytes());
+        data.extend_from_slice(&3u64.to_le_bytes());
+
+        let mut src = SliceSource::new(&data);
+        let err = parse_gguf(&mut src).expect_err("non-power-of-two alignment must be rejected");
+        assert!(matches!(err, GgufError::InvalidMetadata { .. }));
     }
 }

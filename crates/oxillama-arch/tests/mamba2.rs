@@ -9,7 +9,8 @@
 mod mamba2_tests {
     use oxillama_arch::common::rms_norm::RmsNorm;
     use oxillama_arch::error::ArchResult;
-    use oxillama_arch::mamba2::model::{build_mamba2_model, make_zero_mamba2_layer, Mamba2Config};
+    use oxillama_arch::mamba2::model::{build_mamba2_model, make_zero_mamba2_layer};
+    use oxillama_arch::mamba2::Mamba2Config;
     use oxillama_arch::registry::ArchitectureRegistry;
     use oxillama_arch::traits::{ForwardPass, KvCacheAccess};
 
@@ -31,61 +32,50 @@ mod mamba2_tests {
         fn advance(&mut self) {}
     }
 
-    /// Dimensions (small but structurally valid):
-    ///   d_model=16, d_state=8, expand=1 → d_inner=16, d_conv=4, n_layer=2, vocab=64
-    fn build_mamba2_test_model() -> impl ForwardPass {
-        const D_MODEL: usize = 16;
-        const D_STATE: usize = 8;
-        const D_CONV: usize = 4;
-        const EXPAND: usize = 1;
-        const N_LAYER: usize = 2;
-        const VOCAB: usize = 64;
-        const MAX_SEQ: usize = 256;
+    /// Dimensions (small but structurally valid), matching llama.cpp's Mamba-2
+    /// shape rules: d_inner = 2 * d_model, head_dim = d_inner / n_head,
+    /// n_head % n_group == 0.
+    ///
+    ///   d_model=16, d_inner=32, d_state=8, d_conv=4, n_head=4, n_group=2,
+    ///   n_layer=2, vocab=64
+    const D_MODEL: usize = 16;
+    const D_INNER: usize = 32;
+    const D_STATE: usize = 8;
+    const D_CONV: usize = 4;
+    const N_HEAD: usize = 4;
+    const N_GROUP: usize = 2;
+    const N_LAYER: usize = 2;
+    const VOCAB: usize = 64;
+    const MAX_SEQ: usize = 256;
 
-        let cfg = Mamba2Config {
+    fn test_config() -> Mamba2Config {
+        Mamba2Config {
             d_model: D_MODEL,
             n_layer: N_LAYER,
+            d_inner: D_INNER,
             d_state: D_STATE,
             d_conv: D_CONV,
-            expand: EXPAND,
+            n_head: N_HEAD,
+            n_group: N_GROUP,
             vocab_size: VOCAB,
             max_seq_len: MAX_SEQ,
-        };
-
-        let token_embd = vec![0.0f32; VOCAB * D_MODEL];
-        let layers = (0..N_LAYER).map(|_| make_zero_mamba2_layer(&cfg)).collect();
-        let output_norm = RmsNorm::new(vec![1.0f32; D_MODEL], 1e-5);
-        let lm_head = vec![0.0f32; VOCAB * D_MODEL];
-
-        build_mamba2_model(cfg, token_embd, layers, output_norm, lm_head)
+            rms_norm_eps: 1e-5,
+        }
     }
 
-    /// For the reset-roundtrip test we need direct access to `Mamba2Model::reset_state`.
-    fn build_mamba2_concrete_model() -> oxillama_arch::mamba2::model::Mamba2Model {
-        const D_MODEL: usize = 16;
-        const D_STATE: usize = 8;
-        const D_CONV: usize = 4;
-        const EXPAND: usize = 1;
-        const N_LAYER: usize = 2;
-        const VOCAB: usize = 64;
-        const MAX_SEQ: usize = 256;
-
-        let cfg = Mamba2Config {
-            d_model: D_MODEL,
-            n_layer: N_LAYER,
-            d_state: D_STATE,
-            d_conv: D_CONV,
-            expand: EXPAND,
-            vocab_size: VOCAB,
-            max_seq_len: MAX_SEQ,
-        };
-
+    fn build_mamba2_concrete_model() -> oxillama_arch::mamba2::Mamba2Model {
+        let cfg = test_config();
         let token_embd = vec![0.0f32; VOCAB * D_MODEL];
         let layers = (0..N_LAYER).map(|_| make_zero_mamba2_layer(&cfg)).collect();
         let output_norm = RmsNorm::new(vec![1.0f32; D_MODEL], 1e-5);
         let lm_head = vec![0.0f32; VOCAB * D_MODEL];
 
         build_mamba2_model(cfg, token_embd, layers, output_norm, lm_head)
+            .expect("test model must build")
+    }
+
+    fn build_mamba2_test_model() -> impl ForwardPass {
+        build_mamba2_concrete_model()
     }
 
     /// Mamba-2 is registered in the architecture registry under "mamba2".
@@ -160,7 +150,7 @@ mod mamba2_tests {
             "h must be non-zero before reset"
         );
 
-        // Reset clears hidden states AND position counter.
+        // Reset clears hidden states, conv rings AND the position counter.
         model.reset_state();
 
         assert_eq!(

@@ -10,14 +10,17 @@
 //!
 //! ```sh
 //! # Criterion mode (writes HTML report to target/criterion/)
-//! cargo bench --bench long_context --features bench
+//! cargo bench -p oxillama-bench --bench long_context
 //!
 //! # CI / compile-time sanity (--test skips actual timing)
-//! cargo bench --bench long_context --features bench -- --test
+//! cargo bench -p oxillama-bench --bench long_context -- --test
 //!
 //! # Print summary table
-//! OXILLAMA_BENCH_PRINT_TABLE=1 cargo bench --bench long_context --features bench
+//! OXILLAMA_BENCH_PRINT_TABLE=1 cargo bench -p oxillama-bench --bench long_context
 //! ```
+//!
+//! (`oxillama-bench` has no `[features]` table — earlier revisions of this
+//! doc comment referenced a nonexistent `--features bench` flag.)
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use oxillama_bench::{default_ctx_lengths, LongContextSweep, PrefillDecodeBench};

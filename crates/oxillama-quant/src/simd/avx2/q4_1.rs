@@ -80,7 +80,7 @@ impl QuantKernel for Q4_1Avx2 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row and block bounds are checked above.
             // CPU avx2+fma support is guaranteed by KernelDispatcher.
@@ -92,7 +92,7 @@ impl QuantKernel for Q4_1Avx2 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -158,10 +158,11 @@ unsafe fn dequant_block_avx2(block: &[u8], output: &mut [f32]) {
     let lo_bytes = _mm_and_si128(raw, mask_lo); // low nibbles per byte
     let hi_bytes = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo); // high nibbles per byte
 
-    // Interleave: first16 = [lo0,hi0,lo1,hi1,...,lo7,hi7]  (weights 0-15)
-    //             last16  = [lo8,hi8,...,lo15,hi15]         (weights 16-31)
-    let first16 = _mm_unpacklo_epi8(lo_bytes, hi_bytes);
-    let last16 = _mm_unpackhi_epi8(lo_bytes, hi_bytes);
+    // GGML's split-half layout: the 16 low nibbles *are* weights 0..16 and the
+    // 16 high nibbles *are* weights 16..32, already in byte order — no
+    // `_mm_unpacklo_epi8` / `_mm_unpackhi_epi8` interleave is needed.
+    let first16 = lo_bytes; // weights 0..16
+    let last16 = hi_bytes; // weights 16..32
 
     // Convert u8→i32→f32 in four groups of 8, scale by d, add m.
     // Groups: first16[0..8], first16[8..16], last16[0..8], last16[8..16]
@@ -209,7 +210,8 @@ unsafe fn gemv_row_avx2(
     n_cols: usize,
 ) -> f32 {
     let mut row_sum = _mm256_setzero_ps();
-    let mut m_sum = _mm256_setzero_ps(); // accumulates input values for m adjustment
+    let mut m_sum = _mm256_setzero_ps(); // accumulates m * input for the affine term
+    let mut tail_sum = 0.0f32; // scalar accumulator for partial trailing blocks
 
     for blk in 0..blocks_per_row {
         let block_offset = blk * BLOCK_BYTES;
@@ -232,8 +234,9 @@ unsafe fn gemv_row_avx2(
         let lo_bytes = _mm_and_si128(raw, mask_lo);
         let hi_bytes = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo);
 
-        let first16 = _mm_unpacklo_epi8(lo_bytes, hi_bytes);
-        let last16 = _mm_unpackhi_epi8(lo_bytes, hi_bytes);
+        // Split-half layout — see `dequant_block_avx2`.
+        let first16 = lo_bytes; // weights 0..16
+        let last16 = hi_bytes; // weights 16..32
 
         let remaining = n_cols.saturating_sub(input_offset);
 
@@ -285,18 +288,17 @@ unsafe fn gemv_row_avx2(
             _mm256_storeu_ps(partial_ptr.add(16), c_f32);
             _mm256_storeu_ps(partial_ptr.add(24), d_f32);
 
-            let mut scalar_sum = 0.0f32;
-            for j in 0..remaining {
-                let w = partial[j];
-                scalar_sum += (d * w + m) * input[input_offset + j];
+            for (j, &w) in partial.iter().take(remaining).enumerate() {
+                tail_sum += (d * w + m) * input[input_offset + j];
             }
-            row_sum = _mm256_add_ps(row_sum, _mm256_set1_ps(scalar_sum));
         }
     }
 
-    // m_sum already holds the m * input contributions — they were accumulated above.
-    // row_sum holds the nibble*d*input contributions + m*input contributions.
-    hsum_f32_avx(row_sum)
+    // `row_sum` holds the Σ d·q·x terms and `m_sum` the Σ m·x terms; both must
+    // be summed.  `tail_sum` is already a scalar, so it is added after the
+    // horizontal reduction rather than broadcast into the vector (broadcasting
+    // would have counted it once per lane).
+    hsum_f32_avx(_mm256_add_ps(row_sum, m_sum)) + tail_sum
 }
 
 // ---------------------------------------------------------------------------
@@ -359,9 +361,23 @@ mod tests {
         }
     }
 
+    /// Pins ggml's **split-half** nibble order: `qs[i] & 0x0F` is weight `i`
+    /// and `qs[i] >> 4` is weight `i + 16` — not the interleaved
+    /// `lo → 2i, hi → 2i+1` reading.
+    ///
+    /// This test previously asserted the interleaved order (`output[1] == 7`)
+    /// and had been failing ever since the layouts were realigned with GGML.
+    /// Nothing caught it because it is `cfg(target_arch = "x86_64")` and this
+    /// workspace is developed on aarch64, so it was never *executed* — it
+    /// surfaced the first time the suite was run for `x86_64-apple-darwin`
+    /// (see `tests/avx512_fused_goldens.rs`, whose negative control exists to
+    /// stop exactly this reading from creeping back in).  `reference::Q4_1Ref`
+    /// and `ggml_vec_dot_q4_1_q8_1_generic` both use split-half; the kernel was
+    /// right and the expectation was wrong.
     #[test]
     fn test_dequant_nibble_ordering() {
-        // lo nibble of byte 0 = 3, hi nibble of byte 0 = 7
+        // make_block packs nibbles[2i] as the low nibble of byte i and
+        // nibbles[2i+1] as its high nibble, so byte 0 = 3 | (7 << 4).
         let mut nibbles = [0u8; 32];
         nibbles[0] = 3;
         nibbles[1] = 7;
@@ -369,8 +385,12 @@ mod tests {
         let mut output = [0.0f32; BLOCK_SIZE];
         let kernel = Q4_1Avx2;
         kernel.dequant_block(&block, &mut output).unwrap();
+        // Low nibble of byte 0 -> weight 0.
         assert!((output[0] - 3.0).abs() < 1e-4, "output[0]={}", output[0]);
-        assert!((output[1] - 7.0).abs() < 1e-4, "output[1]={}", output[1]);
+        // High nibble of byte 0 -> weight 16, NOT weight 1.
+        assert!((output[16] - 7.0).abs() < 1e-4, "output[16]={}", output[16]);
+        // Weight 1 is the low nibble of byte 1, which is zero here.
+        assert!((output[1]).abs() < 1e-4, "output[1]={}", output[1]);
     }
 
     #[test]

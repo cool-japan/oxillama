@@ -1,17 +1,45 @@
 //! Sampling strategies for next-token selection.
 //!
 //! Supports greedy, top-k, top-p (nucleus), min-p, temperature scaling,
-//! repetition penalty, Mirostat v2, and GBNF grammar-constrained sampling.
+//! repetition/frequency/presence penalties, DRY, XTC, typical-P, top-A,
+//! eta-cutoff, Mirostat v1/v2, and GBNF grammar-constrained sampling.
+//!
+//! # Pipeline (defect S3 / S4)
+//!
+//! [`Sampler::sample`] routes through two [`chain::SamplerChain`]s built
+//! once at construction (not rebuilt per token — see defect S6):
+//!
+//! 1. **Pre-grammar**: logit-bias/bans → repetition penalty (+ frequency /
+//!    presence) → DRY.
+//! 2. **Grammar mask** (if a grammar is configured) — applied directly by
+//!    `Sampler`, not as a stage, since it needs the live, per-call
+//!    [`grammar::GrammarState`] rather than static config.
+//! 3. **Greedy shortcut**: if `temperature <= 0.0 || top_k == 1`, return the
+//!    argmax immediately (matches llama.cpp and avoids the cost of the
+//!    remaining stages entirely).
+//! 4. **Post-grammar**: top-K → typical-P → top-P → min-P → top-A →
+//!    eta-cutoff → XTC → temperature → final selection. This order matches
+//!    llama.cpp's reference chain (`top_k → typ_p → top_p → min_p → xtc →
+//!    temp → dist`), where truncation happens on the *untempered*
+//!    distribution — see defect S4.
+//!
+//! Mirostat v1/v2 (`mirostat: 1 | 2`) bypass step 4 entirely and instead run
+//! their own adaptive-perplexity selection (see `mirostat`).
 
 pub mod advanced;
 pub mod chain;
 pub mod grammar;
+mod mirostat;
+pub mod rng;
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{RuntimeError, RuntimeResult};
+use chain::SamplerChain;
 use grammar::{apply_grammar_mask, Grammar, GrammarState};
+use rng::Xorshift64;
 
 /// Configuration for the sampling strategy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,7 +58,7 @@ pub struct SamplerConfig {
     pub repetition_penalty_window: usize,
     /// Random seed for reproducible sampling (None = random).
     pub seed: Option<u64>,
-    /// Mirostat mode: 0 = disabled, 2 = Mirostat v2.
+    /// Mirostat mode: 0 = disabled, 1 = Mirostat v1, 2 = Mirostat v2.
     pub mirostat: u8,
     /// Mirostat target surprise (tau). Controls coherence vs diversity.
     /// Lower = more coherent, higher = more diverse. Default: 5.0.
@@ -49,6 +77,19 @@ pub struct SamplerConfig {
     #[serde(skip)]
     #[allow(clippy::type_complexity)]
     pub token_vocab: Option<Arc<Vec<(u32, Vec<u8>)>>>,
+
+    /// End-of-generation token IDs (e.g. `</s>`, `<|im_end|>`, `<|endoftext|>`)
+    /// consulted by grammar-constrained sampling.
+    ///
+    /// When a grammar is configured and its parse state becomes complete
+    /// (`GrammarState::is_complete()`), these tokens are exempted from
+    /// grammar masking so the model can actually terminate generation.
+    /// Without this, every logit — including the caller's EOS token —
+    /// would be masked once the grammar is satisfied (defect S1). Populate
+    /// from the tokenizer's EOS/EOG token(s). Ignored when `grammar` is
+    /// `None`.
+    #[serde(default)]
+    pub eog_token_ids: Vec<u32>,
 
     /// Per-token logit biases applied before top-k/top-p.
     ///
@@ -120,6 +161,21 @@ pub struct SamplerConfig {
     /// Epsilon hard-floor probability used together with `eta_cutoff` (0.0 = no floor).
     #[serde(default)]
     pub epsilon_cutoff: f32,
+
+    /// OpenAI-style frequency penalty: `logit[t] -= count(t) * frequency_penalty`.
+    ///
+    /// Applied once per *distinct* token in the repetition-penalty window,
+    /// scaled by how many times it occurred (0.0 = disabled). Unlike
+    /// `repetition_penalty` (multiplicative), this is additive and matches
+    /// the OpenAI / llama.cpp `frequency_penalty` semantics.
+    #[serde(default)]
+    pub frequency_penalty: f32,
+
+    /// OpenAI-style presence penalty: a flat `logit[t] -= presence_penalty`
+    /// for every distinct token that appeared at least once in the window,
+    /// regardless of how many times (0.0 = disabled).
+    #[serde(default)]
+    pub presence_penalty: f32,
 }
 
 // Default-value helpers for serde.
@@ -151,6 +207,7 @@ impl Default for SamplerConfig {
             mirostat_eta: 0.1,
             grammar: None,
             token_vocab: None,
+            eog_token_ids: Vec::new(),
             logit_bias: std::collections::HashMap::new(),
             banned_tokens: Vec::new(),
             // Advanced stages (disabled by default)
@@ -163,6 +220,8 @@ impl Default for SamplerConfig {
             top_a: 0.0,
             eta_cutoff: 0.0,
             epsilon_cutoff: 0.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
         }
     }
 }
@@ -183,6 +242,7 @@ impl SamplerConfig {
             mirostat_eta: 0.1,
             grammar: None,
             token_vocab: None,
+            eog_token_ids: Vec::new(),
             logit_bias: std::collections::HashMap::new(),
             banned_tokens: Vec::new(),
             dry_multiplier: 0.0,
@@ -194,6 +254,8 @@ impl SamplerConfig {
             top_a: 0.0,
             eta_cutoff: 0.0,
             epsilon_cutoff: 0.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
         }
     }
 
@@ -212,6 +274,7 @@ impl SamplerConfig {
             seed: None,
             grammar: None,
             token_vocab: None,
+            eog_token_ids: Vec::new(),
             logit_bias: std::collections::HashMap::new(),
             banned_tokens: Vec::new(),
             dry_multiplier: 0.0,
@@ -223,6 +286,16 @@ impl SamplerConfig {
             top_a: 0.0,
             eta_cutoff: 0.0,
             epsilon_cutoff: 0.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+        }
+    }
+
+    /// Create a Mirostat v1 config with the given target surprise.
+    pub fn mirostat_v1(tau: f32, eta: f32) -> Self {
+        Self {
+            mirostat: 1,
+            ..Self::mirostat_v2(tau, eta)
         }
     }
 }
@@ -231,46 +304,80 @@ impl SamplerConfig {
 pub struct Sampler {
     config: SamplerConfig,
     rng: Xorshift64,
-    /// Mirostat v2 running estimate of surprise (mu).
+    /// Mirostat running estimate of surprise (mu), shared by v1 and v2.
     /// Initialized to 2 * tau, updated after each sample.
     mirostat_mu: f32,
     /// Current grammar parse state (None when no grammar is configured).
     grammar_state: Option<GrammarState>,
+    /// Stages that run before grammar masking (bias/bans, repetition +
+    /// frequency/presence penalty, DRY). Built once at construction —
+    /// see defect S6.
+    pre_grammar_chain: SamplerChain,
+    /// Stages that run after grammar masking (top-k, typical-p, top-p,
+    /// min-p, top-a, eta, xtc, temperature). Built once at construction.
+    post_grammar_chain: SamplerChain,
+    /// Reusable scratch buffer for the processed logit vector, avoiding a
+    /// fresh vocab-sized allocation on every call (defect S6).
+    scratch: Vec<f32>,
 }
 
 impl Sampler {
     /// Create a new sampler with the given config.
     pub fn new(config: SamplerConfig) -> Self {
-        let seed = config.seed.unwrap_or_else(|| {
-            // Use a time-based seed when no explicit seed is provided.
-            // This is deterministic enough for inference; not for crypto.
-            let mut s = 0x517cc1b727220a95u64;
-            // Mix in some bits from the stack address for entropy
-            s ^= (&s as *const u64 as u64).wrapping_mul(0x9e3779b97f4a7c15);
-            s ^ s.wrapping_shr(33)
-        });
+        let seed = config.seed.unwrap_or_else(rng::generate_seed);
         let mirostat_mu = 2.0 * config.mirostat_tau;
         let grammar_state = config.grammar.as_ref().map(|g| g.initial_state());
+        let (pre_grammar_chain, post_grammar_chain) = SamplerChain::split_from_config(&config);
         Self {
             config,
             rng: Xorshift64::new(seed),
             mirostat_mu,
             grammar_state,
+            pre_grammar_chain,
+            post_grammar_chain,
+            scratch: Vec::new(),
         }
     }
 
     /// Sample a token ID from logits.
+    ///
+    /// This is the infallible convenience wrapper around [`Sampler::try_sample`].
+    /// A genuinely degenerate distribution (every logit non-finite — e.g.
+    /// `banned_tokens` covers the entire vocabulary, or a grammar/EOG
+    /// misconfiguration) is logged and falls back to token 0 as a
+    /// last resort, documented explicitly rather than silently returned as
+    /// if it were a real selection (see defect S1's discussion of the old
+    /// `argmax` bug). Through the normal grammar path this should now be
+    /// unreachable, since [`grammar::apply_grammar_mask`] refuses to mask
+    /// the last surviving candidate.
     pub fn sample(&mut self, logits: &[f32], recent_tokens: &[u32]) -> u32 {
-        let token = if self.config.mirostat == 2 {
-            self.sample_mirostat_v2(logits, recent_tokens)
+        match self.try_sample(logits, recent_tokens) {
+            Ok(token) => token,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "sampler degenerated to a fully-masked distribution and fell back to token 0 -- \
+                     check banned_tokens / logit_bias / grammar+eog_token_ids configuration"
+                );
+                0
+            }
+        }
+    }
+
+    /// Sample a token ID from logits, surfacing a degenerate ("every logit
+    /// masked") distribution as an error instead of silently defaulting to
+    /// token 0.
+    pub fn try_sample(&mut self, logits: &[f32], recent_tokens: &[u32]) -> RuntimeResult<u32> {
+        if logits.is_empty() {
+            return Err(RuntimeError::SamplingError {
+                message: "empty logits vector".to_string(),
+            });
+        }
+
+        let token = if self.config.mirostat == 1 || self.config.mirostat == 2 {
+            self.sample_mirostat(logits, recent_tokens)
         } else {
-            sample_with_rng(
-                logits,
-                &self.config,
-                recent_tokens,
-                &mut self.rng,
-                self.grammar_state.as_ref(),
-            )
+            self.sample_standard(logits, recent_tokens)?
         };
 
         // Advance grammar state after token selection.
@@ -278,14 +385,111 @@ impl Sampler {
         if let Some(state) = &mut self.grammar_state {
             if let Some(vocab) = &self.config.token_vocab {
                 if let Ok(idx) = vocab.binary_search_by_key(&token, |&(id, _)| id) {
-                    let bytes = vocab[idx].1.clone();
                     // Silently ignore advance errors — the mask will catch a stuck state
                     // on the next step and -inf all invalid tokens.
-                    let _ = state.advance(&bytes);
+                    let _ = state.advance(&vocab[idx].1);
                 }
             }
         }
 
+        Ok(token)
+    }
+
+    /// Standard (non-mirostat) sampling pipeline — see the module docs for
+    /// the full stage order.
+    fn sample_standard(&mut self, logits: &[f32], recent_tokens: &[u32]) -> RuntimeResult<u32> {
+        self.scratch.clear();
+        self.scratch.extend_from_slice(logits);
+
+        self.pre_grammar_chain.apply_stages_external(
+            &mut self.scratch,
+            recent_tokens,
+            &mut self.rng,
+        );
+
+        if let (Some(state), Some(vocab)) = (&self.grammar_state, &self.config.token_vocab) {
+            apply_grammar_mask(
+                &mut self.scratch,
+                state,
+                vocab.as_ref(),
+                &self.config.eog_token_ids,
+            );
+        }
+
+        // Greedy shortcut — returns BEFORE any sort/softmax (defect S6).
+        if self.config.temperature <= 0.0 || self.config.top_k == 1 {
+            return rng::argmax(&self.scratch).ok_or_else(|| RuntimeError::SamplingError {
+                message:
+                    "no finite logits remain after masking (grammar / bans / logit_bias eliminated every candidate)"
+                        .to_string(),
+            });
+        }
+
+        self.post_grammar_chain.apply_stages_external(
+            &mut self.scratch,
+            recent_tokens,
+            &mut self.rng,
+        );
+
+        chain::select_token(&self.scratch, &mut self.rng).ok_or_else(|| {
+            RuntimeError::SamplingError {
+                message: "no finite logits remain after the sampling pipeline".to_string(),
+            }
+        })
+    }
+
+    /// Mirostat v1/v2 sampling.
+    ///
+    /// Adaptively controls the "surprise" of generated tokens to maintain
+    /// a target perplexity level (tau). This produces more coherent text
+    /// than fixed top-k/top-p by dynamically adjusting the token pool.
+    /// Mirostat always produces a valid token (it never needs the
+    /// `try_sample` error path — see [`mirostat`]'s module docs).
+    fn sample_mirostat(&mut self, logits: &[f32], recent_tokens: &[u32]) -> u32 {
+        self.scratch.clear();
+        self.scratch.extend_from_slice(logits);
+
+        self.pre_grammar_chain.apply_stages_external(
+            &mut self.scratch,
+            recent_tokens,
+            &mut self.rng,
+        );
+
+        if let (Some(state), Some(vocab)) = (&self.grammar_state, &self.config.token_vocab) {
+            apply_grammar_mask(
+                &mut self.scratch,
+                state,
+                vocab.as_ref(),
+                &self.config.eog_token_ids,
+            );
+        }
+
+        if self.config.temperature > 0.0 && self.config.temperature != 1.0 {
+            let inv_temp = 1.0 / self.config.temperature;
+            for val in &mut self.scratch {
+                *val *= inv_temp;
+            }
+        }
+
+        let mut mu = self.mirostat_mu;
+        let token = if self.config.mirostat == 1 {
+            mirostat::sample_v1(
+                &self.scratch,
+                &mut mu,
+                self.config.mirostat_tau,
+                self.config.mirostat_eta,
+                &mut self.rng,
+            )
+        } else {
+            mirostat::sample_v2(
+                &self.scratch,
+                &mut mu,
+                self.config.mirostat_tau,
+                self.config.mirostat_eta,
+                &mut self.rng,
+            )
+        };
+        self.mirostat_mu = mu;
         token
     }
 
@@ -299,112 +503,6 @@ impl Sampler {
         self.grammar_state
             .as_ref()
             .is_none_or(GrammarState::is_complete)
-    }
-
-    /// Mirostat v2 sampling.
-    ///
-    /// Adaptively controls the "surprise" of generated tokens to maintain
-    /// a target perplexity level (tau). This produces more coherent text
-    /// than fixed top-k/top-p by dynamically adjusting the token pool.
-    fn sample_mirostat_v2(&mut self, logits: &[f32], recent_tokens: &[u32]) -> u32 {
-        if logits.is_empty() {
-            return 0;
-        }
-
-        let mut processed = logits.to_vec();
-
-        // Step 0: Apply logit bias and banned tokens — same order as
-        // sample_with_rng so both code paths behave identically.
-        apply_logit_bias_and_banned_tokens(&mut processed, &self.config);
-
-        // Step 1: Apply repetition penalty
-        apply_repetition_penalty(&mut processed, &self.config, recent_tokens);
-
-        // Step 2: Apply grammar mask — BEFORE temperature and sorting.
-        // Grammar masking must happen before any filtering so the constraint
-        // is respected even in the greedy case.
-        if let (Some(state), Some(vocab)) = (&self.grammar_state, &self.config.token_vocab) {
-            apply_grammar_mask(&mut processed, state, vocab.as_ref());
-        }
-
-        // Step 3: Apply temperature
-        if self.config.temperature > 0.0 && self.config.temperature != 1.0 {
-            let inv_temp = 1.0 / self.config.temperature;
-            for val in &mut processed {
-                *val *= inv_temp;
-            }
-        }
-
-        // Build sorted candidates with probabilities
-        let mut candidates: Vec<(u32, f32)> = processed
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (i as u32, v))
-            .collect();
-        candidates
-            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Softmax to get probabilities
-        softmax_candidates(&mut candidates);
-
-        // Mirostat v2: filter tokens by surprise threshold
-        // surprise(token) = -log2(prob)
-        // Keep tokens where surprise <= mu
-        let mu = self.mirostat_mu;
-        candidates.retain(|&(_, p)| {
-            if p <= 0.0 {
-                return false;
-            }
-            let surprise = -p.log2();
-            surprise <= mu
-        });
-
-        // Fallback: if all tokens filtered, keep the top one
-        if candidates.is_empty() {
-            let token = argmax(&processed);
-            // Still update mu
-            let top_prob = softmax_single_max(&processed);
-            let surprise = if top_prob > 0.0 {
-                -top_prob.log2()
-            } else {
-                self.config.mirostat_tau
-            };
-            self.mirostat_mu =
-                mu - self.config.mirostat_eta * (surprise - self.config.mirostat_tau);
-            return token;
-        }
-
-        // Re-normalize
-        let total: f32 = candidates.iter().map(|(_, p)| p).sum();
-        if total > 0.0 && total != 1.0 {
-            for (_, p) in &mut candidates {
-                *p /= total;
-            }
-        }
-
-        // Sample from filtered candidates
-        let r = self.rng.next_f32();
-        let mut cumulative = 0.0f32;
-        let mut selected_idx = candidates[0].0;
-        let mut selected_prob = candidates[0].1 * total; // original probability
-        for &(idx, prob) in &candidates {
-            cumulative += prob;
-            if r < cumulative {
-                selected_idx = idx;
-                selected_prob = prob * total;
-                break;
-            }
-        }
-
-        // Update mu: mu' = mu - eta * (surprise - tau)
-        let surprise = if selected_prob > 0.0 {
-            -selected_prob.log2()
-        } else {
-            self.config.mirostat_tau
-        };
-        self.mirostat_mu = mu - self.config.mirostat_eta * (surprise - self.config.mirostat_tau);
-
-        selected_idx
     }
 
     /// Get a reference to the config.
@@ -433,7 +531,9 @@ impl Sampler {
 ///
 /// This is the stateless variant. Grammar state (if any in config) is ignored
 /// because there is no place to persist it between calls. Use [`Sampler`] for
-/// grammar-constrained generation.
+/// grammar-constrained generation. Mirostat mode, if configured, runs with a
+/// freshly-initialized `mu` on every call (also stateless) — for a
+/// persistent, meaningfully-adapting `mu`, use [`Sampler`].
 ///
 /// # Arguments
 /// * `logits` - Raw logits from the model (length = vocab_size).
@@ -451,254 +551,45 @@ pub fn sample(logits: &[f32], config: &SamplerConfig, recent_tokens: &[u32]) -> 
     // here — callers needing grammar must use `Sampler`.
     let seed = config.seed.unwrap_or(0xDEADBEEF_CAFEBABE);
     let mut rng = Xorshift64::new(seed);
-    sample_with_rng(logits, config, recent_tokens, &mut rng, None)
-}
 
-/// Core sampling implementation with explicit RNG and optional grammar state.
-fn sample_with_rng(
-    logits: &[f32],
-    config: &SamplerConfig,
-    recent_tokens: &[u32],
-    rng: &mut Xorshift64,
-    grammar_state: Option<&GrammarState>,
-) -> u32 {
-    if logits.is_empty() {
-        return 0;
+    let (pre_grammar_chain, post_grammar_chain) = SamplerChain::split_from_config(config);
+
+    let mut scratch = logits.to_vec();
+    pre_grammar_chain.apply_stages_external(&mut scratch, recent_tokens, &mut rng);
+
+    if config.mirostat == 1 || config.mirostat == 2 {
+        if config.temperature > 0.0 && config.temperature != 1.0 {
+            let inv_temp = 1.0 / config.temperature;
+            for v in &mut scratch {
+                *v *= inv_temp;
+            }
+        }
+        let mut mu = 2.0 * config.mirostat_tau;
+        return if config.mirostat == 1 {
+            mirostat::sample_v1(
+                &scratch,
+                &mut mu,
+                config.mirostat_tau,
+                config.mirostat_eta,
+                &mut rng,
+            )
+        } else {
+            mirostat::sample_v2(
+                &scratch,
+                &mut mu,
+                config.mirostat_tau,
+                config.mirostat_eta,
+                &mut rng,
+            )
+        };
     }
 
-    let mut processed = logits.to_vec();
-
-    // Step 0: Apply logit bias and banned tokens FIRST — before any other
-    // transformation so that bans are absolute and biases influence all
-    // downstream filtering steps (top-k, top-p, grammar masking, etc.).
-    apply_logit_bias_and_banned_tokens(&mut processed, config);
-
-    // Step 1: Apply repetition penalty
-    apply_repetition_penalty(&mut processed, config, recent_tokens);
-
-    // Step 2: Apply grammar mask — BEFORE the greedy shortcut.
-    // This ensures grammar constraints are enforced even at temperature=0.
-    if let (Some(state), Some(vocab)) = (grammar_state, &config.token_vocab) {
-        apply_grammar_mask(&mut processed, state, vocab.as_ref());
-    }
-
-    // Step 3: Greedy shortcut (after grammar mask)
     if config.temperature <= 0.0 || config.top_k == 1 {
-        return argmax(&processed);
+        return rng::argmax(&scratch).unwrap_or(0);
     }
 
-    // Step 4: Temperature scaling
-    if config.temperature != 1.0 {
-        let inv_temp = 1.0 / config.temperature;
-        for val in &mut processed {
-            *val *= inv_temp;
-        }
-    }
-
-    // Step 5: Build sorted (index, logit) candidates
-    let mut candidates: Vec<(u32, f32)> = processed
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| (i as u32, v))
-        .collect();
-    candidates.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Step 6: Top-K filtering
-    if config.top_k > 0 && config.top_k < candidates.len() {
-        candidates.truncate(config.top_k);
-    }
-
-    // Step 7: Softmax over remaining candidates
-    softmax_candidates(&mut candidates);
-
-    // Step 8: Min-P filtering (remove tokens with prob < min_p * max_prob)
-    if config.min_p > 0.0 && !candidates.is_empty() {
-        let max_prob = candidates[0].1; // already sorted descending by probability
-        let threshold = config.min_p * max_prob;
-        candidates.retain(|&(_, p)| p >= threshold);
-    }
-
-    // Step 9: Top-P (nucleus) filtering
-    if config.top_p < 1.0 && !candidates.is_empty() {
-        let mut cumulative = 0.0f32;
-        let mut cutoff = candidates.len();
-        for (i, &(_, prob)) in candidates.iter().enumerate() {
-            cumulative += prob;
-            if cumulative >= config.top_p {
-                cutoff = i + 1;
-                break;
-            }
-        }
-        candidates.truncate(cutoff);
-    }
-
-    // Step 10: Re-normalize after filtering
-    let total: f32 = candidates.iter().map(|(_, p)| p).sum();
-    if total > 0.0 && total != 1.0 {
-        for (_, p) in &mut candidates {
-            *p /= total;
-        }
-    }
-
-    // Step 11: Weighted random selection
-    if candidates.is_empty() {
-        return argmax(&processed);
-    }
-    if candidates.len() == 1 {
-        return candidates[0].0;
-    }
-
-    let r = rng.next_f32();
-    let mut cumulative = 0.0f32;
-    for &(idx, prob) in &candidates {
-        cumulative += prob;
-        if r < cumulative {
-            return idx;
-        }
-    }
-
-    // Fallback: return last candidate (rounding issues)
-    candidates.last().map(|&(idx, _)| idx).unwrap_or(0)
-}
-
-/// Apply logit bias and banned-token masking to logits in-place.
-///
-/// Processing order:
-/// 1. Banned tokens are set to `f32::NEG_INFINITY` unconditionally.
-/// 2. Logit biases are added to the surviving logits.
-///
-/// Both operations are applied before repetition penalty, grammar masking,
-/// and temperature / top-k / top-p filtering, so they influence all
-/// downstream steps.
-fn apply_logit_bias_and_banned_tokens(processed: &mut [f32], config: &SamplerConfig) {
-    // Step A: hard-ban tokens.
-    for &token in &config.banned_tokens {
-        let idx = token as usize;
-        if idx < processed.len() {
-            processed[idx] = f32::NEG_INFINITY;
-        }
-    }
-
-    // Step B: additive bias.
-    for (&token, &bias) in &config.logit_bias {
-        let idx = token as usize;
-        if idx < processed.len() {
-            // Do not modify already-banned tokens — a banned token must
-            // remain at -inf even if a positive bias is also specified.
-            if processed[idx].is_finite() {
-                processed[idx] += bias;
-            }
-        }
-    }
-}
-
-/// Apply repetition penalty to logits in-place.
-fn apply_repetition_penalty(processed: &mut [f32], config: &SamplerConfig, recent_tokens: &[u32]) {
-    if config.repetition_penalty == 1.0 || recent_tokens.is_empty() {
-        return;
-    }
-
-    let window_start = recent_tokens
-        .len()
-        .saturating_sub(config.repetition_penalty_window);
-    for &token in &recent_tokens[window_start..] {
-        let idx = token as usize;
-        if idx < processed.len() {
-            if processed[idx] > 0.0 {
-                processed[idx] /= config.repetition_penalty;
-            } else {
-                processed[idx] *= config.repetition_penalty;
-            }
-        }
-    }
-}
-
-/// Compute softmax over candidates in-place (replaces logits with probabilities).
-fn softmax_candidates(candidates: &mut [(u32, f32)]) {
-    if candidates.is_empty() {
-        return;
-    }
-
-    let max_logit = candidates
-        .iter()
-        .map(|(_, v)| *v)
-        .fold(f32::NEG_INFINITY, f32::max);
-
-    let mut sum = 0.0f32;
-    for (_, logit) in candidates.iter_mut() {
-        *logit = (*logit - max_logit).exp();
-        sum += *logit;
-    }
-
-    if sum > 0.0 {
-        for (_, prob) in candidates.iter_mut() {
-            *prob /= sum;
-        }
-    }
-}
-
-/// Compute the softmax probability of the maximum logit (for fallback).
-fn softmax_single_max(logits: &[f32]) -> f32 {
-    let max_val = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    let sum: f32 = logits.iter().map(|&v| (v - max_val).exp()).sum();
-    if sum > 0.0 {
-        1.0 / sum
-    } else {
-        0.0
-    }
-}
-
-/// Return the index of the maximum value.
-fn argmax(values: &[f32]) -> u32 {
-    let mut max_idx = 0u32;
-    let mut max_val = f32::NEG_INFINITY;
-    for (i, &v) in values.iter().enumerate() {
-        if v > max_val {
-            max_val = v;
-            max_idx = i as u32;
-        }
-    }
-    max_idx
-}
-
-/// Simple xorshift64 PRNG — fast, small, seedable, no dependencies.
-struct Xorshift64 {
-    state: u64,
-}
-
-impl Xorshift64 {
-    fn new(seed: u64) -> Self {
-        // Ensure non-zero state
-        Self {
-            state: if seed == 0 { 0x517cc1b727220a95 } else { seed },
-        }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
-    }
-
-    /// Generate a uniform f32 in [0, 1).
-    fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-    }
-
-    /// Return the raw internal state for snapshot/resume.
-    pub(crate) fn state_value(&self) -> u64 {
-        self.state
-    }
-
-    /// Reconstruct from a raw state value (for resume).
-    pub(crate) fn from_state_value(state: u64) -> Self {
-        Self {
-            state: if state == 0 { 1 } else { state },
-        }
-    }
+    post_grammar_chain.apply_stages_external(&mut scratch, recent_tokens, &mut rng);
+    chain::select_token(&scratch, &mut rng).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -856,15 +747,6 @@ mod tests {
     }
 
     #[test]
-    fn test_xorshift_range() {
-        let mut rng = Xorshift64::new(12345);
-        for _ in 0..10000 {
-            let v = rng.next_f32();
-            assert!((0.0..1.0).contains(&v), "RNG produced {v} outside [0, 1)");
-        }
-    }
-
-    #[test]
     fn test_mirostat_v2_basic() {
         // Mirostat v2 should produce valid tokens
         let logits = vec![3.0, 2.0, 1.0, 0.5, 0.1, -1.0, -2.0, -5.0];
@@ -941,14 +823,145 @@ mod tests {
         }
     }
 
+    // ── Mirostat v1 (defect S5) ────────────────────────────────────────────────
+
     #[test]
-    fn test_softmax_candidates_basic() {
-        let mut candidates = vec![(0, 0.0f32), (1, 0.0), (2, 0.0)];
-        softmax_candidates(&mut candidates);
-        // Equal logits → equal probabilities
-        for &(_, p) in &candidates {
-            assert!((p - 1.0 / 3.0).abs() < 0.01, "expected ~0.333, got {p}");
+    fn test_mirostat_v1_is_no_longer_silently_ignored() {
+        // Basic sanity check only: `mirostat: 1` must produce in-range
+        // tokens. NOTE this assertion alone cannot distinguish "v1 actually
+        // ran" from "silently fell through to standard sampling" — with
+        // `SamplerConfig::mirostat_v1`'s underlying `top_k=0, top_p=1.0,
+        // min_p=0.0`, unconstrained standard sampling would *also* produce
+        // in-range tokens every time. The real dispatch regression test is
+        // `test_mirostat_v1_actually_dispatches_not_falls_through` below,
+        // which checks a side effect standard sampling cannot produce.
+        let logits = vec![3.0, 2.0, 1.0, 0.5, 0.1, -1.0, -2.0, -5.0];
+        let config = SamplerConfig {
+            seed: Some(42),
+            ..SamplerConfig::mirostat_v1(5.0, 0.1)
+        };
+        let mut sampler = Sampler::new(config);
+        for _ in 0..50 {
+            let token = sampler.sample(&logits, &[]);
+            assert!((token as usize) < logits.len());
         }
+    }
+
+    /// Defect S5 regression (the actual dispatch bug): `mirostat: 1` used to
+    /// fall through to ordinary top-k/p/min-p sampling with no warning.
+    /// `mirostat_mu` is initialised to `2 * tau` and is *only* ever mutated
+    /// inside `sample_mirostat` (see `sample_mirostat`'s `self.mirostat_mu =
+    /// mu;`) — the standard pipeline never touches it. So if `mirostat: 1`
+    /// silently fell through to `sample_standard`, `mirostat_mu_value()`
+    /// would stay frozen at its initial value forever, which
+    /// `test_mirostat_v1_is_no_longer_silently_ignored` above cannot detect
+    /// but this test can.
+    #[test]
+    fn test_mirostat_v1_actually_dispatches_not_falls_through() {
+        let logits = vec![3.0, 2.0, 1.0, 0.5, 0.1, -1.0, -2.0, -5.0];
+        let config = SamplerConfig {
+            seed: Some(42),
+            ..SamplerConfig::mirostat_v1(5.0, 0.1)
+        };
+        let mut sampler = Sampler::new(config);
+        let initial_mu = sampler.mirostat_mu_value();
+        sampler.sample(&logits, &[]);
+        assert!(
+            (sampler.mirostat_mu_value() - initial_mu).abs() > 1e-6,
+            "mirostat_mu must adapt after sampling with mirostat=1; if it \
+             didn't move, `mirostat: 1` fell through to standard sampling \
+             instead of running the v1 algorithm (defect S5)"
+        );
+    }
+
+    #[test]
+    fn test_mirostat_v1_deterministic_with_seed() {
+        let logits = vec![2.0, 1.5, 1.0, 0.5, 0.2];
+        let config = SamplerConfig {
+            seed: Some(321),
+            ..SamplerConfig::mirostat_v1(5.0, 0.1)
+        };
+        let mut sampler1 = Sampler::new(config.clone());
+        let mut sampler2 = Sampler::new(config);
+        for _ in 0..20 {
+            assert_eq!(sampler1.sample(&logits, &[]), sampler2.sample(&logits, &[]));
+        }
+    }
+
+    // ── Frequency / presence penalties (defect S5) ───────────────────────────
+
+    #[test]
+    fn test_frequency_penalty_applied_via_sampler() {
+        // Token 1 repeats heavily in recent history; with a strong frequency
+        // penalty it must lose to token 2 despite a slightly lower raw logit.
+        //
+        // NOTE: `repetition_penalty_window` gates ALL THREE penalty kinds
+        // (classic repeat, frequency, presence) since they share one
+        // window (matches llama.cpp's single `penalty_last_n`).
+        // `SamplerConfig::greedy()` sets the window to 0 (appropriate when
+        // only the classic repeat penalty, which defaults to 1.0/off, is in
+        // play) -- tests that enable frequency/presence penalties on top of
+        // `greedy()` must override the window explicitly.
+        let logits = vec![1.0f32, 5.0, 4.9, 1.0];
+        let config = SamplerConfig {
+            temperature: 0.0,
+            frequency_penalty: 2.0,
+            repetition_penalty_window: 64,
+            ..SamplerConfig::greedy()
+        };
+        let token = sample(&logits, &config, &[1, 1, 1, 1]);
+        assert_eq!(
+            token, 2,
+            "heavy frequency penalty on token 1 should let token 2 win"
+        );
+    }
+
+    #[test]
+    fn test_presence_penalty_applied_via_sampler() {
+        let logits = vec![1.0f32, 5.0, 4.9, 1.0];
+        let config = SamplerConfig {
+            temperature: 0.0,
+            presence_penalty: 3.0,
+            repetition_penalty_window: 64,
+            ..SamplerConfig::greedy()
+        };
+        // Even a SINGLE occurrence should be enough for a flat presence
+        // penalty of 3.0 to flip the winner from token 1 (5.0) to token 2 (4.9).
+        let token = sample(&logits, &config, &[1]);
+        assert_eq!(
+            token, 2,
+            "presence penalty should fire on a single occurrence"
+        );
+    }
+
+    #[test]
+    fn test_default_config_zero_penalties_no_op() {
+        // Defaults must not change existing greedy behaviour.
+        let logits = vec![1.0f32, 5.0, 4.9, 1.0];
+        let token = sample(&logits, &SamplerConfig::greedy(), &[1, 1, 1]);
+        assert_eq!(
+            token, 1,
+            "no frequency/presence penalty configured -> token 1 still wins"
+        );
+    }
+
+    #[test]
+    fn test_select_token_handles_equal_logits() {
+        let logits = vec![0.0f32, 0.0, 0.0];
+        let mut rng = Xorshift64::new(1);
+        let selected = chain::select_token(&logits, &mut rng);
+        assert!(matches!(selected, Some(idx) if (idx as usize) < logits.len()));
+    }
+
+    #[test]
+    fn test_select_token_none_on_all_masked() {
+        let logits = vec![f32::NEG_INFINITY; 4];
+        let mut rng = Xorshift64::new(1);
+        assert_eq!(
+            chain::select_token(&logits, &mut rng),
+            None,
+            "select_token must report None (not silently pick 0) on a fully-masked input"
+        );
     }
 
     // ── Logit-bias / banned-tokens tests ──────────────────────────────────────
@@ -987,24 +1000,40 @@ mod tests {
     #[test]
     fn positive_bias_increases_token_probability() {
         // Token 1 starts with a very low logit; add a large positive bias.
-        // After bias, token 1 should dominate and be selected nearly always.
+        // After bias, token 1 should dominate. Exercised through the actual
+        // stochastic weighted-draw path (`chain::select_token`, temperature
+        // 1.0, top_k disabled) rather than the greedy shortcut, so this
+        // covers the real S6 code path.
+        //
+        // This also doubles as a regression test for the `select_token`
+        // open-interval draw fix: `select_token` walks candidates in raw
+        // vocab-index order (not sorted by probability, per S6), so with
+        // the old half-open `[0, 1)` draw, an RNG stream that ever produced
+        // exactly `r == 0.0` would make the *lowest-index* token with any
+        // nonzero probability mass win regardless of how astronomically
+        // small its true probability was. Seed 7's first `next_f32()` draw
+        // is exactly `0.0`, which used to make token 0 win here despite its
+        // softmax probability being effectively zero next to token 1's.
         let logits = vec![10.0f32, -20.0, -20.0, -20.0];
         let mut bias = std::collections::HashMap::new();
         bias.insert(1u32, 100.0f32); // huge positive bias on token 1
 
         let config = SamplerConfig {
             temperature: 1.0,
-            top_k: 0,
-            top_p: 1.0,
-            min_p: 0.0,
+            top_k: 0, // disable top-k filtering so the weighted draw actually runs
             seed: Some(7),
             logit_bias: bias,
-            ..SamplerConfig::default()
+            ..SamplerConfig::greedy()
         };
         let mut sampler = Sampler::new(config);
-        // With a +100 bias, token 1's effective logit = 80, far above token 0's 10.
+        // With a +100 bias, token 1's effective logit = 80, far above every
+        // other token's (~10 and ~-20): softmax probability of token 1 is
+        // within float epsilon of 1.0, so it must win the weighted draw too.
         let tok = sampler.sample(&logits, &[]);
-        assert_eq!(tok, 1, "large positive bias should make token 1 dominate");
+        assert_eq!(
+            tok, 1,
+            "large positive bias should make token 1 dominate even under stochastic sampling"
+        );
     }
 
     #[test]
@@ -1121,5 +1150,131 @@ mod tests {
         let mut state = g.initial_state();
         let result = state.advance(b"y");
         assert!(result.is_err(), "advancing with wrong bytes should error");
+    }
+
+    // ── Defect S1: grammar-complete EOG handling, end to end ─────────────────
+
+    #[test]
+    fn test_s1_grammar_complete_allows_eog_and_avoids_token_zero_loop() {
+        // Vocab: 0 = a non-EOG token that would otherwise win on raw logit
+        // value, 1 = "h", 2 = "i" (the grammar requires BOTH, one per step,
+        // so completion happens only after the second sample call), 3 = an
+        // EOG token that is NOT part of the grammar's literal alphabet.
+        let vocab: Vec<(u32, Vec<u8>)> = vec![
+            (0, b"zzz".to_vec()),
+            (1, b"h".to_vec()),
+            (2, b"i".to_vec()),
+            (3, b"<eos>".to_vec()),
+        ];
+        let g = Arc::new(Grammar::parse(r#"root ::= "h" "i""#).unwrap());
+        let config = SamplerConfig {
+            temperature: 0.0, // greedy -- exercises the exact argmax path from S1
+            grammar: Some(g),
+            token_vocab: Some(Arc::new(vocab)),
+            eog_token_ids: vec![3],
+            ..SamplerConfig::default()
+        };
+        let mut sampler = Sampler::new(config);
+
+        // Step 1: only "h" (token 1) is grammar-valid; token 0 has the
+        // highest raw logit but must lose to the grammar constraint.
+        let logits = vec![100.0f32, 1.0, 1.0, 1.0];
+        let tok1 = sampler.sample(&logits, &[]);
+        assert_eq!(
+            tok1, 1,
+            "grammar must force token 1 ('h') despite token 0's higher logit"
+        );
+        assert!(
+            !sampler.grammar_complete(),
+            "grammar should not be complete yet"
+        );
+
+        // Step 2: only "i" (token 2) is grammar-valid; completes the grammar.
+        let tok_mid = sampler.sample(&logits, &[1]);
+        assert_eq!(tok_mid, 2, "second token must be 'i' (id=2)");
+
+        // Step 3: grammar is now complete. Before the S1 fix, EVERY logit
+        // (including the EOG token) was masked to -inf here, and argmax's
+        // "return 0 on an all -inf vector" bug meant token 0 would be
+        // emitted regardless of its actual logit.
+        assert!(
+            sampler.grammar_complete(),
+            "grammar must be complete after 'h' + 'i'"
+        );
+        let tok2 = sampler.sample(&logits, &[1, 2]);
+        assert_eq!(
+            tok2, 3,
+            "once the grammar is complete, the configured EOG token must become selectable"
+        );
+
+        // Drive several more steps: token 0 must never be emitted just
+        // because the distribution degenerated to all -inf.
+        for _ in 0..10 {
+            let tok = sampler.sample(&logits, &[1, 2]);
+            assert_ne!(
+                tok, 0,
+                "token 0 must never be emitted as a silent fallback for a fully-masked distribution"
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_sample_errors_instead_of_silently_returning_zero() {
+        // Ban the entire vocabulary -- a genuinely unrecoverable
+        // configuration. `try_sample` must surface this as an error rather
+        // than `sample`'s documented last-resort fallback of token 0.
+        let logits = vec![1.0f32, 2.0, 3.0];
+        let config = SamplerConfig {
+            temperature: 0.0,
+            banned_tokens: vec![0, 1, 2],
+            ..SamplerConfig::greedy()
+        };
+        let mut sampler = Sampler::new(config);
+        let result = sampler.try_sample(&logits, &[]);
+        assert!(
+            result.is_err(),
+            "banning the entire vocabulary must surface as an error from try_sample"
+        );
+    }
+
+    // ── Defect S2: unseeded samplers must not collide ─────────────────────────
+
+    #[test]
+    fn test_unseeded_samplers_produce_different_rng_streams() {
+        let config = SamplerConfig::default(); // seed: None
+        let sampler_a = Sampler::new(config.clone());
+        let sampler_b = Sampler::new(config);
+        assert_ne!(
+            sampler_a.rng_state(),
+            sampler_b.rng_state(),
+            "two unseeded samplers constructed back-to-back must not draw the same seed"
+        );
+    }
+
+    #[test]
+    fn test_many_unseeded_samplers_all_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let sampler = Sampler::new(SamplerConfig::default());
+            assert!(
+                seen.insert(sampler.rng_state()),
+                "unseeded Sampler construction produced a duplicate RNG seed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_explicitly_seeded_sampler_still_reproducible() {
+        let config = SamplerConfig {
+            seed: Some(4242),
+            ..SamplerConfig::default()
+        };
+        let a = Sampler::new(config.clone());
+        let b = Sampler::new(config);
+        assert_eq!(
+            a.rng_state(),
+            b.rng_state(),
+            "an explicitly seeded sampler must remain fully reproducible"
+        );
     }
 }

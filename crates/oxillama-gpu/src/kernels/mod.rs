@@ -1,18 +1,24 @@
 //! Kernel registry — GPU-accelerated GEMV operations.
 //!
-//! The [`GpuKernel`] trait defines the interface for all GPU-backed tensor
-//! operations.  Two concrete implementations are provided:
+//! The [`GpuKernel`] trait defines the interface for the "dequantise on CPU,
+//! GEMV on GPU" implementations — one per supported quantisation format (24
+//! at last count; see [`crate::GpuDispatcher::get_kernel`] for the exact
+//! list), plus a fused-attention kernel, a tiled GEMM kernel, and a sampling
+//! kernel that don't fit the `GpuKernel` shape.
 //!
-//! - [`Q4_0GpuKernel`] — dequantises Q4_0 on the CPU then dispatches a pure
-//!   f32 GEMV compute shader on the GPU.
-//! - [`Q8_0GpuKernel`] — same pattern for Q8_0.
+//! [`q4_0_resident`] additionally provides a device-resident,
+//! in-shader-dequantising alternative to [`Q4_0GpuKernel`] for callers that
+//! can hold weights resident across many GEMV calls (i.e. every token during
+//! decode) — see its module doc for why that path exists and how it differs.
 //!
-//! When the `gpu` feature is disabled both types compile as zero-size structs
-//! whose `gemv` method always returns `GpuError::NoAdapter`.
+//! When the `gpu` feature is disabled every kernel type here compiles as a
+//! zero-size struct whose `gemv` method always returns `GpuError::NoAdapter`.
 
 pub mod batched_gemv;
 pub mod f16_accumulator;
 pub mod fused_attention;
+#[cfg(test)]
+mod golden_tests;
 pub mod iq1_m;
 pub mod iq1_s;
 pub mod iq1s_grid;
@@ -28,6 +34,7 @@ pub mod q1_0_g128;
 pub mod q2_k;
 pub mod q3_k;
 pub mod q4_0;
+pub mod q4_0_resident;
 pub mod q4_1;
 pub mod q4_k;
 pub mod q5_0;
@@ -62,6 +69,7 @@ pub use q1_0_g128::Q1_0_G128GpuKernel;
 pub use q2_k::Q2_KGpuKernel;
 pub use q3_k::Q3_KGpuKernel;
 pub use q4_0::Q4_0GpuKernel;
+pub use q4_0_resident::{gemv_q4_0_resident, Q4_0Resident};
 pub use q4_1::Q4_1GpuKernel;
 pub use q4_k::Q4_KGpuKernel;
 pub use q5_0::Q5_0GpuKernel;

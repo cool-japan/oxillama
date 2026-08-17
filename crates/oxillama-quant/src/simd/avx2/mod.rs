@@ -10,6 +10,8 @@
 //! available via [`std::arch::is_x86_feature_detected!`].
 
 #[cfg(all(feature = "simd-avx2", target_arch = "x86_64"))]
+mod int_dot;
+#[cfg(all(feature = "simd-avx2", target_arch = "x86_64"))]
 pub mod iq1_m;
 #[cfg(all(feature = "simd-avx2", target_arch = "x86_64"))]
 pub mod iq1_s;

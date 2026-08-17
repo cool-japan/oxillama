@@ -74,17 +74,23 @@ pub(crate) fn dequant_q4_0_to_f32(
             let scale_bits = u16::from_le_bytes([block[0], block[1]]);
             let d = half::f16::from_bits(scale_bits).to_f32();
 
+            // GGML packs Q4_0 in split halves, not interleaved pairs: byte `i`
+            // carries weight `i` in its low nibble and weight `i + 16` in its
+            // high nibble (see `dequantize_row_q4_0` in
+            // `llama.cpp/ggml/src/ggml-quants.c`, and the module doc on
+            // `oxillama_quant::reference::q4_0`).
             for i in 0..(Q4_0_BLOCK_SIZE / 2) {
                 let byte = block[2 + i];
                 let lo = (byte & 0x0F) as i32 - 8;
                 let hi = ((byte >> 4) & 0x0F) as i32 - 8;
 
-                let base_col = blk * Q4_0_BLOCK_SIZE + i * 2;
-                if base_col < cols {
-                    f32_weights[row * cols + base_col] = lo as f32 * d;
+                let col0 = blk * Q4_0_BLOCK_SIZE + i;
+                let col1 = col0 + 16;
+                if col0 < cols {
+                    f32_weights[row * cols + col0] = lo as f32 * d;
                 }
-                if base_col + 1 < cols {
-                    f32_weights[row * cols + base_col + 1] = hi as f32 * d;
+                if col1 < cols {
+                    f32_weights[row * cols + col1] = hi as f32 * d;
                 }
             }
         }
@@ -312,13 +318,16 @@ mod tests {
 
     #[test]
     fn test_dequant_q4_0_values() {
-        // First nibble: lo=0x0 → 0-8=-8, hi=0xF → 15-8=7. Scale=0.5.
+        // First nibble byte: lo=0x0 → 0-8=-8, hi=0xF → 15-8=7. Scale=0.5.
+        // Split-half layout: byte 0's low nibble is weight[0], high nibble is
+        // weight[0 + 16] — NOT weight[1] (that would be the interleaved
+        // layout GGML does not use; see `dequant_q4_0_to_f32`'s doc).
         let mut nibbles = [0x88u8; 16];
         nibbles[0] = 0xF0; // lo=0 (−8×0.5=−4), hi=F (7×0.5=3.5)
         let block = make_q4_0_block(0.5, &nibbles);
         let result = dequant_q4_0_to_f32(&block, 1, 32).expect("dequant");
         assert!((result[0] - (-4.0)).abs() < 0.01, "got {}", result[0]);
-        assert!((result[1] - 3.5).abs() < 0.01, "got {}", result[1]);
+        assert!((result[16] - 3.5).abs() < 0.01, "got {}", result[16]);
     }
 
     #[test]

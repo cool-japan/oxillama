@@ -1,16 +1,24 @@
 //! Quantization data types and tensor wrapper.
 
-use oxillama_gguf::GgufTensorType;
+use oxillama_gguf::{GgufTensorType, SharedBytes};
 
 /// A quantized tensor — raw block data plus shape and type metadata.
 ///
 /// The data is stored as raw bytes in the GGUF block format.
 /// Use a [`QuantKernel`](crate::traits::QuantKernel) to dequantize or
 /// perform fused operations.
+///
+/// `data` is a [`SharedBytes`] rather than a `Vec<u8>` so that a tensor loaded
+/// out of a memory-mapped GGUF file can *point at the mapping* instead of
+/// owning a private copy of it.  Every kernel reads the payload through a
+/// `&[u8]`, which `SharedBytes` derefs to, so nothing on the compute path
+/// notices; what changes is that loading a 2.38 GB checkpoint no longer
+/// duplicates 2.38 GB into anonymous memory.  Cloning a `QuantTensor` is
+/// consequently an `Arc` bump for the payload, not a memcpy.
 #[derive(Debug, Clone)]
 pub struct QuantTensor {
     /// Raw block data (packed quantized weights).
-    pub data: Vec<u8>,
+    pub data: SharedBytes,
     /// Tensor shape (e.g., [out_features, in_features] for a linear layer).
     pub shape: Vec<usize>,
     /// The GGUF quantization type.
@@ -18,8 +26,21 @@ pub struct QuantTensor {
 }
 
 impl QuantTensor {
-    /// Create a new quantized tensor.
+    /// Create a new quantized tensor that owns its block bytes.
     pub fn new(data: Vec<u8>, shape: Vec<usize>, tensor_type: GgufTensorType) -> Self {
+        Self {
+            data: SharedBytes::from_vec(data),
+            shape,
+            tensor_type,
+        }
+    }
+
+    /// Create a new quantized tensor over an already-shared payload.
+    ///
+    /// This is the copy-free constructor: pass the [`SharedBytes`] returned by
+    /// [`GgufModel::tensor_bytes`][oxillama_gguf::GgufModel::tensor_bytes] and
+    /// the weights stay wherever the loader put them.
+    pub fn from_shared(data: SharedBytes, shape: Vec<usize>, tensor_type: GgufTensorType) -> Self {
         Self {
             data,
             shape,

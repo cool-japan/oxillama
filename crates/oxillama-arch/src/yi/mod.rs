@@ -1,13 +1,37 @@
-//! Yi architecture.
+//! Yi architecture — a registry alias, **not** a GGUF architecture id.
 //!
-//! Dense decoder-only Transformer following the LLaMA topology with:
-//! - RMSNorm pre-normalization (no bias)
-//! - Grouped-query attention (GQA) from GGUF `yi.attention.head_count_kv`
-//! - RoPE positional embeddings
-//! - SwiGLU feed-forward network
-//! - Tied input/output embeddings
+//! Yi (01.AI) is dense decoder-only LLaMA topology: RMSNorm pre-normalisation,
+//! grouped-query attention, NORM-convention RoPE, SwiGLU FFN, optionally tied
+//! embeddings.
 //!
-//! GGUF `general.architecture` = `"yi"`.
+//! # `general.architecture` is never `"yi"`
+//!
+//! Verified against the reference checkout:
+//!
+//! * `gguf-py/gguf/constants.py` has **no** `MODEL_ARCH.YI`, and
+//!   `src/llama-arch.cpp`'s `LLM_ARCH_NAMES` has **no** `"yi"` entry — the id
+//!   does not exist in llama.cpp at all.
+//! * `convert_hf_to_gguf.py` never mentions Yi.  Yi checkpoints declare
+//!   `"architectures": ["LlamaForCausalLM"]` in their HF config, so they are
+//!   converted by `LlamaModel` (`model_arch = gguf.MODEL_ARCH.LLAMA`) and the
+//!   resulting GGUF says `general.architecture = "llama"`.
+//!
+//! A real Yi checkpoint therefore loads through
+//! `crate::llama::load_llama_from_gguf`, and this plugin can only be reached
+//! by an explicit `ArchitectureRegistry::get("yi")` — never by architecture
+//! dispatch.  `crate::registry` documents the same thing at its `register`
+//! call, and `crate::config::rope_style_for_arch` already lists `"yi"` under
+//! "registry aliases whose checkpoints ship as `llama`".
+//!
+//! # Why this is an error and not an implementation
+//!
+//! [`YiArchitecture::build`] used to return
+//! `MissingTensor { name: "token_embd.weight (use YiModel::from_gguf for full
+//! loading)" }`, pointing at a `YiModel` type that **did not exist anywhere in
+//! the tree**.  Building one would have produced a byte-for-byte duplicate of
+//! `crate::llama::LlamaModel` that no checkpoint can route to, so both entry
+//! points now return an accurate [`ArchError::NotSupported`] naming the `llama`
+//! path instead.
 
 mod model;
 
@@ -16,13 +40,31 @@ pub use model::YiArchitecture;
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::traits::{ForwardPass, ModelArchitecture, TensorNamePattern};
-use oxillama_gguf::TensorStore;
+use oxillama_gguf::{GgufModel, TensorStore};
+
+/// The message both entry points report, kept in one place.
+const UNREACHABLE_ARCH: &str = "architecture id 'yi' is not written by any GGUF converter: \
+     llama.cpp has no LLM_ARCH_YI and convert_hf_to_gguf.py has no Yi entry, so Yi checkpoints \
+     (HF `LlamaForCausalLM`) ship as general.architecture = \"llama\" and must be loaded through \
+     the llama path (`crate::llama::load_llama_from_gguf`). This registry entry exists only for \
+     an explicit `ArchitectureRegistry::get(\"yi\")` lookup";
 
 impl ModelArchitecture for YiArchitecture {
     fn arch_id(&self) -> &str {
         "yi"
     }
 
+    /// Always reports failure.
+    ///
+    /// The geometry checks run first so a genuinely malformed
+    /// [`ModelConfig`] is still reported as such; a well-formed one then gets
+    /// [`ArchError::NotSupported`] explaining that the id is unreachable.
+    ///
+    /// # Errors
+    ///
+    /// * [`ArchError::ConfigMismatch`] for a zero head count or hidden size.
+    /// * [`ArchError::NotSupported`] otherwise, explaining that real
+    ///   checkpoints load through the `llama` path.
     fn build(
         &self,
         config: &ModelConfig,
@@ -43,8 +85,27 @@ impl ModelArchitecture for YiArchitecture {
             });
         }
 
-        Err(ArchError::MissingTensor {
-            name: "token_embd.weight (use YiModel::from_gguf for full loading)".to_string(),
+        Err(ArchError::NotSupported {
+            detail: UNREACHABLE_ARCH.to_string(),
+        })
+    }
+
+    /// Also reports failure, with the same explanation.
+    ///
+    /// Overriding the default matters: without it the registry would report
+    /// the generic `"architecture 'yi' has not implemented build_from_gguf()"`,
+    /// which reads like an unfinished port rather than a deliberate alias.
+    ///
+    /// # Errors
+    ///
+    /// Always [`ArchError::NotSupported`].
+    fn build_from_gguf(
+        &self,
+        _model: &GgufModel,
+        _config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Err(ArchError::NotSupported {
+            detail: UNREACHABLE_ARCH.to_string(),
         })
     }
 
@@ -166,5 +227,52 @@ mod tests {
             registry.contains("yi"),
             "yi must be present in the default registry"
         );
+    }
+
+    /// Regression: `build()` used to point at `YiModel::from_gguf`, and no
+    /// `YiModel` existed anywhere in the tree.
+    #[test]
+    fn build_does_not_name_a_nonexistent_type() {
+        let arch = YiArchitecture::new();
+        let tensors = TensorStore::new();
+        let err = arch
+            .build(&make_config(), &tensors)
+            .err()
+            .expect("the `yi` arch id is unreachable and must never build");
+        match err {
+            ArchError::NotSupported { detail } => {
+                assert!(
+                    !detail.contains("YiModel"),
+                    "must not reference a type that does not exist: {detail}"
+                );
+                assert!(
+                    detail.contains("llama"),
+                    "must point the caller at the llama path: {detail}"
+                );
+            }
+            other => panic!("expected NotSupported, got {other}"),
+        }
+    }
+
+    /// The registry's GGUF entry point must give the same accurate answer, not
+    /// the trait default's "has not implemented build_from_gguf()".
+    #[test]
+    fn build_from_gguf_reports_the_same_reason() {
+        let arch = YiArchitecture::new();
+        let bytes = oxillama_gguf::test_utils::build_minimal_llama_gguf();
+        let model = oxillama_gguf::GgufModel::from_bytes(bytes).expect("test: parse fixture");
+        let err = arch
+            .build_from_gguf(&model, &make_config())
+            .err()
+            .expect("the `yi` arch id is unreachable and must never build");
+        match err {
+            ArchError::NotSupported { detail } => {
+                assert!(
+                    detail.contains("llama") && !detail.contains("has not implemented"),
+                    "expected the alias explanation, got: {detail}"
+                );
+            }
+            other => panic!("expected NotSupported, got {other}"),
+        }
     }
 }

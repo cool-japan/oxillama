@@ -5,6 +5,10 @@
 //! - bytes[64..66]: FP16 scale `d`
 //!
 //! Each 2-bit code: 0→-1, 1→0, 2→+1.  Weight = d * (code - 1).
+//!
+//! Decode order is GGML's digit-major one (`dequantize_row_tq2_0`): within a
+//! 32-byte group, digit `l` of byte `m` is weight `32*l + m`, so the four
+//! fields of one byte land 32 weights apart.
 
 #![cfg(all(feature = "simd-neon", target_arch = "aarch64"))]
 
@@ -16,6 +20,12 @@ use crate::types::QuantTensor;
 
 const BLOCK_SIZE: usize = 256;
 const BLOCK_BYTES: usize = 66;
+/// Bytes per decode group (upstream's `j += 32` stride).
+const GROUP_BYTES: usize = 32;
+/// 2-bit fields per `qs` byte.
+const DIGITS: usize = 4;
+/// Weights produced by one decode group.
+const GROUP_WEIGHTS: usize = GROUP_BYTES * DIGITS;
 
 /// NEON-accelerated TQ2_0 kernel.
 #[allow(non_camel_case_types)]
@@ -30,15 +40,14 @@ fn decode_block(block: &[u8], output: &mut [f32]) {
     let qs = &block[0..64];
     let d = f16_to_f32(u16::from_le_bytes([block[64], block[65]]));
 
+    // Digit-major within 32-byte groups: digit `l` of byte `i` lands at
+    // `128 * (i / 32) + 32 * l + (i % 32)`.
     for (i, &byte) in qs.iter().enumerate() {
-        let v0 = (byte & 3) as i32 - 1;
-        let v1 = ((byte >> 2) & 3) as i32 - 1;
-        let v2 = ((byte >> 4) & 3) as i32 - 1;
-        let v3 = ((byte >> 6) & 3) as i32 - 1;
-        output[i * 4] = d * v0 as f32;
-        output[i * 4 + 1] = d * v1 as f32;
-        output[i * 4 + 2] = d * v2 as f32;
-        output[i * 4 + 3] = d * v3 as f32;
+        let base = (i / GROUP_BYTES) * GROUP_WEIGHTS + (i % GROUP_BYTES);
+        for l in 0..DIGITS {
+            let v = ((byte >> (2 * l)) & 3) as i32 - 1;
+            output[base + l * GROUP_BYTES] = d * v as f32;
+        }
     }
 }
 
@@ -115,12 +124,18 @@ impl QuantKernel for Tq2_0Neon {
 
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
-        let mut scratch = [0.0f32; BLOCK_SIZE];
-
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
+            // Per-row scratch: the closure may run on several threads at once.
+            let mut scratch = [0.0f32; BLOCK_SIZE];
             let row_start = row * row_bytes;
             // SAFETY: AArch64 with NEON.
             let mut sum = unsafe { vdupq_n_f32(0.0) };
+            // Separate scalar accumulator for the sub-4-lane remainder.
+            // Folding it in as `vaddq_f32(sum, vdupq_n_f32(s))` would put `s`
+            // in all four lanes, and the closing `vaddvq_f32` would then count
+            // it four times — the same tail-accumulation bug already fixed in
+            // `simd/neon/iq2_xxs.rs`.
+            let mut scalar_tail = 0.0f32;
 
             for blk in 0..blocks_per_row {
                 let bo = row_start + blk * BLOCK_BYTES;
@@ -142,15 +157,14 @@ impl QuantKernel for Tq2_0Neon {
                         sum = vfmaq_f32(sum, wv, iv);
                     }
                     for k in (lanes * 4)..block_input_len {
-                        let s: f32 = scratch[k] * input[input_base + k];
-                        sum = vaddq_f32(sum, vdupq_n_f32(s));
+                        scalar_tail += scratch[k] * input[input_base + k];
                     }
                 }
             }
 
             // SAFETY: AArch64 with NEON.
-            *out = unsafe { vaddvq_f32(sum) };
-        }
+            *out = unsafe { vaddvq_f32(sum) } + scalar_tail;
+        });
 
         Ok(())
     }
@@ -213,7 +227,7 @@ mod tests {
         let block = make_zero_block();
         let data = block.clone();
         let tensor = QuantTensor {
-            data,
+            data: data.into(),
             shape: vec![1, BLOCK_SIZE],
             tensor_type: GgufTensorType::Tq2_0,
         };

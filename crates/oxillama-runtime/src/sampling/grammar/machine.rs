@@ -70,16 +70,42 @@ impl GrammarState {
 
     /// Returns true if the given token's byte sequence is a valid continuation
     /// from the current parse state.
+    ///
+    /// This is a best-effort, infallible view over [`GrammarState::allows_token_checked`]:
+    /// any simulator error (recursion limit, oversized token) is treated as
+    /// "not allowed" (fail-closed). Callers that need to distinguish a clean
+    /// rejection from a simulator limit should use the checked variant.
     pub fn allows_token(&self, token_bytes: &[u8]) -> bool {
+        self.allows_token_checked(token_bytes).unwrap_or(false)
+    }
+
+    /// Returns whether `token_bytes` is a valid continuation from the
+    /// current parse state, or an error when the simulator's limits are
+    /// exceeded.
+    ///
+    /// # Soundness (defect S8)
+    ///
+    /// Two limits previously **failed open** (conservatively returned
+    /// `true`/"allowed") when exceeded:
+    /// - Tokens longer than `MAX_SIM_BYTES` were unconditionally allowed.
+    /// - Hitting `MAX_DEPTH` recursion during simulation was treated as
+    ///   "allow".
+    ///
+    /// Both cases now return a typed error instead. [`apply_grammar_mask`]
+    /// treats any such error as "not allowed" (fail-**closed**) — the
+    /// opposite, safe direction — rather than silently admitting a token the
+    /// simulator could not actually verify.
+    pub fn allows_token_checked(&self, token_bytes: &[u8]) -> GrammarResult<bool> {
         if token_bytes.is_empty() {
             // An empty token is always allowed (it doesn't advance the parse).
-            return true;
+            return Ok(true);
         }
         if token_bytes.len() > MAX_SIM_BYTES {
-            // Very long tokens: conservatively allow them.
-            return true;
+            return Err(GrammarError::TokenTooLong {
+                len: token_bytes.len(),
+                max: MAX_SIM_BYTES,
+            });
         }
-        // Simulate consuming the token bytes from the current continuation.
         let mut sim = SimState {
             grammar: &self.grammar,
             depth: 0,
@@ -153,9 +179,9 @@ impl<'g> SimState<'g> {
     /// Returns true if `bytes` can be consumed starting from `cont`.
     /// A successful simulation means all bytes were consumed (possibly with
     /// continuation left over).
-    fn simulate_bytes(&mut self, cont: &[ContNode], bytes: &[u8]) -> bool {
+    fn simulate_bytes(&mut self, cont: &[ContNode], bytes: &[u8]) -> GrammarResult<bool> {
         if bytes.is_empty() {
-            return true;
+            return Ok(true);
         }
         // Expand the first node in the continuation to get all possible
         // one-byte transitions, try each that matches bytes[0], then recurse.
@@ -163,11 +189,16 @@ impl<'g> SimState<'g> {
     }
 
     /// Attempt to consume one byte `b` from `cont`, then continue with `rest`.
-    fn try_consume_byte(&mut self, cont: &[ContNode], b: u8, rest: &[u8]) -> bool {
+    ///
+    /// Depth-limit exceeded is a hard error (fail-closed — see defect S8),
+    /// not the previous "conservatively allow".
+    fn try_consume_byte(&mut self, cont: &[ContNode], b: u8, rest: &[u8]) -> GrammarResult<bool> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             self.depth -= 1;
-            return true; // conservative: allow when we hit the limit
+            return Err(GrammarError::RecursionLimit {
+                rule: "(allows_token)".to_string(),
+            });
         }
 
         let result = self.try_consume_byte_inner(cont, b, rest);
@@ -175,13 +206,18 @@ impl<'g> SimState<'g> {
         result
     }
 
-    fn try_consume_byte_inner(&mut self, cont: &[ContNode], b: u8, rest: &[u8]) -> bool {
+    fn try_consume_byte_inner(
+        &mut self,
+        cont: &[ContNode],
+        b: u8,
+        rest: &[u8],
+    ) -> GrammarResult<bool> {
         if cont.is_empty() {
-            return false; // more bytes but nothing left to match
+            return Ok(false); // more bytes but nothing left to match
         }
 
         let Some((first, tail)) = cont.split_first() else {
-            return false;
+            return Ok(false);
         };
 
         match &first.node {
@@ -202,7 +238,7 @@ impl<'g> SimState<'g> {
                         self.simulate_bytes(&new_cont, rest)
                     }
                 } else {
-                    false
+                    Ok(false)
                 }
             }
 
@@ -212,14 +248,14 @@ impl<'g> SimState<'g> {
                 if matches {
                     self.simulate_bytes(tail, rest)
                 } else {
-                    false
+                    Ok(false)
                 }
             }
 
             GrammarNode::RuleRef(name) => {
                 let rule_node = match self.grammar.rules.get(name) {
                     Some(n) => n.clone(),
-                    None => return false,
+                    None => return Ok(false),
                 };
                 let mut new_cont: Vec<ContNode> = Vec::with_capacity(tail.len() + 1);
                 new_cont.push(ContNode::new(rule_node));
@@ -242,16 +278,20 @@ impl<'g> SimState<'g> {
             }
 
             GrammarNode::Alternation(alts) => {
-                // Try each alternative; succeed if any succeeds
+                // Try each alternative; succeed if any succeeds. A
+                // recursion-limit error from one alternative aborts the
+                // whole check immediately (fail-closed) rather than trying
+                // to salvage a verdict from the remaining alternatives —
+                // see the module-level soundness note on defect S8.
                 for alt in alts {
                     let mut new_cont: Vec<ContNode> = Vec::with_capacity(tail.len() + 1);
                     new_cont.push(ContNode::new(alt.clone()));
                     new_cont.extend_from_slice(tail);
-                    if self.try_consume_byte(&new_cont, b, rest) {
-                        return true;
+                    if self.try_consume_byte(&new_cont, b, rest)? {
+                        return Ok(true);
                     }
                 }
-                false
+                Ok(false)
             }
 
             GrammarNode::Repeat { node, min, max } => {
@@ -262,8 +302,8 @@ impl<'g> SimState<'g> {
                 let max = *max;
 
                 // Option A: zero occurrences (valid when min==0)
-                if min == 0 && self.try_consume_byte(tail, b, rest) {
-                    return true;
+                if min == 0 && self.try_consume_byte(tail, b, rest)? {
+                    return Ok(true);
                 }
 
                 // Option B: take at least one occurrence
@@ -281,12 +321,12 @@ impl<'g> SimState<'g> {
                     new_cont.push(ContNode::new(inner));
                     new_cont.push(ContNode::new(repeat_rest));
                     new_cont.extend_from_slice(tail);
-                    if self.try_consume_byte(&new_cont, b, rest) {
-                        return true;
+                    if self.try_consume_byte(&new_cont, b, rest)? {
+                        return Ok(true);
                     }
                 }
 
-                false
+                Ok(false)
             }
         }
     }
@@ -440,19 +480,74 @@ impl<'g> SimState<'g> {
 /// Zero out (set to `f32::NEG_INFINITY`) logits for tokens that are not allowed
 /// by the current grammar state.
 ///
+/// # Defect S1 fix
+///
+/// Once the grammar is **complete** (`state.is_complete()`), a non-empty
+/// continuation-based grammar can never accept *any* further non-empty
+/// token — `allows_token` correctly returns `false` for every one, since
+/// there is nothing left in the continuation to match. Previously that
+/// meant EVERY logit was masked to `-inf`, including the caller's
+/// end-of-generation token(s), so `super::super::argmax`-style selection
+/// degenerated forever (see the S1 write-up for the exact mechanism).
+///
+/// Two changes fix this:
+/// 1. `eog_token_ids` are exempted from masking once the grammar is
+///    complete, so the model can actually stop.
+/// 2. As a last-resort safety net, if masking would still eliminate every
+///    candidate (e.g. the grammar is complete but the caller didn't
+///    populate `eog_token_ids`, or a pathological grammar), the single
+///    highest pre-mask logit is restored rather than handing the caller a
+///    fully degenerate `-inf` vector.
+///
 /// # Arguments
 /// * `logits` - Raw logits vector; modified in-place.
 /// * `state`  - Current grammar parse state.
 /// * `token_vocab` - Mapping `(token_id, utf-8 bytes)` for every vocabulary entry.
+/// * `eog_token_ids` - End-of-generation token IDs (e.g. `</s>`,
+///   `<|im_end|>`) that should remain selectable once the grammar is
+///   satisfied. Populate from `SamplerConfig::eog_token_ids`.
 pub fn apply_grammar_mask(
     logits: &mut [f32],
     state: &GrammarState,
     token_vocab: &[(u32, Vec<u8>)],
+    eog_token_ids: &[u32],
 ) {
+    let complete = state.is_complete();
+
+    // Track the single best pre-mask candidate for the last-resort fallback
+    // below, without a second vocab-sized pass or allocation.
+    let mut best_id: Option<usize> = None;
+    let mut best_val = f32::NEG_INFINITY;
+
     for (token_id, token_bytes) in token_vocab {
         let id = *token_id as usize;
-        if id < logits.len() && !state.allows_token(token_bytes) {
+        if id >= logits.len() {
+            continue;
+        }
+
+        if logits[id].is_finite() && (best_id.is_none() || logits[id] > best_val) {
+            best_val = logits[id];
+            best_id = Some(id);
+        }
+
+        let allowed = if complete && eog_token_ids.contains(token_id) {
+            true
+        } else {
+            // Fail closed on a simulator error (see defect S8): a token we
+            // could not verify is treated as disallowed, not allowed.
+            state.allows_token_checked(token_bytes).unwrap_or(false)
+        };
+
+        if !allowed {
             logits[id] = f32::NEG_INFINITY;
+        }
+    }
+
+    // Safety net: never return a fully-`-inf` distribution when a
+    // pre-mask candidate existed (defect S1's second fix — see doc above).
+    if let Some(id) = best_id {
+        if logits.iter().all(|v| !v.is_finite()) {
+            logits[id] = best_val;
         }
     }
 }
@@ -533,7 +628,7 @@ mod tests {
             (2, b"no".to_vec()),
             (3, b"nope".to_vec()),
         ];
-        apply_grammar_mask(&mut logits, &state, &vocab);
+        apply_grammar_mask(&mut logits, &state, &vocab, &[]);
         assert_eq!(logits[0], f32::NEG_INFINITY); // "maybe" not allowed
         assert!(logits[1].is_finite()); // "yes" allowed
         assert!(logits[2].is_finite()); // "no" allowed
@@ -652,16 +747,47 @@ mod tests {
         );
     }
 
-    // ── Very long token conservative allow ───────────────────────────────────
+    // ── Very long token: defect S8 fail-closed (was fail-open) ──────────────
 
     #[test]
-    fn test_allows_very_long_token_conservatively() {
-        // Tokens longer than MAX_SIM_BYTES (64) are always allowed conservatively
+    fn test_allows_very_long_token_fails_closed() {
+        // Tokens longer than MAX_SIM_BYTES (64) used to be *conservatively
+        // allowed*. Defect S8: this must now fail CLOSED (disallowed),
+        // since the simulator never actually verified the token.
         let (_g, state) = make_state(r#"root ::= "x""#);
         let long_token: Vec<u8> = vec![b'z'; 65]; // 65 bytes, clearly doesn't match "x"
         assert!(
-            state.allows_token(&long_token),
-            "tokens >64 bytes should be conservatively allowed"
+            !state.allows_token(&long_token),
+            "tokens > MAX_SIM_BYTES must now be disallowed (fail-closed), not conservatively allowed"
+        );
+        let checked = state.allows_token_checked(&long_token);
+        assert!(
+            matches!(checked, Err(GrammarError::TokenTooLong { .. })),
+            "expected TokenTooLong error, got {checked:?}"
+        );
+    }
+
+    #[test]
+    fn test_allows_token_fails_closed_on_recursion_limit() {
+        // Build a grammar with far more than MAX_DEPTH (128) layers of pure
+        // rule-reference indirection, so verifying a single byte requires
+        // more nested calls than the simulator allows.
+        let mut src = String::new();
+        for i in 0..200u32 {
+            src.push_str(&format!("r{i} ::= r{}\n", i + 1));
+        }
+        src.push_str("r200 ::= \"x\"\n");
+        let g = Grammar::parse(&src).expect("deeply nested indirection grammar should parse");
+        let state = g.initial_state();
+
+        let checked = state.allows_token_checked(b"x");
+        assert!(
+            matches!(checked, Err(GrammarError::RecursionLimit { .. })),
+            "expected RecursionLimit error, got {checked:?}"
+        );
+        assert!(
+            !state.allows_token(b"x"),
+            "defect S8: hitting the recursion limit must fail CLOSED (disallow), not fail open"
         );
     }
 
@@ -690,7 +816,7 @@ mod tests {
         let (_, state) = make_state(r#"root ::= "abc""#);
         let mut logits = vec![1.0f32, 2.0, 3.0];
         // Empty vocab — should not change logits
-        apply_grammar_mask(&mut logits, &state, &[]);
+        apply_grammar_mask(&mut logits, &state, &[], &[]);
         assert_eq!(logits, vec![1.0f32, 2.0, 3.0]);
     }
 
@@ -703,10 +829,59 @@ mod tests {
             (0, b"yes".to_vec()),
             (5, b"no".to_vec()), // id 5 is beyond logits len=2, should be skipped
         ];
-        apply_grammar_mask(&mut logits, &state, &vocab);
+        apply_grammar_mask(&mut logits, &state, &vocab, &[]);
         // logits[0] = "yes" which IS allowed → should stay finite
         assert!(logits[0].is_finite(), "allowed token should not be masked");
         assert!(logits[1].is_finite(), "untouched logit should stay finite");
+    }
+
+    // ── Defect S1: grammar-complete EOG handling ─────────────────────────────
+
+    #[test]
+    fn test_apply_grammar_mask_allows_eog_when_complete() {
+        // Once the grammar is complete, a configured EOG token must remain
+        // selectable even though its literal bytes don't match the grammar.
+        let (_, mut state) = make_state(r#"root ::= "hi""#);
+        state.advance(b"hi").unwrap();
+        assert!(state.is_complete());
+
+        let mut logits = vec![1.0f32, 1.0, 1.0];
+        let vocab: Vec<(u32, Vec<u8>)> = vec![
+            (0, b"more".to_vec()),  // not EOG, doesn't match grammar -> masked
+            (1, b"<eos>".to_vec()), // EOG -> must survive
+            (2, b"other".to_vec()), // not EOG -> masked
+        ];
+        apply_grammar_mask(&mut logits, &state, &vocab, &[1]);
+        assert_eq!(logits[0], f32::NEG_INFINITY);
+        assert!(
+            logits[1].is_finite(),
+            "EOG token must remain selectable once the grammar is complete"
+        );
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_apply_grammar_mask_never_fully_masks_when_survivor_available() {
+        // Grammar complete, but NO eog_token_ids configured. Previously this
+        // masked every logit to -inf, which fed straight into argmax's
+        // silent "return index 0" bug (defect S1).
+        let (_, mut state) = make_state(r#"root ::= "hi""#);
+        state.advance(b"hi").unwrap();
+        assert!(state.is_complete());
+
+        let mut logits = vec![3.0f32, 1.0, 2.0];
+        let vocab: Vec<(u32, Vec<u8>)> =
+            vec![(0, b"a".to_vec()), (1, b"b".to_vec()), (2, b"c".to_vec())];
+        apply_grammar_mask(&mut logits, &state, &vocab, &[]); // no EOG configured
+        let finite = logits.iter().filter(|v| v.is_finite()).count();
+        assert_eq!(
+            finite, 1,
+            "the last-resort safety net must leave exactly one survivor, got {logits:?}"
+        );
+        assert_eq!(
+            logits[0], 3.0,
+            "the highest pre-mask logit must be the surviving candidate"
+        );
     }
 
     // ── initial_state via Grammar::initial_state() ───────────────────────────

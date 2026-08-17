@@ -81,7 +81,7 @@ impl QuantKernel for Q5_0Avx2 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row and block bounds are checked above.
             // CPU avx2+fma support is guaranteed by KernelDispatcher.
@@ -93,7 +93,7 @@ impl QuantKernel for Q5_0Avx2 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -136,6 +136,18 @@ impl QuantKernel for Q5_0Avx2 {
         n_cols: usize,
     ) -> QuantResult<()> {
         self.matvec_q8_fused_avx2(weights, acts_q8, out, n_rows, n_cols)
+    }
+
+    /// Q5_0/AVX2 is on the fused decode path: one Q5_0 block (32 weights)
+    /// consumes exactly one Q8_0 activation block, matching
+    /// `matvec_q8_fused_avx2` above.
+    ///
+    /// This override is the dispatch gate itself — without it,
+    /// `matvec_q8_fused_avx2`'s working body is unreachable dead code,
+    /// because callers gate on this method before ever invoking
+    /// `matvec_q8_fused` (see `QuantKernel::q8_fused_acts_blocks`'s trait doc).
+    fn q8_fused_acts_blocks(&self, n_cols: usize) -> Option<usize> {
+        Some(n_cols.div_ceil(BLOCK_SIZE))
     }
 }
 
@@ -501,7 +513,7 @@ impl Q5_0Avx2 {
             });
         }
 
-        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(out, n_rows, n_cols, |row, out_val| {
             let row_start = row * row_bytes;
             // SAFETY: bounds verified above; avx2+fma guaranteed by dispatcher.
             let partial = unsafe {
@@ -513,7 +525,7 @@ impl Q5_0Avx2 {
                 )
             };
             *out_val += partial;
-        }
+        });
 
         Ok(())
     }

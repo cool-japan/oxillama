@@ -20,13 +20,37 @@
 //! - `blk.{i}.ffn_down.weight` — FFN down projection
 //! - `output_norm.weight` — Final RMSNorm
 //! - `output.weight` — LM head (unembedding)
+//!
+//! ## Module layout
+//!
+//! | Module | Contents |
+//! |--------|----------|
+//! | `model` | `LlamaModel`, the per-token forward pass |
+//! | `batch` | tiled multi-token prefill (`M` tokens per pass over the weights) |
+//! | `loader` | GGUF → weights, shared with every arch that builds on LLaMA |
+//! | `attention` | the dot/axpy/softmax primitives both paths accumulate through |
+//! | `rope_norm` | LLaMA's NORM RoPE convention (interleaved pairs) |
+//!
+//! The `token_embd` table (dequantized one row per lookup) lives in
+//! [`crate::common::embedding`], shared with every architecture that keeps
+//! it quantized.
 
+mod attention;
+mod batch;
+mod loader;
 mod model;
+mod rope_norm;
 
-pub(crate) use model::{
-    dequant_to_f32, load_dequant_tensor, load_quant_linear, load_rms_norm_weight, softmax_inplace,
+pub(crate) use attention::{axpy_f32, dot_f32, softmax_inplace};
+pub(crate) use loader::{
+    load_lm_head, load_quant_linear, load_quant_moe, load_rms_norm_weight, load_token_embedding,
+    resolve_kernel,
 };
-pub use model::{load_llama_from_gguf, LlamaModel};
+pub(crate) use rope_norm::apply_rope_norm;
+
+pub use crate::common::embedding::TokenEmbedding;
+pub use loader::load_llama_from_gguf;
+pub use model::{DenseFfn, FfnVariant, LlamaLayer, LlamaModel};
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
@@ -96,8 +120,12 @@ impl ModelArchitecture for LlamaArchitecture {
             },
             TensorNamePattern {
                 pattern: "output.weight".to_string(),
-                description: "LM head / unembedding".to_string(),
-                required: true,
+                // Optional: Llama-3.2-1B/3B tie the output projection to
+                // `token_embd.weight` and ship no `output.weight` at all, and
+                // `loader::load_lm_head` falls back to it — so a validator
+                // must not reject those checkpoints.
+                description: "LM head / unembedding (tied to token_embd when absent)".to_string(),
+                required: false,
             },
         ];
 
@@ -183,8 +211,27 @@ mod tests {
             "token_embd.weight must be required"
         );
         assert!(
-            required.contains(&"output.weight"),
-            "output.weight must be required"
+            required.contains(&"output_norm.weight"),
+            "output_norm.weight must be required"
+        );
+    }
+
+    /// `output.weight` must NOT be required.
+    ///
+    /// Llama-3.2-1B/3B tie the output projection to `token_embd.weight` and
+    /// ship no `output.weight`; `loader::load_lm_head` falls back to the tied
+    /// matrix, so a validator driven by this manifest must not reject them.
+    #[test]
+    fn output_weight_is_optional_because_of_tied_embeddings() {
+        let arch = LlamaArchitecture::new();
+        let head = arch
+            .tensor_names()
+            .into_iter()
+            .find(|p| p.pattern == "output.weight")
+            .expect("output.weight must still be listed");
+        assert!(
+            !head.required,
+            "output.weight is optional: it is tied to token_embd when absent"
         );
     }
 

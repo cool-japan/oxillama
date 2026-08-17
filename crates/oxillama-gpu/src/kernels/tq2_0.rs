@@ -54,13 +54,31 @@ const TQ2_0_BLOCK_SIZE: usize = 256;
 /// Bytes per TQ2_0 block: 64 (qs) + 2 (d).
 #[cfg(any(feature = "gpu", test))]
 const TQ2_0_BLOCK_BYTES: usize = 66;
+/// Bytes per decode group (upstream's `j += 32` stride).
+#[cfg(any(feature = "gpu", test))]
+const TQ2_0_GROUP_BYTES: usize = 32;
+/// 2-bit fields per `qs` byte.
+#[cfg(any(feature = "gpu", test))]
+const TQ2_0_DIGITS: usize = 4;
+/// Weights produced by one decode group: `TQ2_0_GROUP_BYTES * TQ2_0_DIGITS`.
+#[cfg(any(feature = "gpu", test))]
+const TQ2_0_GROUP_WEIGHTS: usize = TQ2_0_GROUP_BYTES * TQ2_0_DIGITS;
 
 /// Dequantise all TQ2_0 blocks to a flat f32 buffer.
 ///
 /// TQ2_0 layout: 64 bytes of 2-bit ternary codes (4 per byte), then 2-byte FP16 scale.
 /// Ternary mapping: code 0 → -1, code 1 → 0, code 2 → +1.
+///
+/// Upstream `dequantize_row_tq2_0` is digit-major within 32-byte groups: the
+/// four 2-bit fields of `qs[m]` land at output indices `m`, `m + 32`,
+/// `m + 64`, `m + 96` (offset by 128 for the second 32-byte group), not
+/// `4m..4m+4` (see `oxillama_quant::reference::tq2_0`'s module doc).
 #[cfg(any(feature = "gpu", test))]
-fn dequant_tq2_0_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuResult<Vec<f32>> {
+pub(crate) fn dequant_tq2_0_to_f32(
+    weight_bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> GpuResult<Vec<f32>> {
     let blocks_per_row = cols.div_ceil(TQ2_0_BLOCK_SIZE);
     let expected_bytes = rows * blocks_per_row * TQ2_0_BLOCK_BYTES;
     if weight_bytes.len() < expected_bytes {
@@ -84,23 +102,15 @@ fn dequant_tq2_0_to_f32(weight_bytes: &[u8], rows: usize, cols: usize) -> GpuRes
             let weight_base = blk * TQ2_0_BLOCK_SIZE;
 
             for (i, &byte) in qs.iter().enumerate() {
-                let v0 = (byte & 3) as i32 - 1;
-                let v1 = ((byte >> 2) & 3) as i32 - 1;
-                let v2 = ((byte >> 4) & 3) as i32 - 1;
-                let v3 = ((byte >> 6) & 3) as i32 - 1;
-
-                let base = weight_base + i * 4;
-                if base < cols {
-                    f32_weights[row * cols + base] = d * v0 as f32;
-                }
-                if base + 1 < cols {
-                    f32_weights[row * cols + base + 1] = d * v1 as f32;
-                }
-                if base + 2 < cols {
-                    f32_weights[row * cols + base + 2] = d * v2 as f32;
-                }
-                if base + 3 < cols {
-                    f32_weights[row * cols + base + 3] = d * v3 as f32;
+                let group_base = weight_base
+                    + (i / TQ2_0_GROUP_BYTES) * TQ2_0_GROUP_WEIGHTS
+                    + (i % TQ2_0_GROUP_BYTES);
+                for l in 0..TQ2_0_DIGITS {
+                    let col = group_base + l * TQ2_0_GROUP_BYTES;
+                    if col < cols {
+                        let v = ((byte >> (2 * l)) & 3) as i32 - 1;
+                        f32_weights[row * cols + col] = d * v as f32;
+                    }
                 }
             }
         }
@@ -343,18 +353,23 @@ mod tests {
     #[test]
     fn test_dequant_tq2_0_mixed() {
         // Byte 0: codes 0,1,2,0 → ternary -1,0,+1,-1 → d*[-1,0,1,-1]
-        // d = 2.0
+        // d = 2.0.  Upstream is digit-major: digit `l` of byte `m` lands at
+        // output index `128*(m/32) + 32*l + (m%32)`, so byte 0's four digits
+        // are 32 weights apart (0, 32, 64, 96), not adjacent.
         let mut qs = [0x55u8; 64]; // code 1 → ternary 0
         qs[0] = pack_2bit(0, 1, 2, 0);
         let block = make_tq2_0_block(2.0, &qs);
         let result = dequant_tq2_0_to_f32(&block, 1, 256).expect("dequant");
         assert!((result[0] - (-2.0)).abs() < 1e-3, "got {}", result[0]);
-        assert!(result[1].abs() < 1e-3, "got {}", result[1]);
-        assert!((result[2] - 2.0).abs() < 1e-3, "got {}", result[2]);
-        assert!((result[3] - (-2.0)).abs() < 1e-3, "got {}", result[3]);
+        assert!(result[32].abs() < 1e-3, "got {}", result[32]);
+        assert!((result[64] - 2.0).abs() < 1e-3, "got {}", result[64]);
+        assert!((result[96] - (-2.0)).abs() < 1e-3, "got {}", result[96]);
         // Remaining: code 1 → ternary 0 → 0.0
-        for &v in &result[4..] {
-            assert!(v.abs() < 1e-5, "tail weight expected 0, got {v}");
+        for (i, &v) in result.iter().enumerate() {
+            if i == 0 || i == 32 || i == 64 || i == 96 {
+                continue;
+            }
+            assert!(v.abs() < 1e-5, "weight[{i}] expected 0, got {v}");
         }
     }
 

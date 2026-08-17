@@ -72,7 +72,7 @@ impl QuantKernel for Q8_0Ref {
         let blocks_per_row = n_cols.div_ceil(Q8_0_BLOCK_SIZE);
         let row_bytes = blocks_per_row * Q8_0_BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -91,7 +91,7 @@ impl QuantKernel for Q8_0Ref {
                 }
             }
             *out = sum;
-        }
+        });
 
         Ok(())
     }

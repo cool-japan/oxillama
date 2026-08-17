@@ -33,6 +33,31 @@ pub enum GrammarError {
         /// Rule that was being evaluated.
         rule: String,
     },
+
+    /// A candidate token exceeded the maximum number of bytes the grammar
+    /// simulator will verify. Previously such tokens were *conservatively
+    /// allowed* (a soundness hole — see defect S8); callers now receive this
+    /// error so they can decide how to treat the token (the default,
+    /// fail-closed policy used by [`super::machine::apply_grammar_mask`] is
+    /// to mask it out).
+    #[error("token exceeds the maximum {max} bytes verified by the grammar simulator (got {len})")]
+    TokenTooLong {
+        /// The token's actual byte length.
+        len: usize,
+        /// The simulator's configured maximum.
+        max: usize,
+    },
+
+    /// A JSON Schema keyword was recognised but cannot be expressed as a
+    /// GBNF (regular) grammar, so it was rejected rather than silently
+    /// ignored (see defect S7).
+    #[error("JSON Schema keyword `{keyword}` cannot be expressed as a GBNF grammar: {reason}")]
+    UnsupportedKeyword {
+        /// The offending keyword (e.g. `"minimum"`, `"anyOf"`).
+        keyword: String,
+        /// Human-readable explanation of why it can't be compiled.
+        reason: String,
+    },
 }
 
 /// Convenience alias.

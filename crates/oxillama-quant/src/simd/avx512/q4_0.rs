@@ -5,16 +5,24 @@
 //! - bytes[2..18]  — 16 packed bytes encoding 32 × 4-bit unsigned nibbles
 //!
 //! Each weight reconstructs as `(nibble − 8) × d`.
-//! Nibble order: for byte `b[i]`, `lo = b[i] & 0x0F` → weight `2i`,
-//!                                `hi = b[i] >> 4`   → weight `2i+1`.
+//!
+//! Nibble order is ggml's **split-half** layout: for byte `b[i]`,
+//! `lo = b[i] & 0x0F` → weight `i` and `hi = b[i] >> 4` → weight `i + 16`.
+//! (This paragraph previously described the *interleaved* layout —
+//! `lo → 2i`, `hi → 2i+1` — which is not what ggml stores and not what the
+//! code below or `dequant_block` implements.  `tests/avx512_fused_goldens.rs`
+//! now pins the real order against llama.cpp lane by lane, and carries a
+//! negative control asserting the interleaved reading is rejected.)
 //!
 //! ## AVX-512 strategy
 //!
 //! Process all 32 weights in **two** AVX-512 (16-wide) passes instead of
 //! the AVX2 kernel's four 8-wide passes:
 //!
-//! 1. Apply the same `_mm_unpacklo/hi_epi8(lo_bytes, hi_bytes)` trick to
-//!    produce interleaved nibble layout in `first16` and `last16` (128-bit).
+//! 1. Mask and shift the 16 nibble bytes into `first16` (the 16 low nibbles =
+//!    weights 0..16) and `last16` (the 16 high nibbles = weights 16..32).
+//!    GGML's split-half layout means these are already in weight order, so no
+//!    lane permutation is involved.
 //! 2. Widen each 16-byte chunk to 16 × i32 with `_mm512_cvtepu8_epi32`,
 //!    subtract 8, convert to f32, multiply by d.
 //!
@@ -91,7 +99,7 @@ impl QuantKernel for Q4_0Avx512 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             // SAFETY: row and block bounds are checked above.
             // CPU avx512f support is guaranteed by KernelDispatcher.
@@ -103,7 +111,7 @@ impl QuantKernel for Q4_0Avx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -123,6 +131,33 @@ impl QuantKernel for Q4_0Avx512 {
             self.gemv(quant_matrix, input_row, output_row)?;
         }
         Ok(())
+    }
+
+    /// Fused Q4_0 weight × Q8_0 activation GEMV — native AVX-512.
+    ///
+    /// See [`crate::simd::avx512::fused`] for the lane arithmetic.  This is
+    /// bit-identical to [`crate::simd::avx2::Q4_0Avx2`]'s fused kernel when
+    /// `n_cols % 32 == 0`; on a ragged last block the two differ by one
+    /// rounding, because AVX2 scales each tail product individually while this
+    /// kernel scales the block's exact `i32` sum once.
+    ///
+    /// **No `q8_fused_acts_blocks` override accompanies this**, deliberately:
+    /// `Q4_0Avx2` also overrides `matvec_q8_fused` without advertising the
+    /// gate, so no caller reaches either kernel through the fused path today.
+    /// Mirroring that keeps the AVX-512 tier a strict superset of AVX2 without
+    /// switching on a path AVX2 has never been measured on — the trait's own
+    /// policy (`QuantKernel::q8_fused_acts_blocks`) is that an unmeasured
+    /// kernel stays `None`.  Enabling Q4_0 should be one decision applied to
+    /// both tiers at once, not a side effect of this change.
+    fn matvec_q8_fused(
+        &self,
+        weights: &[u8],
+        acts_q8: &[u8],
+        out: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> QuantResult<()> {
+        crate::simd::avx512::fused::matvec_q4_0(weights, acts_q8, out, n_rows, n_cols)
     }
 
     fn block_size(&self) -> usize {
@@ -168,11 +203,12 @@ unsafe fn dequant_block_avx512(block: &[u8], output: &mut [f32]) {
     let lo_bytes = _mm_and_si128(raw, mask_lo); // low nibbles in each byte
     let hi_bytes = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo); // high nibbles
 
-    // Interleave: first16 = [lo0,hi0,lo1,hi1,...,lo7,hi7]  (weights 0-15)
-    //             last16  = [lo8,hi8,...,lo15,hi15]         (weights 16-31)
-    // This matches the AVX2 nibble order exactly.
-    let first16 = _mm_unpacklo_epi8(lo_bytes, hi_bytes);
-    let last16 = _mm_unpackhi_epi8(lo_bytes, hi_bytes);
+    // GGML split-half layout: the 16 low nibbles *are* weights 0..16 and the
+    // 16 high nibbles *are* weights 16..32, in byte order.  `_mm512_cvtepu8_epi32`
+    // widens a 128-bit source lane-for-lane, so these feed the two 16-wide
+    // passes directly — no `_mm_unpacklo/hi_epi8` interleave.
+    let first16 = lo_bytes; // weights 0..16
+    let last16 = hi_bytes; // weights 16..32
 
     // Convert each 16-byte chunk to 16 × int32, subtract 8, convert to f32, scale.
     // AVX-512 does 16 lanes at once vs AVX2's 8 lanes — 2 passes instead of 4.
@@ -229,9 +265,9 @@ unsafe fn gemv_row_avx512(
         let lo_bytes = _mm_and_si128(raw, mask_lo);
         let hi_bytes = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo);
 
-        // Produce interleaved nibble order matching the weight layout.
-        let first16 = _mm_unpacklo_epi8(lo_bytes, hi_bytes);
-        let last16 = _mm_unpackhi_epi8(lo_bytes, hi_bytes);
+        // Split-half layout — see `dequant_block_avx512`.
+        let first16 = lo_bytes; // weights 0..16
+        let last16 = hi_bytes; // weights 16..32
 
         // Check whether this block is fully within bounds.
         let remaining = n_cols.saturating_sub(input_offset);
@@ -261,12 +297,13 @@ unsafe fn gemv_row_avx512(
                 let byte = *block.get_unchecked(2 + i);
                 let lo = (byte & 0x0F) as i32 - 8;
                 let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-                let idx = input_offset + i * 2;
-                if idx + 1 < n_cols {
-                    partial_sum += lo as f32 * input[idx];
-                    partial_sum += hi as f32 * input[idx + 1];
-                } else if idx < n_cols {
-                    partial_sum += lo as f32 * input[idx];
+                let idx_lo = input_offset + i;
+                let idx_hi = idx_lo + BLOCK_SIZE / 2;
+                if idx_lo < n_cols {
+                    partial_sum += lo as f32 * input[idx_lo];
+                }
+                if idx_hi < n_cols {
+                    partial_sum += hi as f32 * input[idx_hi];
                 }
             }
             row_sum += partial_sum * d;

@@ -11,6 +11,22 @@ use std::sync::Arc;
 
 use oxillama_quant::{LoraAdapter, QuantKernel, QuantTensor};
 
+/// Convert a GGUF tensor's dimension list into `[out_features, in_features]`.
+///
+/// GGUF stores `ne` fastest-changing-first, so a weight mapping
+/// `in_features → out_features` is written as `[in_features, out_features]` —
+/// llama.cpp builds it with `ggml_new_tensor_2d(ctx, ty, n_in, n_out)`.
+/// [`QuantLinear`] and every kernel behind it expect the mathematical
+/// row-major order, which is the reverse.  Only the shape flips: `ne[1]` rows
+/// of `ne[0]` contiguous values already *are* a row-major
+/// `[out_features, in_features]` matrix, so the payload is left untouched.
+///
+/// Vectors (bias, norm weights) are unaffected — reversing a 1-element list is
+/// a no-op.
+pub fn gguf_linear_shape(dimensions: &[u64]) -> Vec<usize> {
+    dimensions.iter().rev().map(|&d| d as usize).collect()
+}
+
 /// A linear layer with quantized weights and optional LoRA correction.
 ///
 /// Stores the weight matrix in its quantized GGUF format and uses
@@ -30,7 +46,52 @@ pub struct QuantLinear {
     ///
     /// Shared via `Arc` so that the same adapter can be referenced from
     /// multiple layers without cloning the weight data.
+    ///
+    /// This is the *single-adapter* slot kept for backwards compatibility;
+    /// [`QuantLinear::push_lora`] accumulates into a separate stack so that
+    /// several adapters can be composed with independent scale multipliers.
     pub lora: Option<Arc<LoraAdapter>>,
+    /// Accumulated LoRA stack: `(adapter, extra_scale)` applied in order after
+    /// [`Self::lora`].
+    ///
+    /// `set_lora` **replaces** the single slot, which silently discarded every
+    /// earlier adapter when a stack was applied; `push_lora` appends here
+    /// instead, so `apply_lora_stack` composes correctly.
+    lora_stack: Vec<(Arc<LoraAdapter>, f32)>,
+}
+
+/// Apply `B @ (A @ input) * (adapter.scale * extra_scale)` to `output`.
+///
+/// `LoraAdapter::apply` folds only the adapter's intrinsic `alpha / rank`
+/// scale; stacking needs the per-entry multiplier as well, so the correction is
+/// recomputed here.  `rank` is small (typically 8–128), so the intermediate is
+/// cheap.
+fn apply_lora_scaled(adapter: &LoraAdapter, input: &[f32], output: &mut [f32], extra_scale: f32) {
+    let rank = adapter.rank;
+    let in_f = adapter.in_features;
+    if rank == 0 || in_f == 0 || input.len() < in_f {
+        return;
+    }
+    if adapter.a.len() < rank * in_f || adapter.b.len() < adapter.out_features * rank {
+        return;
+    }
+
+    let mut tmp = vec![0.0f32; rank];
+    for (i, slot) in tmp.iter_mut().enumerate() {
+        let row = &adapter.a[i * in_f..(i + 1) * in_f];
+        *slot = row
+            .iter()
+            .zip(input.iter())
+            .map(|(w, x)| w * x)
+            .sum::<f32>();
+    }
+
+    let scale = adapter.scale * extra_scale;
+    let n_out = adapter.out_features.min(output.len());
+    for (o, out_slot) in output.iter_mut().enumerate().take(n_out) {
+        let row = &adapter.b[o * rank..(o + 1) * rank];
+        *out_slot += scale * row.iter().zip(tmp.iter()).map(|(w, x)| w * x).sum::<f32>();
+    }
 }
 
 impl QuantLinear {
@@ -53,20 +114,37 @@ impl QuantLinear {
             out_features,
             in_features,
             lora: None,
+            lora_stack: Vec::new(),
         }
     }
 
     /// Attach a LoRA adapter to this layer.
     ///
-    /// Replaces any previously attached adapter.  Pass `None` to remove the
-    /// correction entirely.
+    /// Replaces any previously attached adapter in the single-adapter slot.
+    /// Use [`Self::push_lora`] to *compose* adapters instead of replacing.
     pub fn set_lora(&mut self, lora: Arc<LoraAdapter>) {
         self.lora = Some(lora);
     }
 
-    /// Remove any attached LoRA adapter.
+    /// Append a LoRA adapter with an extra scale multiplier.
+    ///
+    /// Unlike [`Self::set_lora`] this **accumulates**: applying a
+    /// [`LoraStack`](crate::lora::LoraStack) of three adapters leaves all three
+    /// corrections in effect, each with its own multiplier, which is what
+    /// stacking is supposed to mean.
+    pub fn push_lora(&mut self, lora: Arc<LoraAdapter>, scale: f32) {
+        self.lora_stack.push((lora, scale));
+    }
+
+    /// Remove every attached LoRA adapter (both the single slot and the stack).
     pub fn clear_lora(&mut self) {
         self.lora = None;
+        self.lora_stack.clear();
+    }
+
+    /// Number of adapters currently composed on top of this layer.
+    pub fn lora_count(&self) -> usize {
+        self.lora_stack.len() + usize::from(self.lora.is_some())
     }
 
     /// Forward pass: compute `output = weight @ input + bias [+ lora_delta]`.
@@ -92,6 +170,133 @@ impl QuantLinear {
         // Apply LoRA correction if attached
         if let Some(ref lora) = self.lora {
             lora.apply(input, output)?;
+        }
+
+        for (adapter, scale) in &self.lora_stack {
+            apply_lora_scaled(adapter, input, output, *scale);
+        }
+
+        Ok(())
+    }
+
+    /// Q8_0 activation blocks needed to run this layer through
+    /// [`Self::forward_q8_fused`], or `None` when `kernel` has no fused
+    /// override worth dispatching to.
+    ///
+    /// Callers size one scratch buffer from the maximum over the layers that
+    /// share an activation vector, quantize once, and then hand the same
+    /// buffer to every one of them.
+    pub fn q8_fused_blocks(&self, kernel: &dyn QuantKernel) -> Option<usize> {
+        kernel.q8_fused_acts_blocks(self.in_features)
+    }
+
+    /// Forward pass over an activation vector that has **already** been
+    /// quantized to Q8_0 by [`oxillama_quant::quantize_activations_q8_0_into`].
+    ///
+    /// Semantically identical to [`Self::forward`] except that the activation
+    /// side of every dot product is the Q8_0 reconstruction of `input` rather
+    /// than `input` itself.  That is the whole point: the `f32 → i8`
+    /// conversion happens once per matmul *input* instead of once per weight
+    /// *row*, and the row loop then multiplies i8 by i8 in integer registers.
+    ///
+    /// `input` is still required because the bias and the LoRA correction are
+    /// f32 paths that must see the unquantized activation.
+    ///
+    /// [`QuantKernel::matvec_q8_fused`] accumulates, so `output` is zeroed
+    /// first — unlike `gemv`, which overwrites.
+    ///
+    /// # Adoption
+    ///
+    /// This entry point is architecture-agnostic, but only `qwen3` currently
+    /// calls it: that is the architecture whose decode speed was measured
+    /// (6.34 → 12.98 tok/s on Qwen3-4B `Q4_K_M` / Apple M3), and a fused path
+    /// switched on for an architecture nobody benchmarked would be an
+    /// unmeasured numerics change.  Wiring another architecture is mechanical
+    /// — quantize each activation vector once with
+    /// [`oxillama_quant::quantize_activations_q8_0_into`], size the block
+    /// count from [`Self::q8_fused_blocks`] over the layers that share that
+    /// vector, and call this instead of [`Self::forward`] wherever the count
+    /// is `Some`.
+    pub fn forward_q8_fused(
+        &self,
+        kernel: &dyn QuantKernel,
+        input: &[f32],
+        acts_q8: &[u8],
+        output: &mut [f32],
+    ) -> oxillama_quant::QuantResult<()> {
+        let n_rows = self.out_features.min(output.len());
+        output[..n_rows].fill(0.0);
+        kernel.matvec_q8_fused(
+            &self.weight.data,
+            acts_q8,
+            output,
+            self.out_features,
+            self.in_features,
+        )?;
+
+        if let Some(ref bias) = self.bias {
+            for (o, &b) in output.iter_mut().zip(bias.iter()) {
+                *o += b;
+            }
+        }
+
+        if let Some(ref lora) = self.lora {
+            lora.apply(input, output)?;
+        }
+
+        for (adapter, scale) in &self.lora_stack {
+            apply_lora_scaled(adapter, input, output, *scale);
+        }
+
+        Ok(())
+    }
+
+    /// Batched sibling of [`Self::forward_q8_fused`]: `m` tokens through one
+    /// weight matrix in a single sweep.
+    ///
+    /// `acts_q8` holds the `m` activation vectors back to back, as produced by
+    /// [`oxillama_quant::quantize_activations_q8_0_batch_into`] with the block
+    /// count from [`Self::q8_fused_blocks`].
+    ///
+    /// `output` is **feature-major** `[out_features][m]` — output row `r` for
+    /// token `t` lands at `output[r * m + t]`.  That is the kernel's native
+    /// layout (it keeps a weight row's `m` results contiguous on one thread);
+    /// callers that want token-major hidden states transpose afterwards.
+    ///
+    /// The result for every `(row, token)` is bit-identical to calling
+    /// [`Self::forward_q8_fused`] for that token alone: the kernels hoist the
+    /// weight decode out of the token loop but never reassociate the `K`
+    /// accumulation, and the bias is added once per element either way.
+    ///
+    /// # LoRA
+    ///
+    /// A LoRA correction is per token and is **not** applied here.  Callers
+    /// must keep LoRA-patched layers on the per-token path; the Qwen3 prefill
+    /// checks this before choosing the batched route.
+    pub fn forward_q8_fused_batch(
+        &self,
+        kernel: &dyn QuantKernel,
+        acts_q8: &[u8],
+        output: &mut [f32],
+        m: usize,
+    ) -> oxillama_quant::QuantResult<()> {
+        let n_rows = self.out_features.min(output.len() / m.max(1));
+        output[..n_rows * m].fill(0.0);
+        kernel.matmul_q8_fused(
+            &self.weight.data,
+            acts_q8,
+            output,
+            self.out_features,
+            self.in_features,
+            m,
+        )?;
+
+        if let Some(ref bias) = self.bias {
+            for (row, &b) in bias.iter().enumerate().take(n_rows) {
+                for o in output[row * m..(row + 1) * m].iter_mut() {
+                    *o += b;
+                }
+            }
         }
 
         Ok(())
@@ -262,6 +467,24 @@ mod tests {
         // W @ input + bias + delta = [2+10+2, 3+10+3] = [14, 16]
         assert!((output[0] - 14.0).abs() < 1e-5, "output[0]={}", output[0]);
         assert!((output[1] - 16.0).abs() < 1e-5, "output[1]={}", output[1]);
+    }
+
+    /// GGUF's in-features-first order becomes `[out_features, in_features]`.
+    ///
+    /// Qwen3-4B's `attn_q.weight` is stored as `[2560, 4096]`; reading it
+    /// verbatim makes the GEMV demand a 4096-long activation vector from a
+    /// 2560-wide residual stream.
+    #[test]
+    fn test_gguf_linear_shape_reverses_2d_dims() {
+        assert_eq!(gguf_linear_shape(&[2560, 4096]), vec![4096, 2560]);
+        assert_eq!(gguf_linear_shape(&[9728, 2560]), vec![2560, 9728]);
+    }
+
+    /// 1-D tensors (bias, norm scales) pass through unchanged.
+    #[test]
+    fn test_gguf_linear_shape_leaves_vectors_alone() {
+        assert_eq!(gguf_linear_shape(&[128]), vec![128]);
+        assert_eq!(gguf_linear_shape(&[]), Vec::<usize>::new());
     }
 
     /// `lora` field is None for a freshly constructed QuantLinear.

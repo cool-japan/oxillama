@@ -22,15 +22,34 @@ command-r = ["oxillama-arch/command-r"]
 starcoder = ["oxillama-arch/starcoder"]
 tokenizer-onig = ["dep:tokenizers", "tokenizers/onig"]
 tokenizer-wasm = ["dep:tokenizers", "tokenizers/unstable_wasm"]
-parallel = ["dep:rayon", "oxillama-quant/parallel"]
+parallel = ["dep:rayon", "oxillama-quant/parallel", "oxillama-arch/parallel"]
+# ── SIMD passthroughs ────────────────────────────────────────────────────────
+# `simd-neon`/`simd-avx2` already arrive through `oxillama-arch`; these let a
+# downstream crate name them (and opt into AVX-512) without depending on
+# oxillama-quant directly.
+simd-neon = ["oxillama-quant/simd-neon", "oxillama-arch/simd-neon"]
+simd-avx2 = ["oxillama-quant/simd-avx2", "oxillama-arch/simd-avx2"]
+simd-avx512 = ["oxillama-quant/simd-avx512", "oxillama-arch/simd-avx512"]
 native-async = ["dep:tokio", "dep:tokio-util"]
 mmap = ["oxillama-gguf/mmap", "dep:memmap2"]
 offload = []
+# Device-resident Q4_0 weights via `oxillama-gpu`.  Off by default: the backend
+# pulls in wgpu, and only the Q4_0 resident GEMV is faster than the CPU path.
+gpu = ["dep:oxillama-gpu", "oxillama-gpu/gpu"]
 
 [dependencies]
 oxillama-gguf = { workspace = true }
 oxillama-quant = { workspace = true }
-oxillama-arch.workspace = true
+# The workspace table pins `default-features = false`; name the full
+# architecture set here instead of inheriting it.  The engine routes every
+# GGUF through `ArchitectureRegistry::with_builtins()`, which is gated on
+# *oxillama-arch's* features — not on the seven passthrough features above —
+# so narrowing this list removes architectures from the registry at run time
+# with no compile error.  `engine/tests.rs::registry_routing` loads falcon,
+# olmo2, gptneox, stablelm, minicpm and bloom fixtures and asserts
+# `registry.len() > 7`, which is exactly this requirement made executable.
+oxillama-arch = { workspace = true, features = ["all-architectures"] }
+oxillama-gpu = { workspace = true, optional = true }
 half.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -38,6 +57,11 @@ rayon = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true, default-features = false }
+# Pure-Rust regex engine with look-around support.  The GGUF pre-tokenizer
+# patterns transcribed from llama.cpp use `(?!\S)`, which the `regex` crate
+# cannot express.  Already present in the dependency graph via `tokenizers`
+# (`unstable_wasm`), so this adds no new code to the build.
+fancy-regex.workspace = true
 memmap2 = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -47,7 +71,7 @@ tempfile.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-oxillama-gguf = { workspace = true, features = ["test-utils"] }
+oxillama-gguf = { path = "../oxillama-gguf", default-features = false, features = ["test-utils"] }
 
 [[bench]]
 name = "sampling"

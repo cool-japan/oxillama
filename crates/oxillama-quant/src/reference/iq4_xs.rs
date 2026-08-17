@@ -6,8 +6,11 @@
 //!   2-bit high parts of the 8 sub-block scales (bits `[5:4]`).
 //! - bytes[4..8]:   `scales_l` — 4 bytes holding the 4-bit low parts of
 //!   the 8 sub-block scales (bits `[3:0]`), packed two per byte.
-//! - bytes[8..136]: 128 nibble-bytes encoding 256 four-bit weights.
-//!   Low nibble = `weight[2i]`, high nibble = `weight[2i+1]`.
+//! - bytes[8..136]: 128 nibble-bytes encoding 256 four-bit weights, in GGML's
+//!   split-half layout applied **per 32-weight sub-block**
+//!   (`dequantize_row_iq4_xs`): within sub-block `ib`, the low nibble of
+//!   `qs[16·ib + j]` is `weight[32·ib + j]` and its high nibble is
+//!   `weight[32·ib + 16 + j]`, for `j` in `0..16`.
 //!
 //! Each block is divided into 8 sub-blocks of 32 weights.  Sub-block `i`
 //! has its own sub-scale `ls` derived from `scales_h` and `scales_l`:
@@ -88,8 +91,9 @@ impl QuantKernel for Iq4XsRef {
                 let byte = nibbles[nibble_offset + i];
                 let lo = (byte & 0x0F) as usize;
                 let hi = ((byte >> 4) & 0x0F) as usize;
-                output[weight_offset + i * 2] = scale * KVALUES_IQ4NL[lo] as f32;
-                output[weight_offset + i * 2 + 1] = scale * KVALUES_IQ4NL[hi] as f32;
+                output[weight_offset + i] = scale * KVALUES_IQ4NL[lo] as f32;
+                output[weight_offset + i + IQ4_XS_SUB_BLOCK_SIZE / 2] =
+                    scale * KVALUES_IQ4NL[hi] as f32;
             }
         }
 
@@ -125,7 +129,7 @@ impl QuantKernel for Iq4XsRef {
         let blocks_per_row = n_cols.div_ceil(IQ4_XS_BLOCK_SIZE);
         let row_bytes = blocks_per_row * IQ4_XS_BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -150,19 +154,20 @@ impl QuantKernel for Iq4XsRef {
                         let byte = nibbles[nibble_offset + i];
                         let lo = (byte & 0x0F) as usize;
                         let hi = ((byte >> 4) & 0x0F) as usize;
-                        let idx = col_offset + i * 2;
+                        let idx_lo = col_offset + i;
+                        let idx_hi = idx_lo + IQ4_XS_SUB_BLOCK_SIZE / 2;
 
-                        if idx + 1 < n_cols {
-                            sum += KVALUES_IQ4NL[lo] as f32 * scale * input[idx];
-                            sum += KVALUES_IQ4NL[hi] as f32 * scale * input[idx + 1];
-                        } else if idx < n_cols {
-                            sum += KVALUES_IQ4NL[lo] as f32 * scale * input[idx];
+                        if idx_lo < n_cols {
+                            sum += KVALUES_IQ4NL[lo] as f32 * scale * input[idx_lo];
+                        }
+                        if idx_hi < n_cols {
+                            sum += KVALUES_IQ4NL[hi] as f32 * scale * input[idx_hi];
                         }
                     }
                 }
             }
             *out = sum;
-        }
+        });
 
         Ok(())
     }

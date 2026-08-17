@@ -20,8 +20,13 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
+use crate::queue::{BatchRequest, GenerateStreamReply, StreamCallback};
 use crate::state::AppState;
+use oxillama_runtime::{ChatTemplate, Turn};
 
 // ── Request / response types ─────────────────────────────────────────────
 
@@ -103,10 +108,10 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>
 /// Drive a single WebSocket session end-to-end.
 ///
 /// 1. Receive one text frame containing a [`WsRequest`].
-/// 2. Stream placeholder token events (real inference is wired in via the
-///    inference worker queue in a future integration step).
+/// 2. Dispatch to the inference worker queue and stream token events as they
+///    arrive.
 /// 3. Send a `done` event and close.
-async fn handle_socket(mut socket: WebSocket, _state: Arc<AppState>) {
+async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     // ── Step 1: receive the request ──────────────────────────────────────
     let text = match receive_text(&mut socket).await {
         Some(t) => t,
@@ -121,33 +126,126 @@ async fn handle_socket(mut socket: WebSocket, _state: Arc<AppState>) {
         }
     };
 
-    // ── Step 2: stream tokens ────────────────────────────────────────────
-    // Placeholder: echo a fixed token stream.
-    // In the full integration this will submit `req` to `_state.queue` and
-    // forward streamed tokens from the response channel.
-    let _ = req.model; // suppress unused field warning until full integration
-    let stub_tokens: &[&str] = &["Hello", " from", " OxiLLaMa", " via", " WebSocket"];
-    let mut sent = 0u32;
-    for token in stub_tokens {
-        let event = WsEvent::Token {
-            delta: (*token).to_string(),
+    // ── Step 2: build prompt and sampler config ──────────────────────────
+    let prompt = format_ws_prompt(&req.messages, state.chat_template);
+    let add_special = !state.chat_template.emits_literal_bos();
+
+    let mut sampler_config = state.default_sampler.clone();
+    sampler_config.temperature = req.temperature;
+
+    // ── Step 3: create channels ──────────────────────────────────────────
+    // `token_tx` is moved directly into the callback; the callback is the
+    // sole sender.  When the worker drops the `BatchRequest` after completion,
+    // it drops the callback, which drops `token_tx`, causing `token_rx.recv()`
+    // to return `None` and the drain loop to exit cleanly.
+    let (token_tx, mut token_rx) = mpsc::channel::<String>(32);
+    let (reply_tx, reply_rx) = oneshot::channel::<GenerateStreamReply>();
+
+    // D3/D4: cancelled once the outbound channel to this WS session can no
+    // longer accept tokens (client stalled or disconnected).
+    let cancel = CancellationToken::new();
+
+    // ── Step 4: build streaming callback ────────────────────────────────
+    //
+    // D3 fix: `try_send` instead of `blocking_send` — a full/closed
+    // channel no longer parks the sole blocking worker thread; instead the
+    // request is cancelled.
+    let cancel_cb = cancel.clone();
+    let callback: StreamCallback =
+        Box::new(
+            move |token_text: &str| match token_tx.try_send(token_text.to_string()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                    cancel_cb.cancel();
+                }
+            },
+        );
+
+    // ── Step 5: dispatch to the inference worker ─────────────────────────
+    //
+    // D5 fix: `try_send` sheds with an explicit error instead of parking
+    // this connection handler when the queue is saturated.
+    if let Err(e) = state.queue.try_send(BatchRequest::GenerateStream {
+        prompt,
+        max_tokens: req.max_tokens as usize,
+        config: sampler_config,
+        cache_prompt: true,
+        lora_selection: vec![],
+        add_special,
+        cancel: cancel.clone(),
+        callback,
+        reply: reply_tx,
+    }) {
+        let message = match e {
+            TrySendError::Full(_) => "Inference queue is full — server overloaded",
+            TrySendError::Closed(_) => "Inference worker is unavailable",
         };
-        if !send_event(&mut socket, &event).await {
-            return;
-        }
-        sent += 1;
+        send_error(&mut socket, message).await;
+        return;
     }
 
-    // ── Step 3: send done and close ──────────────────────────────────────
+    // ── Step 6: drain token stream ───────────────────────────────────────
+    while let Some(token) = token_rx.recv().await {
+        let event = WsEvent::Token { delta: token };
+        if !send_event(&mut socket, &event).await {
+            // The client's socket write failed — stop generation rather
+            // than continuing to decode tokens nobody can receive.
+            cancel.cancel();
+            return;
+        }
+    }
+
+    // ── Step 7: await completion and send done ───────────────────────────
+    let (finish_reason, usage) = match reply_rx.await {
+        Ok(Ok((stats, runtime_reason))) => {
+            state
+                .metrics
+                .record_usage(stats.prompt_tokens as u64, stats.completion_tokens as u64);
+            // Reports `"length"` for a generation truncated at `max_tokens`
+            // instead of the unconditional `"stop"` this used to send.
+            let reason = if cancel.is_cancelled() {
+                "cancelled".to_string()
+            } else {
+                runtime_reason.as_openai_str().to_string()
+            };
+            (reason, stats)
+        }
+        Ok(Err(msg)) => {
+            send_error(&mut socket, &format!("Generation failed: {msg}")).await;
+            return;
+        }
+        Err(_) => {
+            send_error(&mut socket, "Inference worker dropped the reply channel").await;
+            return;
+        }
+    };
+
     let done = WsEvent::Done {
-        finish_reason: "stop".to_string(),
+        finish_reason,
         usage: UsageSummary {
-            prompt_tokens: 0,
-            completion_tokens: sent,
+            prompt_tokens: usage.prompt_tokens as u32,
+            completion_tokens: usage.completion_tokens as u32,
         },
     };
     send_event(&mut socket, &done).await;
     // Close is implicit when socket is dropped.
+}
+
+/// Render a sequence of [`WsMessage`] entries through the loaded model's own
+/// chat template.
+///
+/// Same renderer as `chat.rs::format_chat_prompt` — this used to be a second
+/// hand-rolled copy of the fabricated `<|system|>…<|end|>` skeleton, so the
+/// WebSocket transport reproduced the identical defect independently.
+fn format_ws_prompt(messages: &[WsMessage], template: ChatTemplate) -> String {
+    let turns: Vec<Turn<'_>> = messages
+        .iter()
+        .map(|msg| Turn {
+            role: msg.role.as_str(),
+            content: msg.content.as_str(),
+        })
+        .collect();
+    template.render(&turns, true)
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────
@@ -196,6 +294,49 @@ async fn send_error(socket: &mut WebSocket, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ws_msg(role: &str, content: &str) -> WsMessage {
+        WsMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    /// The WebSocket transport used to carry its own hand-rolled copy of the
+    /// fabricated `<|system|>…<|end|>` skeleton, reproducing the chat-route
+    /// defect independently. It must now render through the served model's
+    /// real template.
+    #[test]
+    fn format_ws_prompt_uses_the_models_real_markers() {
+        let messages = vec![ws_msg("system", "Be terse."), ws_msg("user", "Hi")];
+
+        let chatml = format_ws_prompt(&messages, ChatTemplate::ChatMl);
+        assert_eq!(
+            chatml,
+            "<|im_start|>system\nBe terse.<|im_end|>\n\
+             <|im_start|>user\nHi<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+
+        let llama3 = format_ws_prompt(&messages, ChatTemplate::Llama3);
+        assert!(llama3.starts_with("<|begin_of_text|>"));
+        assert!(llama3.contains("<|start_header_id|>user<|end_header_id|>"));
+    }
+
+    #[test]
+    fn format_ws_prompt_never_emits_the_fabricated_markers() {
+        let messages = vec![ws_msg("system", "s"), ws_msg("user", "u")];
+        for template in [
+            ChatTemplate::Llama3,
+            ChatTemplate::ChatMl,
+            ChatTemplate::Mistral,
+            ChatTemplate::Alpaca,
+        ] {
+            let prompt = format_ws_prompt(&messages, template);
+            assert!(!prompt.contains("<|end|>"), "{template}: {prompt}");
+            assert!(!prompt.contains("<|system|>"), "{template}: {prompt}");
+        }
+    }
 
     #[test]
     fn ws_event_token_serializes_correctly() {

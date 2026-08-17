@@ -114,25 +114,53 @@ pub fn run_detokenize(args: &DetokenizeArgs) -> anyhow::Result<()> {
 
 /// Load a `TokenizerBridge` for the given GGUF model path.
 ///
-/// Strategy:
-/// 1. Check for a `tokenizer.json` sidecar alongside the model file.
-/// 2. Return an error if not found (GGUF-embedded tokenizer extraction is
-///    deferred to a future version).
+/// Strategy (mirrors `oxillama_runtime::engine::load_tokenizer`'s priority
+/// order, since a stock HuggingFace GGUF must tokenize identically whether it
+/// runs through `oxillama run` or `oxillama tokenize`):
+///
+/// 1. The vocabulary embedded in the GGUF file itself
+///    (`tokenizer.ggml.tokens` and friends) — this is the vocabulary the
+///    weights were quantized against, so it always agrees with the model's
+///    special-token ids and decodes byte-exactly. It deliberately outranks a
+///    sidecar.
+/// 2. A `tokenizer.json` sidecar alongside the model file, if the GGUF has no
+///    embedded vocabulary or it could not be used.
+///
+/// Returns an error only when neither source is available.
 fn load_tokenizer_bridge(model_path: &Path) -> anyhow::Result<oxillama_runtime::TokenizerBridge> {
-    // ── Sidecar JSON ──────────────────────────────────────────────────
-    if let Some(parent) = model_path.parent() {
-        let sidecar = parent.join("tokenizer.json");
-        if sidecar.exists() {
-            let path_str = sidecar.to_string_lossy();
-            return oxillama_runtime::TokenizerBridge::from_file(&path_str)
-                .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json sidecar: {e}"));
+    let model = oxillama_gguf::GgufModel::load(model_path)
+        .with_context(|| format!("failed to load GGUF model '{}'", model_path.display()))?;
+    let metadata = &model.file.metadata;
+
+    // ── 1. GGUF-embedded vocabulary ──────────────────────────────────
+    if oxillama_runtime::TokenizerBridge::metadata_has_vocab(metadata) {
+        match oxillama_runtime::TokenizerBridge::from_gguf_metadata(metadata) {
+            Ok(bridge) => return Ok(bridge),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "GGUF-embedded vocabulary could not be used; falling back to a tokenizer.json sidecar"
+                );
+            }
         }
     }
 
-    // ── No sidecar found; report clearly ─────────────────────────────
+    // ── 2. Sidecar JSON ───────────────────────────────────────────────
+    if let Some(parent) = model_path.parent() {
+        let sidecar = parent.join("tokenizer.json");
+        if sidecar.exists() {
+            let mut bridge = oxillama_runtime::TokenizerBridge::from_path(&sidecar)
+                .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json sidecar: {e}"))?;
+            bridge.apply_gguf_specials(metadata);
+            return Ok(bridge);
+        }
+    }
+
+    // ── Neither source available; report clearly ─────────────────────
     anyhow::bail!(
-        "no tokenizer found for model '{}': \
-         place a 'tokenizer.json' alongside the model file",
+        "no tokenizer found for model '{}': the GGUF has no embedded vocabulary \
+         (no 'tokenizer.ggml.tokens' metadata) and no 'tokenizer.json' sidecar \
+         exists alongside the model file",
         model_path.display()
     )
 }
@@ -195,5 +223,140 @@ mod tests {
             run_detokenize(&args).is_ok(),
             "empty ID list should return Ok (no tokenizer needed)"
         );
+    }
+
+    // ── GGUF-embedded tokenizer regression tests (C1) ───────────────────────
+    //
+    // Before the fix, `load_tokenizer_bridge` only ever checked for a
+    // `tokenizer.json` sidecar and `anyhow::bail!`'d otherwise — so every one
+    // of these vocabulary-only GGUFs (which carry a full embedded vocabulary
+    // and no sidecar) made `tokenize`/`detokenize` fail unconditionally, even
+    // though `oxillama_runtime::TokenizerBridge::from_gguf_metadata` has been
+    // available since the GGUF-embedded tokenizer landed. This is the
+    // regression test for that: it fails against the pre-fix
+    // `load_tokenizer_bridge` (sidecar-only) and passes now that the
+    // GGUF-embedded vocabulary is consulted first.
+    //
+    // These reference files live outside the repo
+    // (`~/work/refs/llama.cpp/models/ggml-vocab-*.gguf`) and are not present
+    // on every machine, so each test skips (rather than fails) when the file
+    // is absent — this keeps the suite portable while still exercising the
+    // real fix end-to-end wherever the llama.cpp reference checkout exists.
+
+    /// Resolve a `ggml-vocab-<name>.gguf` path under the llama.cpp reference
+    /// checkout, or `None` if that checkout isn't present on this machine.
+    fn vocab_gguf_path(name: &str) -> Option<PathBuf> {
+        let home = dirs::home_dir()?;
+        let path = home
+            .join("work")
+            .join("refs")
+            .join("llama.cpp")
+            .join("models")
+            .join(format!("ggml-vocab-{name}.gguf"));
+        path.exists().then_some(path)
+    }
+
+    /// Round-trip `tokenize` → `detokenize` against a real vocabulary-only
+    /// GGUF, with no `tokenizer.json` sidecar anywhere nearby — the exact
+    /// scenario the pre-fix code could never handle.
+    fn assert_gguf_embedded_round_trip(vocab_name: &str, text: &str) {
+        let Some(model) = vocab_gguf_path(vocab_name) else {
+            eprintln!(
+                "skipping: ~/work/refs/llama.cpp/models/ggml-vocab-{vocab_name}.gguf not present"
+            );
+            return;
+        };
+
+        let bridge = load_tokenizer_bridge(&model)
+            .unwrap_or_else(|e| panic!("load_tokenizer_bridge({vocab_name}) should succeed from the GGUF-embedded vocabulary alone: {e}"));
+
+        let ids = bridge
+            .encode(text)
+            .unwrap_or_else(|e| panic!("encode({vocab_name}) should succeed: {e}"));
+        assert!(
+            !ids.is_empty(),
+            "{vocab_name}: encoding should produce tokens"
+        );
+
+        let decoded = bridge
+            .decode(&ids)
+            .unwrap_or_else(|e| panic!("decode({vocab_name}) should succeed: {e}"));
+        assert!(
+            decoded.contains(text.trim()) || decoded.trim() == text.trim(),
+            "{vocab_name}: round trip should recover the original text; got {decoded:?} from {text:?}"
+        );
+
+        // Also exercise the actual `run_tokenize` / `run_detokenize` entry
+        // points (format::Json), matching how the CLI is really invoked.
+        let tok_args = TokenizeArgs {
+            model: model.clone(),
+            text: text.to_string(),
+            format: TokenizeFormat::Json,
+        };
+        assert!(
+            run_tokenize(&tok_args).is_ok(),
+            "{vocab_name}: run_tokenize should succeed with no sidecar present"
+        );
+
+        let detok_args = DetokenizeArgs { model, ids };
+        assert!(
+            run_detokenize(&detok_args).is_ok(),
+            "{vocab_name}: run_detokenize should succeed with no sidecar present"
+        );
+    }
+
+    #[test]
+    fn gguf_embedded_round_trip_llama_bpe() {
+        assert_gguf_embedded_round_trip("llama-bpe", "Hello, world");
+    }
+
+    #[test]
+    fn gguf_embedded_round_trip_llama_spm() {
+        assert_gguf_embedded_round_trip("llama-spm", "Hello, world");
+    }
+
+    #[test]
+    fn gguf_embedded_round_trip_qwen2() {
+        assert_gguf_embedded_round_trip("qwen2", "Hello, world");
+    }
+
+    #[test]
+    fn gguf_embedded_round_trip_phi_3() {
+        assert_gguf_embedded_round_trip("phi-3", "Hello, world");
+    }
+
+    #[test]
+    fn gguf_embedded_round_trip_gpt_2() {
+        assert_gguf_embedded_round_trip("gpt-2", "Hello, world");
+    }
+
+    #[test]
+    fn gguf_embedded_round_trip_starcoder() {
+        assert_gguf_embedded_round_trip("starcoder", "Hello, world");
+    }
+
+    #[test]
+    fn gguf_embedded_round_trip_falcon() {
+        assert_gguf_embedded_round_trip("falcon", "Hello, world");
+    }
+
+    #[test]
+    fn gguf_embedded_round_trip_deepseek_coder() {
+        assert_gguf_embedded_round_trip("deepseek-coder", "Hello, world");
+    }
+
+    #[test]
+    fn gguf_embedded_round_trip_command_r() {
+        assert_gguf_embedded_round_trip("command-r", "Hello, world");
+    }
+
+    #[test]
+    fn gguf_embedded_round_trip_mpt() {
+        assert_gguf_embedded_round_trip("mpt", "Hello, world");
+    }
+
+    #[test]
+    fn gguf_embedded_round_trip_refact() {
+        assert_gguf_embedded_round_trip("refact", "Hello, world");
     }
 }

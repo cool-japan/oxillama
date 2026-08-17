@@ -172,6 +172,21 @@ pub async fn create_batch(
         return (StatusCode::PAYLOAD_TOO_LARGE, Json(err)).into_response();
     }
 
+    // D10: check that batch processing is actually wired up *before*
+    // writing anything to disk. Previously `batch_queue_tx` was always a
+    // live-looking `Sender` whose receiver had already been dropped (a
+    // capacity-1 channel built and immediately discarded in
+    // `AppState::new`), so every job was written to disk, then silently
+    // failed to enqueue, leaving an orphaned spool directory nothing would
+    // ever process. Now `batch_queue_tx` is `None` until
+    // `AppState::with_batch_queue` is called, so we can reject up front.
+    let Some(batch_queue_tx) = state.batch_queue_tx.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "batch processing is not enabled on this server",
+        );
+    };
+
     let job_id = format!("batch_{}", Uuid::new_v4().as_simple());
 
     // Write to disk.
@@ -188,8 +203,7 @@ pub async fn create_batch(
     match meta_result {
         Ok(Ok(meta)) => {
             // Enqueue for background processing.
-            if let Err(e) = state
-                .batch_queue_tx
+            if let Err(e) = batch_queue_tx
                 .send(BatchWorkItem {
                     job_id: job_id.clone(),
                 })
@@ -288,7 +302,10 @@ pub async fn get_batch_output(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    let output_path = state.batch_disk_store.job_dir(&id).join("output.jsonl");
+    let Ok(job_dir) = state.batch_disk_store.job_dir(&id) else {
+        return not_found(&id);
+    };
+    let output_path = job_dir.join("output.jsonl");
 
     match TokioFile::open(&output_path).await {
         Ok(file) => {

@@ -6,7 +6,7 @@
 //! ensures in-flight requests are drained before the process exits.
 
 use tokio::signal;
-use tracing::info;
+use tracing::{error, info};
 
 /// Wait for a shutdown signal (Ctrl-C / SIGTERM).
 ///
@@ -15,19 +15,37 @@ use tracing::info;
 ///
 /// On Unix, both SIGINT (Ctrl-C) and SIGTERM are handled.
 /// On non-Unix (Windows), only Ctrl-C is available.
+///
+/// D12 fix: if installing a signal handler fails (this can happen — e.g.
+/// another handler is already registered, or the platform denies it), this
+/// used to `.expect(...)`, aborting the entire async runtime — which is a
+/// far worse outcome than simply not being able to shut down gracefully
+/// via that particular signal. It now logs the failure and falls back to
+/// `future::pending()` for that branch, so the *other* signal (or an
+/// external `kill -9`) still works, and a single failed installation
+/// cannot take down an otherwise-healthy server.
 pub async fn shutdown_signal() {
     let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
+        match signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(e) => {
+                error!(error = %e, "failed to install Ctrl-C handler; this signal will not trigger graceful shutdown");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(e) => {
+                error!(error = %e, "failed to install SIGTERM handler; this signal will not trigger graceful shutdown");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

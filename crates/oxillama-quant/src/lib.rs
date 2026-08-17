@@ -21,6 +21,7 @@
 
 pub mod dispatch;
 pub mod error;
+pub mod kquant;
 pub mod lora;
 pub mod parallel;
 pub mod quantize;
@@ -31,10 +32,16 @@ pub mod types;
 
 pub use dispatch::{global_dispatcher, CachedDispatcher, KernelDispatcher};
 pub use error::{QuantError, QuantResult};
+pub use kquant::{
+    quantize_f32_to_q2_k, quantize_f32_to_q3_k, quantize_f32_to_q4_k, quantize_f32_to_q5_k,
+    quantize_f32_to_q6_k, QK_K,
+};
 pub use lora::LoraAdapter;
 pub use quantize::{
-    dequantize_to_f32, quantize_f16_to_q4_0, quantize_f16_to_q8_0, quantize_f32_to_q4_0,
-    quantize_f32_to_q8_0,
+    can_encode, dequantize_to_f32, quantize_activations_q8_0_batch_into,
+    quantize_activations_q8_0_into, quantize_f16_to_q4_0, quantize_f16_to_q8_0, quantize_f32_row,
+    quantize_f32_rows, quantize_f32_to_q4_0, quantize_f32_to_q5_0, quantize_f32_to_q5_1,
+    quantize_f32_to_q8_0, Q8_0_ACT_BLOCK_BYTES, Q8_0_ACT_BLOCK_SIZE,
 };
 pub use traits::QuantKernel;
 pub use types::{BlockInfo, QuantTensor};

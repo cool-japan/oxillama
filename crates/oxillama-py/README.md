@@ -14,14 +14,14 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 - `Lora` — load a LoRA adapter and hot-swap it onto an `Engine`
 - `Tokenizer` — first-class tokenizer object with `encode`, `decode`, `encode_batch`, `apply_chat_template`
 - `CancellationToken` — cooperative cancellation handle accepted by `generate()` and `generate_streaming()`
-- Structured exception hierarchy: `OxiLlamaError` → `LoadError`, `GenerateError`, `TokenizerError`, `GrammarError`, `QuantError`, `KvCacheFullError`
+- Structured exception hierarchy: `OxiLlamaError` → `LoadError`, `GenerateError`, `TokenizerError`, `GrammarError`, `QuantError`, `KvCacheFullError`, `GpuUnavailableError` (raised if GPU offload is ever requested and unavailable — there is currently no constructor kwarg to request it from Python, see below)
 - Full Python type annotations (`.pyi` stubs) and docstrings
 - Wheels built with [maturin](https://www.maturin.rs/) (ABI3, Python 3.8+)
 - Optional numpy interop (`embed_numpy()`, `embed_batch_numpy()`, `forward_logits_numpy()`) via `numpy` feature
 
 ## Status
 
-**Version:** 0.1.2 — **Tests:** 81 passing
+**Version:** 0.1.4 — **Tests:** 131 Rust unit tests passing (`cargo nextest -p oxillama-py --all-features`); see [TODO.md](TODO.md) for the separate Python pytest suite count
 
 ## Installation
 
@@ -100,6 +100,7 @@ engine = ox.Engine.from_hub("meta-llama/Llama-3.2-3B-GGUF")
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `numpy` | no | numpy interop for `embed_numpy()`, `embed_batch_numpy()`, `forward_logits_numpy()` |
+| `hub`   | no | HuggingFace Hub loader (`Engine.from_hub()`) — required for the Hub example above |
 
 ## License
 

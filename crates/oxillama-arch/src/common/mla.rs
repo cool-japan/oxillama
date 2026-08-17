@@ -210,20 +210,43 @@ pub fn mla_forward(
 
     let dispatcher = KernelDispatcher::new();
 
+    // Kernel lookup is a type dispatch, not a per-token decision: hoist all
+    // four out of the token loop.  Inside the loop this cost one virtual
+    // dispatch table walk per token per projection.
+    let q_a_kernel = dispatcher
+        .get_kernel(weights.w_q_a.weight.tensor_type)
+        .map_err(ArchError::from)?;
+    let q_b_kernel = dispatcher
+        .get_kernel(weights.w_q_b.weight.tensor_type)
+        .map_err(ArchError::from)?;
+    let kv_a_kernel = dispatcher
+        .get_kernel(weights.w_kv_a.weight.tensor_type)
+        .map_err(ArchError::from)?;
+    let kv_b_kernel = dispatcher
+        .get_kernel(weights.w_kv_b.weight.tensor_type)
+        .map_err(ArchError::from)?;
+    let w_o_kernel = dispatcher
+        .get_kernel(weights.w_o.weight.tensor_type)
+        .map_err(ArchError::from)?;
+
     // --- Per-token Q and KV projection + RoPE + cache append ---
     // q_rope_all[t × num_heads × qk_rope]:  rotated Q-rope per token per head
     // q_nope_all[t × num_heads × qk_nope]:  Q-nope per token per head (no RoPE)
     let mut q_rope_all = vec![0.0f32; seq_len * cfg.num_heads * cfg.qk_rope_head_dim];
     let mut q_nope_all = vec![0.0f32; seq_len * cfg.num_heads * cfg.qk_nope_head_dim];
 
+    // Scratch buffers reused across the token loop.
+    let mut q_latent = vec![0.0f32; cfg.q_lora_rank];
+    let mut q_full = vec![0.0f32; cfg.q_full_dim()];
+    let mut kv_combined = vec![0.0f32; cfg.kv_combined_dim()];
+    let mut kv_latent_normed = vec![0.0f32; cfg.kv_lora_rank];
+    let mut k_rope_raw = vec![0.0f32; cfg.qk_rope_head_dim];
+    let mut q_rope_head = vec![0.0f32; cfg.qk_rope_head_dim];
+
     for t in 0..seq_len {
         let x_t = &x[t * hidden_size..(t + 1) * hidden_size];
 
         // Step 1: Q latent = w_q_a(x_t) then q_a_norm
-        let q_a_kernel = dispatcher
-            .get_kernel(weights.w_q_a.weight.tensor_type)
-            .map_err(ArchError::from)?;
-        let mut q_latent = vec![0.0f32; cfg.q_lora_rank];
         weights
             .w_q_a
             .forward(&*q_a_kernel, x_t, &mut q_latent)
@@ -231,10 +254,6 @@ pub fn mla_forward(
         weights.q_a_norm.forward(&mut q_latent);
 
         // Step 2: Q full = q_latent @ w_q_b → [num_heads × (qk_nope + qk_rope)]
-        let q_b_kernel = dispatcher
-            .get_kernel(weights.w_q_b.weight.tensor_type)
-            .map_err(ArchError::from)?;
-        let mut q_full = vec![0.0f32; cfg.q_full_dim()];
         weights
             .w_q_b
             .forward(&*q_b_kernel, &q_latent, &mut q_full)
@@ -250,8 +269,7 @@ pub fn mla_forward(
             nope_dst.copy_from_slice(q_nope_src);
 
             let rope_src_off = head_off + cfg.qk_nope_head_dim;
-            let mut q_rope_head =
-                q_full[rope_src_off..rope_src_off + cfg.qk_rope_head_dim].to_vec();
+            q_rope_head.copy_from_slice(&q_full[rope_src_off..rope_src_off + cfg.qk_rope_head_dim]);
             weights.rope.apply(&mut q_rope_head, global_pos);
             let rope_dst = &mut q_rope_all[(t * cfg.num_heads + h) * cfg.qk_rope_head_dim
                 ..(t * cfg.num_heads + h + 1) * cfg.qk_rope_head_dim];
@@ -259,21 +277,16 @@ pub fn mla_forward(
         }
 
         // Step 3: KV combined = x_t @ w_kv_a → [kv_lora_rank + qk_rope]
-        let kv_a_kernel = dispatcher
-            .get_kernel(weights.w_kv_a.weight.tensor_type)
-            .map_err(ArchError::from)?;
-        let mut kv_combined = vec![0.0f32; cfg.kv_combined_dim()];
         weights
             .w_kv_a
             .forward(&*kv_a_kernel, x_t, &mut kv_combined)
             .map_err(ArchError::from)?;
 
         // Step 4: Split kv_combined → kv_latent_t + k_rope_raw
-        let kv_latent_t = kv_combined[..cfg.kv_lora_rank].to_vec();
-        let mut k_rope_raw = kv_combined[cfg.kv_lora_rank..].to_vec();
+        kv_latent_normed.copy_from_slice(&kv_combined[..cfg.kv_lora_rank]);
+        k_rope_raw.copy_from_slice(&kv_combined[cfg.kv_lora_rank..]);
 
         // Apply q_a_norm equivalent (kv_a_norm) to kv_latent part
-        let mut kv_latent_normed = kv_latent_t;
         weights.kv_a_norm.forward(&mut kv_latent_normed);
 
         // Step 5: Apply RoPE to k_rope (shared across heads)
@@ -286,56 +299,59 @@ pub fn mla_forward(
     // --- Attention over all tokens ---
     let mut output = vec![0.0f32; seq_len * hidden_size];
 
-    let kv_b_kernel = dispatcher
-        .get_kernel(weights.w_kv_b.weight.tensor_type)
-        .map_err(ArchError::from)?;
-    let w_o_kernel = dispatcher
-        .get_kernel(weights.w_o.weight.tensor_type)
-        .map_err(ArchError::from)?;
+    // `w_kv_b` maps one `kv_lora_rank` latent to ALL heads at once
+    // (`num_heads × (qk_nope + v_head_dim)` outputs).  The previous shape had
+    // this projection inside `for h in heads { for s in keys { … } }` **twice**,
+    // with a fresh `kv_b_full_dim()` allocation each time: for DeepSeek-V3 that
+    // is 128 KB allocated and a 512×32768 GEMV recomputed ~256× per
+    // (token, key) pair.
+    //
+    // The loop nest below is instead
+    //
+    //     for t in tokens { for s in keys { project once; for h in heads { … } } }
+    //
+    // so `w_kv_b` runs exactly twice per (token, key) — once to fill the score
+    // matrix and once to accumulate V — from a **single** reusable
+    // `kv_b_full_dim()` scratch buffer.  Memory stays O(num_heads × attend_len)
+    // for the score matrix (2 MB at 128 heads × 4096 keys) rather than
+    // O(attend_len × kv_b_full_dim) (512 MB for the same shape), which is why
+    // caching every projected latent would not have been an improvement.
+    let mut attn_head_out = vec![0.0f32; cfg.attn_out_dim()];
+    let mut kv_up = vec![0.0f32; cfg.kv_b_full_dim()];
+    let mut scores = vec![0.0f32; cfg.num_heads * cache.seq_len.max(1)];
+
+    let cache_start = cache.seq_len - seq_len;
 
     for t in 0..seq_len {
-        // The query token corresponds to cache position (position + t), but we read
-        // from the first (position + t + 1) cached entries (all tokens up to and including t).
-        // Note: the cache now has (initial_seq_len + t + 1) entries after the loop above,
-        // but for causal attention token t can attend to positions [0..=position+t].
-        // Since cache was populated starting from seq_len_before (= initial cache seq_len
-        // before this call), token t in our batch corresponds to cache index
-        // (cache_start + t) where cache_start = cache.seq_len - seq_len.
-        let cache_start = cache.seq_len - seq_len;
-        let attend_len = cache_start + t + 1; // attend to all cached tokens up to this one
+        // Token `t` of this batch sits at cache index `cache_start + t` and, by
+        // causality, attends to cache positions `0..=cache_start + t`.
+        let attend_len = cache_start + t + 1;
 
-        // Per-head attention output, accumulated here
-        let mut attn_head_out = vec![0.0f32; cfg.attn_out_dim()];
+        attn_head_out.fill(0.0);
 
-        // Per-head attention scores
-        let mut scores = vec![0.0f32; attend_len];
+        // ── Pass 1: score matrix [num_heads, attend_len] ──────────────────
+        for s in 0..attend_len {
+            let lat_off = s * cfg.kv_lora_rank;
+            let kv_lat_s = &cache.kv_latent[lat_off..lat_off + cfg.kv_lora_rank];
+            weights
+                .w_kv_b
+                .forward(&*kv_b_kernel, kv_lat_s, &mut kv_up)
+                .map_err(ArchError::from)?;
 
-        for h in 0..cfg.num_heads {
-            let q_nope_h = &q_nope_all[(t * cfg.num_heads + h) * cfg.qk_nope_head_dim
-                ..(t * cfg.num_heads + h + 1) * cfg.qk_nope_head_dim];
-            let q_rope_h = &q_rope_all[(t * cfg.num_heads + h) * cfg.qk_rope_head_dim
-                ..(t * cfg.num_heads + h + 1) * cfg.qk_rope_head_dim];
+            // `k_rope` is shared across heads — read straight from the cache.
+            let rope_off = s * cfg.qk_rope_head_dim;
+            let k_rope_s = &cache.k_rope[rope_off..rope_off + cfg.qk_rope_head_dim];
 
-            // Compute attention scores for each cached token
-            for (s, score_slot) in scores.iter_mut().enumerate().take(attend_len) {
-                // Lazy reconstruct: kv_up_s = cache.kv_latent[s] @ w_kv_b
-                let lat_off = s * cfg.kv_lora_rank;
-                let kv_lat_s = &cache.kv_latent[lat_off..lat_off + cfg.kv_lora_rank];
-                let mut kv_up = vec![0.0f32; cfg.kv_b_full_dim()];
-                weights
-                    .w_kv_b
-                    .forward(&*kv_b_kernel, kv_lat_s, &mut kv_up)
-                    .map_err(ArchError::from)?;
+            for h in 0..cfg.num_heads {
+                let q_nope_h = &q_nope_all[(t * cfg.num_heads + h) * cfg.qk_nope_head_dim
+                    ..(t * cfg.num_heads + h + 1) * cfg.qk_nope_head_dim];
+                let q_rope_h = &q_rope_all[(t * cfg.num_heads + h) * cfg.qk_rope_head_dim
+                    ..(t * cfg.num_heads + h + 1) * cfg.qk_rope_head_dim];
 
-                // Split kv_up per head: k_nope[h] + v[h]
                 let h_off = h * cfg.kv_b_per_head_dim();
                 let k_nope_s = &kv_up[h_off..h_off + cfg.qk_nope_head_dim];
 
-                // k_rope is shared across heads — read from cache
-                let rope_off = s * cfg.qk_rope_head_dim;
-                let k_rope_s = &cache.k_rope[rope_off..rope_off + cfg.qk_rope_head_dim];
-
-                // Score: q_nope·k_nope + q_rope·k_rope (decoupled RoPE)
+                // Score: q_nope·k_nope + q_rope·k_rope (decoupled RoPE).
                 let score: f32 = q_nope_h
                     .iter()
                     .zip(k_nope_s.iter())
@@ -346,26 +362,30 @@ pub fn mla_forward(
                         .zip(k_rope_s.iter())
                         .map(|(a, b)| a * b)
                         .sum::<f32>();
-                *score_slot = score * cfg.softmax_scale;
+                scores[h * attend_len + s] = score * cfg.softmax_scale;
             }
+        }
 
-            // Softmax over scores[0..attend_len]
-            softmax_inplace(&mut scores[..attend_len]);
+        // ── Softmax each head's row over `attend_len` keys ────────────────
+        for h in 0..cfg.num_heads {
+            softmax_inplace(&mut scores[h * attend_len..(h + 1) * attend_len]);
+        }
 
-            // Weighted sum of V
-            let v_head_out = &mut attn_head_out[h * cfg.v_head_dim..(h + 1) * cfg.v_head_dim];
-            for (s, &w) in scores.iter().enumerate().take(attend_len) {
-                let lat_off = s * cfg.kv_lora_rank;
-                let kv_lat_s = &cache.kv_latent[lat_off..lat_off + cfg.kv_lora_rank];
-                let mut kv_up = vec![0.0f32; cfg.kv_b_full_dim()];
-                weights
-                    .w_kv_b
-                    .forward(&*kv_b_kernel, kv_lat_s, &mut kv_up)
-                    .map_err(ArchError::from)?;
+        // ── Pass 2: weighted sum of V ─────────────────────────────────────
+        for s in 0..attend_len {
+            let lat_off = s * cfg.kv_lora_rank;
+            let kv_lat_s = &cache.kv_latent[lat_off..lat_off + cfg.kv_lora_rank];
+            weights
+                .w_kv_b
+                .forward(&*kv_b_kernel, kv_lat_s, &mut kv_up)
+                .map_err(ArchError::from)?;
 
+            for h in 0..cfg.num_heads {
+                let w = scores[h * attend_len + s];
                 let h_off = h * cfg.kv_b_per_head_dim();
                 let v_s = &kv_up
                     [h_off + cfg.qk_nope_head_dim..h_off + cfg.qk_nope_head_dim + cfg.v_head_dim];
+                let v_head_out = &mut attn_head_out[h * cfg.v_head_dim..(h + 1) * cfg.v_head_dim];
                 for (vo, &vs) in v_head_out.iter_mut().zip(v_s.iter()) {
                     *vo += w * vs;
                 }

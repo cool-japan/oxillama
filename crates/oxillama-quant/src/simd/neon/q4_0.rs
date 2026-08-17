@@ -40,7 +40,12 @@ unsafe fn hsum_f32x4(v: float32x4_t) -> f32 {
 
 /// Dequantize one Q4_0 block using NEON intrinsics.
 ///
-/// Produces 32 f32 values in interleaved order [lo0, hi0, lo1, hi1, ...].
+/// Produces 32 f32 values in GGML's split-half order: the 16 low nibbles are
+/// weights `0..16` and the 16 high nibbles are weights `16..32`.  Because a
+/// `vld1q_u8` load already delivers the 16 nibble bytes in weight order, the
+/// masked and shifted halves land in their final positions and **no lane
+/// permutation is needed** — the old interleaved layout is what required the
+/// `vzipq_f32` step.
 ///
 /// # Safety
 /// Must be called on AArch64 with NEON. Pointer `nibbles` must point
@@ -60,21 +65,19 @@ unsafe fn dequant_block_neon(nibbles: *const u8, d: f32, output: &mut [f32]) {
     let offset = unsafe { vdupq_n_s16(8) };
     let d_vec = unsafe { vdupq_n_f32(d) };
 
-    // Process lo nibbles (weight indices 0, 2, 4, ..., 30)
+    // Process lo nibbles (weight indices 0..16)
     // SAFETY: vmovl_u8 / vreinterpretq_s16_u16 / vsubq_s16 are always valid on AArch64.
     let lo16_low = unsafe { vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(lo))), offset) };
     let lo16_high = unsafe { vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(lo))), offset) };
 
-    // Process hi nibbles (weight indices 1, 3, 5, ..., 31)
+    // Process hi nibbles (weight indices 16..32)
     // SAFETY: same as above.
     let hi16_low = unsafe { vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(hi))), offset) };
     let hi16_high = unsafe { vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(hi))), offset) };
 
-    // Convert to f32 and multiply by d (4 groups of 4 per lane)
-    // lo_low: weights [0, 2, 4, 6, 8, 10, 12, 14]
-    // lo_high: weights [16, 18, 20, 22, 24, 26, 28, 30]
-    // hi_low: weights [1, 3, 5, 7, 9, 11, 13, 15]
-    // hi_high: weights [17, 19, 21, 23, 25, 27, 29, 31]
+    // Convert to f32 and multiply by d (4 groups of 4 lanes each)
+    // lo_f0..lo_f3 → weights  0..4,  4..8,  8..12, 12..16
+    // hi_f0..hi_f3 → weights 16..20, 20..24, 24..28, 28..32
 
     // SAFETY: vcvtq_f32_s32 / vmovl_s16 / vmulq_f32 are valid on AArch64.
     let lo_f0 = unsafe { vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_low))), d_vec) };
@@ -87,36 +90,27 @@ unsafe fn dequant_block_neon(nibbles: *const u8, d: f32, output: &mut [f32]) {
     let hi_f2 = unsafe { vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_high))), d_vec) };
     let hi_f3 = unsafe { vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi16_high)), d_vec) };
 
-    // Interleave lo/hi pairs into output: [lo0,hi0,lo1,hi1, lo2,hi2,lo3,hi3, ...]
-    // Each vzip group handles 4 lo + 4 hi → 8 interleaved values.
-    // SAFETY: vzipq_f32 is always valid on AArch64.
-    let zip0 = unsafe { vzipq_f32(lo_f0, hi_f0) };
-    let zip1 = unsafe { vzipq_f32(lo_f1, hi_f1) };
-    let zip2 = unsafe { vzipq_f32(lo_f2, hi_f2) };
-    let zip3 = unsafe { vzipq_f32(lo_f3, hi_f3) };
-
-    // Store interleaved results
-    // zip0.0 = [lo0,hi0,lo1,hi1], zip0.1 = [lo2,hi2,lo3,hi3]
-    // zip1.0 = [lo4,hi4,lo5,hi5], zip1.1 = [lo6,hi6,lo7,hi7]
-    // etc.
-    // SAFETY: vst1q_f32 requires a valid pointer to 4 f32 values.
-    unsafe { vst1q_f32(output.as_mut_ptr(), zip0.0) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(4), zip0.1) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(8), zip1.0) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(12), zip1.1) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(16), zip2.0) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(20), zip2.1) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(24), zip3.0) };
-    unsafe { vst1q_f32(output.as_mut_ptr().add(28), zip3.1) };
+    // Store directly — the lanes are already in weight order.
+    // SAFETY: vst1q_f32 requires a valid pointer to 4 f32 values; `output`
+    // has at least BLOCK_SIZE == 32 slots.
+    unsafe { vst1q_f32(output.as_mut_ptr(), lo_f0) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(4), lo_f1) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(8), lo_f2) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(12), lo_f3) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(16), hi_f0) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(20), hi_f1) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(24), hi_f2) };
+    unsafe { vst1q_f32(output.as_mut_ptr().add(28), hi_f3) };
 }
 
 /// Compute the dot product between one dequantized Q4_0 block and 32 f32 inputs.
 ///
 /// Returns `d * Σ (nibble_i - 8) * input_i`.
 ///
-/// The key insight: nibble layout is interleaved [lo0,hi0,lo1,hi1,...] matching
-/// input[0], input[1], input[2], input[3]...  We split the input into even/odd
-/// streams and dot each with the corresponding lo/hi vectors.
+/// GGML's layout is split halves: the 16 low nibbles are weights `0..16` and
+/// the 16 high nibbles are weights `16..32`.  So the low nibbles pair with
+/// `input[0..16]` and the high nibbles with `input[16..32]`, both loaded
+/// contiguously — no de-interleaving of the activation vector is required.
 ///
 /// # Safety
 /// Must be called on AArch64 with NEON. `nibbles` must point to 16 valid bytes,
@@ -152,35 +146,32 @@ unsafe fn dot_block_neon(nibbles: *const u8, d: f32, input: &[f32]) -> f32 {
     let hi_f2 = unsafe { vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_high))) };
     let hi_f3 = unsafe { vcvtq_f32_s32(vmovl_high_s16(hi16_high)) };
 
-    // Load input in deinterleaved form: even indices (0,2,4,...) and odd (1,3,5,...).
-    // We use vld2q_f32 which loads two interleaved f32 streams.
-    // input[0..8]:   vld2q_f32 → val0.0 = [in0,in2,in4,in6], val0.1 = [in1,in3,in5,in7]
-    // input[8..16]:  vld2q_f32 → val1.0, val1.1
-    // input[16..24]: vld2q_f32 → val2.0, val2.1
-    // input[24..32]: vld2q_f32 → val3.0, val3.1
+    // Load the two halves of the activation vector contiguously:
+    // in_lo0..in_lo3 = input[0..16]  → paired with the low  nibbles
+    // in_hi0..in_hi3 = input[16..32] → paired with the high nibbles
     //
-    // SAFETY: vld2q_f32 requires pointer to 8 contiguous f32 (32 bytes).
-    // input has 32 elements; offsets 0, 8, 16, 24 each have 8 f32 remaining.
+    // SAFETY: vld1q_f32 requires a pointer to 4 contiguous f32; `input` has
+    // exactly 32 elements, so offsets 0, 4, …, 28 are all in bounds.
     let ip = input.as_ptr();
-    let val0 = unsafe { vld2q_f32(ip) };
-    let val1 = unsafe { vld2q_f32(ip.add(8)) };
-    let val2 = unsafe { vld2q_f32(ip.add(16)) };
-    let val3 = unsafe { vld2q_f32(ip.add(24)) };
+    let in_lo0 = unsafe { vld1q_f32(ip) };
+    let in_lo1 = unsafe { vld1q_f32(ip.add(4)) };
+    let in_lo2 = unsafe { vld1q_f32(ip.add(8)) };
+    let in_lo3 = unsafe { vld1q_f32(ip.add(12)) };
+    let in_hi0 = unsafe { vld1q_f32(ip.add(16)) };
+    let in_hi1 = unsafe { vld1q_f32(ip.add(20)) };
+    let in_hi2 = unsafe { vld1q_f32(ip.add(24)) };
+    let in_hi3 = unsafe { vld1q_f32(ip.add(28)) };
 
-    // val0.0 = even inputs [in0,in2,in4,in6] → paired with lo nibbles [lo0,lo1,lo2,lo3]
-    // val0.1 = odd  inputs [in1,in3,in5,in7] → paired with hi nibbles [hi0,hi1,hi2,hi3]
-    // etc.
-
-    // Dot products: Σ lo_f * even_input + Σ hi_f * odd_input
+    // Dot products: Σ lo_f * input[0..16] + Σ hi_f * input[16..32]
     // SAFETY: vfmaq_f32 / vmulq_f32 are always valid on AArch64.
-    let mut acc = unsafe { vmulq_f32(lo_f0, val0.0) };
-    acc = unsafe { vfmaq_f32(acc, hi_f0, val0.1) };
-    acc = unsafe { vfmaq_f32(acc, lo_f1, val1.0) };
-    acc = unsafe { vfmaq_f32(acc, hi_f1, val1.1) };
-    acc = unsafe { vfmaq_f32(acc, lo_f2, val2.0) };
-    acc = unsafe { vfmaq_f32(acc, hi_f2, val2.1) };
-    acc = unsafe { vfmaq_f32(acc, lo_f3, val3.0) };
-    acc = unsafe { vfmaq_f32(acc, hi_f3, val3.1) };
+    let mut acc = unsafe { vmulq_f32(lo_f0, in_lo0) };
+    acc = unsafe { vfmaq_f32(acc, lo_f1, in_lo1) };
+    acc = unsafe { vfmaq_f32(acc, lo_f2, in_lo2) };
+    acc = unsafe { vfmaq_f32(acc, lo_f3, in_lo3) };
+    acc = unsafe { vfmaq_f32(acc, hi_f0, in_hi0) };
+    acc = unsafe { vfmaq_f32(acc, hi_f1, in_hi1) };
+    acc = unsafe { vfmaq_f32(acc, hi_f2, in_hi2) };
+    acc = unsafe { vfmaq_f32(acc, hi_f3, in_hi3) };
 
     // SAFETY: hsum_f32x4 calls vaddvq_f32, valid on AArch64.
     d * unsafe { hsum_f32x4(acc) }
@@ -238,7 +229,7 @@ impl QuantKernel for Q4_0Neon {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -263,19 +254,20 @@ impl QuantKernel for Q4_0Neon {
                     };
                 } else {
                     // Partial block at the tail: scalar fallback.
+                    // Split-half layout: weight `i` is byte `i`'s low nibble
+                    // for i < 16, and byte `i - 16`'s high nibble otherwise.
                     for i in 0..block_input_len {
-                        let byte = block[2 + i / 2];
-                        let nibble = if i % 2 == 0 {
-                            (byte & 0x0F) as i32 - 8
+                        let nibble = if i < BLOCK_SIZE / 2 {
+                            (block[2 + i] & 0x0F) as i32 - 8
                         } else {
-                            ((byte >> 4) & 0x0F) as i32 - 8
+                            ((block[2 + i - BLOCK_SIZE / 2] >> 4) & 0x0F) as i32 - 8
                         };
                         sum += nibble as f32 * d * input[input_offset + i];
                     }
                 }
             }
             *out = sum;
-        }
+        });
 
         Ok(())
     }
@@ -336,7 +328,7 @@ impl QuantKernel for Q4_0Neon {
             });
         }
 
-        for (row, out_val) in out.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(out, n_rows, n_cols, |row, out_val| {
             let row_start = row * row_bytes;
             // SAFETY: all bounds checked above; AArch64 always has NEON.
             let row_sum = unsafe {
@@ -348,7 +340,7 @@ impl QuantKernel for Q4_0Neon {
                 )
             };
             *out_val += row_sum; // ACCUMULATE
-        }
+        });
 
         Ok(())
     }
@@ -427,25 +419,21 @@ unsafe fn fused_q4_0_q8_0_row_neon(
             let qa_lo = unsafe { vld1q_s8(q8_ptr) };
             let qa_hi = unsafe { vld1q_s8(q8_ptr.add(16)) };
 
-            // Q4 nibbles interleave: byte i → lo nibble = weight 2i, hi nibble = weight 2i+1.
-            // Q8 activations are sequential: index 0,1,2,3,...,31.
-            // So lo_s8[0..16] pairs with qa[0,2,4,...,30] and hi_s8[0..16] pairs with qa[1,3,5,...,31].
-            // We need to deinterleave qa into even and odd lanes.
+            // GGML's split-half layout: byte i → lo nibble = weight i,
+            // hi nibble = weight i + 16.  Q8_0 activations are sequential, so
+            // lo_s8[0..16] pairs with qa_lo (activations 0..16) and hi_s8[0..16]
+            // with qa_hi (activations 16..32) — the loaded registers already
+            // line up and no de-interleave is required.
 
-            // Deinterleave: even (qa[0,2,4,...]) and odd (qa[1,3,5,...]).
-            // SAFETY: vuzp1q_s8 / vuzp2q_s8 are always valid on AArch64.
-            let qa_even = unsafe { vuzp1q_s8(qa_lo, qa_hi) }; // qa[0,2,4,...,30]
-            let qa_odd = unsafe { vuzp2q_s8(qa_lo, qa_hi) }; // qa[1,3,5,...,31]
-
-            // Multiply lo nibble weights × even activations.
+            // Multiply lo nibble weights × activations 0..16.
             // SAFETY: vmull_s8 / vmlal_s8 are always valid on AArch64.
-            let mut acc_lo = unsafe { vmull_s8(vget_low_s8(lo_s8), vget_low_s8(qa_even)) };
-            acc_lo = unsafe { vmlal_s8(acc_lo, vget_high_s8(lo_s8), vget_high_s8(qa_even)) };
+            let mut acc_lo = unsafe { vmull_s8(vget_low_s8(lo_s8), vget_low_s8(qa_lo)) };
+            acc_lo = unsafe { vmlal_s8(acc_lo, vget_high_s8(lo_s8), vget_high_s8(qa_lo)) };
 
-            // Multiply hi nibble weights × odd activations.
+            // Multiply hi nibble weights × activations 16..32.
             // SAFETY: vmull_s8 / vmlal_s8 are always valid on AArch64.
-            let mut acc_hi = unsafe { vmull_s8(vget_low_s8(hi_s8), vget_low_s8(qa_odd)) };
-            acc_hi = unsafe { vmlal_s8(acc_hi, vget_high_s8(hi_s8), vget_high_s8(qa_odd)) };
+            let mut acc_hi = unsafe { vmull_s8(vget_low_s8(hi_s8), vget_low_s8(qa_hi)) };
+            acc_hi = unsafe { vmlal_s8(acc_hi, vget_high_s8(hi_s8), vget_high_s8(qa_hi)) };
 
             // acc_lo + acc_hi is now a int16x8_t. Widen to i32 and sum.
             let combined = unsafe { vaddq_s16(acc_lo, acc_hi) };
@@ -461,20 +449,22 @@ unsafe fn fused_q4_0_q8_0_row_neon(
             let q8_bytes = &a_block[2..];
             let valid = remaining;
 
-            for i in 0..(valid / 2) {
+            // Split-half layout: nibble `i` pairs with activation `i` and
+            // nibble `i + 16` with activation `i + 16`; a partial trailing
+            // block truncates the two halves independently.
+            for i in 0..(BLOCK_SIZE / 2) {
                 let byte = w_block[2 + i];
-                let q_lo = (byte & 0x0F) as i32 - 8;
-                let q_hi = ((byte >> 4) & 0x0F) as i32 - 8;
-                let a_lo = q8_bytes[i * 2] as i8 as i32;
-                let a_hi = q8_bytes[i * 2 + 1] as i8 as i32;
-                row_sum += scale * (q_lo * a_lo + q_hi * a_hi) as f32;
-            }
-            if valid % 2 == 1 {
-                let i = valid / 2;
-                let byte = w_block[2 + i];
-                let q_lo = (byte & 0x0F) as i32 - 8;
-                let a_lo = q8_bytes[i * 2] as i8 as i32;
-                row_sum += scale * (q_lo * a_lo) as f32;
+                if i < valid {
+                    let q_lo = (byte & 0x0F) as i32 - 8;
+                    let a_lo = q8_bytes[i] as i8 as i32;
+                    row_sum += scale * (q_lo * a_lo) as f32;
+                }
+                let hi_idx = i + BLOCK_SIZE / 2;
+                if hi_idx < valid {
+                    let q_hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                    let a_hi = q8_bytes[hi_idx] as i8 as i32;
+                    row_sum += scale * (q_hi * a_hi) as f32;
+                }
             }
         }
     }

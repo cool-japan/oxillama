@@ -9,16 +9,16 @@ Downstream users depend on this crate to access every subcrate (`gguf`, `quant`,
 
 | Field | Value |
 |-------|-------|
-| Version | `0.1.1` (workspace-inherited) |
+| Version | `0.1.4` (workspace-inherited) |
 | Completion | 100% (re-export shell; contents live in subcrates) |
-| Source files | 1 (`src/lib.rs`, ~55 lines) |
+| Source files | 1 (`src/lib.rs`, 66 lines) |
 | Direct deps | 4 required + 3 optional subcrates |
 | Public items | 0 own items — pure re-export facade |
 | License | Apache-2.0 |
 
-Default features: `server`, `bench`, `dbrx`, `grok`, `mamba2`.
-Opt-in runtime features: `gpu`, `simd-avx2`, `simd-avx512`, `simd-neon`.
-Opt-in architecture features: `llama`, `qwen3`, `mistral`, `gemma`, `phi`, `command-r`, `starcoder`, `deepseek`, `llava`.
+Default features: `server`, `llama`, `simd-avx2`, `simd-neon`.
+Opt-in runtime features: `bench`, `gpu`, `simd-avx512`.
+Opt-in architecture features: `qwen3`, `mistral`, `gemma`, `phi`, `command-r`, `starcoder`, `deepseek`, `dbrx`, `grok`, `mamba2`, `jamba`, `llava`.
 
 Architecture flags intentionally forward to both `oxillama-arch` and `oxillama-runtime` so enabling a model at the meta level pulls in the full kernel + inference path without additional per-crate plumbing.
 
@@ -58,9 +58,17 @@ No submodules, no helpers, no binaries — intentionally thin. Any public surfac
 
 - [x] `examples/` directory: 8 runnable samples (01_load_model, 02_inference, 03_streaming, 04_lora, 05_speculative, 06_metrics, openai_server, python_bridge).
 - No user-facing guides. The rustdoc on `lib.rs` is terse; topics like "how to load a LoRA adapter", "how to use speculative decoding", "how to run in a browser", or "how to target WebGPU" have no narrative docs anchored here.
-- Crate `README.md` is minimal (~60 lines): feature table plus one code snippet, no task-oriented walkthroughs.
+- Crate `README.md` is minimal (~80 lines): feature table plus one code snippet, no task-oriented walkthroughs.
 - [x] Cross-crate integration tests: `tests/feature_matrix.rs` and `tests/error_types.rs` (19 tests, all passing).
 - No benchmarks or examples demonstrating realistic feature-flag combinations.
+- **Six architecture features have no runtime dispatch path.** `deepseek`, `dbrx`,
+  `grok`, `mamba2`, `jamba`, and `llava` forward only to `oxillama-arch` in
+  `Cargo.toml` (e.g. `jamba = ["oxillama-arch/jamba"]`) — `oxillama-runtime` has
+  no matching feature for any of the six, so `InferenceEngine` cannot actually
+  run generation for them even though the flag compiles cleanly. Only
+  `llama`/`qwen3`/`mistral`/`gemma`/`phi`/`command-r`/`starcoder` forward to
+  both crates and are runnable end-to-end today. Now called out as a caveat in
+  README.md's Feature Flags table.
 - [x] `[package.metadata.docs.rs]` stanza added: `all-features = true`, `rustdoc-args = ["--cfg", "docsrs"]`, `targets = ["x86_64-unknown-linux-gnu"]`.
 
 ## 6. v1.1 Roadmap
@@ -91,4 +99,13 @@ No submodules, no helpers, no binaries — intentionally thin. Any public surfac
 - Screencast-paired cookbook entries — one topic per recipe, each backed by a committed example so drift is caught by CI.
 - Community-contributed examples gallery curated through the meta crate, keeping the facade the canonical discovery surface for the entire ecosystem.
 
-*Last updated: 2026-04-24 (F1 plan — facade examples + RECIPES.md cookbook; mdBook deferred to next /ultra round)*
+*Last updated: 2026-08-17 (v0.1.4 — no crate-specific code changes this release. Documentation
+pass: this file's own §2 "Default features"/"Opt-in" lines were still self-contradicting both
+`Cargo.toml` and this footer's own prior correction (they listed `bench`/`dbrx`/`grok`/`mamba2`
+as default and omitted `llama`/`jamba` entirely) — fixed to match the manifest's actual
+`default = ["server", "llama", "simd-neon", "simd-avx2"]`; `src/lib.rs` line count corrected
+55 → 66; a new gap documented — `deepseek`/`dbrx`/`grok`/`mamba2`/`jamba`/`llava` forward only to
+`oxillama-arch` in `Cargo.toml`, and `oxillama-runtime` has no matching feature for any of the
+six, so `InferenceEngine` has no dispatch path for them yet even though they compile cleanly
+(verified against both crates' `Cargo.toml`); same caveat added to README.md's Feature Flags
+table. 20 tests passing. mdBook still deferred.)*

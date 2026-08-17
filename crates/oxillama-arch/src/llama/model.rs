@@ -4,18 +4,35 @@
 //! embedding → N×(RMSNorm → GQA → residual → RMSNorm → SwiGLU FFN → residual) → RMSNorm → LM head
 //!
 //! When `config.num_experts > 0`, the FFN layers use a sparse Mixture-of-Experts
-//! (MoE) layout (Mixtral-style) instead of the standard dense SwiGLU FFN.
+//! (MoE) layout (Mixtral-style) instead of the standard dense SwiGLU FFN.  That
+//! is not a hypothetical: llama.cpp converts `MixtralForCausalLM` to
+//! `MODEL_ARCH.LLAMA`, so every Mixtral GGUF arrives *here*, never through
+//! `crate::mixtral`.
+//!
+//! Weight loading lives in [`super::loader`]; the multi-token prefill in
+//! [`super::batch`].
 
+use std::sync::Arc;
+
+use oxillama_quant::{
+    quantize_activations_q8_0_into, KernelDispatcher, QuantKernel, Q8_0_ACT_BLOCK_BYTES,
+};
+
+use crate::common::embedding::TokenEmbedding;
 use crate::common::linear::QuantLinear;
-use crate::common::moe::{Expert, MoeFfn};
+use crate::common::moe::{MoeScratch, QuantMoeFfn};
 use crate::common::rms_norm::RmsNorm;
 use crate::common::rope::RopeTable;
 use crate::common::swiglu::swiglu_inplace;
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
+use crate::llama::attention::{axpy_f32, dot_f32, softmax_inplace};
+use crate::llama::batch::{BatchScratch, MIN_BATCH_TOKENS};
+use crate::llama::rope_norm::apply_rope_norm;
 use crate::lora::LoadedLora;
-use crate::traits::{BatchedKvView, ForwardPass, KvCacheAccess};
-use oxillama_quant::{KernelDispatcher, QuantTensor};
+use crate::traits::{
+    remap_kernel_slot, BatchedKvView, ForwardPass, KvCacheAccess, QuantKernelRemap,
+};
 
 /// Weights for a dense SwiGLU FFN layer.
 ///
@@ -28,32 +45,50 @@ pub struct DenseFfn {
     pub up: QuantLinear,
     /// Down projection `[hidden_size, intermediate_size]`.
     pub down: QuantLinear,
+    /// Kernel for [`Self::gate`], resolved once at load time.
+    pub gate_kernel: Arc<dyn QuantKernel>,
+    /// Kernel for [`Self::up`], resolved once at load time.
+    pub up_kernel: Arc<dyn QuantKernel>,
+    /// Kernel for [`Self::down`], resolved once at load time.
+    pub down_kernel: Arc<dyn QuantKernel>,
 }
 
 /// FFN layer variant: either a standard dense SwiGLU or a sparse MoE FFN.
-///
-/// Dense models (standard LLaMA) use `Dense` with quantized weights (boxed to
-/// avoid a large enum-variant size difference with `Moe`).
-/// Mixtral and other MoE models use `Moe` with dequantized f32 experts.
 pub enum FfnVariant {
     /// Standard dense SwiGLU FFN using quantized weights.
     Dense(Box<DenseFfn>),
-    /// Sparse Mixture-of-Experts FFN.
-    Moe(Box<MoeFfn>),
+    /// Sparse Mixture-of-Experts FFN, experts left quantized.
+    Moe(Box<QuantMoeFfn>),
 }
 
 /// A single transformer layer (decoder block).
+///
+/// The `*_kernel` fields hold each projection's [`QuantKernel`], looked up from
+/// its tensor type exactly once in [`super::loader::load_llama_from_gguf`].
+/// The decode loop used to call `dispatcher.get_kernel()` — a walk down the full
+/// tensor-type match ladder plus a `Box` allocation — seven times per layer per
+/// token, i.e. 225 times per token on a 32-layer model including the LM head.
+/// Storing the resolved kernel as an `Arc` on the layer that owns the weight
+/// turns every one of those into a field load and a cheap deref.
 pub struct LlamaLayer {
     /// Pre-attention RMSNorm.
     pub attn_norm: RmsNorm,
-    /// Query projection [num_heads * head_dim, hidden_size].
+    /// Query projection `[num_heads * head_dim, hidden_size]`.
     pub attn_q: QuantLinear,
-    /// Key projection [num_kv_heads * head_dim, hidden_size].
+    /// Key projection `[num_kv_heads * head_dim, hidden_size]`.
     pub attn_k: QuantLinear,
-    /// Value projection [num_kv_heads * head_dim, hidden_size].
+    /// Value projection `[num_kv_heads * head_dim, hidden_size]`.
     pub attn_v: QuantLinear,
-    /// Output projection [hidden_size, num_heads * head_dim].
+    /// Output projection `[hidden_size, num_heads * head_dim]`.
     pub attn_output: QuantLinear,
+    /// Kernel for [`Self::attn_q`].
+    pub attn_q_kernel: Arc<dyn QuantKernel>,
+    /// Kernel for [`Self::attn_k`].
+    pub attn_k_kernel: Arc<dyn QuantKernel>,
+    /// Kernel for [`Self::attn_v`].
+    pub attn_v_kernel: Arc<dyn QuantKernel>,
+    /// Kernel for [`Self::attn_output`].
+    pub attn_output_kernel: Arc<dyn QuantKernel>,
     /// Pre-FFN RMSNorm.
     pub ffn_norm: RmsNorm,
     /// FFN variant: dense SwiGLU or sparse MoE.
@@ -64,45 +99,104 @@ pub struct LlamaLayer {
 pub struct LlamaModel {
     /// Model configuration.
     pub config: ModelConfig,
-    /// Token embedding weights [vocab_size, hidden_size] stored as f32.
-    pub token_embd: Vec<f32>,
+    /// Token embedding table.
+    ///
+    /// Held in whatever form the checkpoint allows — quantized and looked up one
+    /// row at a time when the GGUF's rows are block-aligned (the normal case).
+    /// Llama-3-8B's `[128256, 4096]` table is 525 M elements; as `Vec<f32>` that
+    /// was **2.10 GB** resident against ~295 MB of `Q4_K` on disk, for a matrix
+    /// a forward pass reads one row of per token.  See [`TokenEmbedding`].
+    pub token_embd: TokenEmbedding,
     /// Transformer layers.
     pub layers: Vec<LlamaLayer>,
     /// Final RMSNorm before LM head.
     pub output_norm: RmsNorm,
-    /// LM head (unembedding) projection [vocab_size, hidden_size].
+    /// LM head (unembedding) projection `[vocab_size, hidden_size]`.
     pub output: QuantLinear,
+    /// Resolved kernel for [`Self::output`] — see [`LlamaLayer`]'s kernel fields.
+    output_kernel: Arc<dyn QuantKernel>,
     /// RoPE precomputed frequency table.
+    ///
+    /// Applied with LLaMA's NORM convention — see `super::rope_norm`, **not**
+    /// [`RopeTable::apply`], which is the NeoX split.
     pub rope: RopeTable,
     /// Kernel dispatcher for quantized ops.
     pub dispatcher: KernelDispatcher,
 
     // Scratch buffers (reused across forward calls to avoid allocation)
-    buf_hidden: Vec<f32>,
+    pub(crate) buf_hidden: Vec<f32>,
     buf_norm: Vec<f32>,
     buf_q: Vec<f32>,
     buf_k: Vec<f32>,
     buf_v: Vec<f32>,
+    /// Concatenated attention heads, `[num_heads * head_dim]`.
+    ///
+    /// **Not** `hidden_size`: the two coincide for Llama-2/3 but not in general
+    /// (Qwen3-4B attends over 32 × 128 = 4096 with a 2560-wide residual stream),
+    /// and `attn_output`'s input width is the former.  Sizing this from
+    /// `hidden_size` while indexing it by `num_heads * head_dim` was a latent
+    /// out-of-bounds panic.
     buf_attn_out: Vec<f32>,
+    /// Output of `attn_output`'s projection, added into `buf_hidden`.
+    ///
+    /// Preallocated instead of `vec![0.0; hidden_size]`-ed inside `attention()`:
+    /// that was a fresh heap allocation per layer per token — 32 × 16 KB per
+    /// token on Llama-3-8B.
+    buf_proj: Vec<f32>,
     buf_gate: Vec<f32>,
     buf_up: Vec<f32>,
     buf_ffn_out: Vec<f32>,
     buf_logits: Vec<f32>,
-    buf_attn_scores: Vec<f32>,
+    /// Q8_0 image of whichever activation vector the next matmul consumes.
+    ///
+    /// One buffer suffices because the projections that share an input
+    /// (`attn_q`/`attn_k`/`attn_v`, then `ffn_gate`/`ffn_up`) are issued back to
+    /// back, so the vector is quantized once and consumed before the next one
+    /// overwrites it.
+    buf_acts_q8: Vec<u8>,
+    /// Router/expert scratch for MoE layers; untouched by dense models.
+    moe_scratch: MoeScratch,
+    /// Scratch for the batched prefill path ([`super::batch`]).  Empty until the
+    /// first multi-token `forward`/`embed`; decode never touches it.
+    pub(crate) batch: BatchScratch,
 }
 
 impl LlamaModel {
-    /// Create a new LlamaModel from preloaded weights.
+    /// Create a new `LlamaModel` from preloaded weights.
     ///
-    /// This is the primary construction path. Use `from_gguf()` on `GgufModel` to
-    /// load from a GGUF file (implemented in oxillama-runtime).
+    /// Takes the embedding table already dequantized.  Loaders that can keep it
+    /// quantized — [`super::loader::load_llama_from_gguf`] does — should call
+    /// [`Self::with_embedding`] and hand over a [`TokenEmbedding::Quantized`].
+    ///
+    /// Fails if `output`'s tensor type has no registered [`QuantKernel`]: the
+    /// kernel is resolved once here rather than on every forward pass.
     pub fn new(
         config: ModelConfig,
         token_embd: Vec<f32>,
         layers: Vec<LlamaLayer>,
         output_norm: RmsNorm,
         output: QuantLinear,
-    ) -> Self {
+    ) -> ArchResult<Self> {
+        let hidden_size = config.hidden_size;
+        Self::with_embedding(
+            config,
+            TokenEmbedding::dense(token_embd, hidden_size),
+            layers,
+            output_norm,
+            output,
+        )
+    }
+
+    /// Create a new `LlamaModel` over an arbitrary [`TokenEmbedding`].
+    ///
+    /// Fails if `output`'s tensor type has no registered [`QuantKernel`].
+    pub fn with_embedding(
+        config: ModelConfig,
+        token_embd: TokenEmbedding,
+        layers: Vec<LlamaLayer>,
+        output_norm: RmsNorm,
+        output: QuantLinear,
+    ) -> ArchResult<Self> {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_kv_heads;
@@ -110,6 +204,8 @@ impl LlamaModel {
         let intermediate_size = config.intermediate_size;
         let vocab_size = config.vocab_size;
         let max_ctx = config.max_context_length;
+        let attn_dim = num_heads * head_dim;
+        let num_experts = config.num_experts;
 
         let rope = RopeTable::new(
             head_dim,
@@ -119,149 +215,297 @@ impl LlamaModel {
             config.rope_scaling_factor,
         );
         let dispatcher = KernelDispatcher::new();
+        let output_kernel: Arc<dyn QuantKernel> =
+            dispatcher.get_kernel(output.weight.tensor_type)?.into();
 
-        Self {
+        Ok(Self {
             config,
             token_embd,
             layers,
             output_norm,
             output,
+            output_kernel,
             rope,
             dispatcher,
             buf_hidden: vec![0.0; hidden_size],
             buf_norm: vec![0.0; hidden_size],
-            buf_q: vec![0.0; num_heads * head_dim],
+            buf_q: vec![0.0; attn_dim],
             buf_k: vec![0.0; num_kv_heads * head_dim],
             buf_v: vec![0.0; num_kv_heads * head_dim],
-            buf_attn_out: vec![0.0; hidden_size],
+            buf_attn_out: vec![0.0; attn_dim],
+            buf_proj: vec![0.0; hidden_size],
             buf_gate: vec![0.0; intermediate_size],
             buf_up: vec![0.0; intermediate_size],
             buf_ffn_out: vec![0.0; hidden_size],
             buf_logits: vec![0.0; vocab_size],
-            buf_attn_scores: vec![0.0; max_ctx],
+            // Widest activation any projection consumes, rounded up to whole
+            // K-quant blocks (256 weights → 8 Q8_0 blocks).
+            buf_acts_q8: Vec::with_capacity(
+                hidden_size
+                    .max(attn_dim)
+                    .max(intermediate_size)
+                    .div_ceil(256)
+                    * 8
+                    * Q8_0_ACT_BLOCK_BYTES,
+            ),
+            moe_scratch: MoeScratch::new(hidden_size, intermediate_size, num_experts),
+            batch: BatchScratch::default(),
+        })
+    }
+
+    /// Run every token of `tokens` through all layers, leaving the last token's
+    /// pre-output-norm hidden state in `self.buf_hidden`.
+    ///
+    /// Multi-token calls (prompt prefill) take the batched path in
+    /// [`super::batch`] when every projection supports it; single-token calls
+    /// (decode) and models the batched path cannot serve replay the per-token
+    /// loop.  The two produce bit-identical hidden states.
+    pub(crate) fn run_layers(
+        &mut self,
+        tokens: &[u32],
+        kv_cache: &mut dyn KvCacheAccess,
+    ) -> ArchResult<()> {
+        let start_pos = kv_cache.seq_len();
+        // Guard the context window *before* any weight is touched.  Past
+        // `max_context_length` the RoPE table has no entry for the position and
+        // the KV cache has no slot for the key: the old code walked straight off
+        // the end of both and aborted the process.
+        let end = start_pos.saturating_add(tokens.len());
+        if end > self.config.max_context_length {
+            return Err(ArchError::ForwardPassError {
+                layer: 0,
+                message: format!(
+                    "context overflow: {} cached + {} new tokens exceeds max_context_length {}",
+                    start_pos,
+                    tokens.len(),
+                    self.config.max_context_length
+                ),
+            });
         }
+
+        if tokens.len() >= MIN_BATCH_TOKENS && self.batched_prefill_supported() {
+            return self.forward_prefill_batched(tokens, kv_cache);
+        }
+
+        for (i, &token) in tokens.iter().enumerate() {
+            let position = start_pos + i;
+
+            self.embed_token(token)?;
+
+            for layer_idx in 0..self.layers.len() {
+                self.layers[layer_idx]
+                    .attn_norm
+                    .forward_to(&self.buf_hidden, &mut self.buf_norm);
+
+                self.attention(layer_idx, position, kv_cache)?;
+
+                self.layers[layer_idx]
+                    .ffn_norm
+                    .forward_to(&self.buf_hidden, &mut self.buf_norm);
+
+                self.feed_forward(layer_idx)?;
+            }
+
+            kv_cache.advance();
+        }
+
+        Ok(())
     }
 
-    /// Get the kernel for a QuantLinear's tensor type.
-    fn kernel_for(&self, linear: &QuantLinear) -> ArchResult<Box<dyn oxillama_quant::QuantKernel>> {
-        self.dispatcher
-            .get_kernel(linear.weight.tensor_type)
-            .map_err(ArchError::from)
-    }
-
-    /// Embed a single token into the hidden state buffer.
-    fn embed_token(&mut self, token: u32) {
-        let hidden_size = self.config.hidden_size;
-        let offset = token as usize * hidden_size;
-        self.buf_hidden
-            .copy_from_slice(&self.token_embd[offset..offset + hidden_size]);
+    /// Load the residual stream with `token`'s embedding row.
+    ///
+    /// Dequantizes exactly one row.  An out-of-vocabulary id is an **error**,
+    /// not a panic: `vocab_size` is frequently over-estimated (`config.rs` falls
+    /// back to the tokenizer token-array length and then to a hard-coded 32000),
+    /// and a server must not abort because a client sent a stray token id.
+    fn embed_token(&mut self, token: u32) -> ArchResult<()> {
+        let Self {
+            token_embd,
+            dispatcher,
+            buf_hidden,
+            ..
+        } = self;
+        token_embd.row_into(dispatcher, token, buf_hidden)
     }
 
     /// Run grouped-query attention for a single layer.
-    ///
-    /// Steps:
-    /// 1. Project hidden → Q, K, V
-    /// 2. Apply RoPE to Q and K
-    /// 3. Store K, V in cache
-    /// 4. Compute attention scores: softmax(Q·K^T / sqrt(head_dim))
-    /// 5. Multiply attention weights by V
-    /// 6. Project output back to hidden_size
     fn attention(
         &mut self,
         layer_idx: usize,
         position: usize,
         kv_cache: &mut dyn KvCacheAccess,
     ) -> ArchResult<()> {
-        let layer = &self.layers[layer_idx];
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_kv_heads;
         let head_dim = self.config.head_dim;
+        let attn_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
+        if num_kv_heads == 0 || head_dim == 0 || num_heads < num_kv_heads {
+            return Err(ArchError::InvalidConfig {
+                detail: format!(
+                    "attention geometry: head_count={num_heads}, head_count_kv={num_kv_heads}, \
+                     head_dim={head_dim}"
+                ),
+            });
+        }
         let heads_per_kv = num_heads / num_kv_heads;
 
-        // Project to Q, K, V
-        let q_kernel = self.kernel_for(&layer.attn_q)?;
-        let k_kernel = self.kernel_for(&layer.attn_k)?;
-        let v_kernel = self.kernel_for(&layer.attn_v)?;
+        let layer = &self.layers[layer_idx];
 
-        layer
-            .attn_q
-            .forward(&*q_kernel, &self.buf_norm, &mut self.buf_q)?;
-        layer
-            .attn_k
-            .forward(&*k_kernel, &self.buf_norm, &mut self.buf_k)?;
-        layer
-            .attn_v
-            .forward(&*v_kernel, &self.buf_norm, &mut self.buf_v)?;
+        // Q/K/V all read the same post-attn-norm activation vector, so it is
+        // quantized to Q8_0 exactly once here and shared by all three GEMVs —
+        // the `f32 → i8` conversion then happens once per matmul *input* rather
+        // than once per weight *row*, and the row loop multiplies i8 by i8 in
+        // integer registers.  The block count is the max over the three so that
+        // a mixed-precision checkpoint (Q4_K q/k with a Q6_K v, which is exactly
+        // what `Q4_K_M` ships) still gets a long enough buffer.
+        let q_kernel: &dyn QuantKernel = &*layer.attn_q_kernel;
+        let k_kernel: &dyn QuantKernel = &*layer.attn_k_kernel;
+        let v_kernel: &dyn QuantKernel = &*layer.attn_v_kernel;
+        let q_fused = layer.attn_q.q8_fused_blocks(q_kernel);
+        let k_fused = layer.attn_k.q8_fused_blocks(k_kernel);
+        let v_fused = layer.attn_v.q8_fused_blocks(v_kernel);
+        if let Some(n_blocks) = q_fused
+            .iter()
+            .chain(&k_fused)
+            .chain(&v_fused)
+            .copied()
+            .max()
+        {
+            quantize_activations_q8_0_into(&self.buf_norm, n_blocks, &mut self.buf_acts_q8);
+        }
 
-        // Apply RoPE to Q and K (per-head)
+        if q_fused.is_some() {
+            layer.attn_q.forward_q8_fused(
+                q_kernel,
+                &self.buf_norm,
+                &self.buf_acts_q8,
+                &mut self.buf_q,
+            )?;
+        } else {
+            layer
+                .attn_q
+                .forward(q_kernel, &self.buf_norm, &mut self.buf_q)?;
+        }
+        if k_fused.is_some() {
+            layer.attn_k.forward_q8_fused(
+                k_kernel,
+                &self.buf_norm,
+                &self.buf_acts_q8,
+                &mut self.buf_k,
+            )?;
+        } else {
+            layer
+                .attn_k
+                .forward(k_kernel, &self.buf_norm, &mut self.buf_k)?;
+        }
+        if v_fused.is_some() {
+            layer.attn_v.forward_q8_fused(
+                v_kernel,
+                &self.buf_norm,
+                &self.buf_acts_q8,
+                &mut self.buf_v,
+            )?;
+        } else {
+            layer
+                .attn_v
+                .forward(v_kernel, &self.buf_norm, &mut self.buf_v)?;
+        }
+
+        // RoPE, LLaMA's NORM convention (consecutive pairs) — see `rope_norm`.
         for h in 0..num_heads {
-            let q_head = &mut self.buf_q[h * head_dim..(h + 1) * head_dim];
-            self.rope.apply(q_head, position);
+            apply_rope_norm(
+                &self.rope,
+                &mut self.buf_q[h * head_dim..(h + 1) * head_dim],
+                position,
+            );
         }
         for h in 0..num_kv_heads {
-            let k_head = &mut self.buf_k[h * head_dim..(h + 1) * head_dim];
-            self.rope.apply(k_head, position);
+            apply_rope_norm(
+                &self.rope,
+                &mut self.buf_k[h * head_dim..(h + 1) * head_dim],
+                position,
+            );
         }
 
-        // Store K, V in cache
         kv_cache.store_kv(layer_idx, &self.buf_k[..kv_dim], &self.buf_v[..kv_dim])?;
 
-        // Get cached keys and values [seq_len * kv_dim]
-        let cached_keys = kv_cache.get_keys(layer_idx)?;
-        let cached_values = kv_cache.get_values(layer_idx)?;
-        let seq_len = position + 1; // includes current token
-
+        let cached_keys = crate::common::fetch_keys(&*kv_cache, layer_idx)?;
+        let cached_values = crate::common::fetch_values(&*kv_cache, layer_idx)?;
+        let cached_keys: &[f32] = &cached_keys;
+        let cached_values: &[f32] = &cached_values;
+        let seq_len = position + 1;
+        let needed = seq_len * kv_dim;
+        if cached_keys.len() < needed || cached_values.len() < needed {
+            return Err(ArchError::ForwardPassError {
+                layer: layer_idx,
+                message: format!(
+                    "kv cache exposes {} key / {} value floats, attention at position \
+                     {position} needs {needed}",
+                    cached_keys.len(),
+                    cached_values.len()
+                ),
+            });
+        }
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        // Clear attention output buffer
-        self.buf_attn_out.fill(0.0);
+        // One task per head.  A head's output is a contiguous `head_dim` slice
+        // of `buf_attn_out` that no other head reads or writes, so handing each
+        // to a worker changes no accumulation order — and attention was the last
+        // single-threaded stretch of the forward pass, with a cost that grows
+        // linearly in the context length while the GEMVs around it already used
+        // every core.  The per-head score vector is the `init` state, so it is
+        // allocated once per worker rather than once per head.
+        {
+            let q: &[f32] = &self.buf_q;
+            oxillama_quant::parallel::for_each_chunk_init(
+                &mut self.buf_attn_out[..attn_dim],
+                head_dim,
+                // Roughly the MACs one head performs: two passes (scores, then
+                // the value-weighted sum) over `seq_len` cached keys.
+                seq_len * 2,
+                Vec::<f32>::new,
+                |scores, h, out_head| {
+                    let kv_head = h / heads_per_kv;
+                    let q_head = &q[h * head_dim..(h + 1) * head_dim];
 
-        // Per-head attention
-        for h in 0..num_heads {
-            let kv_head = h / heads_per_kv;
-            let q_head = &self.buf_q[h * head_dim..(h + 1) * head_dim];
+                    scores.clear();
+                    scores.resize(seq_len, 0.0);
+                    for (pos, score) in scores.iter_mut().enumerate() {
+                        let off = pos * kv_dim + kv_head * head_dim;
+                        *score = dot_f32(q_head, &cached_keys[off..off + head_dim]) * scale;
+                    }
 
-            // Compute attention scores: Q·K^T for all cached positions
-            for pos in 0..seq_len {
-                let k_offset = pos * kv_dim + kv_head * head_dim;
-                let k_vec = &cached_keys[k_offset..k_offset + head_dim];
+                    softmax_inplace(scores);
 
-                let mut score = 0.0f32;
-                for d in 0..head_dim {
-                    score += q_head[d] * k_vec[d];
-                }
-                self.buf_attn_scores[pos] = score * scale;
-            }
-
-            // Causal softmax over [0..seq_len]
-            softmax_inplace(&mut self.buf_attn_scores[..seq_len]);
-
-            // Weighted sum of V
-            let out_head = &mut self.buf_attn_out[h * head_dim..(h + 1) * head_dim];
-            for pos in 0..seq_len {
-                let v_offset = pos * kv_dim + kv_head * head_dim;
-                let v_vec = &cached_values[v_offset..v_offset + head_dim];
-                let w = self.buf_attn_scores[pos];
-                for d in 0..head_dim {
-                    out_head[d] += w * v_vec[d];
-                }
-            }
+                    out_head.fill(0.0);
+                    for (pos, &w) in scores.iter().enumerate() {
+                        let off = pos * kv_dim + kv_head * head_dim;
+                        axpy_f32(out_head, w, &cached_values[off..off + head_dim]);
+                    }
+                },
+            );
         }
 
-        // Project attention output back to hidden_size
-        let o_kernel = self.kernel_for(&self.layers[layer_idx].attn_output)?;
+        // Project the concatenated heads back to the residual stream.
         let layer = &self.layers[layer_idx];
-        // attn_output: [hidden_size, num_heads * head_dim]
-        // We need to use buf_attn_out as input and write to buf_norm (temporarily)
-        // but we actually want to add to residual, so write to a temp then add.
-        let mut proj_out = vec![0.0f32; self.config.hidden_size];
-        layer
-            .attn_output
-            .forward(&*o_kernel, &self.buf_attn_out, &mut proj_out)?;
+        let o_kernel: &dyn QuantKernel = &*layer.attn_output_kernel;
+        let o_fused = layer.attn_output.q8_fused_blocks(o_kernel);
+        if let Some(n_blocks) = o_fused {
+            quantize_activations_q8_0_into(&self.buf_attn_out, n_blocks, &mut self.buf_acts_q8);
+            layer.attn_output.forward_q8_fused(
+                o_kernel,
+                &self.buf_attn_out,
+                &self.buf_acts_q8,
+                &mut self.buf_proj,
+            )?;
+        } else {
+            layer
+                .attn_output
+                .forward(o_kernel, &self.buf_attn_out, &mut self.buf_proj)?;
+        }
 
-        // Add to residual (buf_hidden)
-        for (h, &p) in self.buf_hidden.iter_mut().zip(proj_out.iter()) {
+        for (h, &p) in self.buf_hidden.iter_mut().zip(self.buf_proj.iter()) {
             *h += p;
         }
 
@@ -270,58 +514,109 @@ impl LlamaModel {
 
     /// Run the feed-forward network for a single layer.
     ///
-    /// Dispatches to either the dense SwiGLU path or the sparse MoE path
-    /// depending on the layer's `FfnVariant`.
-    ///
-    /// Dense: `FFN(x) = down_proj(silu(gate_proj(x)) * up_proj(x))`
+    /// Dense: `FFN(x) = down(silu(gate(x)) * up(x))`
     /// MoE:   weighted sum of top-K expert SwiGLU outputs
     fn feed_forward(&mut self, layer_idx: usize) -> ArchResult<()> {
         match &self.layers[layer_idx].ffn {
             FfnVariant::Dense(dense) => {
-                let gate_kernel = self
-                    .dispatcher
-                    .get_kernel(dense.gate.weight.tensor_type)
-                    .map_err(ArchError::from)?;
-                let up_kernel = self
-                    .dispatcher
-                    .get_kernel(dense.up.weight.tensor_type)
-                    .map_err(ArchError::from)?;
-                let down_kernel = self
-                    .dispatcher
-                    .get_kernel(dense.down.weight.tensor_type)
-                    .map_err(ArchError::from)?;
+                let gate_kernel: &dyn QuantKernel = &*dense.gate_kernel;
+                let up_kernel: &dyn QuantKernel = &*dense.up_kernel;
+                let down_kernel: &dyn QuantKernel = &*dense.down_kernel;
 
-                // gate = gate_proj(norm_hidden)
-                dense
-                    .gate
-                    .forward(&*gate_kernel, &self.buf_norm, &mut self.buf_gate)?;
+                // `gate` and `up` share the post-ffn-norm activation.
+                let gate_fused = dense.gate.q8_fused_blocks(gate_kernel);
+                let up_fused = dense.up.q8_fused_blocks(up_kernel);
+                if let Some(n_blocks) = gate_fused.iter().chain(&up_fused).copied().max() {
+                    quantize_activations_q8_0_into(&self.buf_norm, n_blocks, &mut self.buf_acts_q8);
+                }
 
-                // up = up_proj(norm_hidden)
-                dense
-                    .up
-                    .forward(&*up_kernel, &self.buf_norm, &mut self.buf_up)?;
+                if gate_fused.is_some() {
+                    dense.gate.forward_q8_fused(
+                        gate_kernel,
+                        &self.buf_norm,
+                        &self.buf_acts_q8,
+                        &mut self.buf_gate,
+                    )?;
+                } else {
+                    dense
+                        .gate
+                        .forward(gate_kernel, &self.buf_norm, &mut self.buf_gate)?;
+                }
+                if up_fused.is_some() {
+                    dense.up.forward_q8_fused(
+                        up_kernel,
+                        &self.buf_norm,
+                        &self.buf_acts_q8,
+                        &mut self.buf_up,
+                    )?;
+                } else {
+                    dense
+                        .up
+                        .forward(up_kernel, &self.buf_norm, &mut self.buf_up)?;
+                }
 
-                // gate = silu(gate) * up  (SwiGLU)
                 swiglu_inplace(&mut self.buf_gate, &self.buf_up);
 
-                // ffn_out = down_proj(gate)
-                dense
-                    .down
-                    .forward(&*down_kernel, &self.buf_gate, &mut self.buf_ffn_out)?;
+                match dense.down.q8_fused_blocks(down_kernel) {
+                    Some(n_blocks) => {
+                        quantize_activations_q8_0_into(
+                            &self.buf_gate,
+                            n_blocks,
+                            &mut self.buf_acts_q8,
+                        );
+                        dense.down.forward_q8_fused(
+                            down_kernel,
+                            &self.buf_gate,
+                            &self.buf_acts_q8,
+                            &mut self.buf_ffn_out,
+                        )?;
+                    }
+                    None => {
+                        dense
+                            .down
+                            .forward(down_kernel, &self.buf_gate, &mut self.buf_ffn_out)?
+                    }
+                }
             }
-            FfnVariant::Moe(moe_ffn) => {
-                // Clone buf_norm to satisfy borrow checker: MoeFfn reads input,
-                // buf_ffn_out is written. No unsafe needed.
-                let input = self.buf_norm.clone();
-                moe_ffn.forward(&input, &mut self.buf_ffn_out)?;
+            FfnVariant::Moe(moe) => {
+                // No `self.buf_norm.clone()` here: the router reads `buf_norm`
+                // and the experts write `buf_ffn_out`/`moe_scratch`, which are
+                // disjoint fields, so nothing needs copying.
+                moe.forward(&self.buf_norm, &mut self.buf_ffn_out, &mut self.moe_scratch)?;
             }
         }
 
-        // Add FFN output to residual (buf_hidden)
         for (h, &f) in self.buf_hidden.iter_mut().zip(self.buf_ffn_out.iter()) {
             *h += f;
         }
 
+        Ok(())
+    }
+
+    /// Project the final hidden state through the LM head into `buf_logits`.
+    fn project_logits(&mut self) -> ArchResult<()> {
+        // `buf_logits` may have been handed to the caller by ownership on a
+        // previous call (see the `mem::take` in `forward`) and therefore be
+        // empty; restore its length before the kernel writes into it.
+        if self.buf_logits.len() != self.config.vocab_size {
+            self.buf_logits.resize(self.config.vocab_size, 0.0);
+        }
+
+        let output_kernel: &dyn QuantKernel = &*self.output_kernel;
+        match self.output.q8_fused_blocks(output_kernel) {
+            Some(n_blocks) => {
+                quantize_activations_q8_0_into(&self.buf_hidden, n_blocks, &mut self.buf_acts_q8);
+                self.output.forward_q8_fused(
+                    output_kernel,
+                    &self.buf_hidden,
+                    &self.buf_acts_q8,
+                    &mut self.buf_logits,
+                )?;
+            }
+            None => self
+                .output
+                .forward(output_kernel, &self.buf_hidden, &mut self.buf_logits)?,
+        }
         Ok(())
     }
 }
@@ -332,47 +627,17 @@ impl ForwardPass for LlamaModel {
         tokens: &[u32],
         kv_cache: &mut dyn KvCacheAccess,
     ) -> ArchResult<Vec<f32>> {
-        // Process each token (for prefill we process all, for decode just one)
-        let start_pos = kv_cache.seq_len();
+        self.run_layers(tokens, kv_cache)?;
 
-        for (i, &token) in tokens.iter().enumerate() {
-            let position = start_pos + i;
-
-            // Embed token
-            self.embed_token(token);
-
-            // Run through all transformer layers
-            for layer_idx in 0..self.layers.len() {
-                // Pre-attention norm
-                self.layers[layer_idx]
-                    .attn_norm
-                    .forward_to(&self.buf_hidden, &mut self.buf_norm);
-
-                // Grouped-query attention + residual
-                self.attention(layer_idx, position, kv_cache)?;
-
-                // Pre-FFN norm
-                self.layers[layer_idx]
-                    .ffn_norm
-                    .forward_to(&self.buf_hidden, &mut self.buf_norm);
-
-                // SwiGLU FFN + residual
-                self.feed_forward(layer_idx)?;
-            }
-
-            // Advance KV cache position after all layers processed this token
-            kv_cache.advance();
-        }
-
-        // Final norm on the last token's hidden state
         self.output_norm.forward(&mut self.buf_hidden);
+        self.project_logits()?;
 
-        // Project to vocabulary logits
-        let output_kernel = self.kernel_for(&self.output)?;
-        self.output
-            .forward(&*output_kernel, &self.buf_hidden, &mut self.buf_logits)?;
-
-        Ok(self.buf_logits.clone())
+        // Hand the freshly computed logits to the caller by ownership transfer
+        // instead of `self.buf_logits.clone()`.  The clone was a 513 KB
+        // (Llama-3 vocab_size == 128256) allocation-and-memcpy on every decoded
+        // token; `mem::take` moves the `Vec`'s (ptr, len, cap) for free and
+        // leaves `buf_logits` empty, which `project_logits` repairs next call.
+        Ok(std::mem::take(&mut self.buf_logits))
     }
 
     /// Extract the post-output-norm hidden state for embedding.
@@ -381,35 +646,14 @@ impl ForwardPass for LlamaModel {
     /// Stops SHORT of the LM-head projection (output.weight) that maps
     /// hidden_size → vocab_size. Returns a `hidden_size`-dimensional vector
     /// suitable for L2-normalised semantic embeddings.
+    ///
+    /// Unlike `forward`, this **clones**: `buf_hidden` is the model's live
+    /// residual stream, not a write-only output buffer, and it is `hidden_size`
+    /// (16 KB) rather than `vocab_size` (513 KB) — and `embed` runs once per
+    /// request, not once per generated token.
     fn embed(&mut self, tokens: &[u32], kv_cache: &mut dyn KvCacheAccess) -> ArchResult<Vec<f32>> {
-        let start_pos = kv_cache.seq_len();
-
-        for (i, &token) in tokens.iter().enumerate() {
-            let position = start_pos + i;
-
-            self.embed_token(token);
-
-            for layer_idx in 0..self.layers.len() {
-                self.layers[layer_idx]
-                    .attn_norm
-                    .forward_to(&self.buf_hidden, &mut self.buf_norm);
-
-                self.attention(layer_idx, position, kv_cache)?;
-
-                self.layers[layer_idx]
-                    .ffn_norm
-                    .forward_to(&self.buf_hidden, &mut self.buf_norm);
-
-                self.feed_forward(layer_idx)?;
-            }
-
-            kv_cache.advance();
-        }
-
-        // Final norm on the last token's hidden state.
-        // Does NOT project through the LM head — returns hidden state directly.
+        self.run_layers(tokens, kv_cache)?;
         self.output_norm.forward(&mut self.buf_hidden);
-
         Ok(self.buf_hidden.clone())
     }
 
@@ -484,6 +728,82 @@ impl ForwardPass for LlamaModel {
         }
     }
 
+    /// Visit every kernel the per-token path dispatches through: each layer's
+    /// four attention projections, its three dense-FFN projections, then the
+    /// LM head as `(None, "output")`.
+    ///
+    /// Two bindings this model owns are deliberately **not** offered:
+    ///
+    /// * [`FfnVariant::Moe`] layers.  Their expert and router kernels live
+    ///   inside [`QuantMoeFfn`], which does not expose them, so a Mixtral
+    ///   checkpoint (which arrives here, not through `crate::mixtral`) yields
+    ///   only its attention sites and its LM head.
+    /// * The token-embedding row lookup, which re-dispatches from
+    ///   [`Self::dispatcher`] per token rather than reading a stored `Arc`.
+    ///
+    /// The tiled prefill in `super::batch` likewise re-dispatches per tile,
+    /// so a remapped kernel governs decode but not a multi-token `forward`
+    /// that qualifies for the batched path — see the trait contract.
+    fn remap_quant_kernels(&mut self, f: &mut QuantKernelRemap<'_>) {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let idx = Some(i);
+            remap_kernel_slot(
+                f,
+                idx,
+                "attn_q",
+                &layer.attn_q.weight,
+                &mut layer.attn_q_kernel,
+            );
+            remap_kernel_slot(
+                f,
+                idx,
+                "attn_k",
+                &layer.attn_k.weight,
+                &mut layer.attn_k_kernel,
+            );
+            remap_kernel_slot(
+                f,
+                idx,
+                "attn_v",
+                &layer.attn_v.weight,
+                &mut layer.attn_v_kernel,
+            );
+            remap_kernel_slot(
+                f,
+                idx,
+                "attn_output",
+                &layer.attn_output.weight,
+                &mut layer.attn_output_kernel,
+            );
+
+            if let FfnVariant::Dense(dense) = &mut layer.ffn {
+                remap_kernel_slot(
+                    f,
+                    idx,
+                    "ffn_gate",
+                    &dense.gate.weight,
+                    &mut dense.gate_kernel,
+                );
+                remap_kernel_slot(f, idx, "ffn_up", &dense.up.weight, &mut dense.up_kernel);
+                remap_kernel_slot(
+                    f,
+                    idx,
+                    "ffn_down",
+                    &dense.down.weight,
+                    &mut dense.down_kernel,
+                );
+            }
+        }
+
+        remap_kernel_slot(
+            f,
+            None,
+            "output",
+            &self.output.weight,
+            &mut self.output_kernel,
+        );
+    }
+
     fn forward_batched(
         &mut self,
         q_batch: &[f32],
@@ -553,12 +873,7 @@ impl ForwardPass for LlamaModel {
                         break;
                     }
                     let k_pos = &keys[k_base..k_end];
-                    *score = q_head
-                        .iter()
-                        .zip(k_pos.iter())
-                        .map(|(a, b)| a * b)
-                        .sum::<f32>()
-                        * scale;
+                    *score = dot_f32(q_head, k_pos) * scale;
                 }
 
                 // Softmax over scores.
@@ -580,9 +895,7 @@ impl ForwardPass for LlamaModel {
                     if v_start >= values.len() {
                         break;
                     }
-                    for (o, &v) in out_head.iter_mut().zip(values[v_start..v_end].iter()) {
-                        *o += attn_weight * v;
-                    }
+                    axpy_f32(out_head, attn_weight, &values[v_start..v_end]);
                 }
             }
         }
@@ -591,370 +904,287 @@ impl ForwardPass for LlamaModel {
     }
 }
 
-/// In-place softmax over a slice.
-pub(crate) fn softmax_inplace(x: &mut [f32]) {
-    if x.is_empty() {
-        return;
-    }
-
-    // Find max for numerical stability
-    let max_val = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-
-    // exp(x - max) and sum
-    let mut sum = 0.0f32;
-    for v in x.iter_mut() {
-        *v = (*v - max_val).exp();
-        sum += *v;
-    }
-
-    // Normalize
-    if sum > 0.0 {
-        let inv_sum = 1.0 / sum;
-        for v in x.iter_mut() {
-            *v *= inv_sum;
-        }
-    }
-}
-
-/// Load a LLaMA model from a `GgufModel` (convenience function).
-///
-/// Extracts all tensors by name and constructs a `LlamaModel`.
-pub fn load_llama_from_gguf(
-    model: &oxillama_gguf::GgufModel,
-    config: &ModelConfig,
-) -> ArchResult<LlamaModel> {
-    let dispatcher = KernelDispatcher::new();
-
-    // Load token embeddings (always F32 or F16 in GGUF)
-    let embd_data = model.tensor_data("token_embd.weight")?;
-    let embd_info = model.file.tensors.get("token_embd.weight")?;
-    let token_embd = dequant_to_f32(embd_info, embd_data, &dispatcher)?;
-
-    // Load transformer layers
-    let mut layers = Vec::with_capacity(config.num_layers);
-    for i in 0..config.num_layers {
-        let prefix = format!("blk.{i}");
-
-        let attn_norm = load_rms_norm_weight(model, &format!("{prefix}.attn_norm.weight"))?;
-        let ffn_norm = load_rms_norm_weight(model, &format!("{prefix}.ffn_norm.weight"))?;
-
-        let attn_q = load_quant_linear(model, &format!("{prefix}.attn_q.weight"))?;
-        let attn_k = load_quant_linear(model, &format!("{prefix}.attn_k.weight"))?;
-        let attn_v = load_quant_linear(model, &format!("{prefix}.attn_v.weight"))?;
-        let attn_output = load_quant_linear(model, &format!("{prefix}.attn_output.weight"))?;
-
-        let ffn = if config.num_experts > 0 {
-            load_moe_ffn(model, &dispatcher, &prefix, config)?
-        } else {
-            let gate = load_quant_linear(model, &format!("{prefix}.ffn_gate.weight"))?;
-            let up = load_quant_linear(model, &format!("{prefix}.ffn_up.weight"))?;
-            let down = load_quant_linear(model, &format!("{prefix}.ffn_down.weight"))?;
-            FfnVariant::Dense(Box::new(DenseFfn { gate, up, down }))
-        };
-
-        layers.push(LlamaLayer {
-            attn_norm: RmsNorm::new(attn_norm, config.rms_norm_eps),
-            attn_q,
-            attn_k,
-            attn_v,
-            attn_output,
-            ffn_norm: RmsNorm::new(ffn_norm, config.rms_norm_eps),
-            ffn,
-        });
-    }
-
-    // Load final norm and output projection
-    let output_norm_weight = load_rms_norm_weight(model, "output_norm.weight")?;
-    let output_norm = RmsNorm::new(output_norm_weight, config.rms_norm_eps);
-
-    let output = load_quant_linear(model, "output.weight")?;
-
-    Ok(LlamaModel::new(
-        config.clone(),
-        token_embd,
-        layers,
-        output_norm,
-        output,
-    ))
-}
-
-/// Load a MoE FFN for one transformer block from GGUF.
-///
-/// Mixtral GGUF stores stacked expert tensors under these names:
-/// - `blk.{i}.ffn_gate_inp.weight`   — router: `[num_experts, hidden_size]`
-/// - `blk.{i}.ffn_gate_exps.weight`  — stacked gate: `[num_experts, intermediate_size, hidden_size]`
-/// - `blk.{i}.ffn_up_exps.weight`    — stacked up:   `[num_experts, intermediate_size, hidden_size]`
-/// - `blk.{i}.ffn_down_exps.weight`  — stacked down: `[num_experts, hidden_size, intermediate_size]`
-///
-/// Each stacked tensor is split by `expert_slice_size` to build per-expert weight vectors.
-fn load_moe_ffn(
-    model: &oxillama_gguf::GgufModel,
-    dispatcher: &KernelDispatcher,
-    prefix: &str,
-    config: &ModelConfig,
-) -> ArchResult<FfnVariant> {
-    let num_experts = config.num_experts;
-    let top_k = config.num_experts_used.max(1);
-    let hidden = config.hidden_size;
-    let intermediate = config.intermediate_size;
-
-    // --- Router ---
-    let router_name = format!("{prefix}.ffn_gate_inp.weight");
-    let router_info =
-        model
-            .file
-            .tensors
-            .get(&router_name)
-            .map_err(|_| ArchError::MissingTensor {
-                name: router_name.clone(),
-            })?;
-    let router_data = model.tensor_data(&router_name)?;
-    let router = dequant_to_f32(router_info, router_data, dispatcher)?;
-
-    // Validate router shape: should be [num_experts, hidden_size].
-    let expected_router = num_experts * hidden;
-    if router.len() != expected_router {
-        return Err(ArchError::TensorShapeMismatch {
-            tensor: router_name,
-            expected: vec![num_experts, hidden],
-            got: vec![router.len()],
-        });
-    }
-
-    // --- Stacked expert tensors ---
-    let gate_stacked =
-        load_dequant_tensor(model, dispatcher, &format!("{prefix}.ffn_gate_exps.weight"))?;
-    let up_stacked =
-        load_dequant_tensor(model, dispatcher, &format!("{prefix}.ffn_up_exps.weight"))?;
-    let down_stacked =
-        load_dequant_tensor(model, dispatcher, &format!("{prefix}.ffn_down_exps.weight"))?;
-
-    // Each expert's gate/up slice is [intermediate_size, hidden_size].
-    let gate_up_stride = intermediate * hidden;
-    // Each expert's down slice is [hidden_size, intermediate_size].
-    let down_stride = hidden * intermediate;
-
-    let total_gate_up = num_experts * gate_up_stride;
-    let total_down = num_experts * down_stride;
-
-    if gate_stacked.len() != total_gate_up {
-        return Err(ArchError::TensorShapeMismatch {
-            tensor: format!("{prefix}.ffn_gate_exps.weight"),
-            expected: vec![num_experts, intermediate, hidden],
-            got: vec![gate_stacked.len()],
-        });
-    }
-    if up_stacked.len() != total_gate_up {
-        return Err(ArchError::TensorShapeMismatch {
-            tensor: format!("{prefix}.ffn_up_exps.weight"),
-            expected: vec![num_experts, intermediate, hidden],
-            got: vec![up_stacked.len()],
-        });
-    }
-    if down_stacked.len() != total_down {
-        return Err(ArchError::TensorShapeMismatch {
-            tensor: format!("{prefix}.ffn_down_exps.weight"),
-            expected: vec![num_experts, hidden, intermediate],
-            got: vec![down_stacked.len()],
-        });
-    }
-
-    // Split stacked tensors into per-expert weight vectors.
-    let experts: Vec<Expert> = (0..num_experts)
-        .map(|e| {
-            let gate_start = e * gate_up_stride;
-            let up_start = e * gate_up_stride;
-            let down_start = e * down_stride;
-            Expert {
-                gate: gate_stacked[gate_start..gate_start + gate_up_stride].to_vec(),
-                up: up_stacked[up_start..up_start + gate_up_stride].to_vec(),
-                down: down_stacked[down_start..down_start + down_stride].to_vec(),
-                hidden_size: hidden,
-                intermediate_size: intermediate,
-            }
-        })
-        .collect();
-
-    Ok(FfnVariant::Moe(Box::new(MoeFfn {
-        router,
-        experts,
-        top_k,
-        num_experts,
-        hidden_size: hidden,
-    })))
-}
-
-/// Load and dequantize a tensor to f32, looking it up by name.
-pub(crate) fn load_dequant_tensor(
-    model: &oxillama_gguf::GgufModel,
-    dispatcher: &KernelDispatcher,
-    name: &str,
-) -> ArchResult<Vec<f32>> {
-    let info = model
-        .file
-        .tensors
-        .get(name)
-        .map_err(|_| ArchError::MissingTensor {
-            name: name.to_string(),
-        })?;
-    let data = model.tensor_data(name)?;
-    dequant_to_f32(info, data, dispatcher)
-}
-
-/// Load a quantized linear layer from GGUF.
-pub(crate) fn load_quant_linear(
-    model: &oxillama_gguf::GgufModel,
-    name: &str,
-) -> ArchResult<QuantLinear> {
-    let info = model
-        .file
-        .tensors
-        .get(name)
-        .map_err(|_| ArchError::MissingTensor {
-            name: name.to_string(),
-        })?;
-    let data = model.tensor_data(name)?;
-
-    let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
-    let tensor = QuantTensor::new(data.to_vec(), shape, info.tensor_type);
-
-    Ok(QuantLinear::new(tensor, None))
-}
-
-/// Load an RMSNorm weight vector from GGUF (always dequantized to F32).
-pub(crate) fn load_rms_norm_weight(
-    model: &oxillama_gguf::GgufModel,
-    name: &str,
-) -> ArchResult<Vec<f32>> {
-    let info = model
-        .file
-        .tensors
-        .get(name)
-        .map_err(|_| ArchError::MissingTensor {
-            name: name.to_string(),
-        })?;
-    let data = model.tensor_data(name)?;
-    let dispatcher = KernelDispatcher::new();
-
-    dequant_to_f32(info, data, &dispatcher)
-}
-
-/// Dequantize tensor data to f32.
-pub(crate) fn dequant_to_f32(
-    info: &oxillama_gguf::TensorInfo,
-    data: &[u8],
-    dispatcher: &KernelDispatcher,
-) -> ArchResult<Vec<f32>> {
-    let n_elements = info.n_elements() as usize;
-    let tensor_type = info.tensor_type;
-
-    // F32 tensors — direct copy
-    if tensor_type == oxillama_gguf::GgufTensorType::F32 {
-        let mut out = vec![0.0f32; n_elements];
-        for (i, chunk) in data.chunks_exact(4).enumerate().take(n_elements) {
-            out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-        return Ok(out);
-    }
-
-    // F16 tensors — convert via half crate
-    if tensor_type == oxillama_gguf::GgufTensorType::F16 {
-        let mut out = vec![0.0f32; n_elements];
-        for (i, chunk) in data.chunks_exact(2).enumerate().take(n_elements) {
-            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            out[i] = half::f16::from_bits(bits).to_f32();
-        }
-        return Ok(out);
-    }
-
-    // Quantized tensors — use kernel dequant
-    let kernel = dispatcher.get_kernel(tensor_type)?;
-    let block_size = tensor_type.block_size();
-    let block_bytes = tensor_type.block_bytes();
-    let n_blocks = n_elements.div_ceil(block_size);
-
-    let mut out = vec![0.0f32; n_elements];
-    for blk in 0..n_blocks {
-        let data_offset = blk * block_bytes;
-        let out_offset = blk * block_size;
-        let block_data = &data[data_offset..data_offset + block_bytes];
-        let out_slice = &mut out[out_offset..out_offset.saturating_add(block_size).min(n_elements)];
-        kernel.dequant_block(block_data, out_slice)?;
-    }
-
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::moe::{QuantExpert, QuantMoeFfn};
+    use crate::traits::remap_test_support::CountingKernel;
+    use oxillama_gguf::GgufTensorType;
+    use oxillama_quant::QuantTensor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn test_softmax_basic() {
-        let mut x = vec![1.0, 2.0, 3.0];
-        softmax_inplace(&mut x);
+    // Deliberately small, and deliberately mutually distinct: `ATTN_DIM`,
+    // `HIDDEN`, `FFN` and `VOCAB` all differ, so a site that reports the wrong
+    // weight tensor is caught by its shape rather than passing unnoticed.
+    const HIDDEN: usize = 8;
+    const FFN: usize = 16;
+    const VOCAB: usize = 12;
+    const HEADS: usize = 2;
+    const HEAD_DIM: usize = 6;
+    const ATTN_DIM: usize = HEADS * HEAD_DIM;
+    const LAYERS: usize = 2;
+    const EXPERTS: usize = 2;
 
-        let sum: f32 = x.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-5,
-            "softmax sum should be 1.0, got {sum}"
-        );
-        assert!(
-            x[2] > x[1] && x[1] > x[0],
-            "softmax should preserve ordering"
-        );
-    }
-
-    #[test]
-    fn test_softmax_single() {
-        let mut x = vec![42.0];
-        softmax_inplace(&mut x);
-        assert!((x[0] - 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_softmax_empty() {
-        let mut x: Vec<f32> = vec![];
-        softmax_inplace(&mut x);
-    }
-
-    #[test]
-    fn test_softmax_large_values() {
-        // Should not overflow due to max subtraction
-        let mut x = vec![1000.0, 1001.0, 1002.0];
-        softmax_inplace(&mut x);
-        let sum: f32 = x.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5);
-    }
-
-    /// Verify the design invariant that embed() and forward() produce vectors
-    /// of different lengths: hidden_size vs vocab_size.
+    /// An F32 `[out_features, in_features]` weight with deterministic,
+    /// non-degenerate values.
     ///
-    /// embed() stops before the LM-head projection so its output has length
-    /// `hidden_size`.  forward() returns logits, length `vocab_size`.
-    /// For any realistic model these two dimensions differ, which this test
-    /// confirms by checking the LlamaModel scratch buffer sizes directly.
-    #[test]
-    fn test_embed_output_length_differs_from_vocab_size() {
-        // The LlamaModel struct stores buf_hidden (hidden_size) and buf_logits
-        // (vocab_size) as distinct fields.  We verify their sizes are different
-        // for a configuration where hidden_size != vocab_size, which is the
-        // universal case for production LLaMA models.
-        let hidden_size: usize = 64;
-        let vocab_size: usize = 256;
+    /// Zero weights would make every logit zero and the parity assertion
+    /// vacuous, so `seed` decorrelates the projections.
+    fn f32_linear(out_features: usize, in_features: usize, seed: usize) -> QuantLinear {
+        let mut bytes = Vec::with_capacity(out_features * in_features * 4);
+        for i in 0..out_features * in_features {
+            let v = (((i * 37 + seed * 13) % 23) as f32 - 11.0) / 32.0;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        QuantLinear::new(
+            QuantTensor::new(bytes, vec![out_features, in_features], GgufTensorType::F32),
+            None,
+        )
+    }
 
-        // embed() result length == hidden_size (the buf_hidden dimension).
-        // forward() result length == vocab_size (the buf_logits dimension).
-        assert_ne!(
-            hidden_size, vocab_size,
-            "test requires hidden_size != vocab_size"
+    fn f32_kernel(dispatcher: &KernelDispatcher) -> Arc<dyn QuantKernel> {
+        dispatcher
+            .get_kernel(GgufTensorType::F32)
+            .expect("the F32 kernel must be registered")
+            .into()
+    }
+
+    fn tiny_config() -> ModelConfig {
+        ModelConfig {
+            architecture: "llama".to_string(),
+            hidden_size: HIDDEN,
+            intermediate_size: FFN,
+            num_layers: LAYERS,
+            num_attention_heads: HEADS,
+            num_kv_heads: HEADS,
+            head_dim: HEAD_DIM,
+            vocab_size: VOCAB,
+            max_context_length: 16,
+            ..ModelConfig::default()
+        }
+    }
+
+    fn attention_block(dispatcher: &KernelDispatcher, layer: usize) -> LlamaLayer {
+        LlamaLayer {
+            attn_norm: RmsNorm::new(vec![1.0; HIDDEN], 1e-5),
+            attn_q: f32_linear(ATTN_DIM, HIDDEN, layer * 7 + 1),
+            attn_k: f32_linear(ATTN_DIM, HIDDEN, layer * 7 + 2),
+            attn_v: f32_linear(ATTN_DIM, HIDDEN, layer * 7 + 3),
+            attn_output: f32_linear(HIDDEN, ATTN_DIM, layer * 7 + 4),
+            attn_q_kernel: f32_kernel(dispatcher),
+            attn_k_kernel: f32_kernel(dispatcher),
+            attn_v_kernel: f32_kernel(dispatcher),
+            attn_output_kernel: f32_kernel(dispatcher),
+            ffn_norm: RmsNorm::new(vec![1.0; HIDDEN], 1e-5),
+            ffn: FfnVariant::Dense(Box::new(DenseFfn {
+                gate: f32_linear(FFN, HIDDEN, layer * 7 + 5),
+                up: f32_linear(FFN, HIDDEN, layer * 7 + 6),
+                down: f32_linear(HIDDEN, FFN, layer * 7 + 7),
+                gate_kernel: f32_kernel(dispatcher),
+                up_kernel: f32_kernel(dispatcher),
+                down_kernel: f32_kernel(dispatcher),
+            })),
+        }
+    }
+
+    /// A two-layer dense LLaMA over F32 weights.
+    fn tiny_llama() -> LlamaModel {
+        let dispatcher = KernelDispatcher::new();
+        let layers = (0..LAYERS)
+            .map(|l| attention_block(&dispatcher, l))
+            .collect();
+        let token_embd: Vec<f32> = (0..VOCAB * HIDDEN)
+            .map(|i| ((i % 11) as f32 - 5.0) / 16.0)
+            .collect();
+        LlamaModel::new(
+            tiny_config(),
+            token_embd,
+            layers,
+            RmsNorm::new(vec![1.0; HIDDEN], 1e-5),
+            f32_linear(VOCAB, HIDDEN, 99),
+        )
+        .expect("the F32 LM head must resolve a kernel")
+    }
+
+    /// The same model with layer 0's dense FFN replaced by a 2-expert MoE.
+    fn tiny_llama_with_moe_layer() -> LlamaModel {
+        let dispatcher = KernelDispatcher::new();
+        let mut layers: Vec<LlamaLayer> = (0..LAYERS)
+            .map(|l| attention_block(&dispatcher, l))
+            .collect();
+        let experts = (0..EXPERTS)
+            .map(|e| {
+                QuantExpert::new(
+                    f32_linear(FFN, HIDDEN, 40 + e),
+                    f32_linear(FFN, HIDDEN, 50 + e),
+                    f32_linear(HIDDEN, FFN, 60 + e),
+                )
+                .expect("expert projections must compose")
+            })
+            .collect();
+        let moe = QuantMoeFfn::new(f32_linear(EXPERTS, HIDDEN, 70), experts, 1)
+            .expect("router and experts must agree on hidden_size");
+        layers[0].ffn = FfnVariant::Moe(Box::new(moe));
+
+        let token_embd: Vec<f32> = (0..VOCAB * HIDDEN)
+            .map(|i| ((i % 11) as f32 - 5.0) / 16.0)
+            .collect();
+        LlamaModel::new(
+            tiny_config(),
+            token_embd,
+            layers,
+            RmsNorm::new(vec![1.0; HIDDEN], 1e-5),
+            f32_linear(VOCAB, HIDDEN, 99),
+        )
+        .expect("the F32 LM head must resolve a kernel")
+    }
+
+    /// Per-layer KV cache backing the forward-pass tests.
+    struct TestKv {
+        keys: Vec<Vec<f32>>,
+        values: Vec<Vec<f32>>,
+        seq_len: usize,
+    }
+
+    impl TestKv {
+        fn new(layers: usize) -> Self {
+            Self {
+                keys: vec![Vec::new(); layers],
+                values: vec![Vec::new(); layers],
+                seq_len: 0,
+            }
+        }
+    }
+
+    impl KvCacheAccess for TestKv {
+        fn seq_len(&self) -> usize {
+            self.seq_len
+        }
+        fn store_kv(&mut self, layer: usize, key: &[f32], value: &[f32]) -> ArchResult<()> {
+            self.keys[layer].extend_from_slice(key);
+            self.values[layer].extend_from_slice(value);
+            Ok(())
+        }
+        fn get_keys(&self, layer: usize) -> ArchResult<&[f32]> {
+            Ok(&self.keys[layer])
+        }
+        fn get_values(&self, layer: usize) -> ArchResult<&[f32]> {
+            Ok(&self.values[layer])
+        }
+        fn advance(&mut self) {
+            self.seq_len += 1;
+        }
+    }
+
+    /// Collect `(layer, role, weight shape)` for every visited site.
+    fn visit_sites(model: &mut LlamaModel) -> Vec<(Option<usize>, &'static str, Vec<usize>)> {
+        let mut sites = Vec::new();
+        model.remap_quant_kernels(&mut |site, kernel| {
+            sites.push((site.layer, site.role, site.weight.shape.clone()));
+            kernel
+        });
+        sites
+    }
+
+    /// Every projection the decode path reads is offered exactly once, in
+    /// block order, with the weight tensor that projection owns.
+    #[test]
+    fn remap_visits_seven_sites_per_layer_plus_the_lm_head() {
+        let mut model = tiny_llama();
+        let sites = visit_sites(&mut model);
+
+        let mut expected: Vec<(Option<usize>, &'static str, Vec<usize>)> = Vec::new();
+        for l in 0..LAYERS {
+            expected.push((Some(l), "attn_q", vec![ATTN_DIM, HIDDEN]));
+            expected.push((Some(l), "attn_k", vec![ATTN_DIM, HIDDEN]));
+            expected.push((Some(l), "attn_v", vec![ATTN_DIM, HIDDEN]));
+            expected.push((Some(l), "attn_output", vec![HIDDEN, ATTN_DIM]));
+            expected.push((Some(l), "ffn_gate", vec![FFN, HIDDEN]));
+            expected.push((Some(l), "ffn_up", vec![FFN, HIDDEN]));
+            expected.push((Some(l), "ffn_down", vec![HIDDEN, FFN]));
+        }
+        expected.push((None, "output", vec![VOCAB, HIDDEN]));
+
+        assert_eq!(
+            sites.len(),
+            7 * LAYERS + 1,
+            "a dense model exposes 7 sites per layer plus the LM head"
+        );
+        assert_eq!(
+            sites, expected,
+            "roles, layer indices and weight shapes must match the contract exactly"
+        );
+    }
+
+    /// A MoE layer contributes only its attention sites: the expert and router
+    /// kernels live inside `QuantMoeFfn` and are out of contract.
+    #[test]
+    fn remap_skips_moe_expert_kernels() {
+        let mut model = tiny_llama_with_moe_layer();
+        let sites = visit_sites(&mut model);
+
+        assert_eq!(
+            sites.len(),
+            4 + 7 + 1,
+            "the MoE layer contributes 4 attention sites, the dense layer 7, plus the LM head"
+        );
+        assert!(
+            !sites
+                .iter()
+                .any(|(layer, role, _)| *layer == Some(0) && role.starts_with("ffn_")),
+            "no FFN site may be reported for the MoE layer"
+        );
+        assert!(
+            sites
+                .iter()
+                .any(|(layer, role, _)| layer.is_none() && *role == "output"),
+            "the LM head must still be offered on a MoE model"
+        );
+    }
+
+    /// Wrapping every kernel in a forwarding decorator changes no logit, and
+    /// the decorator really is on the path that produced them.
+    #[test]
+    fn remapped_delegating_kernels_reproduce_the_baseline_logits() {
+        // Single-token steps: a multi-token `forward` may take the tiled
+        // prefill path, which re-dispatches kernels and would bypass the remap.
+        let mut baseline = tiny_llama();
+        let mut kv = TestKv::new(LAYERS);
+        let first = baseline
+            .forward(&[3], &mut kv)
+            .expect("baseline decode step must succeed");
+        let second = baseline
+            .forward(&[7], &mut kv)
+            .expect("baseline decode step must succeed");
+        assert!(
+            first.iter().any(|&v| v != 0.0),
+            "the fixture must produce non-trivial logits, else parity is vacuous"
         );
 
-        // Confirm the buf sizes we rely on in the implementation match.
-        let buf_hidden = vec![0.0f32; hidden_size];
-        let buf_logits = vec![0.0f32; vocab_size];
-        assert_eq!(buf_hidden.len(), hidden_size);
-        assert_eq!(buf_logits.len(), vocab_size);
-        assert_ne!(buf_hidden.len(), buf_logits.len());
+        let mut remapped = tiny_llama();
+        let calls = Arc::new(AtomicUsize::new(0));
+        remapped.remap_quant_kernels(&mut |_site, kernel| {
+            CountingKernel::wrap(kernel, Arc::clone(&calls))
+        });
+
+        let mut kv = TestKv::new(LAYERS);
+        let first_remapped = remapped
+            .forward(&[3], &mut kv)
+            .expect("remapped decode step must succeed");
+        let second_remapped = remapped
+            .forward(&[7], &mut kv)
+            .expect("remapped decode step must succeed");
+
+        assert_eq!(
+            first_remapped, first,
+            "a forwarding decorator must not perturb the logits"
+        );
+        assert_eq!(second_remapped, second, "same on the second decode step");
+        assert!(
+            calls.load(Ordering::Relaxed) >= 2 * (7 * LAYERS + 1),
+            "each of the {} sites must be driven once per decode step, got {} calls",
+            7 * LAYERS + 1,
+            calls.load(Ordering::Relaxed)
+        );
     }
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::error::{ServerError, ServerResult};
-use crate::queue::{BatchRequest, UsageStats};
+use crate::queue::{BatchRequest, GenerateReply, GenerateStreamReply};
 use crate::state::AppState;
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -12,8 +12,11 @@ use axum::response::IntoResponse;
 use axum::Json;
 use oxillama_runtime::sampling::grammar::Grammar;
 use oxillama_runtime::sampling::SamplerConfig;
+use oxillama_runtime::{ChatTemplate, Turn};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use super::tools::{Tool, ToolCall, ToolCallDelta, ToolChoice};
 
@@ -184,7 +187,12 @@ pub async fn chat_completions(
     }
 
     let max_tokens = request.max_tokens.unwrap_or(256);
-    let prompt = format_chat_prompt(&request.messages);
+    let prompt = format_chat_prompt(&request.messages, state.chat_template);
+    // Llama-3 and Mistral templates render their own literal BOS marker
+    // (`<|begin_of_text|>` / `<s>`); letting the tokenizer add another would
+    // give the model two. ChatML/Alpaca render none, so their encoding must
+    // keep the model's own `add_bos_token` policy in play.
+    let add_special = !state.chat_template.emits_literal_bos();
     let model_id = state.model_id.clone();
     let now = unix_now();
     let request_id = format!("chatcmpl-{:x}", now);
@@ -201,7 +209,12 @@ pub async fn chat_completions(
         // blocking worker thread and pushes encoded events into `sse_tx`.
         let (sse_tx, sse_rx) =
             tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
-        let (reply_tx, reply_rx) = oneshot::channel::<Result<UsageStats, String>>();
+        let (reply_tx, reply_rx) = oneshot::channel::<GenerateStreamReply>();
+
+        // D3/D4: cancelled when the SSE channel can no longer accept
+        // events (client stopped reading / disconnected) so the worker can
+        // shed the request instead of the producer blocking forever.
+        let cancel = CancellationToken::new();
 
         let req_id = request_id.clone();
         let model_id_clone = model_id.clone();
@@ -231,9 +244,17 @@ pub async fn chat_completions(
             .await;
 
         // Build the streaming callback that runs on the blocking worker thread.
+        //
+        // D3 fix: this used to be `sse_tx_cb.blocking_send(...)`, which
+        // parks the (sole) blocking worker thread if the bounded SSE
+        // channel is full — i.e. if the client stops reading, generation
+        // for every other request on the server stalls indefinitely. We
+        // now use `try_send` and cancel the request the moment the client
+        // can no longer keep up, rather than ever blocking the worker.
         let req_id_cb = req_id.clone();
         let model_id_cb = model_id_clone.clone();
         let sse_tx_cb = sse_tx.clone();
+        let cancel_cb = cancel.clone();
         let callback: crate::queue::StreamCallback = Box::new(move |token_text: &str| {
             let chunk = ChatCompletionChunk {
                 id: req_id_cb.clone(),
@@ -250,12 +271,24 @@ pub async fn chat_completions(
                     finish_reason: None,
                 }],
             };
-            let _ = sse_tx_cb.blocking_send(Ok(
-                Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
-            ));
+            let event =
+                Ok(Event::default().data(serde_json::to_string(&chunk).unwrap_or_default()));
+            match sse_tx_cb.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                    // Client isn't draining the channel fast enough (or has
+                    // disconnected entirely). Signal cancellation so the
+                    // worker can stop treating this as billable, live work.
+                    cancel_cb.cancel();
+                }
+            }
         });
 
         // Dispatch to the worker.
+        //
+        // D5 fix: `try_send` + map `Full` to `QueueFull` (429) instead of
+        // `.send(...).await`, which parks the caller (and, transitively,
+        // never sheds load) when the queue is saturated.
         let lora_selection = request
             .lora
             .as_ref()
@@ -263,25 +296,44 @@ pub async fn chat_completions(
             .unwrap_or_default();
         state
             .queue
-            .send(BatchRequest::GenerateStream {
+            .try_send(BatchRequest::GenerateStream {
                 prompt,
                 max_tokens,
                 config: sampler_config,
                 cache_prompt: request.cache_prompt,
                 lora_selection,
+                add_special,
+                cancel: cancel.clone(),
                 callback,
                 reply: reply_tx,
             })
-            .await
-            .map_err(|_| ServerError::WorkerDead)?;
+            .map_err(|e| match e {
+                TrySendError::Full(_) => ServerError::QueueFull,
+                TrySendError::Closed(_) => ServerError::WorkerDead,
+            })?;
 
         // Spawn a task that waits for the worker to finish, then sends the
         // finish and [DONE] events.
         let req_id_finish = req_id.clone();
         let model_id_finish = model_id_clone.clone();
+        let metrics = Arc::clone(&state.metrics);
+        let cancel_finish = cancel.clone();
         tokio::spawn(async move {
+            // The trailing chunk now reports what actually happened: a
+            // request truncated at `max_tokens` yields `"length"`, not the
+            // unconditional `"stop"` this used to emit for every successful
+            // generation.
             let finish_reason = match reply_rx.await {
-                Ok(Ok(_usage)) => "stop",
+                Ok(Ok((usage, reason))) => {
+                    metrics
+                        .record_usage(usage.prompt_tokens as u64, usage.completion_tokens as u64);
+                    if cancel_finish.is_cancelled() {
+                        "cancelled"
+                    } else {
+                        reason.as_openai_str()
+                    }
+                }
+                _ if cancel_finish.is_cancelled() => "cancelled",
                 _ => "error",
             };
             let finish_chunk = ChatCompletionChunk {
@@ -312,7 +364,7 @@ pub async fn chat_completions(
         Ok(sse.into_response())
     } else {
         // Non-streaming: send a Generate request and await the result.
-        let (reply_tx, reply_rx) = oneshot::channel::<Result<(String, UsageStats), String>>();
+        let (reply_tx, reply_rx) = oneshot::channel::<GenerateReply>();
 
         let lora_selection = request
             .lora
@@ -321,21 +373,27 @@ pub async fn chat_completions(
             .unwrap_or_default();
         state
             .queue
-            .send(BatchRequest::Generate {
+            .try_send(BatchRequest::Generate {
                 prompt,
                 max_tokens,
                 config: sampler_config,
                 cache_prompt: request.cache_prompt,
                 lora_selection,
+                add_special,
                 reply: reply_tx,
             })
-            .await
-            .map_err(|_| ServerError::WorkerDead)?;
+            .map_err(|e| match e {
+                TrySendError::Full(_) => ServerError::QueueFull,
+                TrySendError::Closed(_) => ServerError::WorkerDead,
+            })?;
 
-        let (generated, usage) = reply_rx
+        let (generated, usage, runtime_finish_reason) = reply_rx
             .await
             .map_err(|_| ServerError::WorkerDead)?
             .map_err(|e| ServerError::InvalidRequest { message: e })?;
+        state
+            .metrics
+            .record_usage(usage.prompt_tokens as u64, usage.completion_tokens as u64);
 
         // Check if this was a tool-calling request and try to parse the
         // generated output as a tool call JSON.
@@ -345,6 +403,12 @@ pub async fn chat_completions(
             Some(ToolChoice::Mode(m)) if m == "none"
         );
 
+        // `"tool_calls"` overrides whatever the decode loop reported — a
+        // successfully parsed tool call is the OpenAI-mandated reason. Every
+        // other outcome now reflects reality (`"length"` when generation was
+        // truncated at `max_tokens` or ran out of context) instead of the
+        // unconditional `"stop"` this used to return.
+        let openai_finish_reason = runtime_finish_reason.as_openai_str().to_string();
         let (message, finish_reason, choice_tool_calls) = if has_tools && !tool_choice_is_none {
             let call_id = format!("call_{:x}", now);
             if let Some(tc) = super::tools::parse_tool_call_output(&generated, &call_id) {
@@ -363,7 +427,7 @@ pub async fn chat_completions(
                     tool_calls: None,
                     tool_call_id: None,
                 };
-                (msg, "stop".to_string(), None)
+                (msg, openai_finish_reason, None)
             }
         } else {
             let msg = ChatMessage {
@@ -372,7 +436,7 @@ pub async fn chat_completions(
                 tool_calls: None,
                 tool_call_id: None,
             };
-            (msg, "stop".to_string(), None)
+            (msg, openai_finish_reason, None)
         };
 
         let response = ChatCompletionResponse {
@@ -449,40 +513,30 @@ fn build_sampler_config(
     Ok(config)
 }
 
-/// Format chat messages into a prompt string.
-fn format_chat_prompt(messages: &[ChatMessage]) -> String {
-    let mut prompt = String::new();
-    for msg in messages {
-        let content = msg.content.as_deref().unwrap_or("");
-        match msg.role.as_str() {
-            "system" => {
-                prompt.push_str("<|system|>\n");
-                prompt.push_str(content);
-                prompt.push_str("\n<|end|>\n");
-            }
-            "user" => {
-                prompt.push_str("<|user|>\n");
-                prompt.push_str(content);
-                prompt.push_str("\n<|end|>\n");
-            }
-            "assistant" => {
-                prompt.push_str("<|assistant|>\n");
-                prompt.push_str(content);
-                prompt.push_str("\n<|end|>\n");
-            }
-            "tool" => {
-                prompt.push_str("<|tool|>\n");
-                prompt.push_str(content);
-                prompt.push_str("\n<|end|>\n");
-            }
-            _ => {
-                prompt.push_str(content);
-                prompt.push('\n');
-            }
-        }
-    }
-    prompt.push_str("<|assistant|>\n");
-    prompt
+/// Render chat messages into a prompt string using the **loaded model's own**
+/// chat template.
+///
+/// This used to build a fixed `<|system|>…<|end|>` skeleton for every model,
+/// regardless of what that model was trained on. No real model uses those
+/// markers: on Qwen3 (ChatML — `<|im_start|>`/`<|im_end|>`) the fabricated
+/// `<|end|>` tokenized as ordinary text, and the model, never having seen
+/// that framing, imitated it back as literal output — the reported
+/// `"content": "Hello! <|end|#>"`.
+///
+/// `template` is resolved once at model-load time and cached on
+/// [`AppState::chat_template`]. Roles are passed through verbatim, so a
+/// `"tool"` message renders as that family's tool turn where one exists
+/// (ChatML's `<|im_start|>tool`) and is folded/ignored where it does not
+/// (Mistral) — matching what the CLI's REPL does with the same renderer.
+pub(crate) fn format_chat_prompt(messages: &[ChatMessage], template: ChatTemplate) -> String {
+    let turns: Vec<Turn<'_>> = messages
+        .iter()
+        .map(|msg| Turn {
+            role: msg.role.as_str(),
+            content: msg.content.as_deref().unwrap_or(""),
+        })
+        .collect();
+    template.render(&turns, true)
 }
 
 fn unix_now() -> u64 {
@@ -496,7 +550,434 @@ fn unix_now() -> u64 {
 mod tests {
     use serde_json::json;
 
-    use crate::test_helpers::{build_live_test_app, build_test_app, post_json};
+    use super::{format_chat_prompt, ChatMessage};
+    use crate::test_helpers::{
+        build_live_test_app, build_live_test_app_spec, build_test_app, post_json, MockWorkerSpec,
+    };
+    use oxillama_runtime::{ChatTemplate, FinishReason};
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Chat template rendering (Defect: hardcoded fake template)
+    //
+    // `format_chat_prompt` used to render EVERY model through a fabricated
+    // `<|system|>…<|end|>` skeleton that no model was trained on. On Qwen3
+    // that produced `"content": "Hello! <|end|#>"` — the model imitating the
+    // fake marker as literal text. These tests pin the real markers of each
+    // family, and pin the absence of the fabricated ones.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn render_chatml_uses_im_start_markers() {
+        let messages = vec![msg("system", "You are helpful."), msg("user", "2+2?")];
+        let prompt = format_chat_prompt(&messages, ChatTemplate::ChatMl);
+        assert_eq!(
+            prompt,
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n\
+             <|im_start|>user\n2+2?<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn render_llama3_uses_header_id_markers() {
+        let messages = vec![msg("system", "Be terse."), msg("user", "Hi")];
+        let prompt = format_chat_prompt(&messages, ChatTemplate::Llama3);
+        assert!(prompt.starts_with("<|begin_of_text|>"));
+        assert!(
+            prompt.contains("<|start_header_id|>system<|end_header_id|>\n\nBe terse.<|eot_id|>")
+        );
+        assert!(prompt.contains("<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>"));
+        assert!(prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+    }
+
+    #[test]
+    fn render_mistral_uses_inst_markers() {
+        let messages = vec![msg("user", "Hi")];
+        let prompt = format_chat_prompt(&messages, ChatTemplate::Mistral);
+        assert!(prompt.starts_with("<s>"));
+        assert!(prompt.contains("[INST] Hi [/INST]"));
+    }
+
+    #[test]
+    fn render_alpaca_uses_section_headers() {
+        let messages = vec![msg("user", "What is 2+2?")];
+        let prompt = format_chat_prompt(&messages, ChatTemplate::Alpaca);
+        assert!(prompt.contains("### Instruction:\nWhat is 2+2?"));
+        assert!(prompt.ends_with("### Response:\n"));
+    }
+
+    /// The exact defect, asserted for every family at once: the fabricated
+    /// markers must never appear in a rendered prompt again.
+    #[test]
+    fn no_family_emits_the_fabricated_generic_markers() {
+        let messages = vec![
+            msg("system", "sys"),
+            msg("user", "hi"),
+            msg("assistant", "hello"),
+            msg("tool", "tool output"),
+        ];
+        for template in [
+            ChatTemplate::Llama3,
+            ChatTemplate::ChatMl,
+            ChatTemplate::Mistral,
+            ChatTemplate::Alpaca,
+        ] {
+            let prompt = format_chat_prompt(&messages, template);
+            for fake in [
+                "<|end|>",
+                "<|system|>",
+                "<|user|>",
+                "<|assistant|>",
+                "<|tool|>",
+            ] {
+                assert!(
+                    !prompt.contains(fake),
+                    "{template} must not emit the fabricated {fake} marker: {prompt}"
+                );
+            }
+        }
+    }
+
+    /// A message with `content: null` (an assistant turn that carried only
+    /// tool calls) must render as an empty turn rather than panicking or
+    /// being dropped silently.
+    #[test]
+    fn render_handles_null_content() {
+        let messages = vec![ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let prompt = format_chat_prompt(&messages, ChatTemplate::ChatMl);
+        assert_eq!(
+            prompt,
+            "<|im_start|>assistant\n<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    /// End-to-end through the HTTP layer: the prompt the worker actually
+    /// receives must carry the served model's markers. The pure-function
+    /// tests above cannot catch a handler that forgets to pass
+    /// `state.chat_template`.
+    #[tokio::test]
+    async fn chat_route_dispatches_a_template_rendered_prompt() {
+        let (app, captured) = build_live_test_app_spec(MockWorkerSpec {
+            chat_template: ChatTemplate::ChatMl,
+            echo_prompt: true,
+            ..MockWorkerSpec::default()
+        })
+        .await;
+        let (status, json) = post_json(
+            app,
+            "/v1/chat/completions",
+            json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "Say hello."}]
+            }),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200, "{json}");
+
+        let echoed = json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            echoed.contains("<|im_start|>user\nSay hello.<|im_end|>"),
+            "the dispatched prompt must use the model's real ChatML markers: {echoed}"
+        );
+        assert!(
+            !echoed.contains("<|end|>"),
+            "the fabricated marker must not reach the model: {echoed}"
+        );
+
+        let captured = captured.lock().expect("captured lock");
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0].add_special,
+            "ChatML renders no literal BOS, so the tokenizer's own \
+             add_bos_token policy must still apply"
+        );
+        assert_eq!(
+            captured[0].max_tokens, 256,
+            "an omitted max_tokens must resolve to the documented default"
+        );
+    }
+
+    /// An explicit `max_tokens` reaches the worker unchanged — the budget the
+    /// caller asked for is the budget the decode loop enforces, which is what
+    /// makes a `"length"` finish reason meaningful.
+    #[tokio::test]
+    async fn chat_route_forwards_explicit_max_tokens() {
+        let (app, captured) = build_live_test_app_spec(MockWorkerSpec::default()).await;
+        let (status, json) = post_json(
+            app,
+            "/v1/chat/completions",
+            json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 7
+            }),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200, "{json}");
+        let captured = captured.lock().expect("captured lock");
+        assert_eq!(captured[0].max_tokens, 7);
+    }
+
+    /// The same route, a different served model: the markers must change
+    /// with it, and Llama-3 (which renders its own `<|begin_of_text|>`) must
+    /// suppress `add_special` so the model does not get two BOS tokens.
+    #[tokio::test]
+    async fn chat_route_follows_the_served_models_template() {
+        let (app, captured) = build_live_test_app_spec(MockWorkerSpec {
+            chat_template: ChatTemplate::Llama3,
+            echo_prompt: true,
+            ..MockWorkerSpec::default()
+        })
+        .await;
+        let (status, json) = post_json(
+            app,
+            "/v1/chat/completions",
+            json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "Say hello."}]
+            }),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200, "{json}");
+
+        let echoed = json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(echoed.starts_with("<|begin_of_text|>"), "{echoed}");
+        assert!(
+            echoed.contains("<|start_header_id|>user<|end_header_id|>"),
+            "{echoed}"
+        );
+        assert!(!echoed.contains("<|im_start|>"), "{echoed}");
+
+        let captured = captured.lock().expect("captured lock");
+        assert!(
+            !captured[0].add_special,
+            "Llama-3 renders a literal <|begin_of_text|>; add_special must be \
+             false or the prompt gets two BOS tokens"
+        );
+    }
+
+    /// The WebSocket / Responses / Assistants / batch paths render through
+    /// the same `AppState::chat_template`; this covers the streaming branch
+    /// of the chat route specifically, which builds its prompt separately
+    /// from the non-streaming one only in the sense that it shares the same
+    /// `prompt` binding — a regression that reverted one branch would show
+    /// up here.
+    #[tokio::test]
+    async fn chat_streaming_route_dispatches_a_template_rendered_prompt() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Method, Request};
+        use tower::ServiceExt as _;
+
+        let (app, captured) = build_live_test_app_spec(MockWorkerSpec {
+            chat_template: ChatTemplate::ChatMl,
+            echo_prompt: true,
+            ..MockWorkerSpec::default()
+        })
+        .await;
+        let body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "stream": true
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&body).expect("test: body should serialise"),
+            ))
+            .expect("test: build request");
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("test: router should handle request");
+        let bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("test: read body");
+        let _ = String::from_utf8_lossy(&bytes);
+
+        let captured = captured.lock().expect("captured lock");
+        assert_eq!(
+            captured.len(),
+            1,
+            "the stream request must reach the worker"
+        );
+        assert!(
+            captured[0]
+                .prompt
+                .contains("<|im_start|>user\nSay hello.<|im_end|>"),
+            "streaming must render through the model's template too: {}",
+            captured[0].prompt
+        );
+        assert!(!captured[0].prompt.contains("<|end|>"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // finish_reason (Defect: hardcoded "stop")
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// A generation that ended on an EOG token reports `"stop"`.
+    #[tokio::test]
+    async fn chat_finish_reason_is_stop_when_generation_ended_naturally() {
+        let (app, _captured) = build_live_test_app_spec(MockWorkerSpec {
+            finish_reason: FinishReason::Eos,
+            ..MockWorkerSpec::default()
+        })
+        .await;
+        let (status, json) = post_json(
+            app,
+            "/v1/chat/completions",
+            json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200, "{json}");
+        assert_eq!(json["choices"][0]["finish_reason"].as_str(), Some("stop"));
+    }
+
+    /// The regression: a generation truncated at `max_tokens` must report
+    /// `"length"`. This used to be hardcoded to `"stop"` regardless.
+    #[tokio::test]
+    async fn chat_finish_reason_is_length_when_max_tokens_was_hit() {
+        let (app, _captured) = build_live_test_app_spec(MockWorkerSpec {
+            finish_reason: FinishReason::MaxTokens,
+            ..MockWorkerSpec::default()
+        })
+        .await;
+        let (status, json) = post_json(
+            app,
+            "/v1/chat/completions",
+            json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1
+            }),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200, "{json}");
+        assert_eq!(
+            json["choices"][0]["finish_reason"].as_str(),
+            Some("length"),
+            "a truncated generation must not claim the model chose to stop: {json}"
+        );
+    }
+
+    /// Running out of context is also `"length"` in OpenAI's vocabulary.
+    #[tokio::test]
+    async fn chat_finish_reason_is_length_when_context_filled() {
+        let (app, _captured) = build_live_test_app_spec(MockWorkerSpec {
+            finish_reason: FinishReason::ContextFull,
+            ..MockWorkerSpec::default()
+        })
+        .await;
+        let (status, json) = post_json(
+            app,
+            "/v1/chat/completions",
+            json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200, "{json}");
+        assert_eq!(json["choices"][0]["finish_reason"].as_str(), Some("length"));
+    }
+
+    /// The trailing SSE chunk carries the same truthful reason.
+    #[tokio::test]
+    async fn chat_streaming_finish_reason_is_length_when_max_tokens_was_hit() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Method, Request};
+        use tower::ServiceExt as _;
+
+        let (app, _captured) = build_live_test_app_spec(MockWorkerSpec {
+            finish_reason: FinishReason::MaxTokens,
+            ..MockWorkerSpec::default()
+        })
+        .await;
+        let body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "stream": true
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&body).expect("test: body should serialise"),
+            ))
+            .expect("test: build request");
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("test: router should handle request");
+        let bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("test: read body");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""finish_reason":"length""#),
+            "the trailing SSE chunk must report length, got: {text}"
+        );
+    }
+
+    /// And still reports `"stop"` when the model really did stop.
+    #[tokio::test]
+    async fn chat_streaming_finish_reason_is_stop_on_eos() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Method, Request};
+        use tower::ServiceExt as _;
+
+        let (app, _captured) = build_live_test_app_spec(MockWorkerSpec {
+            finish_reason: FinishReason::Eos,
+            ..MockWorkerSpec::default()
+        })
+        .await;
+        let body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&body).expect("test: body should serialise"),
+            ))
+            .expect("test: build request");
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("test: router should handle request");
+        let bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("test: read body");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains(r#""finish_reason":"stop""#), "got: {text}");
+    }
 
     /// A request body that is missing required fields (`model`, `messages`)
     /// must be rejected by axum's JSON extractor before the handler runs

@@ -24,10 +24,14 @@
 //! - `blk.{i}.ffn_up.weight` — FFN up projection
 //! - `blk.{i}.ffn_down.weight` — FFN down projection
 //! - `output_norm.weight` — Final RMSNorm
-//! - `output.weight` — LM head
+//! - `output.weight` — LM head (absent on ≤4B checkpoints, which tie it to
+//!   `token_embd.weight`)
 
-mod model;
+pub(crate) mod batch;
+pub mod embedding;
+pub(crate) mod model;
 
+pub use embedding::TokenEmbedding;
 pub use model::{load_qwen3_from_gguf, Qwen3Model};
 
 use crate::config::ModelConfig;
@@ -87,8 +91,8 @@ impl ModelArchitecture for Qwen3Architecture {
             },
             TensorNamePattern {
                 pattern: "output.weight".to_string(),
-                description: "LM head / unembedding".to_string(),
-                required: true,
+                description: "LM head / unembedding (may be tied to token_embd)".to_string(),
+                required: false, // may be tied
             },
         ];
 
@@ -185,6 +189,20 @@ mod tests {
         assert!(
             optional.iter().any(|p| p.contains(".bias")),
             "bias patterns should be optional in Qwen3"
+        );
+    }
+
+    #[test]
+    fn test_output_weight_is_optional_when_tied() {
+        let arch = Qwen3Architecture::new();
+        let names = arch.tensor_names();
+        let output_pattern = names
+            .iter()
+            .find(|p| p.pattern == "output.weight")
+            .expect("output.weight should be listed");
+        assert!(
+            !output_pattern.required,
+            "output.weight should be optional in Qwen3 (tied on ≤4B checkpoints)"
         );
     }
 

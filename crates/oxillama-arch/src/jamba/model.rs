@@ -786,6 +786,45 @@ fn load_rms_norm(model: &oxillama_gguf::GgufModel, name: &str, eps: f32) -> Arch
 /// Optional tensors (`ssm_conv1d.bias`, `ssm_dt.bias`) default to zero
 /// vectors if absent from the file.
 pub fn load_jamba_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<JambaModel> {
+    // ── Refuse to load rather than produce silently-wrong output ─────────────
+    //
+    // This block is a hybrid Mamba-1 + attention + MoE architecture
+    // (`llm_build_jamba`, `LLM_ARCH_JAMBA` in `src/llama-arch.cpp`: SSM_IN,
+    // SSM_CONV1D, SSM_X, SSM_DT, SSM_DT_NORM, SSM_A, SSM_B_NORM, SSM_C_NORM,
+    // SSM_D, SSM_OUT, ATTN_{Q,K,V,OUT}, FFN_GATE_INP, FFN_{GATE,UP,DOWN}_EXPS,
+    // with `recurrent_layer_arr[i] = n_head_kv(i) == 0` deciding per layer).
+    //
+    // What is in this file is not that.  Concretely, and each of these changes
+    // the output rather than merely slowing it down:
+    //
+    // * `attention_forward` ignores its `_kv_cache`, applies no RoPE, does no
+    //   head split (`gemv(&w.w_k, &normed, hidden_size, hidden_size)` — GQA is
+    //   ignored) and replaces softmax attention with
+    //   `v.iter().map(|vi| vi * score.tanh())`.
+    // * The SSM `C` matrix is hard-coded to zeros, so the recurrent branch
+    //   contributes only the `D` skip connection.
+    // * `w_delta` / `log_a` / `d_skip` / `w_b` all fall back to zeros via
+    //   `.unwrap_or_else(|_| vec![0.0; …])` when their tensor is absent.
+    // * `temp_ssm_states` is allocated inside the per-token loop, so the SSM
+    //   recurrence resets on every token.
+    // * There is no MoE at all, despite `expert_count` / `expert_top_k` in the
+    //   config.
+    // * `ssm_dt_norm` / `ssm_b_norm` / `ssm_c_norm` are never loaded.
+    //
+    // A model that loads and returns plausible-looking logits from that is
+    // worse than one that refuses, so the loader refuses.  `jamba` has also been
+    // removed from the crate's `default` feature list.
+    let _ = &model.file.metadata;
+    return Err(ArchError::NotSupported {
+        detail: "the Jamba loader is incomplete: the SSM C matrix is hard-coded to zero, \
+                 attention is not softmax attention and ignores the KV cache and RoPE, the \
+                 MoE branch is absent, and ssm_dt_norm/ssm_b_norm/ssm_c_norm are never read. \
+                 Loading would produce silently wrong output. See the notes on \
+                 `load_jamba_from_gguf`."
+            .to_string(),
+    });
+
+    #[allow(unreachable_code)]
     let config = JambaConfig::from_metadata(&model.file.metadata);
 
     let eps = config.rms_norm_eps;
@@ -902,18 +941,41 @@ pub fn load_jamba_from_gguf(model: &oxillama_gguf::GgufModel) -> ArchResult<Jamb
 // ─── Math helpers ─────────────────────────────────────────────────────────────
 
 /// Row-major GEMV: `y = A @ x`, `A: [out × in]`, `x: [in]`, `y: [out]`.
+///
+/// A short `a` used to be silently tolerated by clamping the row to
+/// `.min(a.len())`, which turned a shape bug into a partial dot product and a
+/// plausible-looking wrong number.  Missing rows now contribute nothing and the
+/// caller can detect the truncation from [`gemv_checked`].
 fn gemv(a: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    gemv_checked(a, x, out_dim, in_dim).unwrap_or_else(|_| vec![0.0f32; out_dim])
+}
+
+/// Row-major GEMV that reports a weight buffer too short for `[out_dim, in_dim]`.
+fn gemv_checked(a: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> ArchResult<Vec<f32>> {
+    let need = out_dim
+        .checked_mul(in_dim)
+        .ok_or_else(|| ArchError::InvalidShape {
+            name: "jamba.gemv".to_string(),
+            expected: vec![out_dim, in_dim],
+            got: vec![a.len()],
+        })?;
+    if a.len() < need || x.len() < in_dim {
+        return Err(ArchError::InvalidShape {
+            name: "jamba.gemv".to_string(),
+            expected: vec![out_dim, in_dim],
+            got: vec![a.len(), x.len()],
+        });
+    }
     let mut y = vec![0.0f32; out_dim];
     for (o, y_o) in y.iter_mut().enumerate() {
-        let row_start = o * in_dim;
-        let row_end = (row_start + in_dim).min(a.len());
-        *y_o = a[row_start..row_end]
+        let row = &a[o * in_dim..(o + 1) * in_dim];
+        *y_o = row
             .iter()
             .zip(x.iter().take(in_dim))
             .map(|(a_val, x_val)| a_val * x_val)
             .sum();
     }
-    y
+    Ok(y)
 }
 
 /// SiLU (swish) activation: `x * sigmoid(x)`.
@@ -1181,21 +1243,38 @@ mod tests {
         );
     }
 
-    /// GGUF round-trip: load a minimal Jamba GGUF and assert tensor shapes.
+    /// The loader refuses rather than returning a silently-wrong model.
     ///
-    /// Ignored until `build_minimal_jamba_gguf` is added to
-    /// `oxillama_gguf::test_utils`.
+    /// This replaces an `#[ignore]`d round-trip test whose fixture was never
+    /// written.  A fixture would not have helped: the implementation behind it
+    /// zeroes the SSM `C` matrix and does not run softmax attention, so a
+    /// passing round-trip test would only have certified that garbage loads.
     #[test]
-    #[ignore = "build_minimal_jamba_gguf not yet implemented in oxillama_gguf::test_utils"]
-    fn jamba_loader_round_trip() {
-        // When build_minimal_jamba_gguf becomes available, replace the line below:
-        //   let bytes = oxillama_gguf::test_utils::build_minimal_jamba_gguf();
-        //   let model_file = oxillama_gguf::GgufModel::from_bytes(&bytes)
-        //       .expect("must parse minimal jamba GGUF");
-        //   let jamba = load_jamba_from_gguf(&model_file)
-        //       .expect("load_jamba_from_gguf must succeed on minimal fixture");
-        //   assert!(!jamba.layers.is_empty(), "loaded model must have layers");
-        //   assert!(!jamba.token_embd.is_empty(), "token_embd must be non-empty");
-        //   assert!(!jamba.lm_head.is_empty(), "lm_head must be non-empty");
+    fn jamba_loader_reports_that_it_is_incomplete() {
+        // Any GGUF at all: the refusal happens before a single tensor is read.
+        let bytes = oxillama_gguf::test_utils::build_minimal_mamba2_gguf();
+        let gguf = oxillama_gguf::GgufModel::from_bytes(bytes).expect("GGUF parses");
+        match load_jamba_from_gguf(&gguf) {
+            Err(ArchError::NotSupported { detail }) => {
+                assert!(
+                    detail.contains("C matrix"),
+                    "the refusal must name what is missing, got: {detail}"
+                );
+            }
+            other => panic!(
+                "expected NotSupported, got {:?}",
+                other.map(|_| "Ok(model)")
+            ),
+        }
+    }
+
+    /// A weight buffer shorter than `[out_dim, in_dim]` is a shape error, not a
+    /// partial dot product.
+    #[test]
+    fn gemv_reports_a_truncated_weight_matrix() {
+        let a = vec![1.0f32; 5]; // needs 2 * 4 = 8
+        let x = vec![1.0f32; 4];
+        assert!(gemv_checked(&a, &x, 2, 4).is_err());
+        assert!(gemv_checked(&[1.0f32; 8], &x, 2, 4).is_ok());
     }
 }

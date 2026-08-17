@@ -1,9 +1,13 @@
 //! HuggingFace Hub integration for oxillama-py.
 //!
 //! Downloads GGUF files from a HuggingFace repository using the `hf-hub`
-//! crate's synchronous Cache API.
+//! crate's synchronous (`blocking`-feature) client, so these bindings stay
+//! callable from Python without an async runtime of their own. Download
+//! progress renders as an `indicatif` bar via [`PullProgress`] — see its doc
+//! comment for why this duplicates `oxillama-cli`'s copy instead of sharing
+//! it.
 
-use hf_hub::api::sync::ApiBuilder;
+use hf_hub::HFClient;
 use pyo3::exceptions::{PyIOError, PyRuntimeError};
 use pyo3::prelude::*;
 
@@ -16,6 +20,95 @@ fn resolve_token(token: Option<&str>) -> Option<String> {
     std::env::var("HF_TOKEN")
         .ok()
         .or_else(|| std::env::var("HUGGINGFACE_HUB_TOKEN").ok())
+}
+
+/// Renders `Engine.from_hub()` / `oxillama_py.hub.load_from_hub()` download
+/// progress as an `indicatif` bar.
+///
+/// This is a near-verbatim duplicate of `oxillama-cli`'s `PullProgress`
+/// (`crates/oxillama-cli/src/hub.rs`) — same hf-hub 1.0
+/// [`ProgressHandler`](hf_hub::progress::ProgressHandler) contract, same
+/// template. There is no crate shared by both `oxillama-cli` and
+/// `oxillama-py` that this could live in without misplacing a terminal-UI
+/// helper inside a lower layer (`oxillama-runtime`/`oxillama-gguf`), so the
+/// two copies are kept independently — if the rendering changes in one,
+/// check whether the other should follow.
+///
+/// Fixes a regression: the hf-hub 0.5 → 1.0 migration (v0.1.4) dropped the
+/// old `ApiBuilder::new()` (defaulted `progress = true`) built-in renderer in
+/// favour of this callback, and `oxillama-py` did not yet depend on
+/// `indicatif` to replace it — see TODO.md's Known Gaps for the dated history.
+struct PullProgress {
+    bar: indicatif::ProgressBar,
+}
+
+impl PullProgress {
+    /// Longest filename rendered in the bar's message; longer names are shown
+    /// as `..{tail}` — the elision rule hf-hub 0.5 applied.
+    const MAX_MESSAGE_CHARS: usize = 30;
+
+    fn new() -> Self {
+        // The total is unknown until the `Start` event reports the HEAD size.
+        let bar = indicatif::ProgressBar::new(0);
+        bar.set_style(
+            indicatif::ProgressStyle::with_template(
+                "{msg} [{elapsed_precise}] [{wide_bar}] {bytes}/{total_bytes} {bytes_per_sec} ({eta})",
+            )
+            .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar()),
+        );
+        Self { bar }
+    }
+
+    /// Elide `filename` from the left so the message stays one line wide.
+    ///
+    /// Split on `char` boundaries rather than bytes: repo paths are arbitrary
+    /// UTF-8, and byte slicing would panic mid-codepoint.
+    fn shorten(filename: &str) -> String {
+        let chars = filename.chars().count();
+        if chars <= Self::MAX_MESSAGE_CHARS {
+            return filename.to_string();
+        }
+        let tail: String = filename
+            .chars()
+            .skip(chars - Self::MAX_MESSAGE_CHARS)
+            .collect();
+        format!("..{tail}")
+    }
+}
+
+impl hf_hub::progress::ProgressHandler for PullProgress {
+    fn on_progress(&self, event: &hf_hub::progress::ProgressEvent) {
+        use hf_hub::progress::{DownloadEvent, ProgressEvent};
+
+        // `download_model_from_hub` only ever downloads, so upload events
+        // cannot reach here.
+        let ProgressEvent::Download(download) = event else {
+            return;
+        };
+
+        match download {
+            DownloadEvent::Start { total_bytes, .. } => self.bar.set_length(*total_bytes),
+            // Per-file deltas. Exactly one file downloads per call, so the
+            // most recent entry always describes it.
+            DownloadEvent::Progress { files } => {
+                if let Some(file) = files.last() {
+                    self.bar.set_message(Self::shorten(&file.filename));
+                    self.bar.set_position(file.bytes_completed);
+                }
+            }
+            // Xet-backed blobs report batch aggregates instead of per-file
+            // deltas, and the batch here is that single file.
+            DownloadEvent::AggregateProgress {
+                bytes_completed,
+                total_bytes,
+                ..
+            } => {
+                self.bar.set_length(*total_bytes);
+                self.bar.set_position(*bytes_completed);
+            }
+            DownloadEvent::Complete => self.bar.finish(),
+        }
+    }
 }
 
 /// Download a GGUF model file from HuggingFace Hub.
@@ -38,34 +131,42 @@ pub fn download_model_from_hub(
 ) -> PyResult<String> {
     let resolved_token = resolve_token(token);
 
-    let mut builder = ApiBuilder::new();
+    // hf-hub 1.0 replaced `ApiBuilder` with `HFClient::builder()`; `token`
+    // takes the value directly (no `Option` wrapper), and `build_sync()`
+    // (feature = "blocking") yields the synchronous facade over the async core.
+    let mut builder = HFClient::builder();
     if let Some(t) = resolved_token {
-        builder = builder.with_token(Some(t));
+        builder = builder.token(t);
     }
 
-    let api = builder
-        .build()
+    let client = builder
+        .build_sync()
         .map_err(|e| PyIOError::new_err(format!("Failed to build HF Hub API client: {e}")))?;
 
     let rev = revision.unwrap_or("main");
-    let model_api = api.repo(hf_hub::Repo::with_revision(
-        repo_id.to_owned(),
-        hf_hub::RepoType::Model,
-        rev.to_owned(),
-    ));
+    // Repo handles are typed by repo kind and take `(owner, name)` instead of
+    // a repo-id string plus a `RepoType` enum value; the revision is passed per
+    // request rather than bound to the handle (`Repo::with_revision` is gone).
+    let (owner, repo_name) = hf_hub::split_id(repo_id);
+    let model_repo = client.model(owner, repo_name);
 
     let target_filename: String = if let Some(f) = filename {
         f.to_owned()
     } else {
         // List all siblings in the repo and pick the first .gguf file.
-        let siblings = model_api
+        // `siblings` is optional in 1.0; an absent listing is the same outcome
+        // as an empty one — no GGUF found.
+        let siblings = model_repo
             .info()
+            .revision(rev)
+            .send()
             .map_err(|e| {
                 PyRuntimeError::new_err(format!(
                     "Failed to fetch repository info for '{repo_id}': {e}"
                 ))
             })?
-            .siblings;
+            .siblings
+            .unwrap_or_default();
 
         siblings
             .into_iter()
@@ -79,8 +180,12 @@ pub fn download_model_from_hub(
             })?
     };
 
-    let path = model_api
-        .get(&target_filename)
+    let path = model_repo
+        .download_file()
+        .filename(target_filename.as_str())
+        .revision(rev)
+        .progress(PullProgress::new())
+        .send()
         .map_err(|e| PyIOError::new_err(format!("Failed to download '{target_filename}': {e}")))?;
 
     path.to_str()

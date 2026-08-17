@@ -1,15 +1,43 @@
 //! TQ1_0 reference (naive) implementation — Ternary Quantization 1-bit, type 0.
 //!
 //! TQ1_0 block format (54 bytes per 256 weights):
-//! - 48 bytes (`qs`): base-3 packed ternary values. Each byte encodes 5 ternary
-//!   values via repeated mod-3/div-3 decomposition (48 × 5 = 240 values).
-//! - 4 bytes (`qh`): 16 remaining ternary values packed as 2-bit codes
-//!   (each byte holds 4 values in bits \[1:0\], \[3:2\], \[5:4\], \[7:6\]).
+//! - 48 bytes (`qs`): 5 ternary digits per byte (48 × 5 = 240 values).
+//! - 4 bytes (`qh`): the remaining 16 values, 4 ternary digits per byte.
 //! - 2 bytes (`d`): FP16 scale factor.
 //!
-//! Ternary encoding: `{0 → -1, 1 → 0, 2 → +1}` (i.e. `value - 1`).
+//! Ternary encoding: `{0 → -1, 1 → 0, 2 → +1}` (i.e. `digit - 1`).
 //!
 //! Final weight: `w = d * ternary_value`.
+//!
+//! # Encoding: base-3 in *fixed point*, not plain base-3
+//!
+//! TQ1_0 is **not** a plain base-3 packing.  `quantize_row_tq1_0_ref` builds
+//! the 5-digit value most-significant-digit-first,
+//! `q = Σ_n xi_n · 3^(4-n)` in `0..=242`, and then stores the scaled
+//! ceiling `ceil(q · 256 / 243)`.  `dequantize_row_tq1_0` recovers digit `n`
+//! from the stored byte with
+//!
+//! ```text
+//! let q  = stored_byte.wrapping_mul(3^n);   // u8 arithmetic — wraps mod 256
+//! let xi = ((q as u16) * 3) >> 8;           // leading base-3 digit, 0..=2
+//! ```
+//!
+//! Decoding the stored byte with naive `% 3` / `/ 3` arithmetic produces
+//! *different values*, not merely a different order: the all-`+1` block stores
+//! `ceil(242·256/243) = 255`, which upstream decodes to `+1,+1,+1,+1,+1` and
+//! the naive decomposition decodes to `-1,0,0,-1,-1`.
+//!
+//! `qh` uses the **same** base-3 decomposition — it packs 4 digits shifted up
+//! one position (`q *= 3` after the accumulate loop), *not* four 2-bit fields.
+//!
+//! # Decode order
+//!
+//! Upstream is **digit-major**: for each 32-byte group it emits digit 0 of all
+//! 32 bytes, then digit 1 of all 32, and so on.  So `qs[m]`'s five digits land
+//! at output indices `m`, `m + 32`, `m + 64`, `m + 96`, `m + 128` — 32 apart,
+//! not adjacent.  `sizeof(qs) = 48` splits into one 32-byte group (160 values)
+//! and one 16-byte group (80 values); `qh`'s 4 bytes then contribute
+//! `4 digits × 4 bytes = 16` values, also digit-major.
 //!
 //! This format is part of the llama.cpp ecosystem (GgufTensorType value 34)
 //! and supports BitNet b1.58 and similar ternary-weight models.
@@ -37,31 +65,32 @@ const TQ1_0_D_OFFSET: usize = TQ1_0_QS_BYTES + TQ1_0_QH_BYTES;
 /// multiplied by a shared FP16 scale factor.
 pub struct Tq1_0Ref;
 
-/// Decode a single `qs` byte into 5 ternary values (-1, 0, or +1).
-///
-/// The byte encodes 5 base-3 digits: `v[i] = (q / 3^i) % 3 - 1`.
-#[inline]
-fn decode_qs_byte(byte: u8) -> [i8; 5] {
-    let mut q = byte as u16;
-    let mut out = [0i8; 5];
-    for v in &mut out {
-        *v = (q % 3) as i8 - 1;
-        q /= 3;
-    }
-    out
-}
+/// Powers of three used by the fixed-point base-3 decode, as `u8` exactly as
+/// upstream declares them (`static const uint8_t pow3[6]`).
+const POW3: [u8; 5] = [1, 3, 9, 27, 81];
 
-/// Decode a single `qh` byte into 4 ternary values (-1, 0, or +1).
+/// Number of ternary digits packed into one `qs` byte.
+const TQ1_0_QS_DIGITS: usize = 5;
+/// Number of ternary digits packed into one `qh` byte.
+const TQ1_0_QH_DIGITS: usize = 4;
+
+/// Recover ternary digit `digit` from a packed TQ1_0 byte.
 ///
-/// Each pair of bits encodes one value: `(bits & 3) - 1`.
+/// Literal port of upstream's two-line kernel:
+///
+/// ```c
+/// uint8_t q  = x[i].qs[j + m] * pow3[n];   // uint8_t: wraps mod 256
+/// int16_t xi = ((uint16_t) q * 3) >> 8;    // leading base-3 digit
+/// *y++ = (float) (xi - 1) * d;
+/// ```
+///
+/// Multiplying by `3^digit` shifts the requested digit into the leading
+/// position (the `u8` wrap discards the more significant digits), and the
+/// `(·3) >> 8` reads it back out of the fixed-point representation.
 #[inline]
-fn decode_qh_byte(byte: u8) -> [i8; 4] {
-    [
-        (byte & 0x03) as i8 - 1,
-        ((byte >> 2) & 0x03) as i8 - 1,
-        ((byte >> 4) & 0x03) as i8 - 1,
-        ((byte >> 6) & 0x03) as i8 - 1,
-    ]
+fn decode_trit(byte: u8, digit: usize) -> i8 {
+    let q = byte.wrapping_mul(POW3[digit]);
+    ((((q as u16) * 3) >> 8) as i8) - 1
 }
 
 /// Convert an IEEE 754 FP16 half-precision value to FP32.
@@ -90,21 +119,35 @@ impl QuantKernel for Tq1_0Ref {
             block[TQ1_0_D_OFFSET + 1],
         ]));
 
-        // Decode qs: 48 bytes → 240 ternary values
+        // Decode qs: 48 bytes → 240 ternary values, digit-major within each
+        // group.  48 = one 32-byte group + one 16-byte group, exactly as
+        // upstream's `sizeof(qs) - sizeof(qs) % 32` split.
         let mut out_idx = 0;
-        for &qs_byte in &block[..TQ1_0_QS_BYTES] {
-            let vals = decode_qs_byte(qs_byte);
-            for &v in &vals {
-                output[out_idx] = d * v as f32;
-                out_idx += 1;
+        let mut j = 0usize;
+        let qs_head = TQ1_0_QS_BYTES - TQ1_0_QS_BYTES % 32;
+        while j < qs_head {
+            for digit in 0..TQ1_0_QS_DIGITS {
+                for m in 0..32 {
+                    output[out_idx] = d * decode_trit(block[j + m], digit) as f32;
+                    out_idx += 1;
+                }
             }
+            j += 32;
+        }
+        while j < TQ1_0_QS_BYTES {
+            for digit in 0..TQ1_0_QS_DIGITS {
+                for m in 0..16 {
+                    output[out_idx] = d * decode_trit(block[j + m], digit) as f32;
+                    out_idx += 1;
+                }
+            }
+            j += 16;
         }
 
-        // Decode qh: 4 bytes → 16 ternary values
-        for &qh_byte in &block[TQ1_0_QH_OFFSET..TQ1_0_QH_OFFSET + TQ1_0_QH_BYTES] {
-            let vals = decode_qh_byte(qh_byte);
-            for &v in &vals {
-                output[out_idx] = d * v as f32;
+        // Decode qh: 4 bytes → 16 ternary values, also digit-major.
+        for digit in 0..TQ1_0_QH_DIGITS {
+            for m in 0..TQ1_0_QH_BYTES {
+                output[out_idx] = d * decode_trit(block[TQ1_0_QH_OFFSET + m], digit) as f32;
                 out_idx += 1;
             }
         }
@@ -141,7 +184,7 @@ impl QuantKernel for Tq1_0Ref {
         let blocks_per_row = n_cols.div_ceil(TQ1_0_BLOCK_SIZE);
         let row_bytes = blocks_per_row * TQ1_0_BLOCK_BYTES;
 
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
             let mut sum = 0.0f32;
 
@@ -155,23 +198,41 @@ impl QuantKernel for Tq1_0Ref {
                 let input_offset = blk * TQ1_0_BLOCK_SIZE;
                 let inp = &input[input_offset..];
 
-                // Inline dot product for qs portion (240 values)
+                // Inline dot product for qs portion (240 values), in the same
+                // digit-major order `dequant_block` writes.
                 let mut in_off = 0;
-                for qs_idx in 0..TQ1_0_QS_BYTES {
-                    let vals = decode_qs_byte(data[bo + qs_idx]);
-                    for &v in &vals {
-                        if input_offset + in_off < n_cols {
-                            sum += d * v as f32 * inp[in_off];
+                let mut j = 0usize;
+                let qs_head = TQ1_0_QS_BYTES - TQ1_0_QS_BYTES % 32;
+                while j < qs_head {
+                    for digit in 0..TQ1_0_QS_DIGITS {
+                        for m in 0..32 {
+                            if input_offset + in_off < n_cols {
+                                let v = decode_trit(data[bo + j + m], digit);
+                                sum += d * v as f32 * inp[in_off];
+                            }
+                            in_off += 1;
                         }
-                        in_off += 1;
                     }
+                    j += 32;
+                }
+                while j < TQ1_0_QS_BYTES {
+                    for digit in 0..TQ1_0_QS_DIGITS {
+                        for m in 0..16 {
+                            if input_offset + in_off < n_cols {
+                                let v = decode_trit(data[bo + j + m], digit);
+                                sum += d * v as f32 * inp[in_off];
+                            }
+                            in_off += 1;
+                        }
+                    }
+                    j += 16;
                 }
 
                 // Inline dot product for qh portion (16 values)
-                for qh_idx in 0..TQ1_0_QH_BYTES {
-                    let vals = decode_qh_byte(data[bo + TQ1_0_QH_OFFSET + qh_idx]);
-                    for &v in &vals {
+                for digit in 0..TQ1_0_QH_DIGITS {
+                    for m in 0..TQ1_0_QH_BYTES {
                         if input_offset + in_off < n_cols {
+                            let v = decode_trit(data[bo + TQ1_0_QH_OFFSET + m], digit);
                             sum += d * v as f32 * inp[in_off];
                         }
                         in_off += 1;
@@ -180,7 +241,7 @@ impl QuantKernel for Tq1_0Ref {
             }
 
             *out = sum;
-        }
+        });
 
         Ok(())
     }
@@ -229,27 +290,50 @@ mod tests {
         block
     }
 
-    /// Encode 5 ternary values (-1, 0, +1) into a single qs byte (base-3).
+    /// Encode 5 ternary values into one `qs` byte — literal port of the inner
+    /// loop of upstream `quantize_row_tq1_0_ref`.
+    ///
+    /// `vals[n]` becomes digit `n`, i.e. the value the decoder recovers with
+    /// `decode_trit(byte, n)`.  Digits are accumulated most-significant-first
+    /// and the result is stored as the fixed-point ceiling
+    /// `ceil(q · 256 / 243)`, which is what makes the `(·3) >> 8` decode exact.
     fn encode_qs(vals: [i8; 5]) -> u8 {
-        let mut byte: u8 = 0;
-        let mut multiplier: u8 = 1;
+        let mut q: u8 = 0;
         for &v in &vals {
-            // ternary: -1→0, 0→1, +1→2
-            let encoded = (v + 1) as u8;
-            byte += encoded * multiplier;
-            multiplier *= 3;
+            q = q * 3 + (v + 1) as u8;
         }
-        byte
+        // ceiling division by 243 == 3^5
+        ((q as u16) * 256).div_ceil(243) as u8
     }
 
-    /// Encode 4 ternary values (-1, 0, +1) into a single qh byte (2-bit codes).
+    /// Encode 4 ternary values into one `qh` byte — literal port of upstream's
+    /// `qh` loop, which uses the *same* base-3 scheme as `qs` but with the
+    /// four digits shifted up one position (`q *= 3`), leaving the least
+    /// significant trit unused.
     fn encode_qh(vals: [i8; 4]) -> u8 {
-        let mut byte: u8 = 0;
-        for (i, &v) in vals.iter().enumerate() {
-            let encoded = (v + 1) as u8; // -1→0, 0→1, +1→2
-            byte |= encoded << (i * 2);
+        let mut q: u8 = 0;
+        for &v in &vals {
+            q = q * 3 + (v + 1) as u8;
         }
-        byte
+        q *= 3; // shift the first value to the most significant trit
+        ((q as u16) * 256).div_ceil(243) as u8
+    }
+
+    /// Output index that carries digit `digit` of `qs[byte_index]`.
+    ///
+    /// `qs` is decoded digit-major in a 32-byte group (bytes 0..32, output
+    /// 0..160) followed by a 16-byte group (bytes 32..48, output 160..240).
+    fn qs_out_index(byte_index: usize, digit: usize) -> usize {
+        if byte_index < 32 {
+            digit * 32 + byte_index
+        } else {
+            160 + digit * 16 + (byte_index - 32)
+        }
+    }
+
+    /// Output index that carries digit `digit` of `qh[byte_index]`.
+    fn qh_out_index(byte_index: usize, digit: usize) -> usize {
+        240 + digit * 4 + byte_index
     }
 
     #[test]
@@ -307,11 +391,14 @@ mod tests {
 
     #[test]
     fn test_dequant_mixed() {
-        // d=2.0, encode known pattern and verify
-        let qs_val = encode_qs([-1, 0, 1, -1, 0]); // should give [-2, 0, 2, -2, 0]
-        let qs = [qs_val; 48];
-        let qh_val = encode_qh([1, 0, -1, 1]); // should give [2, 0, -2, 2]
-        let qh = [qh_val; 4];
+        // d=2.0, encode known pattern and verify.  Every byte carries the same
+        // five digits, so the digit-major decode order makes the output
+        // piecewise constant in runs of 32 (then 16) rather than repeating
+        // every five weights.
+        let qs_digits = [-1i8, 0, 1, -1, 0];
+        let qh_digits = [1i8, 0, -1, 1];
+        let qs = [encode_qs(qs_digits); 48];
+        let qh = [encode_qh(qh_digits); 4];
         let block = make_tq1_0_block(2.0, &qs, &qh);
         let kernel = Tq1_0Ref;
         let mut output = vec![0.0f32; TQ1_0_BLOCK_SIZE];
@@ -319,26 +406,24 @@ mod tests {
             .dequant_block(&block, &mut output)
             .expect("test: dequant mixed");
 
-        // Check qs portion pattern repeats
-        let expected_qs = [-2.0f32, 0.0, 2.0, -2.0, 0.0];
-        for chunk in 0..48 {
-            for (j, &exp) in expected_qs.iter().enumerate() {
-                let idx = chunk * 5 + j;
+        for byte_index in 0..48 {
+            for (digit, &v) in qs_digits.iter().enumerate() {
+                let idx = qs_out_index(byte_index, digit);
+                let exp = 2.0 * v as f32;
                 assert!(
                     (output[idx] - exp).abs() < 1e-2,
-                    "output[{idx}] = {}, expected {exp}",
+                    "qs byte {byte_index} digit {digit} → output[{idx}] = {}, expected {exp}",
                     output[idx]
                 );
             }
         }
-        // Check qh portion pattern repeats
-        let expected_qh = [2.0f32, 0.0, -2.0, 2.0];
-        for chunk in 0..4 {
-            for (j, &exp) in expected_qh.iter().enumerate() {
-                let idx = 240 + chunk * 4 + j;
+        for byte_index in 0..4 {
+            for (digit, &v) in qh_digits.iter().enumerate() {
+                let idx = qh_out_index(byte_index, digit);
+                let exp = 2.0 * v as f32;
                 assert!(
                     (output[idx] - exp).abs() < 1e-2,
-                    "output[{idx}] = {}, expected {exp}",
+                    "qh byte {byte_index} digit {digit} → output[{idx}] = {}, expected {exp}",
                     output[idx]
                 );
             }
@@ -501,9 +586,14 @@ mod tests {
         );
     }
 
+    /// Every one of the 3^5 = 243 `qs` digit tuples and 3^4 = 81 `qh` tuples
+    /// survives upstream's encode → decode exactly.
+    ///
+    /// This is the property the fixed-point `ceil(q·256/243)` / `(·3) >> 8`
+    /// pair exists to guarantee, and it is exhaustive: a decoder using naive
+    /// `% 3` arithmetic fails it on the very first non-trivial tuple.
     #[test]
     fn test_encode_decode_roundtrip() {
-        // Verify our test encode helpers round-trip with decode
         for a in -1i8..=1 {
             for b in -1i8..=1 {
                 for c in -1i8..=1 {
@@ -511,7 +601,7 @@ mod tests {
                         for e in -1i8..=1 {
                             let vals = [a, b, c, d_val, e];
                             let encoded = encode_qs(vals);
-                            let decoded = decode_qs_byte(encoded);
+                            let decoded: [i8; 5] = std::array::from_fn(|n| decode_trit(encoded, n));
                             assert_eq!(
                                 vals, decoded,
                                 "roundtrip failed for {vals:?}: encoded={encoded}, decoded={decoded:?}"
@@ -528,7 +618,7 @@ mod tests {
                     for d_val in -1i8..=1 {
                         let vals = [a, b, c, d_val];
                         let encoded = encode_qh(vals);
-                        let decoded = decode_qh_byte(encoded);
+                        let decoded: [i8; 4] = std::array::from_fn(|n| decode_trit(encoded, n));
                         assert_eq!(
                             vals, decoded,
                             "qh roundtrip failed for {vals:?}: encoded={encoded}, decoded={decoded:?}"
@@ -536,6 +626,24 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The all-`+1` block is the cheapest discriminator between upstream's
+    /// fixed-point base-3 decode and a naive `% 3` decomposition.
+    ///
+    /// `q = 242` → stored `ceil(242·256/243) = 255`.  Upstream decodes `255`
+    /// to five `+1`s; the naive decomposition of `255` in base 3 is
+    /// `0,1,1,0,0` → `-1,0,0,-1,-1`.
+    #[test]
+    fn test_all_plus_one_stores_0xff() {
+        assert_eq!(encode_qs([1, 1, 1, 1, 1]), 0xFF);
+        assert_eq!(encode_qh([1, 1, 1, 1]), 253);
+        for n in 0..5 {
+            assert_eq!(decode_trit(0xFF, n), 1, "digit {n} of 0xFF");
+        }
+        for n in 0..4 {
+            assert_eq!(decode_trit(253, n), 1, "digit {n} of 253");
         }
     }
 

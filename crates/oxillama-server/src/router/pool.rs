@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use oxillama_runtime::engine::{EngineConfig, InferenceEngine};
+use oxillama_runtime::GpuPolicy;
 
 use crate::error::{ServerError, ServerResult};
 use crate::router::eviction::LruQueue;
@@ -94,8 +95,13 @@ pub struct ModelLoader {
     registry: HashMap<ModelId, ModelSpec>,
     /// Default context size to pass to the engine.
     pub default_context_size: Option<usize>,
-    /// Default thread count.
+    /// Default thread count for the GEMV pool (`0` = auto, one per logical CPU).
     pub default_num_threads: usize,
+    /// Default GPU offload policy applied to every engine this loader builds.
+    ///
+    /// [`GpuPolicy::Off`] keeps pool-loaded models byte-for-byte on the CPU
+    /// path, which is what the pool did before this field existed.
+    pub default_gpu: GpuPolicy,
 }
 
 impl ModelLoader {
@@ -104,7 +110,8 @@ impl ModelLoader {
         Self {
             registry: HashMap::new(),
             default_context_size: None,
-            default_num_threads: 4,
+            default_num_threads: 0,
+            default_gpu: GpuPolicy::Off,
         }
     }
 
@@ -125,6 +132,7 @@ impl ModelLoader {
             model_path: spec.path.to_string_lossy().into_owned(),
             context_size: self.default_context_size,
             num_threads: self.default_num_threads,
+            gpu: self.default_gpu.clone(),
             ..EngineConfig::default()
         }
     }
@@ -453,6 +461,28 @@ fn estimate_mem_bytes(path: &std::path::Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh loader must not silently opt pool-loaded models into GPU
+    /// offload, and whatever policy it does carry must reach `EngineConfig`.
+    #[test]
+    fn build_engine_config_propagates_default_gpu() {
+        let mut loader = ModelLoader::new();
+        assert_eq!(loader.default_gpu, GpuPolicy::Off);
+
+        let spec = ModelSpec {
+            path: PathBuf::from("/nonexistent/model.gguf"),
+            quant: None,
+        };
+        let cfg = loader.build_engine_config("m", &spec);
+        assert_eq!(cfg.gpu, GpuPolicy::Off);
+
+        loader.default_gpu = GpuPolicy::On(oxillama_runtime::GpuOptions::default());
+        let cfg = loader.build_engine_config("m", &spec);
+        assert_eq!(
+            cfg.gpu,
+            GpuPolicy::On(oxillama_runtime::GpuOptions::default())
+        );
+    }
 
     /// (a) pool_single_model_routes: manual insert; acquire same model twice;
     ///     second call returns same Arc (pointer equality).

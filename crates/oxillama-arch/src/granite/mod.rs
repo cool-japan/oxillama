@@ -1,22 +1,77 @@
 //! Granite-3.x (IBM) architecture.
 //!
-//! Dense decoder-only Transformer following the LLaMA topology with:
-//! - RMSNorm pre-normalization (no bias)
-//! - Grouped-query attention (GQA) from GGUF `granite.attention.head_count_kv`
-//! - RoPE positional embeddings
-//! - SwiGLU feed-forward network
-//! - Tied input/output embeddings
+//! GGUF `general.architecture` = `"granite"` — a **real** architecture id that
+//! llama.cpp writes (`convert_hf_to_gguf.py`'s
+//! `@ModelBase.register("GraniteForCausalLM")` sets
+//! `model_arch = gguf.MODEL_ARCH.GRANITE`, and `gguf-py/gguf/constants.py` maps
+//! `MODEL_ARCH.GRANITE` to the string `"granite"`), so unlike `yi` / `internlm3`
+//! this plugin is genuinely reachable from `general.architecture`.
 //!
-//! GGUF `general.architecture` = `"granite"`.
+//! # Topology
+//!
+//! LLaMA's, exactly: RMSNorm pre-normalisation, grouped-query attention with
+//! NORM-convention RoPE, SwiGLU FFN, optionally tied input/output embeddings.
+//! `src/llama-arch.cpp` gives `LLM_ARCH_GRANITE` the same twelve tensors as
+//! `LLM_ARCH_LLAMA`; `src/llama-model.cpp` creates them in the same arm; and
+//! `llama_model_rope_type` lists it under `LLAMA_ROPE_TYPE_NORM`.
+//!
+//! # What actually makes it Granite
+//!
+//! Four scalar multipliers — [`GraniteScales`] — that this crate did not read
+//! at all before, and whose omission is silent: the model runs and returns
+//! finite, wrong logits.
+//!
+//! | Key | Applied |
+//! |-----|---------|
+//! | `granite.embedding_scale` | multiplies the token embedding |
+//! | `granite.residual_scale`  | multiplies the branch at **both** residual adds |
+//! | `granite.attention.scale` | replaces `1/sqrt(head_dim)` as the softmax scale |
+//! | `granite.logit_scale`     | **divides** the final logits |
+//!
+//! Plus `granite.rope.scaling.finetuned`, which Granite repurposes as an on/off
+//! switch for RoPE and which defaults to `true`.
+//!
+//! See [`scales`] for the reference citations, the sentinel semantics, and why
+//! `logit_scale` divides rather than multiplies.
+//!
+//! # Before this module
+//!
+//! `GraniteArchitecture::build()` returned
+//! `MissingTensor { name: "token_embd.weight (use GraniteModel::from_gguf for
+//! full loading)" }` — naming a `GraniteModel` type that did not exist anywhere
+//! in the tree.  There was no loader, no forward pass, and no code path that
+//! read any of the four multipliers.
 
+mod loader;
 mod model;
+pub mod scales;
 
-pub use model::GraniteArchitecture;
+pub use loader::load_granite_from_gguf;
+pub use model::{GraniteLayer, GraniteModel};
+pub use scales::GraniteScales;
 
 use crate::config::ModelConfig;
 use crate::error::{ArchError, ArchResult};
 use crate::traits::{ForwardPass, ModelArchitecture, TensorNamePattern};
-use oxillama_gguf::TensorStore;
+use oxillama_gguf::{GgufModel, TensorStore};
+
+/// Granite-3.x (IBM) dense decoder-only architecture plugin.
+///
+/// Registered under GGUF `general.architecture` = `"granite"`.
+pub struct GraniteArchitecture;
+
+impl GraniteArchitecture {
+    /// Create a new Granite architecture plugin instance.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for GraniteArchitecture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ModelArchitecture for GraniteArchitecture {
     fn arch_id(&self) -> &str {
@@ -43,9 +98,26 @@ impl ModelArchitecture for GraniteArchitecture {
             });
         }
 
+        // `TensorStore` carries tensor *metadata* only — no payload and no
+        // GGUF KV table, so neither the weights nor Granite's four multipliers
+        // are reachable from here.  `build_from_gguf` is the real entry point.
         Err(ArchError::MissingTensor {
-            name: "token_embd.weight (use GraniteModel::from_gguf for full loading)".to_string(),
+            name: "token_embd.weight (TensorStore has no payload; use \
+                   GraniteArchitecture::build_from_gguf or GraniteModel::from_gguf)"
+                .to_string(),
         })
+    }
+
+    /// Build a runnable Granite model from a fully-loaded GGUF file.
+    ///
+    /// This is what lets the registry route `general.architecture = "granite"`
+    /// to a working model instead of an error.
+    fn build_from_gguf(
+        &self,
+        model: &GgufModel,
+        config: &ModelConfig,
+    ) -> ArchResult<Box<dyn ForwardPass>> {
+        Ok(Box::new(GraniteModel::from_gguf(model, config)?))
     }
 
     fn tensor_names(&self) -> Vec<TensorNamePattern> {
@@ -157,6 +229,29 @@ mod tests {
         let result = arch.build(&config, &tensors);
         assert!(result.is_err());
         assert!(matches!(result, Err(ArchError::ConfigMismatch { .. })));
+    }
+
+    /// The `build()` error must not name a type that does not exist.
+    ///
+    /// It used to read `"… (use GraniteModel::from_gguf for full loading)"`
+    /// while no `GraniteModel` existed anywhere in the tree.
+    #[test]
+    fn build_error_names_only_real_entry_points() {
+        let arch = GraniteArchitecture::new();
+        let tensors = TensorStore::new();
+        let err = arch
+            .build(&make_config(), &tensors)
+            .err()
+            .expect("build() cannot succeed without tensor payload");
+        match err {
+            ArchError::MissingTensor { name } => {
+                assert!(
+                    name.contains("build_from_gguf") && name.contains("GraniteModel::from_gguf"),
+                    "build() should point at the real loaders, got: {name}"
+                );
+            }
+            other => panic!("expected MissingTensor, got {other}"),
+        }
     }
 
     #[test]

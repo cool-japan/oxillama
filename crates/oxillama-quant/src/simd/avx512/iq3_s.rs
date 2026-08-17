@@ -43,6 +43,16 @@ const SIGNS_BYTES: usize = 32;
 const SCALES_OFFSET: usize = 106;
 
 /// AVX-512 accelerated IQ3_S kernel.
+///
+/// Requires `avx512f`. [`crate::dispatch::KernelDispatcher`] is the single
+/// gate: it only constructs this kernel after confirming `avx512f` at
+/// runtime, so — matching every AVX2 kernel in this crate, none of which
+/// re-checks its own CPU feature either — the methods below trust that
+/// invariant instead of repeating the (already cached)
+/// `is_x86_feature_detected!` call on every `dequant_block`/`gemv`
+/// invocation. Constructing this struct directly on hardware without
+/// `avx512f` and calling a trait method is unsound; go through the
+/// dispatcher.
 pub struct Iq3SAvx512;
 
 impl QuantKernel for Iq3SAvx512 {
@@ -59,10 +69,7 @@ impl QuantKernel for Iq3SAvx512 {
                 available: output.len(),
             });
         }
-        if !std::arch::is_x86_feature_detected!("avx512f") {
-            return scalar_dequant_block(block, output);
-        }
-        // SAFETY: bounds verified; avx512f confirmed.
+        // SAFETY: bounds verified above; avx512f guaranteed by KernelDispatcher.
         unsafe { dequant_block_avx512(block, output) }
         Ok(())
     }
@@ -96,21 +103,9 @@ impl QuantKernel for Iq3SAvx512 {
         let blocks_per_row = n_cols.div_ceil(BLOCK_SIZE);
         let row_bytes = blocks_per_row * BLOCK_BYTES;
 
-        if !std::arch::is_x86_feature_detected!("avx512f") {
-            return scalar_gemv(
-                &quant_matrix.data,
-                input,
-                output,
-                n_rows,
-                n_cols,
-                blocks_per_row,
-                row_bytes,
-            );
-        }
-
-        for (row, out) in output.iter_mut().enumerate().take(n_rows) {
+        crate::parallel::for_each_row(output, n_rows, n_cols, |row, out| {
             let row_start = row * row_bytes;
-            // SAFETY: bounds checked; avx512f confirmed.
+            // SAFETY: bounds checked above; avx512f guaranteed by KernelDispatcher.
             *out = unsafe {
                 gemv_row_avx512(
                     &quant_matrix.data[row_start..row_start + row_bytes],
@@ -119,7 +114,7 @@ impl QuantKernel for Iq3SAvx512 {
                     n_cols,
                 )
             };
-        }
+        });
 
         Ok(())
     }
@@ -152,86 +147,6 @@ impl QuantKernel for Iq3SAvx512 {
     fn name(&self) -> &'static str {
         "IQ3_S"
     }
-}
-
-// ---------------------------------------------------------------------------
-// Scalar fallback
-// ---------------------------------------------------------------------------
-
-fn scalar_dequant_block(block: &[u8], output: &mut [f32]) -> QuantResult<()> {
-    use crate::reference::iq3_s::Iq3SRef;
-    Iq3SRef.dequant_block(block, output)
-}
-
-fn scalar_gemv(
-    data: &[u8],
-    input: &[f32],
-    output: &mut [f32],
-    n_rows: usize,
-    n_cols: usize,
-    blocks_per_row: usize,
-    row_bytes: usize,
-) -> QuantResult<()> {
-    for (row, out) in output.iter_mut().enumerate().take(n_rows) {
-        let row_start = row * row_bytes;
-        let mut sum = 0.0f32;
-        for blk in 0..blocks_per_row {
-            let bo = row_start + blk * BLOCK_BYTES;
-            let block = &data[bo..bo + BLOCK_BYTES];
-            let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-            let qs = &block[QS_OFFSET..QS_OFFSET + QS_BYTES];
-            let qh = &block[QH_OFFSET..QH_OFFSET + QH_BYTES];
-            let signs = &block[SIGNS_OFFSET..SIGNS_OFFSET + SIGNS_BYTES];
-            let scales = &block[SCALES_OFFSET..BLOCK_BYTES];
-            let mut ib32 = 0usize;
-            let col = blk * BLOCK_SIZE;
-            while ib32 < N_SUPERBLOCKS {
-                let pair = ib32 / 2;
-                let scale_byte = scales[pair];
-                let dbs = [
-                    d * (1.0 + 2.0 * (scale_byte & 0xF) as f32),
-                    d * (1.0 + 2.0 * (scale_byte >> 4) as f32),
-                ];
-                for (sb_idx, &db) in dbs.iter().enumerate() {
-                    let ib = ib32 + sb_idx;
-                    for l in 0..GROUPS_PER_SUPER {
-                        let idx1 = (qs[8 * ib + 2 * l] as usize)
-                            | (((qh[ib] as usize) << (8 - 2 * l)) & 0x100);
-                        let idx2 = (qs[8 * ib + 2 * l + 1] as usize)
-                            | (((qh[ib] as usize) << (7 - 2 * l)) & 0x100);
-                        let grid1 = IQ3S_GRID[idx1].to_le_bytes();
-                        let grid2 = IQ3S_GRID[idx2].to_le_bytes();
-                        let sign_byte = signs[4 * ib + l];
-                        let base_col = col + ib * SUPER_BLOCK_SIZE + l * 8;
-                        for j in 0..4 {
-                            let c1 = base_col + j;
-                            let c2 = base_col + 4 + j;
-                            let s1 = if sign_byte & KMASK_IQ2XS[j] != 0 {
-                                -1.0_f32
-                            } else {
-                                1.0_f32
-                            };
-                            let s2 = if sign_byte & KMASK_IQ2XS[j + 4] != 0 {
-                                -1.0_f32
-                            } else {
-                                1.0_f32
-                            };
-                            if c1 < n_cols {
-                                sum += db * s1 * grid1[j] as f32 * input[c1];
-                            }
-                            if c2 < n_cols {
-                                sum += db * s2 * grid2[j] as f32 * input[c2];
-                            }
-                        }
-                    }
-                }
-                ib32 += 2;
-            }
-            let _ = col;
-        }
-        *out = sum;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

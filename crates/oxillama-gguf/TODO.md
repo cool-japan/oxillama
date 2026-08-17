@@ -5,39 +5,50 @@
 `oxillama-gguf` is the Pure Rust GGUF v3 binary format parser and tensor
 loader. It is the **first link** in the OxiLLaMa dependency chain —
 consumed by `oxillama-quant`, `oxillama-arch`, and `oxillama-runtime` to
-materialise model weights. No C, no C++, no Fortran, no FFI: pure
-`byteorder` + `memmap2` on stable Rust. Every downstream crate in the
+materialise model weights. No C, no C++, no Fortran, no FFI: a pure
+hand-rolled bounds-checked binary reader + `memmap2` on stable Rust. Every downstream crate in the
 workspace assumes this layer is correct and zero-copy where possible.
 
 ## 2. Status Snapshot
 
 | Field | Value |
 |---|---|
-| Version | `0.1.1` (workspace-pinned) |
+| Version | `0.1.4` (workspace-pinned) |
 | Completion | ~93% (GGUF v1/v2/v3 complete + writer API + streaming parser) |
-| Source files | 11 `.rs` under `src/` (~4,500 LoC) |
+| Source files | 25 `.rs` under `src/` (11,228 LoC, tokei) |
 | Format support | GGUF v1, v2, v3 (all supported) — version-dispatched layouts |
 | Default feature | `mmap` (memmap2-backed zero-copy loader) |
 | Optional feature | `test-utils` (stable since v0.1.1 — synthetic GGUF builders) |
-| Fuzz targets | 4 under `fuzz/fuzz_targets/` (3 raw-byte + 1 arbitrary-structured) |
-| Core deps | `thiserror`, `byteorder`, `half`, `memmap2`, `tracing` |
+| Fuzz targets | 6 under `fuzz/fuzz_targets/` (5 raw-byte + 1 arbitrary-structured) |
+| Core deps | `thiserror`, `half`, `blake3`, `oxicode`, `serde_json`, `memmap2` (mmap), `ureq` (http) |
 | Upstream consumers | `oxillama-quant`, `oxillama-arch`, `oxillama-runtime` |
 
 ## 3. Module Map
 
 | File | Role |
 |---|---|
-| `src/lib.rs` | Crate root; re-exports `GgufFile`, `GgufModel`, `GgufHeader`, `MetadataStore`, `TensorStore` |
-| `src/error.rs` | `GgufError` + `GgufResult<T>` via `thiserror` — invalid magic, unsupported version, unexpected EOF, mmap errors |
-| `src/types.rs` | `GGUF_MAGIC` constant, `GgufValueType` (13 variants), `GgufTensorType` (all GGML dtype IDs), `GGUF_DEFAULT_ALIGNMENT` |
+| `src/lib.rs` | Crate root; re-exports the public API (`GgufFile`, `GgufModel`, `GgufHeader`, `MetadataStore`, `TensorStore`, `GgufWriter`, ...) |
+| `src/error.rs` | `GgufError` + `GgufResult<T>` via `thiserror` — invalid magic, unsupported version, unexpected EOF, invalid metadata, mmap errors |
+| `src/types.rs` | `GGUF_MAGIC` constant, `GgufValueType` (13 variants), `GgufTensorType` (all GGML dtype IDs incl. `Q1_0_G128`), `GGUF_DEFAULT_ALIGNMENT` |
 | `src/header.rs` | `GgufHeader::parse()` — magic/version/tensor-count/KV-count validation |
 | `src/reader.rs` | `BinaryReader` — bounds-checked cursor over `&[u8]` for all primitive reads |
+| `src/reader_core.rs` | `no_std`-compatible parse core generic over any `Source` (`parse_gguf`, `read_header`, `read_metadata_kv`, `read_tensor_infos`, `align_up`) |
+| `src/source.rs` | `Source` trait + `SliceSource` / `ReadSource` / `FileSource` — parse over a slice, a `Read + Seek`, or a file |
 | `src/metadata.rs` | `MetadataStore` + `MetadataValue` — typed KV access (scalars, strings, nested arrays) |
-| `src/tensor_info.rs` | `TensorInfo` + `TensorStore` — per-tensor descriptor (name, shape, dtype, offset) + registry |
+| `src/tensor_info.rs` | `TensorInfo` + `TensorStore` — per-tensor descriptor (name, dimensions, tensor_type, offset) + registry |
 | `src/parser.rs` | `GgufFile::parse()` — full-file parse (header + KV + tensor-info + alignment) without loading data |
-| `src/loader.rs` | `GgufModel` — high-level handle with `load_mmap()` / `load_owned()` / `from_bytes()` entry points |
+| `src/loader.rs` | `GgufModel` — high-level handle: `load_mmap()` / `load_read()` / `load()` / `from_bytes()` entry points |
+| `src/bytes.rs` | `SharedBytes` / `ByteOwner` — `Arc`-backed zero-copy byte views into mmap'd or owned tensor data |
 | `src/streaming.rs` | `StreamingGgufParser` — lazy/streaming tensor parser (`TensorInfoIter`, `find_tensor`, `load_tensors`, `into_full`) |
-| `src/test_utils.rs` | `build_minimal_llama_gguf()` + multi-arch builders (Qwen3, Mistral, Gemma, Phi3, Command-R, StarCoder), `minimal_tokenizer_json()` |
+| `src/writer.rs` | `GgufWriter` (buffered `add_tensor`/`write_to` + streaming `declare_tensor`/`into_data_writer`) and `GgufTensorDataWriter` |
+| `src/resume.rs` | `ResumeCheckpoint`, `ResumeHandle`, `PrefixFingerprint` — partial-download resume via `.oxiresume` sidecar |
+| `src/sharded.rs` | `ShardedGgufModel` — multi-file `model-0000N-of-0000M.gguf` sharding |
+| `src/quantize_on_load.rs` | `QuantTarget`, `QuantPlan`, `GgufModel::load_with_quant_plan()` — on-the-fly quantization at load time |
+| `src/schema.rs` | `SchemaValidator` trait + built-in per-architecture validators; `validate_schema()` |
+| `src/integrity.rs` | `TensorHashValidator` + Blake3 manifest helpers, gated behind the `integrity`/`validate` feature |
+| `src/safetensors.rs` | `SafetensorsConverter` — safetensors → `GgufModel` import bridge |
+| `src/http_source.rs` | `HttpRangeSource`, `GgufModel::from_url()` — remote GGUF loading via HTTP range requests, gated behind the `http` feature |
+| `src/test_utils/` | `build_minimal_llama_gguf()` + 22 multi-arch builders across `mod.rs`/`arch.rs`/`arch_ext.rs`/`arch_deepseek.rs`, `minimal_tokenizer_json()` |
 
 ## 4. Shipped in v0.1.0
 
@@ -56,7 +67,7 @@ workspace assumes this layer is correct and zero-copy where possible.
 ### Loader
 - `GgufModel::load_mmap()` — zero-copy `memmap2` backend (recommended
   path, gated behind default `mmap` feature).
-- `GgufModel::load_owned()` / `GgufModel::from_bytes()` — read-to-memory
+- `GgufModel::load_read()` / `GgufModel::from_bytes()` — read-to-memory
   fallback for WASM, sandboxes, and in-memory fixtures.
 - Clean `reader` / `loader` module split, enabling future streaming
   extension without breaking the public API.
@@ -67,12 +78,10 @@ workspace assumes this layer is correct and zero-copy where possible.
 - `BinaryReader` bounds-checks every primitive read; no
   `debug_assert!` shortcuts on the hot path.
 - Structured errors: `InvalidMagic`, `UnsupportedVersion`,
-  `UnexpectedEof { offset }`, `InvalidValueType`, `MmapError`.
+  `UnexpectedEof { offset }`, `InvalidMetadata`, `MmapError`.
 - All error variants implement `std::error::Error` via `thiserror`,
   making them composable with the upstream `ArchError` and
   `RuntimeError` wrappers.
-- Tracing spans via the `tracing` crate at every top-level
-  parse / load entry point for structured diagnostics.
 
 ### Fuzzing
 - `fuzz/fuzz_targets/gguf_header_parse.rs` — header-level fuzzer
@@ -85,6 +94,20 @@ workspace assumes this layer is correct and zero-copy where possible.
 ### GGUF writer
 - GGUF v3 writer API (`GgufWriter` builder — metadata + tensor
   serialization with 32-byte alignment).
+- Streaming write path (added post-v0.1.0, 2026-08):
+  `GgufWriter::declare_tensor` (shape/type
+  only, no data) + `into_data_writer`/`into_file_data_writer` finalize the
+  header once every tensor is declared (offsets are computable up front from
+  declared sizes + alignment), then `GgufTensorDataWriter::write_tensor` /
+  `write_tensor_from_chunks` stream each tensor's bytes straight to the
+  destination in declared order. Peak memory is O(largest single tensor)
+  instead of O(model) — quantizing an 8B model no longer needs ~4.5 GB of
+  RAM just to hold the output writer's buffered tensors. The original
+  `add_tensor` + `write_to`/`write_to_file` (fully-buffered) API is
+  unchanged and still the right choice for small fixtures/tests; the two
+  APIs are not interchangeable on one `GgufWriter` instance (mixing them
+  returns a typed error). `oxillama convert` migrated to the streaming path;
+  `oxillama quantize` still uses the buffered path.
 
 ### Test fixtures (`test-utils` feature)
 - `build_minimal_llama_gguf()` — synthetic 1-layer LLaMA GGUF binary.
@@ -116,7 +139,7 @@ workspace assumes this layer is correct and zero-copy where possible.
   - **Tests:** `resume_roundtrip_valid_checkpoint`, `resume_rejects_hash_mismatch`, `resume_rejects_future_file_size`, `sharded_loads_two_shards_roundtrip`, `sharded_rejects_mismatched_architecture`, `sharded_rejects_duplicate_tensor`, `quantize_on_load_f16_to_q4_0`, `quantize_on_load_rejects_requantize`, `quantize_on_load_override_per_tensor`.
 - ~~**`test-utils` feature stability.**~~ ✅ Resolved in v0.1.1 — builder
   signatures are now semver-stable within the 0.1.x series.
-- Tensor-data hash validation shipped via `TensorHashValidator` in `src/validate.rs` (v1.1); use `GgufModel::validate_tensor_hashes()` to verify integrity.
+- Tensor-data hash validation shipped via `TensorHashValidator` in `src/integrity.rs` (v1.1); use `GgufModel::validate_tensor_hashes()` to verify integrity.
 - Deep metadata schema validation shipped via pluggable `SchemaValidator` in `src/schema.rs` (v1.1); use `GgufModel::validate_schema()` with a custom validator.
 - ~~**No `no_std` story.**~~ ✅ Resolved: `Source` trait + `SliceSource` in `src/source.rs`, `reader_core.rs` parse logic generic over any `Source`, `cfg_attr(not(feature = "std"), no_std)` in `lib.rs`, cfg-gated `HashMap`→`BTreeMap` in `metadata.rs`/`tensor_info.rs`, cfg-gated `Io` variant in `error.rs`. `cargo check --no-default-features --features alloc` green.
 
@@ -148,6 +171,11 @@ Priority order (highest first):
 8. ~~**Richer fuzzing.**~~ ✅ Done — `fuzz/fuzz_targets/gguf_metadata_arbitrary.rs`
    added using `arbitrary`-derived `ArbScalar`/`ArbMetadata` types that map
    directly to all `MetadataValue` variants including nested `Array` trees.
+   Two more raw-byte targets landed alongside the `no_std` reader core and
+   streaming parser: `gguf_reader_core_parse.rs` (fuzzes `reader_core::parse_gguf`
+   over `SliceSource`, plus direct `SliceSource::seek` probing) and
+   `gguf_streaming_parse.rs` (fuzzes `StreamingGgufParser` lazy tensor
+   iteration, `tensor_data()`, and `into_full()`). 6 fuzz targets total.
 
 ## 7. v2.0+ Vision
 
@@ -162,10 +190,9 @@ Priority order (highest first):
   in-memory `GgufModel` with `general.architecture = "safetensors_import"`.
   Dtype mapping: `F32`→`F32`, `F16`→`F16`, `BF16`→`Bf16`, `I8`→`Q8_0`
   (approximate). Unsupported dtypes → `GgufError::UnsupportedDtype`.
-- **Quantize-on-the-fly.** During parse, downcast `F16`/`BF16` weights
-  to `Q4_0` / `Q8_0` via `oxillama-quant` kernels so that unquantised
-  reference weights fit in consumer RAM without an explicit
-  pre-conversion step.
+- ~~**Quantize-on-the-fly.**~~ ✅ Shipped (2026-04-24, see §5). `QuantPlan` /
+  `QuantTarget` in `src/quantize_on_load.rs`; `GgufModel::load_with_quant_plan(path, plan)`
+  downconverts `F16`/`F32` weights to `Q4_0`/`Q8_0` during load.
 - **Async / `tokio`-based parser.** Non-blocking loaders for the
   server crate, with back-pressure across HTTP range reads and a
   tokenised progress stream exposed to `oxillama-py` and
@@ -180,10 +207,14 @@ Priority order (highest first):
 - **Live-patched weights.** Mmap with `MAP_PRIVATE` + COW so
   `oxillama-runtime` can apply LoRA deltas in-place without evicting
   the base model from the page cache.
-- **Sharded / multi-file GGUF support.** Read `model.gguf` +
-  `model-00002-of-00004.gguf` shards as a single logical view,
-  mirroring HuggingFace `*.safetensors` sharding conventions.
-- **`no_std + alloc` profile.** Fully embedded-target-capable reader
-  and parser (no `std::fs`, no `std::path`) for on-device LLM shells.
+- ~~**Sharded / multi-file GGUF support.**~~ ✅ Shipped (2026-04-24, see §5).
+  `ShardedGgufModel::load_sharded(first_shard)` in `src/sharded.rs` reads
+  `model-00001-of-00004.gguf`-style HF-convention shards as one logical view.
+- ~~**`no_std + alloc` profile.**~~ ✅ Shipped (2026-04-24, see §5/§6). The
+  `alloc` feature builds without `std`; every `std::fs`/`std::path`-touching
+  module (`loader`, `resume`, `sharded`, `writer`, `streaming`, ...) is
+  `#[cfg(feature = "std")]`-gated out. `cargo check --no-default-features
+  --features alloc` green (2026-08-17).
 
-*Last updated: 2026-04-24 (v0.1.1)*
+*Last updated: 2026-08-17 (v0.1.4 — zero-copy mmap weight loading via `SharedBytes`/`ByteOwner`
+in `src/bytes.rs`, GGUF magic-byte regression test in `src/header.rs`; 354 tests passing)*
