@@ -22,7 +22,7 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 
 ## Status
 
-**Version:** 0.1.4 — **Tests:** 266 passing (`--features gpu`) — **Status:** Alpha (optional feature)
+**Version:** 0.1.5 — **Tests:** 266 passing (`--features gpu`) — **Status:** Alpha (optional feature)
 
 **Total GPU kernels:** Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K,
 Q5_K, Q6_K, Q8_K, Q1_0_G128, IQ4_NL, IQ4_XS, IQ1_S, IQ1_M, IQ2_XS, IQ2_S,

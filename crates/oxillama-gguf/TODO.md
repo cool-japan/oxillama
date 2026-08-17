@@ -13,7 +13,7 @@ workspace assumes this layer is correct and zero-copy where possible.
 
 | Field | Value |
 |---|---|
-| Version | `0.1.4` (workspace-pinned) |
+| Version | `0.1.5` (workspace-pinned) |
 | Completion | ~93% (GGUF v1/v2/v3 complete + writer API + streaming parser) |
 | Source files | 25 `.rs` under `src/` (11,228 LoC, tokei) |
 | Format support | GGUF v1, v2, v3 (all supported) — version-dispatched layouts |

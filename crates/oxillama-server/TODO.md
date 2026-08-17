@@ -25,7 +25,7 @@ Rust Policy.
 
 | Item | Value |
 |---|---|
-| Workspace version | 0.1.4 |
+| Workspace version | 0.1.5 |
 | Tests | 357 passing, 1 skipped (`--all-features`); 341 passing, 0 skipped (default features) |
 | Completion | ~99% complete (v0.1.4) — remaining gaps: client-disconnect mid-decode cancellation (§5), audio transcriptions, gRPC transport (§7) |
 | Source files | 58 (`src/**/*.rs`) — 21 top-level + `routes/` (11), `admin/` (6), `batch_spool/` (5), `threads/` (8), `jwt_auth/` (4), `router/` (3) |

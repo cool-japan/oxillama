@@ -20,7 +20,7 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 
 ## Status
 
-**Version:** 0.1.4 — **Tests:** 59 passing
+**Version:** 0.1.5 — **Tests:** 59 passing
 
 ## Feature Flags
 

@@ -21,7 +21,7 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 
 ## Status
 
-**Version:** 0.1.4 — **Tests:** 131 Rust unit tests passing (`cargo nextest -p oxillama-py --all-features`); see [TODO.md](TODO.md) for the separate Python pytest suite count
+**Version:** 0.1.5 — **Tests:** 131 Rust unit tests passing (`cargo nextest -p oxillama-py --all-features`); see [TODO.md](TODO.md) for the separate Python pytest suite count
 
 ## Installation
 

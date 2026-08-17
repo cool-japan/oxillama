@@ -9,7 +9,7 @@ Downstream users depend on this crate to access every subcrate (`gguf`, `quant`,
 
 | Field | Value |
 |-------|-------|
-| Version | `0.1.4` (workspace-inherited) |
+| Version | `0.1.5` (workspace-inherited) |
 | Completion | 100% (re-export shell; contents live in subcrates) |
 | Source files | 1 (`src/lib.rs`, 66 lines) |
 | Direct deps | 4 required + 3 optional subcrates |

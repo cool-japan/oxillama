@@ -42,7 +42,7 @@ re-quantizes activations internally.
 
 | Field | Value |
 |---|---|
-| Version | 0.1.4 |
+| Version | 0.1.5 |
 | Completion | ~99% |
 | Source files | 134 under `src/` |
 | Top-level modules | `dispatch`, `error`, `kquant`, `lora`, `parallel`, `quantize`, `reference`, `simd`, `traits`, `types` |

@@ -26,7 +26,7 @@ as typed `JsValue` rejections — no panics leak through.
 
 | Item                    | Value                                                       |
 |-------------------------|-------------------------------------------------------------|
-| Version                 | 0.1.4                                                       |
+| Version                 | 0.1.5                                                       |
 | Completion              | 95%                                                         |
 | Tests                   | 59 passing (`cargo nextest run -p oxillama-wasm`)           |
 | Public API items        | 27                                                          |

@@ -31,7 +31,7 @@ shader coverage, batching, and attention fusion.
 
 | Item              | Value                                        |
 |-------------------|----------------------------------------------|
-| Version           | 0.1.4 (workspace)                            |
+| Version           | 0.1.5 (workspace)                            |
 | Completion        | ~95 %                                        |
 | Feature flag      | `gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]` (off by default) |
 | wgpu version      | 30.0.0 (workspace-pinned; measured from `Cargo.lock`, not guessed) |

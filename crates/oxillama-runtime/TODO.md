@@ -41,7 +41,7 @@ into `arch` unless they have a concrete reason.
 
 | Field | Value |
 |---|---|
-| Version | 0.1.4 |
+| Version | 0.1.5 |
 | Completion | ~98% |
 | Source files | 48 (`src/**/*.rs`) |
 | Largest file | `src/sampling/grammar/json_schema.rs` (~1.46K lines, under 2000-line policy) |

@@ -6,7 +6,7 @@ Part of the [OxiLLaMa](https://github.com/cool-japan/oxillama) workspace — a P
 
 ## Status
 
-**Version:** 0.1.4 — **Tests:** 357 passing, 1 skipped — **Status:** Alpha (~99% complete)
+**Version:** 0.1.5 — **Tests:** 357 passing, 1 skipped — **Status:** Alpha (~99% complete)
 
 ## What It Provides
 

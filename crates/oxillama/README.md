@@ -10,7 +10,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxillama = "0.1.4"
+oxillama = "0.1.5"
 ```
 
 Then use any subcrate through the unified namespace:

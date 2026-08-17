@@ -19,7 +19,7 @@ both sides of the interpreter boundary.
 
 | Key                 | Value                                                    |
 |---------------------|----------------------------------------------------------|
-| Version             | 0.1.4 (workspace-pinned)                                 |
+| Version             | 0.1.5 (workspace-pinned)                                 |
 | Overall completion  | ~80% (all v1.1 items shipped; hub-download progress bar regression from the hf-hub 1.0 migration fixed 2026-08-17 — see Known Gaps) |
 | Rust source files   | 16 (`lib.rs`, `engine.rs`, `speculative.rs`, `lora.rs`, `sampler.rs`, `error.rs`, `callback.rs`, `async_support.rs`, `hub.rs`, `cancel.rs`, `chat_template.rs`, `dlpack.rs`, `generation.rs`, `snapshot.rs`, `tokenizer.rs`, `torch_interop.rs`) |
 | Rust unit tests     | 131 across all modules (verified 2026-08-17)             |

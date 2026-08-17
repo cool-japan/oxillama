@@ -18,7 +18,7 @@ production paths.
 
 ## 2. Status Snapshot
 
-- Version: **0.1.4** (workspace inherited).
+- Version: **0.1.5** (workspace inherited).
 - Completion: **99%**.
 - Source files: **127** under `src/**/*.rs`.
 - Supported architectures: **26** (24 feature-gated + Yi and InternLM3 compiled unconditionally).

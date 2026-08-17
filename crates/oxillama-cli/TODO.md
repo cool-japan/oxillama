@@ -10,7 +10,7 @@ Terminal leaf in the workspace dependency chain: nothing depends on this crate, 
 
 | Field | Value |
 |---|---|
-| Version | 0.1.4 (workspace) |
+| Version | 0.1.5 (workspace) |
 | Completion | 100% (K-quant re-encoding shipped in v0.1.4 — see §9; the I-quant mixtures remain out of reach because `oxillama-quant` has no I-quant *encoder*) |
 | Source files | 23 (`src/main.rs` + `run_cmd.rs`, `serve_cmd.rs`, `cli_args.rs`, `chat_template.rs`, `bench.rs`, `manpage.rs`, `exit_codes.rs`, `config.rs`, `quantize.rs`, `quantize/type_select.rs`, `quantize/mixture_tests.rs`, `tokenize.rs`, `session.rs`, `hub.rs`, `convert.rs`, `verify.rs`, `dump_logits.rs`, `tui/*.rs`; ~7300 lines total, none over 2000 |
 | Binary name | `oxillama` |

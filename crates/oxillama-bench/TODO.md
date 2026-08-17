@@ -17,7 +17,7 @@ never linked into production builds.
 
 | Field | Value |
 |---|---|
-| Version | 0.1.4 |
+| Version | 0.1.5 |
 | Tests | 146 passing |
 | Completion | ~80% |
 | src files | 16 (`lib.rs`, `arch_config.rs`, `dispatch_matrix.rs`, `e2e.rs`, `heatmap.rs`, `latency.rs`, `long_context.rs`, `memory.rs`, `memory_profiler.rs`, `power.rs`, `prefill_decode.rs`, `real_e2e.rs`, `regression_gate.rs`, `simd_comparison.rs`, `speculative.rs`, `throughput.rs`) |
